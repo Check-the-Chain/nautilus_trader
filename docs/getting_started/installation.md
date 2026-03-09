@@ -46,6 +46,7 @@ uv pip install nautilus_trader
 
 Install optional dependencies as 'extras' for specific integrations:
 
+- `alpaca`: Alpaca adapter (integration) dependencies.
 - `betfair`: Betfair adapter (integration) dependencies.
 - `docker`: Needed for Docker when using the IB gateway (with the Interactive Brokers adapter).
 - `ib`: Interactive Brokers adapter (integration) dependencies.

@@ -1456,6 +1456,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+alpaca = [
+    { name = "aiohttp" },
+]
 betfair = [
     { name = "betfair-parser" },
 ]
@@ -1508,6 +1511,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", marker = "extra == 'alpaca'", specifier = ">=3.13.3,<4.0.0" },
     { name = "betfair-parser", marker = "extra == 'betfair'", specifier = "==0.19.1" },
     { name = "click", specifier = ">=8.0.0,<9.0.0" },
     { name = "defusedxml", marker = "python_full_version < '3.14' and extra == 'ib'", specifier = ">=0.7.1,<1.0.0" },
@@ -1526,7 +1530,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.3,<5.0.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = "==0.22.1,<1.0.0" },
 ]
-provides-extras = ["betfair", "ib", "docker", "polymarket", "visualization"]
+provides-extras = ["alpaca", "betfair", "ib", "docker", "polymarket", "visualization"]
 
 [package.metadata.requires-dev]
 dev = [

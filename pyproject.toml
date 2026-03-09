@@ -74,6 +74,7 @@ script = "build.py"
 generate-setup-file = false
 
 [project.optional-dependencies]
+alpaca = ["aiohttp>=3.13.3,<4.0.0"]
 betfair = ["betfair-parser==0.19.1"] # Pinned to 0.19.1 for stability
 ib = [
   "defusedxml>=0.7.1,<1.0.0; python_version < '3.14'",
