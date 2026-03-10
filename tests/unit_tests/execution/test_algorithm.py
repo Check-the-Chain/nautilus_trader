@@ -34,6 +34,8 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.datetime import secs_to_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
+from nautilus_trader.examples.algorithms.limit_chaser import LimitChaserExecAlgorithm
+from nautilus_trader.examples.algorithms.limit_chaser import LimitChaserExecAlgorithmConfig
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm
 from nautilus_trader.execution.emulator import OrderEmulator
 from nautilus_trader.execution.engine import ExecutionEngine
@@ -1484,3 +1486,188 @@ class TestExecAlgorithm:
 
         # Assert
         assert self.cache.order_exists(primary_order.client_order_id)
+
+    def test_limit_chaser_submits_primary_order_at_touch(self) -> None:
+        # Arrange
+        exec_algorithm = LimitChaserExecAlgorithm()
+        exec_algorithm.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        exec_algorithm.start()
+
+        tick = TestDataStubs.quote_tick(
+            instrument=ETHUSDT_PERP_BINANCE,
+            bid_price=5000.0,
+            ask_price=5001.0,
+            bid_size=10.000,
+            ask_size=10.000,
+        )
+        self.data_engine.process(tick)
+        self.exchange.process_quote_tick(tick)
+
+        order = self.strategy.order_factory.limit(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=ETHUSDT_PERP_BINANCE.make_qty(Decimal("1.000")),
+            price=ETHUSDT_PERP_BINANCE.make_price(Decimal("5002.00")),
+            exec_algorithm_id=exec_algorithm.id,
+        )
+
+        # Act
+        self.strategy.submit_order(order)
+        self.exchange.process(0)
+
+        # Assert
+        assert order.price == ETHUSDT_PERP_BINANCE.make_price(Decimal("5000.00"))
+        assert self.risk_engine.command_count == 1
+        assert self.exec_engine.command_count == 1
+
+    def test_limit_chaser_slices_with_spawned_child_before_primary(self) -> None:
+        # Arrange
+        exec_algorithm = LimitChaserExecAlgorithm()
+        exec_algorithm.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        exec_algorithm.start()
+
+        tick = TestDataStubs.quote_tick(
+            instrument=ETHUSDT_PERP_BINANCE,
+            bid_price=5000.0,
+            ask_price=5001.0,
+            bid_size=10.000,
+            ask_size=10.000,
+        )
+        self.data_engine.process(tick)
+        self.exchange.process_quote_tick(tick)
+
+        order = self.strategy.order_factory.limit(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=ETHUSDT_PERP_BINANCE.make_qty(Decimal("1.500")),
+            price=ETHUSDT_PERP_BINANCE.make_price(Decimal("5002.00")),
+            exec_algorithm_id=exec_algorithm.id,
+            exec_algorithm_params={"max_child_quantity": "1.0"},
+        )
+
+        # Act
+        self.strategy.submit_order(order)
+        self.exchange.process(0)
+
+        # Assert
+        spawned_orders = self.cache.orders_for_exec_spawn(order.client_order_id)
+        assert len(spawned_orders) == 2
+        assert order.quantity == ETHUSDT_PERP_BINANCE.make_qty(Decimal("0.500"))
+        assert spawned_orders[1].client_order_id.value.endswith("-E1")
+        assert spawned_orders[1].quantity == ETHUSDT_PERP_BINANCE.make_qty(Decimal("1.000"))
+        assert spawned_orders[1].price == ETHUSDT_PERP_BINANCE.make_price(Decimal("5000.00"))
+
+    def test_limit_chaser_reprices_primary_order_on_quote_move(self) -> None:
+        # Arrange
+        exec_algorithm = LimitChaserExecAlgorithm(
+            LimitChaserExecAlgorithmConfig(reprice_interval_ms=100),
+        )
+        exec_algorithm.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        exec_algorithm.start()
+
+        tick1 = TestDataStubs.quote_tick(
+            instrument=ETHUSDT_PERP_BINANCE,
+            bid_price=5000.0,
+            ask_price=5001.0,
+            bid_size=10.000,
+            ask_size=10.000,
+        )
+        self.data_engine.process(tick1)
+        self.exchange.process_quote_tick(tick1)
+
+        order = self.strategy.order_factory.limit(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=ETHUSDT_PERP_BINANCE.make_qty(Decimal("1.000")),
+            price=ETHUSDT_PERP_BINANCE.make_price(Decimal("5003.00")),
+            exec_algorithm_id=exec_algorithm.id,
+        )
+        self.strategy.submit_order(order)
+        self.exchange.process(0)
+
+        for event in self.clock.advance_time(secs_to_nanos(0.2)):
+            event.handle()
+
+        tick2 = TestDataStubs.quote_tick(
+            instrument=ETHUSDT_PERP_BINANCE,
+            bid_price=5001.0,
+            ask_price=5002.0,
+            bid_size=10.000,
+            ask_size=10.000,
+        )
+
+        # Act
+        self.data_engine.process(tick2)
+        self.exchange.process_quote_tick(tick2)
+        self.exchange.process(0)
+
+        # Assert
+        cached_order = self.cache.order(order.client_order_id)
+        assert cached_order is not None
+        assert cached_order.price == ETHUSDT_PERP_BINANCE.make_price(Decimal("5001.00"))
+
+    def test_limit_chaser_turns_aggressive_after_deadline(self) -> None:
+        # Arrange
+        exec_algorithm = LimitChaserExecAlgorithm(
+            LimitChaserExecAlgorithmConfig(
+                aggressive_after_secs=1.0,
+                reprice_interval_ms=100,
+            ),
+        )
+        exec_algorithm.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        exec_algorithm.start()
+
+        tick = TestDataStubs.quote_tick(
+            instrument=ETHUSDT_PERP_BINANCE,
+            bid_price=5000.0,
+            ask_price=5002.0,
+            bid_size=10.000,
+            ask_size=10.000,
+        )
+        self.data_engine.process(tick)
+        self.exchange.process_quote_tick(tick)
+
+        order = self.strategy.order_factory.limit(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=ETHUSDT_PERP_BINANCE.make_qty(Decimal("1.000")),
+            price=ETHUSDT_PERP_BINANCE.make_price(Decimal("5002.00")),
+            post_only=False,
+            exec_algorithm_id=exec_algorithm.id,
+        )
+        self.strategy.submit_order(order)
+        self.exchange.process(0)
+
+        # Act
+        for event in self.clock.advance_time(secs_to_nanos(1.1)):
+            event.handle()
+        self.exchange.process(0)
+
+        # Assert
+        cached_order = self.cache.order(order.client_order_id)
+        assert cached_order is not None
+        assert cached_order.price == ETHUSDT_PERP_BINANCE.make_price(Decimal("5002.00"))

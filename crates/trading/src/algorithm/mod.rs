@@ -37,11 +37,13 @@
 
 pub mod config;
 pub mod core;
+pub mod limit_chaser;
 pub mod twap;
 
 pub use core::{ExecutionAlgorithmCore, StrategyEventHandlers};
 
-pub use config::ExecutionAlgorithmConfig;
+pub use config::{ExecutionAlgorithmConfig, ImportableExecutionAlgorithmConfig};
+pub use limit_chaser::{LimitChaserAlgorithm, LimitChaserAlgorithmConfig};
 use nautilus_common::{
     actor::{DataActor, registry::try_get_actor_unchecked},
     enums::ComponentState,

@@ -555,6 +555,34 @@ impl Trader {
         Ok(())
     }
 
+    /// Adds an externally-registered execution algorithm ID to lifecycle tracking.
+    ///
+    /// The execution algorithm must already be registered in the global component
+    /// and actor registries. This helper is used by Python-wrapped native execution
+    /// algorithms which are registered externally but should still participate in
+    /// trader lifecycle management.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the execution algorithm ID is already tracked.
+    pub fn add_exec_algorithm_id_for_lifecycle(
+        &mut self,
+        exec_algorithm_id: ExecAlgorithmId,
+    ) -> anyhow::Result<()> {
+        if self.exec_algorithm_ids.contains(&exec_algorithm_id) {
+            anyhow::bail!("Execution algorithm '{exec_algorithm_id}' is already tracked by trader");
+        }
+
+        self.exec_algorithm_ids.push(exec_algorithm_id);
+
+        log::debug!(
+            "Added execution algorithm '{exec_algorithm_id}' to trader {} for lifecycle management",
+            self.trader_id
+        );
+
+        Ok(())
+    }
+
     /// Validates that the trader is in a valid state for component registration.
     fn validate_component_registration(&self) -> anyhow::Result<()> {
         match self.state {

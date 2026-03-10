@@ -59,8 +59,9 @@ pub mod strategy;
 pub mod examples;
 
 pub use algorithm::{
-    ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore, TwapAlgorithm,
-    TwapAlgorithmConfig,
+    ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore,
+    ImportableExecutionAlgorithmConfig, LimitChaserAlgorithm, LimitChaserAlgorithmConfig,
+    TwapAlgorithm, TwapAlgorithmConfig,
 };
 pub use strategy::{ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore};
 

@@ -15,6 +15,7 @@
 
 //! Python bindings from [PyO3](https://pyo3.rs).
 
+pub mod algorithm;
 pub mod sessions;
 pub mod strategy;
 
@@ -36,5 +37,11 @@ pub fn trading(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<strategy::PyStrategy>()?;
     m.add_class::<crate::strategy::StrategyConfig>()?;
     m.add_class::<crate::strategy::ImportableStrategyConfig>()?;
+    m.add_class::<algorithm::PyExecutionAlgorithm>()?;
+    m.add_function(wrap_pyfunction!(algorithm::py_twap_algorithm, m)?)?;
+    m.add_function(wrap_pyfunction!(algorithm::py_limit_chaser_algorithm, m)?)?;
+    m.add_class::<crate::algorithm::ExecutionAlgorithmConfig>()?;
+    m.add_class::<crate::algorithm::ImportableExecutionAlgorithmConfig>()?;
+    m.add_class::<crate::algorithm::LimitChaserAlgorithmConfig>()?;
     Ok(())
 }
