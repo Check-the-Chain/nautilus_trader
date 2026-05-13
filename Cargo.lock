@@ -4981,6 +4981,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6050,6 +6060,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-lighter"
+version = "0.56.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bon",
+ "futures-util",
+ "libloading",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "nautilus-testkit",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "pyo3-stub-gen",
+ "reqwest 0.13.3",
+ "rstest",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_urlencoded",
+ "strum 0.28.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "nautilus-live"
 version = "0.56.0"
 dependencies = [
@@ -6347,6 +6395,7 @@ dependencies = [
  "nautilus-infrastructure",
  "nautilus-interactive-brokers",
  "nautilus-kraken",
+ "nautilus-lighter",
  "nautilus-live",
  "nautilus-model",
  "nautilus-network",
