@@ -22,7 +22,8 @@ use nautilus_model::identifiers::ExecAlgorithmId;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for an execution algorithm.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.trading", from_py_object)
@@ -32,39 +33,38 @@ pub struct ExecutionAlgorithmConfig {
     pub exec_algorithm_id: Option<ExecAlgorithmId>,
     /// If events should be logged by the algorithm.
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub log_events: bool,
     /// If commands should be logged by the algorithm.
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub log_commands: bool,
 }
 
+impl Default for ExecutionAlgorithmConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// Configuration for creating execution algorithms from importable paths.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.trading",
-        name = "ImportableExecAlgorithmConfig",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.trading", from_py_object)
 )]
-pub struct ImportableExecutionAlgorithmConfig {
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.trading")
+)]
+pub struct ImportableExecAlgorithmConfig {
     /// The fully qualified name of the execution algorithm class.
     pub exec_algorithm_path: String,
     /// The fully qualified name of the execution algorithm config class.
     pub config_path: String,
     /// The execution algorithm configuration as a dictionary.
     pub config: HashMap<String, serde_json::Value>,
-}
-
-impl Default for ExecutionAlgorithmConfig {
-    fn default() -> Self {
-        Self {
-            exec_algorithm_id: None,
-            log_events: true,
-            log_commands: true,
-        }
-    }
 }
 
 #[cfg(test)]

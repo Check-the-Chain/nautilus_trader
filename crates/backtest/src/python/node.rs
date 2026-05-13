@@ -19,35 +19,55 @@ use std::collections::HashMap;
 
 use nautilus_common::{actor::data_actor::ImportableActorConfig, python::actor::PyDataActor};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::identifiers::{ActorId, ComponentId, ExecAlgorithmId, StrategyId};
+use nautilus_model::identifiers::{ActorId, ComponentId, StrategyId};
 use nautilus_trading::{
-    ImportableExecutionAlgorithmConfig, ImportableStrategyConfig,
-    python::{
-        algorithm::PyExecutionAlgorithm,
-        strategy::{PyStrategy, PyStrategyInner},
-    },
+    ImportableStrategyConfig,
+    python::strategy::{PyStrategy, PyStrategyInner},
 };
 use pyo3::{prelude::*, types::PyDict};
 
-use crate::{config::BacktestRunConfig, engine::BacktestResult, node::BacktestNode};
+use crate::{config::BacktestRunConfig, node::BacktestNode, result::BacktestResult};
 
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
 impl BacktestNode {
+    /// Orchestrates catalog-driven backtests from run configurations.
+    ///
+    /// `BacktestNode` connects the `ParquetDataCatalog` with `BacktestEngine` to load
+    /// historical data and run backtests. Supports both oneshot and streaming modes.
     #[new]
     fn py_new(configs: Vec<BacktestRunConfig>) -> PyResult<Self> {
         Self::new(configs).map_err(to_pyruntime_err)
     }
 
+    /// Builds backtest engines from the run configurations.
+    ///
+    /// For each config, creates a `BacktestEngine`, adds venues, and loads
+    /// instruments from the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if engine creation, venue setup, or instrument loading fails.
     #[pyo3(name = "build")]
     fn py_build(&mut self) -> PyResult<()> {
         self.build().map_err(to_pyruntime_err)
     }
 
+    /// Runs all configured backtests and returns results.
+    ///
+    /// Automatically calls `build()` if engines have not been created yet.
+    /// For each run config, loads data from the catalog and runs the engine.
+    /// Supports both oneshot (`chunk_size = None`) and streaming modes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building, data loading, or engine execution fails.
     #[pyo3(name = "run")]
     fn py_run(&mut self) -> PyResult<Vec<BacktestResult>> {
         self.run().map_err(to_pyruntime_err)
     }
 
+    /// Disposes all engines and releases resources.
     #[pyo3(name = "dispose")]
     fn py_dispose(&mut self) {
         self.dispose();
@@ -58,6 +78,7 @@ impl BacktestNode {
         reason = "Required for Python actor component registration"
     )]
     #[pyo3(name = "add_actor_from_config")]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_add_actor_from_config(
         &mut self,
         _py: Python,
@@ -143,7 +164,13 @@ impl BacktestNode {
             .map_err(to_pyruntime_err)?;
 
         // Validate no duplicate before any mutations
-        if engine.kernel().trader.actor_ids().contains(&actor_id) {
+        if engine
+            .kernel()
+            .trader
+            .borrow()
+            .actor_ids()
+            .contains(&actor_id)
+        {
             return Err(to_pyruntime_err(format!(
                 "Actor '{actor_id}' is already registered"
             )));
@@ -157,6 +184,7 @@ impl BacktestNode {
         let clock = engine
             .kernel_mut()
             .trader
+            .borrow_mut()
             .create_component_clock(component_id);
 
         // Phase 3: Register the actor with its dedicated clock
@@ -195,6 +223,7 @@ impl BacktestNode {
         engine
             .kernel_mut()
             .trader
+            .borrow_mut()
             .add_actor_id_for_lifecycle(actor_id)
             .map_err(to_pyruntime_err)?;
 
@@ -207,6 +236,7 @@ impl BacktestNode {
         reason = "Required for Python strategy component registration"
     )]
     #[pyo3(name = "add_strategy_from_config")]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_add_strategy_from_config(
         &mut self,
         _py: Python,
@@ -292,7 +322,13 @@ impl BacktestNode {
             .map_err(to_pyruntime_err)?;
 
         // Validate no duplicate before any mutations
-        if engine.kernel().trader.strategy_ids().contains(&strategy_id) {
+        if engine
+            .kernel()
+            .trader
+            .borrow()
+            .strategy_ids()
+            .contains(&strategy_id)
+        {
             return Err(to_pyruntime_err(format!(
                 "Strategy '{strategy_id}' is already registered"
             )));
@@ -307,6 +343,7 @@ impl BacktestNode {
         let clock = engine
             .kernel_mut()
             .trader
+            .borrow_mut()
             .create_component_clock(component_id);
 
         // Phase 3: Register the strategy with its dedicated clock
@@ -344,155 +381,11 @@ impl BacktestNode {
         engine
             .kernel_mut()
             .trader
+            .borrow_mut()
             .add_strategy_id_with_subscriptions::<PyStrategyInner>(strategy_id)
             .map_err(to_pyruntime_err)?;
 
         log::info!("Registered Python strategy {strategy_id}");
-        Ok(())
-    }
-
-    #[allow(
-        unsafe_code,
-        reason = "Required for Python execution algorithm component registration"
-    )]
-    #[pyo3(name = "add_exec_algorithm")]
-    fn py_add_exec_algorithm(
-        &mut self,
-        _py: Python,
-        run_config_id: &str,
-        exec_algorithm: Py<PyAny>,
-    ) -> PyResult<()> {
-        let engine = self.get_engine_mut(run_config_id).ok_or_else(|| {
-            to_pyruntime_err(format!("No engine for run config '{run_config_id}'"))
-        })?;
-
-        let exec_algorithm_id = Python::attach(|py| -> anyhow::Result<ExecAlgorithmId> {
-            extract_exec_algorithm_id(exec_algorithm.bind(py))
-        })
-        .map_err(to_pyruntime_err)?;
-
-        if engine
-            .kernel()
-            .trader
-            .exec_algorithm_ids()
-            .contains(&exec_algorithm_id)
-        {
-            return Err(to_pyruntime_err(format!(
-                "Execution algorithm '{exec_algorithm_id}' is already registered"
-            )));
-        }
-
-        let trader_id = engine.kernel().config.trader_id();
-        let cache = engine.kernel().cache.clone();
-        let component_id = ComponentId::new(exec_algorithm_id.inner().as_str());
-        let clock = engine
-            .kernel_mut()
-            .trader
-            .create_component_clock(component_id);
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            register_exec_algorithm(exec_algorithm.bind(py), trader_id, clock, cache)
-        })
-        .map_err(to_pyruntime_err)?;
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            register_exec_algorithm_in_registries(exec_algorithm.bind(py))
-        })
-        .map_err(to_pyruntime_err)?;
-
-        engine
-            .kernel_mut()
-            .trader
-            .add_exec_algorithm_id_for_lifecycle(exec_algorithm_id)
-            .map_err(to_pyruntime_err)?;
-
-        log::info!("Registered Python execution algorithm {exec_algorithm_id}");
-        Ok(())
-    }
-
-    #[allow(
-        unsafe_code,
-        reason = "Required for Python execution algorithm component registration"
-    )]
-    #[pyo3(name = "add_exec_algorithm_from_config")]
-    fn py_add_exec_algorithm_from_config(
-        &mut self,
-        _py: Python,
-        run_config_id: &str,
-        config: ImportableExecutionAlgorithmConfig,
-    ) -> PyResult<()> {
-        log::debug!("`add_exec_algorithm_from_config` with: {config:?}");
-
-        let parts: Vec<&str> = config.exec_algorithm_path.split(':').collect();
-        if parts.len() != 2 {
-            return Err(to_pyvalue_err(
-                "exec_algorithm_path must be in format 'module.path:ClassName'",
-            ));
-        }
-        let (module_name, class_name) = (parts[0], parts[1]);
-
-        let engine = self.get_engine_mut(run_config_id).ok_or_else(|| {
-            to_pyruntime_err(format!("No engine for run config '{run_config_id}'"))
-        })?;
-
-        let python_exec_algorithm = Python::attach(|py| -> anyhow::Result<Py<PyAny>> {
-            let algorithm_module = py
-                .import(module_name)
-                .map_err(|e| anyhow::anyhow!("Failed to import module {module_name}: {e}"))?;
-            let algorithm_class = algorithm_module
-                .getattr(class_name)
-                .map_err(|e| anyhow::anyhow!("Failed to get class {class_name}: {e}"))?;
-            let config_instance = create_config_instance(py, &config.config_path, &config.config)?;
-            let python_exec_algorithm = if let Some(config_obj) = config_instance {
-                algorithm_class.call1((config_obj,))?
-            } else {
-                algorithm_class.call0()?
-            };
-            Ok(python_exec_algorithm.unbind())
-        })
-        .map_err(to_pyruntime_err)?;
-
-        let exec_algorithm_id = Python::attach(|py| -> anyhow::Result<ExecAlgorithmId> {
-            extract_exec_algorithm_id(python_exec_algorithm.bind(py))
-        })
-        .map_err(to_pyruntime_err)?;
-
-        if engine
-            .kernel()
-            .trader
-            .exec_algorithm_ids()
-            .contains(&exec_algorithm_id)
-        {
-            return Err(to_pyruntime_err(format!(
-                "Execution algorithm '{exec_algorithm_id}' is already registered"
-            )));
-        }
-
-        let trader_id = engine.kernel().config.trader_id();
-        let cache = engine.kernel().cache.clone();
-        let component_id = ComponentId::new(exec_algorithm_id.inner().as_str());
-        let clock = engine
-            .kernel_mut()
-            .trader
-            .create_component_clock(component_id);
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            register_exec_algorithm(python_exec_algorithm.bind(py), trader_id, clock, cache)
-        })
-        .map_err(to_pyruntime_err)?;
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            register_exec_algorithm_in_registries(python_exec_algorithm.bind(py))
-        })
-        .map_err(to_pyruntime_err)?;
-
-        engine
-            .kernel_mut()
-            .trader
-            .add_exec_algorithm_id_for_lifecycle(exec_algorithm_id)
-            .map_err(to_pyruntime_err)?;
-
-        log::info!("Registered Python execution algorithm {exec_algorithm_id}");
         Ok(())
     }
 
@@ -501,37 +394,7 @@ impl BacktestNode {
     }
 }
 
-fn extract_exec_algorithm_id(exec_algorithm: &Bound<'_, PyAny>) -> anyhow::Result<ExecAlgorithmId> {
-    if let Ok(py_exec_ref) = exec_algorithm.extract::<PyRefMut<PyExecutionAlgorithm>>() {
-        return Ok(py_exec_ref.exec_algorithm_id());
-    }
-
-    anyhow::bail!("Unsupported execution algorithm type, expected Rust-native ExecutionAlgorithm");
-}
-
-fn register_exec_algorithm(
-    exec_algorithm: &Bound<'_, PyAny>,
-    trader_id: nautilus_model::identifiers::TraderId,
-    clock: std::rc::Rc<std::cell::RefCell<dyn nautilus_common::clock::Clock>>,
-    cache: std::rc::Rc<std::cell::RefCell<nautilus_common::cache::Cache>>,
-) -> anyhow::Result<()> {
-    if let Ok(mut py_exec_ref) = exec_algorithm.extract::<PyRefMut<PyExecutionAlgorithm>>() {
-        return py_exec_ref.register(trader_id, clock, cache);
-    }
-
-    anyhow::bail!("Unsupported execution algorithm type, expected Rust-native ExecutionAlgorithm");
-}
-
-fn register_exec_algorithm_in_registries(exec_algorithm: &Bound<'_, PyAny>) -> anyhow::Result<()> {
-    if let Ok(py_exec_ref) = exec_algorithm.cast::<PyExecutionAlgorithm>() {
-        py_exec_ref.borrow().register_in_global_registries();
-        return Ok(());
-    }
-
-    anyhow::bail!("Unsupported execution algorithm type, expected Rust-native ExecutionAlgorithm");
-}
-
-fn create_config_instance<'py>(
+pub(crate) fn create_config_instance<'py>(
     py: Python<'py>,
     config_path: &str,
     config: &HashMap<String, serde_json::Value>,
@@ -560,6 +423,7 @@ fn create_config_instance<'py>(
 
     // Convert config dict to Python dict
     let py_dict = PyDict::new(py);
+
     for (key, value) in config {
         let json_str = serde_json::to_string(value)
             .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;

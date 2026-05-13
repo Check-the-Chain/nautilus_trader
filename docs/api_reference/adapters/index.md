@@ -11,14 +11,12 @@
    :titlesonly:
    :hidden:
 
-   alpaca.md
    betfair.md
    binance.md
    bybit.md
    databento.md
    dydx.md
    interactive_brokers.md
-   lighter.md
    okx.md
    polymarket.md
    tardis.md
