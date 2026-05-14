@@ -87,3 +87,10 @@ pyo3-stub-gen = { workspace = true, optional = true }
 axum = { workspace = true }
 nautilus-testkit = { workspace = true }
 rstest = { workspace = true }
+
+# Run with `cargo run -p nautilus-lighter --example lighter-data-latency-smoke --features examples`
+[[example]]
+name = "lighter-data-latency-smoke"
+path = "examples/data_latency_smoke.rs"
+required-features = ["examples"]
+doc = false

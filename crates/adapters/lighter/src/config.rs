@@ -254,9 +254,12 @@ impl LighterDataClientConfig {
 
     #[must_use]
     pub fn ws_url(&self) -> String {
-        self.base_url_ws
-            .clone()
-            .unwrap_or_else(|| lighter_ws_base_url_for_environment(self.environment))
+        self.base_url_ws.clone().unwrap_or_else(|| {
+            format!(
+                "{}?readonly=true",
+                lighter_ws_base_url_for_environment(self.environment)
+            )
+        })
     }
 }
 
@@ -331,5 +334,46 @@ impl LighterExecClientConfig {
             (Some(index), Some(key)) => HashMap::from([(index, key)]),
             _ => HashMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LighterDataClientConfig, LighterEnvironment, LighterExecClientConfig,
+        lighter_ws_base_url_for_environment,
+    };
+
+    #[test]
+    fn data_ws_url_defaults_to_readonly_stream() {
+        let config = LighterDataClientConfig::default();
+
+        assert_eq!(
+            config.ws_url(),
+            format!(
+                "{}?readonly=true",
+                lighter_ws_base_url_for_environment(LighterEnvironment::Mainnet)
+            )
+        );
+    }
+
+    #[test]
+    fn exec_ws_url_does_not_default_to_readonly_stream() {
+        let config = LighterExecClientConfig::default();
+
+        assert_eq!(
+            config.ws_url(),
+            lighter_ws_base_url_for_environment(LighterEnvironment::Mainnet)
+        );
+    }
+
+    #[test]
+    fn data_ws_url_preserves_explicit_override() {
+        let config = LighterDataClientConfig {
+            base_url_ws: Some("ws://localhost:8000/stream".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(config.ws_url(), "ws://localhost:8000/stream");
     }
 }

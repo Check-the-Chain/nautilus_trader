@@ -210,7 +210,8 @@ pub struct WsTickerUpdate {
 pub struct WsMessage {
     #[serde(rename = "type")]
     pub msg_type: String,
-    pub channel: String,
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

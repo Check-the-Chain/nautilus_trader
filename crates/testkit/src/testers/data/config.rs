@@ -127,6 +127,9 @@ pub struct DataTesterConfig {
     /// Whether to log received data.
     #[builder(default = true)]
     pub log_data: bool,
+    /// Whether to log local adapter latency for received data.
+    #[builder(default = false)]
+    pub log_latency: bool,
     /// Stats logging interval in seconds (0 to disable).
     #[builder(default = 5)]
     pub stats_interval_secs: u64,
@@ -175,6 +178,7 @@ impl DataTesterConfig {
             book_levels_to_print: 10,
             manage_book: true,
             log_data: true,
+            log_latency: false,
             stats_interval_secs: 5,
         }
     }

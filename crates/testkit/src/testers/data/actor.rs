@@ -23,6 +23,7 @@ use nautilus_common::{
     log_info, nautilus_actor,
     timer::TimeEvent,
 };
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
@@ -371,6 +372,12 @@ impl DataActor for DataTester {
         } else if self.config.log_data {
             log_info!("{deltas:?}", color = LogColor::Cyan);
         }
+        self.log_latency(
+            "book_deltas",
+            deltas.instrument_id,
+            deltas.ts_event,
+            deltas.ts_init,
+        );
         Ok(())
     }
 
@@ -378,6 +385,7 @@ impl DataActor for DataTester {
         if self.config.log_data {
             log_info!("{quote:?}", color = LogColor::Cyan);
         }
+        self.log_latency("quote", quote.instrument_id, quote.ts_event, quote.ts_init);
         Ok(())
     }
 
@@ -385,6 +393,7 @@ impl DataActor for DataTester {
         if self.config.log_data {
             log_info!("{trade:?}", color = LogColor::Cyan);
         }
+        self.log_latency("trade", trade.instrument_id, trade.ts_event, trade.ts_init);
         Ok(())
     }
 
@@ -519,5 +528,25 @@ impl DataTester {
             config,
             books: AHashMap::new(),
         }
+    }
+
+    fn log_latency(
+        &mut self,
+        data_type: &str,
+        instrument_id: InstrumentId,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) {
+        if !self.config.log_latency {
+            return;
+        }
+
+        let now = self.clock().timestamp_ns().as_u64();
+        let adapter_us = now.saturating_sub(ts_init.as_u64()) / 1_000;
+        let event_us = now.saturating_sub(ts_event.as_u64()) / 1_000;
+        log_info!(
+            "{data_type} {instrument_id} adapter={adapter_us}us event_age={event_us}us",
+            color = LogColor::Cyan
+        );
     }
 }

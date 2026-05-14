@@ -55,6 +55,7 @@ fn test_config_creation() {
     assert!(config.subscribe_quotes);
     assert!(!config.subscribe_trades);
     assert!(config.log_data);
+    assert!(!config.log_latency);
     assert_eq!(config.stats_interval_secs, 5);
 }
 
@@ -75,6 +76,7 @@ fn test_config_default() {
     assert!(!config.request_funding_rates);
     assert!(config.can_unsubscribe);
     assert!(config.log_data);
+    assert!(!config.log_latency);
     assert!(config.subscribe_params.is_none());
     assert!(config.request_params.is_none());
 }

@@ -90,3 +90,10 @@ rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }
 tracing-test = { workspace = true }
+
+# Run with `cargo run -p nautilus-interactive-brokers --example interactive-brokers-data-latency-smoke --features examples`
+[[example]]
+name = "interactive-brokers-data-latency-smoke"
+path = "examples/data_latency_smoke.rs"
+required-features = ["examples"]
+doc = false

@@ -238,8 +238,12 @@ fn instrument_meta_from_perp_detail(
         venue(),
     );
     let raw_symbol_value = raw_symbol.as_str().into();
-    let base_currency = Currency::from(base_code.as_str());
-    let quote_currency = Currency::from(quote_code.as_str());
+    let base_currency =
+        Currency::get_or_create_crypto_with_context(base_code.as_str(), Some("lighter perp base"));
+    let quote_currency = Currency::get_or_create_crypto_with_context(
+        quote_code.as_str(),
+        Some("lighter perp quote"),
+    );
 
     let info = detail_to_params(
         &serde_json::to_value(detail).unwrap_or(Value::Null),
@@ -325,8 +329,12 @@ fn instrument_meta_from_spot_detail(
         venue(),
     );
     let raw_symbol_value = raw_symbol.as_str().into();
-    let base_currency = Currency::from(base_code.as_str());
-    let quote_currency = Currency::from(quote_code.as_str());
+    let base_currency =
+        Currency::get_or_create_crypto_with_context(base_code.as_str(), Some("lighter spot base"));
+    let quote_currency = Currency::get_or_create_crypto_with_context(
+        quote_code.as_str(),
+        Some("lighter spot quote"),
+    );
 
     let info = detail_to_params(
         &serde_json::to_value(detail).unwrap_or(Value::Null),
@@ -742,7 +750,10 @@ pub fn account_balances_from_assets(assets: &[Asset]) -> Vec<AccountBalance> {
     assets
         .iter()
         .map(|asset| {
-            let currency = Currency::from(asset.symbol.as_str());
+            let currency = Currency::get_or_create_crypto_with_context(
+                asset.symbol.as_str(),
+                Some("lighter account asset"),
+            );
             let total = asset.balance_f64().unwrap_or_default();
             let locked = asset.locked_balance_f64().unwrap_or_default();
             AccountBalance::new(
@@ -1253,10 +1264,13 @@ fn non_zero_i64_to_unix_nanos(value: i64) -> Option<UnixNanos> {
 #[cfg(test)]
 mod tests {
     use ahash::AHashMap;
+    use nautilus_model::{instruments::Instrument, types::Currency};
 
     use super::{
-        LIGHTER_SETTLEMENT_CURRENCY, LighterMarketType, channel_market_id, resolve_symbol_metadata,
+        LIGHTER_SETTLEMENT_CURRENCY, LighterMarketType, account_balances_from_assets,
+        channel_market_id, instrument_meta_from_perp_detail, resolve_symbol_metadata,
     };
+    use crate::models::{asset::Asset, order_book::PerpsOrderBookDetail};
 
     #[test]
     fn resolve_symbol_metadata_supports_single_token_perp_symbols() {
@@ -1281,5 +1295,43 @@ mod tests {
         assert_eq!(channel_market_id("order_book/2048"), Some(2048));
         assert_eq!(channel_market_id("order_book:2048"), Some(2048));
         assert_eq!(channel_market_id("market_stats:all"), None);
+    }
+
+    #[test]
+    fn instrument_meta_registers_unknown_lighter_crypto_assets() {
+        let assets_by_id = AHashMap::from_iter([(1, "JUP".to_string()), (2, "USDC".to_string())]);
+        let detail = PerpsOrderBookDetail {
+            market_id: Some(42),
+            symbol: Some("JUP-USDC".to_string()),
+            base_asset_id: Some(1),
+            quote_asset_id: Some(2),
+            price_decimals: Some(4),
+            size_decimals: Some(2),
+            ..serde_json::from_value(serde_json::json!({})).unwrap()
+        };
+
+        let meta = instrument_meta_from_perp_detail(&detail, &assets_by_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            meta.instrument.base_currency().unwrap().code.as_str(),
+            "JUP"
+        );
+        assert!(Currency::try_from_str("JUP").is_some());
+    }
+
+    #[test]
+    fn account_balances_register_unknown_lighter_crypto_assets() {
+        let balances = account_balances_from_assets(&[Asset {
+            symbol: "JUP".to_string(),
+            asset_id: 1,
+            balance: Some("1.5".to_string()),
+            locked_balance: Some("0.25".to_string()),
+            extra: serde_json::Map::new(),
+        }]);
+
+        assert_eq!(balances[0].currency.code.as_str(), "JUP");
+        assert!(Currency::try_from_str("JUP").is_some());
     }
 }
