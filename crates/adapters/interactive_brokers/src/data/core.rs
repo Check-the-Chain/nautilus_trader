@@ -984,19 +984,31 @@ impl DataClient for InteractiveBrokersDataClient {
 
         // Clear subscriptions and cache
         {
-            let mut subscriptions = self.subscriptions.blocking_lock();
+            let mut subscriptions = self
+                .subscriptions
+                .try_lock()
+                .context("Failed to lock IB subscriptions for reset")?;
             subscriptions.clear();
         }
         {
-            let mut subscriptions = self.option_greeks_subscriptions.blocking_lock();
+            let mut subscriptions = self
+                .option_greeks_subscriptions
+                .try_lock()
+                .context("Failed to lock IB option greeks subscriptions for reset")?;
             subscriptions.clear();
         }
         {
-            let mut cache = self.quote_cache.blocking_lock();
+            let mut cache = self
+                .quote_cache
+                .try_lock()
+                .context("Failed to lock IB quote cache for reset")?;
             cache.clear();
         }
         {
-            let mut cache = self.option_greeks_cache.blocking_lock();
+            let mut cache = self
+                .option_greeks_cache
+                .try_lock()
+                .context("Failed to lock IB option greeks cache for reset")?;
             cache.clear();
         }
 
@@ -1242,7 +1254,10 @@ impl DataClient for InteractiveBrokersDataClient {
         self.tasks.push(task);
 
         // Record subscription
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for quote subscription")?;
         subscriptions.insert(
             cmd.instrument_id,
             SubscriptionInfo {
@@ -1330,7 +1345,10 @@ impl DataClient for InteractiveBrokersDataClient {
 
         self.tasks.push(task);
 
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for index price subscription")?;
         subscriptions.insert(
             cmd.instrument_id,
             SubscriptionInfo {
@@ -1413,7 +1431,10 @@ impl DataClient for InteractiveBrokersDataClient {
 
         self.tasks.push(task);
 
-        let mut subscriptions = self.option_greeks_subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .option_greeks_subscriptions
+            .try_lock()
+            .context("Failed to lock IB option greeks subscriptions")?;
         if let Some(existing) = subscriptions.insert(cmd.instrument_id, subscription_token) {
             existing.cancel();
         }
@@ -1428,7 +1449,10 @@ impl DataClient for InteractiveBrokersDataClient {
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
         tracing::debug!("Unsubscribing from quotes for {}", cmd.instrument_id);
 
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for quote unsubscribe")?;
         if let Some(sub_info) = subscriptions.remove(&cmd.instrument_id) {
             sub_info.cancellation_token.cancel();
             tracing::info!("Unsubscribed from quotes for {}", cmd.instrument_id);
@@ -1451,7 +1475,10 @@ impl DataClient for InteractiveBrokersDataClient {
     fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
         tracing::debug!("Unsubscribing from index prices for {}", cmd.instrument_id);
 
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for index price unsubscribe")?;
         if let Some(sub_info) = subscriptions.remove(&cmd.instrument_id) {
             sub_info.cancellation_token.cancel();
             tracing::info!("Unsubscribed from index prices for {}", cmd.instrument_id);
@@ -1468,7 +1495,10 @@ impl DataClient for InteractiveBrokersDataClient {
     fn unsubscribe_option_greeks(&mut self, cmd: &UnsubscribeOptionGreeks) -> anyhow::Result<()> {
         tracing::debug!("Unsubscribing from option greeks for {}", cmd.instrument_id);
 
-        let mut subscriptions = self.option_greeks_subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .option_greeks_subscriptions
+            .try_lock()
+            .context("Failed to lock IB option greeks subscriptions for unsubscribe")?;
         if let Some(subscription_token) = subscriptions.remove(&cmd.instrument_id) {
             subscription_token.cancel();
             tracing::info!("Unsubscribed from option greeks for {}", cmd.instrument_id);
@@ -1548,7 +1578,10 @@ impl DataClient for InteractiveBrokersDataClient {
         self.tasks.push(task);
 
         // Record subscription
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for trade subscription")?;
         subscriptions.insert(
             cmd.instrument_id,
             SubscriptionInfo {
@@ -1565,7 +1598,10 @@ impl DataClient for InteractiveBrokersDataClient {
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
         tracing::debug!("Unsubscribing from trades for {}", cmd.instrument_id);
 
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for trade unsubscribe")?;
         if let Some(sub_info) = subscriptions.remove(&cmd.instrument_id) {
             sub_info.cancellation_token.cancel();
             tracing::info!("Unsubscribed from trades for {}", cmd.instrument_id);
@@ -1664,7 +1700,10 @@ impl DataClient for InteractiveBrokersDataClient {
         self.tasks.push(task);
 
         // Record subscription
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for bar subscription")?;
         subscriptions.insert(
             instrument_id,
             SubscriptionInfo {
@@ -1682,7 +1721,10 @@ impl DataClient for InteractiveBrokersDataClient {
         tracing::debug!("Unsubscribing from bars for {}", cmd.bar_type);
 
         let instrument_id = cmd.bar_type.instrument_id();
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for bar unsubscribe")?;
         if let Some(sub_info) = subscriptions.remove(&instrument_id) {
             sub_info.cancellation_token.cancel();
             tracing::info!("Unsubscribed from bars for {}", cmd.bar_type);
@@ -1774,7 +1816,10 @@ impl DataClient for InteractiveBrokersDataClient {
         self.tasks.push(task);
 
         // Record subscription
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for book delta subscription")?;
         subscriptions.insert(
             cmd.instrument_id,
             SubscriptionInfo {
@@ -1794,7 +1839,10 @@ impl DataClient for InteractiveBrokersDataClient {
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         tracing::debug!("Unsubscribing from book deltas for {}", cmd.instrument_id);
 
-        let mut subscriptions = self.subscriptions.blocking_lock();
+        let mut subscriptions = self
+            .subscriptions
+            .try_lock()
+            .context("Failed to lock IB subscriptions for book delta unsubscribe")?;
         if let Some(sub_info) = subscriptions.remove(&cmd.instrument_id) {
             sub_info.cancellation_token.cancel();
             tracing::info!("Unsubscribed from book deltas for {}", cmd.instrument_id);
