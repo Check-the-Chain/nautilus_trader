@@ -58,6 +58,7 @@ extension-module = [
   "nautilus-risk/extension-module",
   "nautilus-serialization/extension-module",
   "nautilus-tardis/extension-module",
+  "nautilus-variational/extension-module",
   "nautilus-testkit/extension-module",
   "nautilus-trading/extension-module",
   "pyo3/extension-module",
@@ -85,6 +86,7 @@ high-precision = [
   "nautilus-polymarket/high-precision",
   "nautilus-sandbox/high-precision",
   "nautilus-tardis/high-precision",
+  "nautilus-variational/high-precision",
 ]
 hypersync = ["nautilus-blockchain/hypersync"]
 postgres = ["nautilus-infrastructure/postgres"]
@@ -134,6 +136,7 @@ nautilus-okx = { workspace = true, features = ["python"] }
 nautilus-polymarket = { workspace = true, features = ["python"] }
 nautilus-sandbox = { workspace = true, features = ["python"] }
 nautilus-tardis = { workspace = true, features = ["python", "replay"] }
+nautilus-variational = { workspace = true, features = ["python"] }
 
 pyo3 = { workspace = true }
 pyo3-stub-gen = { workspace = true }

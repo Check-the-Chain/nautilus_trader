@@ -33,12 +33,12 @@ pub mod ffi;
 pub mod http;
 pub mod models;
 pub mod nonce;
+pub mod normalize;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod rest;
 pub mod types;
 pub mod websocket;
-pub mod ws;
 
 pub use crate::{
     config::{

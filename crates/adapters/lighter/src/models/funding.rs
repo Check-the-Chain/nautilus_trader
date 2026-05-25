@@ -6,11 +6,19 @@ use super::de::{opt_f64_from_string_or_number, opt_i64_from_string_or_number};
 pub struct FundingRate {
     #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
     pub market_id: Option<i64>,
+    #[serde(default)]
+    pub exchange: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
     #[serde(default, deserialize_with = "opt_f64_from_string_or_number")]
     pub mark_price: Option<f64>,
     #[serde(default, deserialize_with = "opt_f64_from_string_or_number")]
     pub index_price: Option<f64>,
-    #[serde(default, deserialize_with = "opt_f64_from_string_or_number")]
+    #[serde(
+        default,
+        alias = "rate",
+        deserialize_with = "opt_f64_from_string_or_number"
+    )]
     pub funding_rate: Option<f64>,
     #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
     pub settlement_time: Option<i64>,

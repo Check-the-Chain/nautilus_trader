@@ -74,6 +74,8 @@ pub mod datetime;
 pub mod drop;
 pub mod env;
 pub mod hex;
+#[cfg(feature = "latency-probe")]
+pub mod latency;
 pub mod math;
 pub mod message;
 pub mod nanos;

@@ -22,14 +22,14 @@ use nautilus_common::{
     live::runner::set_data_event_sender,
     messages::{
         DataEvent,
-        data::{SubscribeBookDeltas, SubscribeQuotes, SubscribeTrades},
+        data::{SubscribeBookDeltas, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades},
     },
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_lighter::data::LighterDataClient;
 use nautilus_model::{
     data::Data,
-    enums::BookType,
+    enums::{BookType, RecordFlag},
     identifiers::{ClientId, InstrumentId},
 };
 use rstest::rstest;
@@ -109,6 +109,43 @@ async fn test_data_client_subscribe_trades() {
 
 #[rstest]
 #[tokio::test]
+async fn test_data_client_subscribe_mark_prices() {
+    let addr = start_mock_server().await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = data_client_config(addr);
+    let mut client = LighterDataClient::new(ClientId::from("LIGHTER"), &config).unwrap();
+    client.connect().await.unwrap();
+    while rx.try_recv().is_ok() {}
+
+    let cmd = SubscribeMarkPrices::new(
+        InstrumentId::from(TEST_INSTRUMENT_ID),
+        Some(ClientId::from("LIGHTER")),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.subscribe_mark_prices(cmd).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        event,
+        DataEvent::Data(Data::MarkPriceUpdate(_))
+            | DataEvent::Data(Data::IndexPriceUpdate(_))
+            | DataEvent::FundingRate(_)
+    ));
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_data_client_subscribe_quotes() {
     let addr = start_mock_server().await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
@@ -170,7 +207,18 @@ async fn test_data_client_subscribe_book_deltas() {
         .unwrap()
         .unwrap();
 
-    assert!(matches!(event, DataEvent::Data(Data::Deltas(_))));
+    match event {
+        DataEvent::Data(Data::Deltas(deltas)) => {
+            assert_eq!(deltas.deltas.len(), 3);
+            assert_eq!(deltas.deltas[0].flags, RecordFlag::F_SNAPSHOT as u8);
+            assert_eq!(deltas.deltas[1].flags, RecordFlag::F_SNAPSHOT as u8);
+            assert_eq!(
+                deltas.deltas[2].flags,
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+            );
+        }
+        _ => panic!("expected book deltas"),
+    }
     client.disconnect().await.unwrap();
 }
 

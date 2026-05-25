@@ -22,6 +22,7 @@ crate-type = ["rlib", "staticlib"]
 
 [features]
 default = []
+latency-probe = []
 simulation = ["madsim"]
 extension-module = ["python", "pyo3/extension-module"]
 ffi = ["cbindgen"]

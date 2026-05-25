@@ -23,7 +23,6 @@
 //! - `LIGHTER_ENV`, use `testnet` for testnet, defaults to mainnet
 //! - `LIGHTER_BASE_URL_HTTP` / `LIGHTER_BASE_URL_WS`, for endpoint overrides
 //! - `LIGHTER_PROXY_URL`, for HTTP/WebSocket proxying
-//! - `LIGHTER_TRANSPORT_BACKEND`, use `sockudo` to opt into Sockudo, defaults to Tungstenite
 //! - `SMOKE_DURATION_SECS`, defaults to 30
 
 use std::{env, time::Duration};
@@ -39,7 +38,6 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, TraderId},
     stubs::TestDefault,
 };
-use nautilus_network::websocket::TransportBackend;
 use nautilus_testkit::testers::{DataTester, DataTesterConfig};
 
 #[tokio::main]
@@ -59,21 +57,11 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30);
-    let transport_backend = match env::var("LIGHTER_TRANSPORT_BACKEND")
-        .unwrap_or_else(|_| "tungstenite".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "sockudo" => TransportBackend::Sockudo,
-        _ => TransportBackend::Tungstenite,
-    };
-
     let data_config = LighterDataClientConfig {
         base_url_http: env::var("LIGHTER_BASE_URL_HTTP").ok(),
         base_url_ws: env::var("LIGHTER_BASE_URL_WS").ok(),
         proxy_url: env::var("LIGHTER_PROXY_URL").ok(),
         environment: lighter_environment,
-        transport_backend,
         ..Default::default()
     };
 

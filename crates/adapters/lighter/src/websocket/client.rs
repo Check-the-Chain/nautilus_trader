@@ -24,18 +24,51 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
+#[cfg(feature = "latency-probe")]
+use nautilus_core::time::get_atomic_clock_realtime;
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
-use tokio::sync::{Mutex, mpsc};
-use tokio_tungstenite::tungstenite::Message;
+use serde::Deserialize;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_tungstenite::tungstenite::{
+    Error as TungsteniteError, Message, client::IntoClientRequest, http::HeaderValue,
+};
 
 use crate::error::{Result, SdkError};
 
 static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
 
+type WsEventHandler = Box<dyn FnMut(WsEvent) + Send + 'static>;
+
 #[derive(Debug)]
 enum WsCommand {
-    Json(serde_json::Value),
+    Json {
+        value: serde_json::Value,
+        completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    },
     Close,
+}
+
+#[derive(Debug)]
+pub(crate) struct WsEvent {
+    pub(crate) text: String,
+    #[cfg(feature = "latency-probe")]
+    pub(crate) received_ns: u64,
+}
+
+impl WsEvent {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            #[cfg(feature = "latency-probe")]
+            received_ns: get_atomic_clock_realtime().get_time_ns().as_u64(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WsPingProbe<'a> {
+    #[serde(rename = "type", borrow)]
+    msg_type: &'a str,
 }
 
 /// Raw Lighter WebSocket client that forwards venue messages to Python without
@@ -49,7 +82,7 @@ pub struct LighterWebSocketClient {
     default_auth_token: Arc<Mutex<Option<String>>>,
     subscriptions: Arc<Mutex<HashMap<String, Option<String>>>>,
     command_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WsCommand>>>>,
-    event_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
+    event_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<WsEvent>>>>,
     is_active: Arc<AtomicBool>,
 }
 
@@ -104,16 +137,35 @@ impl LighterWebSocketClient {
     }
 
     pub async fn connect(&self) -> Result<()> {
+        self.connect_inner(None).await
+    }
+
+    pub(crate) async fn connect_with_event_handler<F>(&self, handler: F) -> Result<()>
+    where
+        F: FnMut(WsEvent) + Send + 'static,
+    {
+        self.connect_inner(Some(Box::new(handler))).await
+    }
+
+    async fn connect_inner(&self, mut event_handler: Option<WsEventHandler>) -> Result<()> {
         if self.is_active() {
             return Ok(());
         }
 
         install_crypto_provider();
-        let (stream, _) = tokio_tungstenite::connect_async(&self.url).await?;
+        let request = websocket_request(&self.url)?;
+        let (stream, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(websocket_connect_error)?;
         let (mut write, mut read) = stream.split();
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<WsCommand>();
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<String>();
+        let (event_tx, event_rx) = if event_handler.is_none() {
+            let (tx, rx) = mpsc::unbounded_channel::<WsEvent>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         {
             let mut tx_guard = self.command_tx.lock().await;
@@ -121,7 +173,7 @@ impl LighterWebSocketClient {
         }
         {
             let mut rx_guard = self.event_rx.lock().await;
-            *rx_guard = Some(event_rx);
+            *rx_guard = event_rx;
         }
 
         self.is_active.store(true, Ordering::SeqCst);
@@ -130,8 +182,16 @@ impl LighterWebSocketClient {
         tokio::spawn(async move {
             while let Some(command) = command_rx.recv().await {
                 let result = match command {
-                    WsCommand::Json(value) => {
-                        write.send(Message::Text(value.to_string().into())).await
+                    WsCommand::Json { value, completion } => {
+                        let result = write.send(Message::Text(value.to_string().into())).await;
+                        if let Some(completion) = completion {
+                            let completion_result = match &result {
+                                Ok(()) => Ok(()),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            let _ = completion.send(completion_result);
+                        }
+                        result
                     }
                     WsCommand::Close => {
                         let _ = write.close().await;
@@ -158,17 +218,17 @@ impl LighterWebSocketClient {
                 match message {
                     Message::Text(text) => {
                         let text_string = text.to_string();
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text_string)
-                            && parsed.get("type").and_then(|value| value.as_str()) == Some("ping")
-                        {
-                            let _ = command_tx_reader
-                                .send(WsCommand::Json(serde_json::json!({"type": "pong"})));
+                        if is_ping_message(&text_string) {
+                            let _ = command_tx_reader.send(WsCommand::Json {
+                                value: serde_json::json!({"type": "pong"}),
+                                completion: None,
+                            });
                         }
-                        let _ = event_tx.send(text_string);
+                        dispatch_event(&mut event_handler, &event_tx, text_string);
                     }
                     Message::Binary(bytes) => {
                         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                            let _ = event_tx.send(text);
+                            dispatch_event(&mut event_handler, &event_tx, text);
                         }
                     }
                     Message::Close(_) => break,
@@ -181,7 +241,10 @@ impl LighterWebSocketClient {
 
         let initial_subscriptions = self.subscriptions.lock().await.clone();
         for (channel, auth) in initial_subscriptions {
-            let _ = command_tx.send(WsCommand::Json(subscription_message(&channel, auth)));
+            let _ = command_tx.send(WsCommand::Json {
+                value: subscription_message(&channel, auth),
+                completion: None,
+            });
         }
 
         Ok(())
@@ -207,10 +270,10 @@ impl LighterWebSocketClient {
             .insert(channel.clone(), resolved_auth.clone());
 
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
-            tx.send(WsCommand::Json(subscription_message(
-                &channel,
-                resolved_auth,
-            )))
+            tx.send(WsCommand::Json {
+                value: subscription_message(&channel, resolved_auth),
+                completion: None,
+            })
             .map_err(|e| SdkError::Other(format!("Failed to send subscribe command: {e}")))?;
         }
 
@@ -221,20 +284,60 @@ impl LighterWebSocketClient {
         self.subscriptions.lock().await.remove(&channel);
 
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
-            tx.send(WsCommand::Json(serde_json::json!({
-                "type": "unsubscribe",
-                "channel": channel,
-            })))
+            tx.send(WsCommand::Json {
+                value: serde_json::json!({
+                    "type": "unsubscribe",
+                    "channel": channel,
+                }),
+                completion: None,
+            })
             .map_err(|e| SdkError::Other(format!("Failed to send unsubscribe command: {e}")))?;
         }
 
         Ok(())
     }
 
+    pub async fn send_json(&self, value: serde_json::Value) -> Result<()> {
+        let Some(tx) = self.command_tx.lock().await.as_ref().cloned() else {
+            return Err(SdkError::Other("WebSocket is not connected".to_string()));
+        };
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        tx.send(WsCommand::Json {
+            value,
+            completion: Some(completion_tx),
+        })
+        .map_err(|e| SdkError::Other(format!("Failed to send WebSocket command: {e}")))?;
+
+        completion_rx
+            .await
+            .map_err(|_| {
+                SdkError::Other("WebSocket writer closed before send completed".to_string())
+            })?
+            .map_err(|e| SdkError::Other(format!("Failed to write WebSocket command: {e}")))
+    }
+
     pub async fn next_message(&self) -> Option<String> {
+        self.next_event().await.map(|event| event.text)
+    }
+
+    pub(crate) async fn next_event(&self) -> Option<WsEvent> {
         let mut guard = self.event_rx.lock().await;
         let receiver = guard.as_mut()?;
         receiver.recv().await
+    }
+}
+
+fn dispatch_event(
+    event_handler: &mut Option<WsEventHandler>,
+    event_tx: &Option<mpsc::UnboundedSender<WsEvent>>,
+    text: String,
+) {
+    let event = WsEvent::new(text);
+    if let Some(handler) = event_handler.as_mut() {
+        handler(event);
+    } else if let Some(event_tx) = event_tx {
+        let _ = event_tx.send(event);
     }
 }
 
@@ -244,6 +347,58 @@ fn install_crypto_provider() {
             let _ = aws_lc_rs::default_provider().install_default();
         }
     });
+}
+
+fn is_ping_message(text: &str) -> bool {
+    text.contains("ping")
+        && serde_json::from_str::<WsPingProbe<'_>>(text)
+            .is_ok_and(|message| message.msg_type == "ping")
+}
+
+fn websocket_request(
+    url: &str,
+) -> std::result::Result<
+    tokio_tungstenite::tungstenite::handshake::client::Request,
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let mut request = url.into_client_request()?;
+    if let Some(origin) = origin_for_ws_url(url)
+        && let Ok(header) = HeaderValue::from_str(&origin)
+    {
+        request.headers_mut().insert("Origin", header);
+    }
+    Ok(request)
+}
+
+fn origin_for_ws_url(url: &str) -> Option<String> {
+    let (origin_scheme, rest) = if let Some(rest) = url.strip_prefix("wss://") {
+        ("https", rest)
+    } else if let Some(rest) = url.strip_prefix("ws://") {
+        ("http", rest)
+    } else {
+        return None;
+    };
+
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())?;
+    Some(format!("{origin_scheme}://{authority}"))
+}
+
+fn websocket_connect_error(error: TungsteniteError) -> SdkError {
+    match error {
+        TungsteniteError::Http(response) => {
+            let status = response.status();
+            let body = response
+                .body()
+                .as_ref()
+                .map(|body| String::from_utf8_lossy(body).into_owned())
+                .unwrap_or_default();
+            SdkError::Other(format!("WebSocket HTTP error {status}: {body}"))
+        }
+        other => SdkError::from(other),
+    }
 }
 
 fn subscription_message(channel: &str, auth_token: Option<String>) -> serde_json::Value {

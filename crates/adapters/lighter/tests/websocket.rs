@@ -28,6 +28,7 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::HeaderMap,
     response::Response,
     routing::get,
 };
@@ -40,6 +41,7 @@ use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 struct TestWsState {
     connection_count: Arc<AtomicUsize>,
     received: Arc<Mutex<Vec<Value>>>,
+    origins: Arc<Mutex<Vec<String>>>,
     send_initial_ping: Arc<AtomicBool>,
     received_pong: Arc<AtomicBool>,
 }
@@ -53,7 +55,14 @@ async fn spawn_server(router: Router) -> SocketAddr {
     addr
 }
 
-async fn handle_ws_upgrade(ws: WebSocketUpgrade, State(state): State<TestWsState>) -> Response {
+async fn handle_ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<TestWsState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) {
+        state.origins.lock().await.push(origin.to_string());
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -146,6 +155,9 @@ async fn test_connect_and_subscribe_receives_messages() {
     assert!(message.contains("\"channel\":\"order_book/1\""));
 
     wait_for(|| state.connection_count.load(Ordering::Relaxed) == 1).await;
+    let origins = state.origins.lock().await.clone();
+    assert_eq!(origins, vec![format!("http://{addr}")]);
+
     let received = state.received.lock().await.clone();
     assert!(
         received

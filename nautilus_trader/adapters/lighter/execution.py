@@ -173,6 +173,7 @@ class LighterExecutionClient(LiveExecutionClient):
 
     async def _connect(self) -> None:
         await self._instrument_provider.initialize()
+        self._sync_client_order_index_cache()
         token = await self._ensure_auth_token()
         environment = (
             self._config.environment
@@ -194,6 +195,23 @@ class LighterExecutionClient(LiveExecutionClient):
         await self._ws_client.subscribe_user_stats(self._account_index)
 
         await self._update_account_state()
+
+    def _sync_client_order_index_cache(self) -> None:
+        count = 0
+        for order in self._cache.orders(venue=self.venue):
+            if order.is_closed:
+                continue
+            client_order_index = self._lighter_client_order_index(order.client_order_id)
+            self._client_order_index_to_id[client_order_index] = order.client_order_id
+            self._client_order_id_to_index[order.client_order_id] = client_order_index
+            if order.venue_order_id is not None:
+                self._track_venue_order_id(order.client_order_id, order.venue_order_id)
+            count += 1
+        if count:
+            self._log.info(
+                f"Cached Lighter client order indexes for {count} existing order(s)",
+                LogColor.BLUE,
+            )
 
     async def _disconnect(self) -> None:
         await asyncio.sleep(0.25)
@@ -312,12 +330,14 @@ class LighterExecutionClient(LiveExecutionClient):
     def _lighter_time_in_force(self, order) -> int:
         if order.is_post_only:
             return LIGHTER_TIF_POST_ONLY
-        if order.time_in_force in (TimeInForce.IOC, TimeInForce.FOK):
+        if order.time_in_force == TimeInForce.IOC:
             return LIGHTER_TIF_IOC
+        if order.time_in_force not in (TimeInForce.GTC, TimeInForce.GTD):
+            raise ValueError(f"Unsupported time in force {order.time_in_force}")
         return LIGHTER_TIF_GTT
 
     def _order_expiry_ms(self, order) -> int:
-        if order.time_in_force in (TimeInForce.IOC, TimeInForce.FOK):
+        if order.time_in_force == TimeInForce.IOC:
             return 0
         if order.expire_time is not None:
             expire_time_ns = int(order.expire_time)
@@ -583,6 +603,7 @@ class LighterExecutionClient(LiveExecutionClient):
             order,
             self.account_id,
             instrument,
+            self._clock.timestamp_ns(),
             self._resolve_client_order_id,
         )
         if command.open_only and report.order_status in {
@@ -660,6 +681,7 @@ class LighterExecutionClient(LiveExecutionClient):
             self._account_index,
             self.account_id,
             instrument,
+            self._clock.timestamp_ns(),
             self._resolve_client_order_id,
         )
         if report is None:
@@ -1695,14 +1717,7 @@ class LighterExecutionClient(LiveExecutionClient):
             self._log.exception("Error handling Lighter execution message", e)
 
     def _handle_assets_update(self, payload: dict[str, Any]) -> None:
-        assets = self._flatten_ws_values(payload.get("assets"))
-        balances = account_balances_from_assets(assets)
-        self.generate_account_state(
-            balances=balances,
-            margins=[],
-            reported=True,
-            ts_event=self._clock.timestamp_ns(),
-        )
+        self.create_task(self._refresh_account_state())
 
     def _handle_account_all_update(self, payload: dict[str, Any]) -> None:
         assets = self._flatten_ws_values(payload.get("assets"))
@@ -1743,6 +1758,7 @@ class LighterExecutionClient(LiveExecutionClient):
                 order,
                 self.account_id,
                 instrument,
+                self._clock.timestamp_ns(),
                 self._resolve_client_order_id,
             )
             self._track_venue_order_id(report.client_order_id, report.venue_order_id)
@@ -1867,6 +1883,7 @@ class LighterExecutionClient(LiveExecutionClient):
                 self._account_index,
                 self.account_id,
                 instrument,
+                self._clock.timestamp_ns(),
                 self._resolve_client_order_id,
             )
             if report is None:
@@ -1893,6 +1910,19 @@ class LighterExecutionClient(LiveExecutionClient):
         )
         if instrument is None:
             return
+
+        if (
+            order.venue_order_id is None
+            and report.client_order_id not in self._venue_order_id_by_client_order_id
+        ):
+            self.generate_order_accepted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=report.venue_order_id,
+                ts_event=report.ts_event,
+            )
+            self._track_venue_order_id(order.client_order_id, report.venue_order_id)
 
         self.generate_order_filled(
             strategy_id=order.strategy_id,

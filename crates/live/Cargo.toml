@@ -22,6 +22,7 @@ crate-type = ["rlib"]
 
 [features]
 default = ["node"]
+latency-probe = ["nautilus-core/latency-probe", "nautilus-data?/latency-probe"]
 node = [
   "dep:nautilus-data",
   "dep:nautilus-portfolio",

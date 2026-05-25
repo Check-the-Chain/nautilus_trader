@@ -95,22 +95,32 @@ fn looks_like_market_stats_payload(value: &serde_json::Value) -> bool {
 /// 2) a map keyed by market_id with one or more market objects.
 ///
 /// For map payloads, this returns the first decoded market entry.
-fn market_or_market_stats<'de, D>(deserializer: D) -> Result<Option<PerpsMarketStats>, D::Error>
+fn markets_or_market_stats<'de, D>(deserializer: D) -> Result<Vec<PerpsMarketStats>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
     let Some(value) = raw else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
     if looks_like_market_stats_payload(&value) {
         let market =
             serde_json::from_value::<PerpsMarketStats>(value).map_err(serde::de::Error::custom)?;
-        return Ok(Some(market));
+        return Ok(vec![market]);
+    }
+
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .cloned()
+            .map(serde_json::from_value::<PerpsMarketStats>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom);
     }
 
     if let Some(map) = value.as_object() {
+        let mut markets = Vec::with_capacity(map.len());
         for (market_key, entry) in map {
             if !entry.is_object() {
                 continue;
@@ -120,22 +130,44 @@ where
             if market.market_id.is_none() {
                 market.market_id = market_key.parse::<i64>().ok();
             }
-            return Ok(Some(market));
+            markets.push(market);
         }
+        return Ok(markets);
     }
 
-    Ok(None)
+    Ok(Vec::new())
+}
+
+fn vec_or_single<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum VecOrSingle<T> {
+        Vec(Vec<T>),
+        Single(T),
+        Null(()),
+    }
+
+    match Option::<VecOrSingle<T>>::deserialize(deserializer)? {
+        None | Some(VecOrSingle::Null(())) => Ok(Vec::new()),
+        Some(VecOrSingle::Vec(values)) => Ok(values),
+        Some(VecOrSingle::Single(value)) => Ok(vec![value]),
+    }
 }
 
 pub use super::asset::Asset;
+use super::de::opt_i64_from_string_or_number;
 use super::market::PerpsMarketStats;
 use super::order::Order;
 use super::order_book::PriceLevel;
 pub use super::trade::Trade;
 
-/// Deserialize an `Option<f64>` from either a JSON string (`"1.23"`) or a
-/// JSON number (`1.23`).  Missing / `null` → `None`.
-fn f64_from_string_or_number<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+/// Deserialize an `Option<String>` from either a JSON string (`"1.23"`) or a
+/// JSON number (`1.23`). Missing / `null` → `None`.
+fn numeric_string_from_string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -144,7 +176,7 @@ where
 
     struct V;
     impl<'de> Visitor<'de> for V {
-        type Value = Option<f64>;
+        type Value = Option<String>;
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("a numeric string or number")
         }
@@ -152,21 +184,26 @@ where
             if v.is_empty() {
                 return Ok(None);
             }
-            v.parse::<f64>()
-                .map(Some)
+            v.parse::<rust_decimal::Decimal>()
+                .map(|_| Some(v.to_string()))
                 .map_err(|_| E::custom(format!("invalid numeric string: {v}")))
         }
         fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-            self.visit_str(&v)
+            if v.is_empty() {
+                return Ok(None);
+            }
+            v.parse::<rust_decimal::Decimal>()
+                .map(|_| Some(v))
+                .map_err(|_| E::custom("invalid numeric string"))
         }
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-            Ok(Some(v))
+            Ok(Some(v.to_string()))
         }
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            Ok(Some(v as f64))
+            Ok(Some(v.to_string()))
         }
         fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(Some(v as f64))
+            Ok(Some(v.to_string()))
         }
         fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
             Ok(None)
@@ -181,10 +218,10 @@ where
 /// A single price/size level from the BBO ticker channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsTickerLevel {
-    #[serde(default, deserialize_with = "f64_from_string_or_number")]
-    pub price: Option<f64>,
-    #[serde(default, deserialize_with = "f64_from_string_or_number")]
-    pub size: Option<f64>,
+    #[serde(default, deserialize_with = "numeric_string_from_string_or_number")]
+    pub price: Option<String>,
+    #[serde(default, deserialize_with = "numeric_string_from_string_or_number")]
+    pub size: Option<String>,
 }
 
 /// Ticker payload: symbol + best ask (`a`) + best bid (`b`).
@@ -193,6 +230,8 @@ pub struct WsTickerData {
     pub s: String,
     pub a: WsTickerLevel,
     pub b: WsTickerLevel,
+    #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
+    pub last_updated_at: Option<i64>,
 }
 
 /// Top-level WS message for `subscribed/ticker` and `update/ticker`.
@@ -202,6 +241,10 @@ pub struct WsTickerUpdate {
     pub msg_type: String,
     #[serde(default)]
     pub channel: Option<String>,
+    #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
+    pub timestamp: Option<i64>,
+    #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
+    pub last_updated_at: Option<i64>,
     #[serde(default)]
     pub ticker: Option<WsTickerData>,
 }
@@ -232,6 +275,15 @@ pub struct WsOrderBook {
     pub offset: i64,
     pub nonce: i64,
     pub begin_nonce: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsTradeUpdate {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub channel: String,
+    #[serde(default, alias = "trade", deserialize_with = "vec_or_single")]
+    pub trades: Vec<Trade>,
 }
 
 /// Local normalized state used by the sdk orderbook handler.
@@ -479,12 +531,15 @@ pub struct WsMarketStatsUpdate {
     #[serde(rename = "type")]
     pub msg_type: String,
     pub channel: String,
+    #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
+    pub timestamp: Option<i64>,
     #[serde(
         default,
+        alias = "market",
         alias = "market_stats",
-        deserialize_with = "market_or_market_stats"
+        deserialize_with = "markets_or_market_stats"
     )]
-    pub market: Option<PerpsMarketStats>,
+    pub markets: Vec<PerpsMarketStats>,
 }
 
 /// Nested stats block inside a `user_stats` update.
@@ -531,7 +586,7 @@ mod tests {
     use super::{
         WsAccountAllOrdersUpdate, WsAccountAllPositionsUpdate, WsAccountAllTradesUpdate,
         WsAccountAllUpdate, WsAccountOrdersUpdate, WsMarketStatsUpdate, WsOrderBookMessage,
-        WsUserStatsUpdate,
+        WsTickerUpdate, WsTradeUpdate, WsUserStatsUpdate,
     };
 
     #[test]
@@ -557,6 +612,31 @@ mod tests {
         assert_eq!(msg.offset, 282472);
         assert_eq!(msg.timestamp, 1736739654);
         assert_eq!(msg.order_book.nonce, 281220);
+    }
+
+    #[test]
+    fn ticker_levels_preserve_exchange_numeric_strings() {
+        let raw = r#"{
+            "type":"update/ticker",
+            "channel":"ticker:110",
+            "timestamp":1779268887550,
+            "ticker":{
+                "s":"NVDA",
+                "a":{"price":"223.978","size":"94.307"},
+                "b":{"price":"223.933","size":"2.389"},
+                "last_updated_at":1779268887206872
+            }
+        }"#;
+
+        let msg: WsTickerUpdate = serde_json::from_str(raw).unwrap();
+        let ticker = msg.ticker.unwrap();
+
+        assert_eq!(ticker.a.price.as_deref(), Some("223.978"));
+        assert_eq!(ticker.a.size.as_deref(), Some("94.307"));
+        assert_eq!(ticker.b.price.as_deref(), Some("223.933"));
+        assert_eq!(ticker.b.size.as_deref(), Some("2.389"));
+        assert_eq!(ticker.last_updated_at, Some(1779268887206872));
+        assert_eq!(msg.timestamp, Some(1779268887550));
     }
 
     #[test]
@@ -1164,12 +1244,13 @@ mod tests {
         let msg: WsMarketStatsUpdate = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.msg_type, "update/market_stats");
         assert_eq!(msg.channel, "market_stats:91");
-        let market = msg.market.unwrap();
+        let market = msg.markets.first().unwrap();
         assert_eq!(market.market_id, Some(91));
         assert_eq!(market.symbol.as_deref(), Some("BTC-USDC"));
         assert_eq!(market.last_trade_price, Some(108331.1));
         assert_eq!(market.mark_price, Some(108330.8));
         assert_eq!(market.next_funding_time, Some(1736834400));
+        assert_eq!(market.funding_timestamp, None);
         assert_eq!(market.funding_countdown, Some(22994));
     }
 
@@ -1178,6 +1259,7 @@ mod tests {
         let raw = r#"{
             "type":"update/market_stats",
             "channel":"market_stats/all",
+            "timestamp":1779269543866,
             "market_stats":{
                 "market_id":"91",
                 "symbol":"BTC-USDC",
@@ -1197,11 +1279,13 @@ mod tests {
         let msg: WsMarketStatsUpdate = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.msg_type, "update/market_stats");
         assert_eq!(msg.channel, "market_stats/all");
-        let market = msg.market.unwrap();
+        assert_eq!(msg.timestamp, Some(1779269543866));
+        let market = msg.markets.first().unwrap();
         assert_eq!(market.market_id, Some(91));
         assert_eq!(market.symbol.as_deref(), Some("BTC-USDC"));
         assert_eq!(market.mark_price, Some(108330.8));
-        assert_eq!(market.next_funding_time, Some(1736834400));
+        assert_eq!(market.next_funding_time, None);
+        assert_eq!(market.funding_timestamp, Some(1736834400));
         assert_eq!(market.current_funding_rate, Some(0.0000038));
         assert_eq!(market.volume_24h, Some(223388779.12));
         assert_eq!(market.high_24h, Some(109220.3));
@@ -1226,10 +1310,68 @@ mod tests {
         let msg: WsMarketStatsUpdate = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.msg_type, "update/market_stats");
         assert_eq!(msg.channel, "market_stats:all");
-        let market = msg.market.unwrap();
+        let market = msg.markets.first().unwrap();
         assert_eq!(market.market_id, Some(2));
         assert_eq!(market.symbol.as_deref(), Some("SOL"));
         assert_eq!(market.mark_price, Some(85.395));
         assert_eq!(market.current_funding_rate, Some(-0.0011));
+    }
+
+    #[test]
+    fn parses_market_stats_all_multi_market_map_shape() {
+        let raw = r#"{
+            "type":"update/market_stats",
+            "channel":"market_stats/all",
+            "market_stats":{
+                "2":{"symbol":"SOL","mark_price":"85.395"},
+                "91":{"symbol":"BTC-USDC","mark_price":"108330.8"}
+            }
+        }"#;
+
+        let msg: WsMarketStatsUpdate = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.markets.len(), 2);
+        assert!(msg.markets.iter().any(|market| market.market_id == Some(2)));
+        assert!(
+            msg.markets
+                .iter()
+                .any(|market| market.market_id == Some(91))
+        );
+    }
+
+    #[test]
+    fn parses_trade_update_array_and_single_trade_shapes() {
+        let array_raw = r#"{
+            "type":"update/trade",
+            "channel":"trade/1",
+            "trades":[{
+                "trade_id":12346,
+                "market_id":1,
+                "size":"0.1000",
+                "price":"100006.00",
+                "is_maker_ask":false,
+                "timestamp":1704067265000
+            }]
+        }"#;
+        let single_raw = r#"{
+            "type":"update/trade",
+            "channel":"trade/1",
+            "trade":{
+                "trade_id":12347,
+                "market_id":1,
+                "size":"0.2000",
+                "price":"100007.00",
+                "is_maker_ask":true,
+                "timestamp":1704067266000
+            }
+        }"#;
+
+        let array_msg: WsTradeUpdate = serde_json::from_str(array_raw).unwrap();
+        let single_msg: WsTradeUpdate = serde_json::from_str(single_raw).unwrap();
+
+        assert_eq!(array_msg.trades.len(), 1);
+        assert_eq!(array_msg.trades[0].trade_id, 12346);
+        assert_eq!(single_msg.trades.len(), 1);
+        assert_eq!(single_msg.trades[0].trade_id, 12347);
+        assert!(single_msg.trades[0].is_maker_ask);
     }
 }

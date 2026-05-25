@@ -25,12 +25,10 @@ pub struct PerpsMarketStats {
     pub index_price: Option<f64>,
     #[serde(default, deserialize_with = "opt_f64_from_string_or_number")]
     pub open_interest: Option<f64>,
-    #[serde(
-        default,
-        alias = "funding_timestamp",
-        deserialize_with = "opt_i64_from_string_or_number"
-    )]
+    #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
     pub next_funding_time: Option<i64>,
+    #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
+    pub funding_timestamp: Option<i64>,
     #[serde(default, deserialize_with = "opt_f64_from_string_or_number")]
     pub current_funding_rate: Option<f64>,
     #[serde(default, deserialize_with = "opt_f64_from_string_or_number")]

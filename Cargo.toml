@@ -20,6 +20,7 @@ members = [
   "crates/adapters/okx",
   "crates/adapters/sandbox",
   "crates/adapters/tardis",
+  "crates/adapters/variational",
   "crates/analysis",
   "crates/backtest",
   "crates/cli",
@@ -110,6 +111,7 @@ nautilus-okx = { path = "crates/adapters/okx", version = "0.56.0", default-featu
 nautilus-polymarket = { path = "crates/adapters/polymarket", version = "0.56.0", default-features = false }
 nautilus-sandbox = { path = "crates/adapters/sandbox", version = "0.56.0", default-features = false }
 nautilus-tardis = { path = "crates/adapters/tardis", version = "0.56.0", default-features = false }
+nautilus-variational = { path = "crates/adapters/variational", version = "0.56.0", default-features = false }
 
 # -----------------------------------------------------------------------------
 # Core dependencies
@@ -137,6 +139,7 @@ aws-lc-rs = { version = "1.16.3", default-features = false, features = [
   "non-fips", # FIPS 140-3 mode blocked: aws-lc-fips-sys requires Go toolchain
 ] }
 base64 = "0.22.1"
+blake2 = "0.10.6"
 bon = "3.9.1"
 bytes = { version = "1.11.1", features = ["serde"] }
 capnp = "0.25.4"

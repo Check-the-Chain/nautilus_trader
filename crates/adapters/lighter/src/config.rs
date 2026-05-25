@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 
-use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
@@ -225,12 +224,6 @@ pub struct LighterDataClientConfig {
     pub environment: LighterEnvironment,
     #[builder(default = 30)]
     pub http_timeout_secs: u64,
-    #[builder(default = 30)]
-    pub ws_timeout_secs: u64,
-    #[builder(default = 60)]
-    pub update_instruments_interval_mins: u64,
-    #[builder(default)]
-    pub transport_backend: TransportBackend,
 }
 
 impl Default for LighterDataClientConfig {
@@ -277,6 +270,8 @@ pub struct LighterExecClientConfig {
     pub account_index: Option<i64>,
     pub private_key: Option<String>,
     pub api_key_index: Option<u8>,
+    pub maker_private_key: Option<String>,
+    pub maker_api_key_index: Option<u8>,
     pub api_private_keys: Option<HashMap<u8, String>>,
     pub signer_lib_path: Option<String>,
     pub base_url_http: Option<String>,
@@ -294,8 +289,6 @@ pub struct LighterExecClientConfig {
     pub default_auth_token_ttl_secs: u64,
     #[builder(default = 300)]
     pub cancel_all_gtt_secs: u64,
-    #[builder(default)]
-    pub transport_backend: TransportBackend,
 }
 
 impl Default for LighterExecClientConfig {
@@ -325,15 +318,29 @@ impl LighterExecClientConfig {
     }
 
     #[must_use]
+    pub fn readonly_ws_url(&self) -> String {
+        self.base_url_ws.clone().unwrap_or_else(|| {
+            format!(
+                "{}?readonly=true",
+                lighter_ws_base_url_for_environment(self.environment)
+            )
+        })
+    }
+
+    #[must_use]
     pub fn credentials_map(&self) -> HashMap<u8, String> {
-        if let Some(map) = &self.api_private_keys {
-            return map.clone();
+        let mut credentials = self.api_private_keys.clone().unwrap_or_default();
+
+        if let (Some(index), Some(key)) = (self.api_key_index, self.private_key.clone()) {
+            credentials.insert(index, key);
         }
 
-        match (self.api_key_index, self.private_key.clone()) {
-            (Some(index), Some(key)) => HashMap::from([(index, key)]),
-            _ => HashMap::new(),
+        if let (Some(index), Some(key)) = (self.maker_api_key_index, self.maker_private_key.clone())
+        {
+            credentials.insert(index, key);
         }
+
+        credentials
     }
 }
 
@@ -365,6 +372,13 @@ mod tests {
             config.ws_url(),
             lighter_ws_base_url_for_environment(LighterEnvironment::Mainnet)
         );
+        assert_eq!(
+            config.readonly_ws_url(),
+            format!(
+                "{}?readonly=true",
+                lighter_ws_base_url_for_environment(LighterEnvironment::Mainnet)
+            )
+        );
     }
 
     #[test]
@@ -375,5 +389,21 @@ mod tests {
         };
 
         assert_eq!(config.ws_url(), "ws://localhost:8000/stream");
+    }
+
+    #[test]
+    fn exec_credentials_map_includes_default_and_maker_keys() {
+        let config = LighterExecClientConfig {
+            api_key_index: Some(3),
+            private_key: Some("normal".to_string()),
+            maker_api_key_index: Some(4),
+            maker_private_key: Some("maker".to_string()),
+            ..Default::default()
+        };
+
+        let credentials = config.credentials_map();
+
+        assert_eq!(credentials.get(&3).map(String::as_str), Some("normal"));
+        assert_eq!(credentials.get(&4).map(String::as_str), Some("maker"));
     }
 }

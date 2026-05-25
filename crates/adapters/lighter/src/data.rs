@@ -38,6 +38,8 @@ use nautilus_common::{
         },
     },
 };
+#[cfg(feature = "latency-probe")]
+use nautilus_core::latency;
 use nautilus_core::{UnixNanos, datetime::datetime_to_unix_nanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     data::{Data, OrderBookDeltas_API},
@@ -45,25 +47,22 @@ use nautilus_model::{
     identifiers::{ClientId, Venue},
     orderbook::OrderBook,
 };
-use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        LighterBookState, LighterInstrumentRegistry, LighterMarketStatUpdate, bar_granularity,
-        candles_to_bars, channel_market_id, funding_rate_update_from_history,
-        load_instrument_registry, market_stats_to_updates, order_book_delta_updates,
-        order_book_snapshot_deltas, populate_order_book, quote_tick_from_ticker,
-        trade_tick_from_trade, venue,
+        LighterInstrumentRegistry, LighterMarketStatUpdate, bar_granularity, candles_to_bars,
+        channel_market_id, funding_rate_updates_from_history, load_instrument_registry,
+        market_stats_to_updates, order_book_delta_updates, order_book_snapshot_deltas,
+        populate_order_book, quote_tick_from_ticker, trade_tick_from_trade, venue,
     },
     config::{Config, LighterDataClientConfig},
     http::client::LighterHttpClient,
-    models::{
-        market::PerpsMarketStats,
-        trade::Trade,
-        ws::{WsMessage, WsOrderBookMessage, WsTickerUpdate},
+    models::ws::{
+        WsMarketStatsUpdate, WsMessage, WsOrderBookMessage, WsTickerUpdate, WsTradeUpdate,
     },
+    normalize::timestamp::{epoch_to_unix_nanos, message_event_time, ticker_event_time},
     websocket::client::LighterWebSocketClient,
 };
 
@@ -77,8 +76,6 @@ pub struct LighterDataClient {
     tasks: Vec<JoinHandle<()>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     registry: Arc<tokio::sync::RwLock<LighterInstrumentRegistry>>,
-    book_offsets: Arc<tokio::sync::RwLock<AHashMap<i64, u64>>>,
-    book_states: Arc<tokio::sync::RwLock<AHashMap<i64, LighterBookState>>>,
     market_stats_refcount: usize,
     clock: &'static nautilus_core::time::AtomicTime,
 }
@@ -108,8 +105,6 @@ impl LighterDataClient {
             registry: Arc::new(tokio::sync::RwLock::new(
                 LighterInstrumentRegistry::default(),
             )),
-            book_offsets: Arc::new(tokio::sync::RwLock::new(AHashMap::new())),
-            book_states: Arc::new(tokio::sync::RwLock::new(AHashMap::new())),
             market_stats_refcount: 0,
             clock: get_atomic_clock_realtime(),
         })
@@ -126,44 +121,34 @@ impl LighterDataClient {
         Ok(instruments)
     }
 
-    async fn spawn_ws_loop(&mut self) -> anyhow::Result<()> {
+    async fn spawn_ws_loop(&self) -> anyhow::Result<()> {
         let ws_client = self.ws_client.clone();
-        ws_client
-            .connect()
-            .await
-            .context("failed to connect Lighter websocket")?;
-
         let cancellation_token = self.cancellation_token.clone();
         let sender = self.data_sender.clone();
-        let registry = Arc::clone(&self.registry);
-        let book_offsets = Arc::clone(&self.book_offsets);
-        let book_states = Arc::clone(&self.book_states);
+        let registry = self.registry.read().await.clone();
         let clock = self.clock;
+        let mut book_offsets = AHashMap::new();
 
-        let handle = get_runtime().spawn(async move {
-            loop {
-                tokio::select! {
-                    () = cancellation_token.cancelled() => break,
-                    message = ws_client.next_message() => {
-                        let Some(message) = message else {
-                            break;
-                        };
-                        if let Err(error) = handle_ws_message(
-                            &message,
-                            &sender,
-                            &registry,
-                            &book_offsets,
-                            &book_states,
-                            clock,
-                        ).await {
-                            log::warn!("Failed to handle Lighter websocket message: {error}");
-                        }
-                    }
+        ws_client
+            .connect_with_event_handler(move |event| {
+                if cancellation_token.is_cancelled() {
+                    return;
                 }
-            }
-        });
 
-        self.tasks.push(handle);
+                if let Err(error) = handle_ws_message(
+                    &event.text,
+                    &sender,
+                    &registry,
+                    &mut book_offsets,
+                    clock,
+                    #[cfg(feature = "latency-probe")]
+                    event.received_ns,
+                ) {
+                    log::warn!("Failed to handle Lighter websocket message: {error}");
+                }
+            })
+            .await
+            .context("failed to connect Lighter websocket")?;
         Ok(())
     }
 
@@ -200,14 +185,6 @@ impl DataClient for LighterDataClient {
         for task in self.tasks.drain(..) {
             task.abort();
         }
-        self.book_offsets
-            .try_write()
-            .expect("book offsets lock poisoned")
-            .clear();
-        self.book_states
-            .try_write()
-            .expect("book states lock poisoned")
-            .clear();
         self.registry
             .try_write()
             .expect("instrument registry lock poisoned")
@@ -481,6 +458,9 @@ impl DataClient for LighterDataClient {
         let sender = self.data_sender.clone();
         let registry = Arc::clone(&self.registry);
         let client_id = request.client_id.unwrap_or(self.client_id);
+        let start = datetime_to_unix_nanos(request.start);
+        let end = datetime_to_unix_nanos(request.end);
+        let limit = request.limit.map(|value| value.get());
         let clock = self.clock;
 
         get_runtime().spawn(async move {
@@ -501,20 +481,22 @@ impl DataClient for LighterDataClient {
             {
                 Ok(response) => {
                     let ts_init = clock.get_time_ns();
-                    let updates = response
-                        .funding_rates
-                        .iter()
-                        .filter_map(|item| {
-                            funding_rate_update_from_history(&meta.instrument, item, ts_init)
-                        })
-                        .collect();
+                    let updates = funding_rate_updates_from_history(
+                        &meta.instrument,
+                        &response.funding_rates,
+                        meta.market_id,
+                        start,
+                        end,
+                        limit,
+                        ts_init,
+                    );
                     let response = DataResponse::FundingRates(FundingRatesResponse::new(
                         request.request_id,
                         client_id,
                         request.instrument_id,
                         updates,
-                        datetime_to_unix_nanos(request.start),
-                        datetime_to_unix_nanos(request.end),
+                        start,
+                        end,
                         ts_init,
                         request.params,
                     ));
@@ -772,76 +754,102 @@ impl DataClient for LighterDataClient {
     }
 }
 
-async fn handle_ws_message(
+fn handle_ws_message(
     message: &str,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    registry: &Arc<tokio::sync::RwLock<LighterInstrumentRegistry>>,
-    book_offsets: &Arc<tokio::sync::RwLock<AHashMap<i64, u64>>>,
-    book_states: &Arc<tokio::sync::RwLock<AHashMap<i64, LighterBookState>>>,
+    registry: &LighterInstrumentRegistry,
+    book_offsets: &mut AHashMap<i64, u64>,
     clock: &'static nautilus_core::time::AtomicTime,
+    #[cfg(feature = "latency-probe")] raw_received_ns: u64,
 ) -> anyhow::Result<()> {
+    #[cfg(feature = "latency-probe")]
+    {
+        latency::record_duration(
+            "lighter.adapter.raw_to_loop",
+            raw_received_ns,
+            latency::timestamp_ns(),
+        );
+    }
+
+    #[cfg(feature = "latency-probe")]
+    let header_parse_start_ns = latency::timestamp_ns();
     let header: WsMessage = serde_json::from_str(message)?;
+    #[cfg(feature = "latency-probe")]
+    latency::record_duration(
+        "lighter.adapter.header_parse",
+        header_parse_start_ns,
+        latency::timestamp_ns(),
+    );
     if matches!(header.msg_type.as_str(), "connected" | "ping" | "pong") {
         return Ok(());
     }
 
     match header.msg_type.as_str() {
         "subscribed/order_book" | "update/order_book" => {
+            #[cfg(feature = "latency-probe")]
+            let payload_parse_start_ns = latency::timestamp_ns();
             let payload: WsOrderBookMessage = serde_json::from_str(message)?;
+            #[cfg(feature = "latency-probe")]
+            latency::record_duration(
+                "lighter.adapter.book_payload_parse",
+                payload_parse_start_ns,
+                latency::timestamp_ns(),
+            );
             let Some(market_id) = channel_market_id(&payload.channel) else {
                 return Ok(());
             };
-            let registry = registry.read().await;
-            let Some(meta) = registry.meta_for_market_id(market_id).cloned() else {
+            let Some(meta) = registry.meta_for_market_id(market_id) else {
                 return Ok(());
             };
             let sequence = payload.offset as u64;
-            let ts_event = crate::common::epoch_to_unix_nanos(Some(payload.timestamp));
-            let ts_init = if ts_event == UnixNanos::default() {
-                clock.get_time_ns()
-            } else {
-                ts_event
+            let ts_init = adapter_ts_init(
+                clock,
+                #[cfg(feature = "latency-probe")]
+                raw_received_ns,
+            );
+            let ts_event = {
+                let ts_event = epoch_to_unix_nanos(Some(payload.timestamp));
+                if ts_event == UnixNanos::default() {
+                    ts_init
+                } else {
+                    ts_event
+                }
             };
 
             if payload.msg_type.starts_with("subscribed/") {
-                book_offsets.write().await.insert(market_id, sequence);
-                book_states
-                    .write()
-                    .await
-                    .entry(market_id)
-                    .or_default()
-                    .set_snapshot(&payload.order_book.bids, &payload.order_book.asks);
+                #[cfg(feature = "latency-probe")]
+                let normalize_start_ns = latency::timestamp_ns();
+                book_offsets.insert(market_id, sequence);
                 let deltas = order_book_snapshot_deltas(
                     &meta.instrument,
                     &payload.order_book.bids,
                     &payload.order_book.asks,
                     sequence,
+                    ts_event,
                     ts_init,
-                    ts_init,
+                );
+                #[cfg(feature = "latency-probe")]
+                latency::record_duration(
+                    "lighter.adapter.book_snapshot_normalize",
+                    normalize_start_ns,
+                    latency::timestamp_ns(),
                 );
                 let _ = sender.send(DataEvent::Data(Data::Deltas(OrderBookDeltas_API::new(
                     deltas,
                 ))));
+                #[cfg(feature = "latency-probe")]
+                record_after_send("lighter.adapter.book_snapshot_after_send", raw_received_ns);
                 return Ok(());
             }
 
-            let last_sequence = book_offsets
-                .read()
-                .await
-                .get(&market_id)
-                .copied()
-                .unwrap_or_default();
+            let last_sequence = book_offsets.get(&market_id).copied().unwrap_or_default();
             if sequence <= last_sequence {
                 return Ok(());
             }
 
-            book_offsets.write().await.insert(market_id, sequence);
-            book_states
-                .write()
-                .await
-                .entry(market_id)
-                .or_default()
-                .apply_delta(&payload.order_book.bids, &payload.order_book.asks);
+            #[cfg(feature = "latency-probe")]
+            let normalize_start_ns = latency::timestamp_ns();
+            book_offsets.insert(market_id, sequence);
             let deltas = order_book_delta_updates(
                 &meta.instrument,
                 &payload.order_book.bids,
@@ -850,97 +858,132 @@ async fn handle_ws_message(
                 ts_event,
                 ts_init,
             );
+            #[cfg(feature = "latency-probe")]
+            latency::record_duration(
+                "lighter.adapter.book_delta_normalize",
+                normalize_start_ns,
+                latency::timestamp_ns(),
+            );
             let _ = sender.send(DataEvent::Data(Data::Deltas(OrderBookDeltas_API::new(
                 deltas,
             ))));
+            #[cfg(feature = "latency-probe")]
+            record_after_send("lighter.adapter.book_delta_after_send", raw_received_ns);
         }
         "subscribed/ticker" | "update/ticker" => {
+            #[cfg(feature = "latency-probe")]
+            let payload_parse_start_ns = latency::timestamp_ns();
             let payload: WsTickerUpdate = serde_json::from_str(message)?;
+            #[cfg(feature = "latency-probe")]
+            latency::record_duration(
+                "lighter.adapter.ticker_payload_parse",
+                payload_parse_start_ns,
+                latency::timestamp_ns(),
+            );
             let Some(market_id) = payload.channel.as_deref().and_then(channel_market_id) else {
                 return Ok(());
             };
             let Some(ticker) = payload.ticker else {
                 return Ok(());
             };
-            let registry = registry.read().await;
             let Some(meta) = registry.meta_for_market_id(market_id) else {
                 return Ok(());
             };
-            let ts_init = clock.get_time_ns();
-            if let Some(quote) = quote_tick_from_ticker(&meta.instrument, &ticker, ts_init, ts_init)
+            let ts_init = adapter_ts_init(
+                clock,
+                #[cfg(feature = "latency-probe")]
+                raw_received_ns,
+            );
+            let ts_event = ticker_event_time(
+                ticker.last_updated_at,
+                payload.last_updated_at,
+                payload.timestamp,
+                ts_init,
+            );
+            #[cfg(feature = "latency-probe")]
+            let normalize_start_ns = latency::timestamp_ns();
+            if let Some(quote) =
+                quote_tick_from_ticker(&meta.instrument, &ticker, ts_event, ts_init)
             {
+                #[cfg(feature = "latency-probe")]
+                latency::record_duration(
+                    "lighter.adapter.ticker_normalize",
+                    normalize_start_ns,
+                    latency::timestamp_ns(),
+                );
                 let _ = sender.send(DataEvent::Data(Data::Quote(quote)));
+                #[cfg(feature = "latency-probe")]
+                record_after_send("lighter.adapter.ticker_after_send", raw_received_ns);
             }
         }
         "subscribed/trade" | "update/trade" => {
-            let payload: serde_json::Value = serde_json::from_str(message)?;
-            let Some(market_id) = payload
-                .get("channel")
-                .and_then(|value| value.as_str())
-                .and_then(channel_market_id)
-            else {
+            #[cfg(feature = "latency-probe")]
+            let payload_parse_start_ns = latency::timestamp_ns();
+            let payload: WsTradeUpdate = serde_json::from_str(message)?;
+            #[cfg(feature = "latency-probe")]
+            latency::record_duration(
+                "lighter.adapter.trade_payload_parse",
+                payload_parse_start_ns,
+                latency::timestamp_ns(),
+            );
+            let Some(market_id) = channel_market_id(&payload.channel) else {
                 return Ok(());
             };
-            let registry = registry.read().await;
             let Some(meta) = registry.meta_for_market_id(market_id) else {
                 return Ok(());
             };
-            let ts_init = clock.get_time_ns();
-            let trades = payload
-                .get("trades")
-                .and_then(|value| value.as_array().cloned())
-                .or_else(|| payload.get("trade").map(|value| vec![value.clone()]))
-                .unwrap_or_default();
-            for trade in trades {
-                if let Ok(trade) = serde_json::from_value::<Trade>(trade) {
-                    let _ = sender.send(DataEvent::Data(Data::Trade(trade_tick_from_trade(
-                        &meta.instrument,
-                        &trade,
-                        ts_init,
-                    ))));
-                }
+            let ts_init = adapter_ts_init(
+                clock,
+                #[cfg(feature = "latency-probe")]
+                raw_received_ns,
+            );
+            #[cfg(feature = "latency-probe")]
+            let normalize_start_ns = latency::timestamp_ns();
+            for trade in payload.trades {
+                let _ = sender.send(DataEvent::Data(Data::Trade(trade_tick_from_trade(
+                    &meta.instrument,
+                    &trade,
+                    ts_init,
+                ))));
+            }
+            #[cfg(feature = "latency-probe")]
+            {
+                latency::record_duration(
+                    "lighter.adapter.trade_normalize_send",
+                    normalize_start_ns,
+                    latency::timestamp_ns(),
+                );
+                record_after_send("lighter.adapter.trade_after_send", raw_received_ns);
             }
         }
         "update/market_stats" | "subscribed/market_stats" => {
-            let payload: serde_json::Value = serde_json::from_str(message)?;
-            let ts_init = clock.get_time_ns();
-            let stats = payload
-                .get("market_stats")
-                .cloned()
-                .or_else(|| payload.get("market").cloned())
-                .unwrap_or(Value::Null);
+            #[cfg(feature = "latency-probe")]
+            let payload_parse_start_ns = latency::timestamp_ns();
+            let payload: WsMarketStatsUpdate = serde_json::from_str(message)?;
+            #[cfg(feature = "latency-probe")]
+            latency::record_duration(
+                "lighter.adapter.market_stats_payload_parse",
+                payload_parse_start_ns,
+                latency::timestamp_ns(),
+            );
+            let ts_init = adapter_ts_init(
+                clock,
+                #[cfg(feature = "latency-probe")]
+                raw_received_ns,
+            );
+            let ts_event = message_event_time(payload.timestamp, ts_init);
 
-            let mut markets = Vec::new();
-            if let Value::Object(map) = stats {
-                if map.get("market_id").is_some() {
-                    markets.push(serde_json::from_value::<PerpsMarketStats>(Value::Object(
-                        map,
-                    ))?);
-                } else {
-                    for (market_key, entry) in map {
-                        if let Value::Object(mut entry_map) = entry {
-                            if entry_map.get("market_id").is_none() {
-                                entry_map.insert("market_id".to_string(), Value::from(market_key));
-                            }
-                            if let Ok(market) =
-                                serde_json::from_value::<PerpsMarketStats>(Value::Object(entry_map))
-                            {
-                                markets.push(market);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let registry = registry.read().await;
-            for market in markets {
+            #[cfg(feature = "latency-probe")]
+            let normalize_start_ns = latency::timestamp_ns();
+            for market in payload.markets {
                 let Some(market_id) = market.market_id else {
                     continue;
                 };
                 let Some(meta) = registry.meta_for_market_id(market_id) else {
                     continue;
                 };
-                for update in market_stats_to_updates(&meta.instrument, &market, ts_init, ts_init) {
+                for update in market_stats_to_updates(&meta.instrument, &market, ts_event, ts_init)
+                {
                     match update {
                         LighterMarketStatUpdate::Mark(update) => {
                             let _ = sender.send(DataEvent::Data(Data::MarkPriceUpdate(update)));
@@ -954,9 +997,40 @@ async fn handle_ws_message(
                     }
                 }
             }
+            #[cfg(feature = "latency-probe")]
+            {
+                latency::record_duration(
+                    "lighter.adapter.market_stats_normalize_send",
+                    normalize_start_ns,
+                    latency::timestamp_ns(),
+                );
+                record_after_send("lighter.adapter.market_stats_after_send", raw_received_ns);
+            }
         }
         _ => {}
     }
 
     Ok(())
+}
+
+#[cfg(feature = "latency-probe")]
+fn adapter_ts_init(
+    clock: &'static nautilus_core::time::AtomicTime,
+    raw_received_ns: u64,
+) -> UnixNanos {
+    if latency::enabled() {
+        UnixNanos::from(raw_received_ns)
+    } else {
+        clock.get_time_ns()
+    }
+}
+
+#[cfg(not(feature = "latency-probe"))]
+fn adapter_ts_init(clock: &'static nautilus_core::time::AtomicTime) -> UnixNanos {
+    clock.get_time_ns()
+}
+
+#[cfg(feature = "latency-probe")]
+fn record_after_send(stage: &'static str, raw_received_ns: u64) {
+    latency::record_duration(stage, raw_received_ns, latency::timestamp_ns());
 }

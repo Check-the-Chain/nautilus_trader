@@ -32,8 +32,6 @@ impl LighterDataClientConfig {
         base_url_ws = None,
         proxy_url = None,
         http_timeout_secs = None,
-        ws_timeout_secs = None,
-        update_instruments_interval_mins = None,
     ))]
     fn py_new(
         environment: Option<LighterEnvironment>,
@@ -41,8 +39,6 @@ impl LighterDataClientConfig {
         base_url_ws: Option<String>,
         proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
-        ws_timeout_secs: Option<u64>,
-        update_instruments_interval_mins: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -51,10 +47,6 @@ impl LighterDataClientConfig {
             proxy_url,
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
-            ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
-            update_instruments_interval_mins: update_instruments_interval_mins
-                .unwrap_or(defaults.update_instruments_interval_mins),
-            transport_backend: defaults.transport_backend,
         }
     }
 
@@ -72,6 +64,8 @@ impl LighterExecClientConfig {
         account_index = None,
         private_key = None,
         api_key_index = None,
+        maker_private_key = None,
+        maker_api_key_index = None,
         api_private_keys = None,
         signer_lib_path = None,
         environment = None,
@@ -89,6 +83,8 @@ impl LighterExecClientConfig {
         account_index: Option<i64>,
         private_key: Option<String>,
         api_key_index: Option<u8>,
+        maker_private_key: Option<String>,
+        maker_api_key_index: Option<u8>,
         api_private_keys: Option<HashMap<u8, String>>,
         signer_lib_path: Option<String>,
         environment: Option<LighterEnvironment>,
@@ -106,6 +102,8 @@ impl LighterExecClientConfig {
             account_index,
             private_key,
             api_key_index,
+            maker_private_key,
+            maker_api_key_index,
             api_private_keys,
             signer_lib_path,
             base_url_http,
@@ -118,7 +116,6 @@ impl LighterExecClientConfig {
             default_auth_token_ttl_secs: default_auth_token_ttl_secs
                 .unwrap_or(defaults.default_auth_token_ttl_secs),
             cancel_all_gtt_secs: cancel_all_gtt_secs.unwrap_or(defaults.cancel_all_gtt_secs),
-            transport_backend: defaults.transport_backend,
         }
     }
 

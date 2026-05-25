@@ -23,7 +23,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -57,6 +57,7 @@ use nautilus_lighter::{
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
+    data::QuoteTick,
     enums::{AccountType, ContingencyType, OmsType, OrderSide, OrderType, TimeInForce},
     events::{AccountState, OrderAccepted, OrderEventAny, OrderInitialized},
     identifiers::{
@@ -76,6 +77,7 @@ use crate::common::{
 #[derive(Debug)]
 struct MockExecutionApi {
     auth_token_calls: AtomicUsize,
+    auth_token_deadlines: Mutex<Vec<i64>>,
     request_account_calls: AtomicUsize,
     account: Mutex<DetailedAccounts>,
     active_orders: Mutex<Orders>,
@@ -93,6 +95,7 @@ impl Default for MockExecutionApi {
     fn default() -> Self {
         Self {
             auth_token_calls: AtomicUsize::new(0),
+            auth_token_deadlines: Mutex::new(Vec::new()),
             request_account_calls: AtomicUsize::new(0),
             account: Mutex::new(detailed_accounts_with_position()),
             active_orders: Mutex::new(Orders {
@@ -117,10 +120,14 @@ impl Default for MockExecutionApi {
 impl LighterExecutionApi for MockExecutionApi {
     async fn create_auth_token(
         &self,
-        _deadline_secs: i64,
+        deadline_unix_secs: i64,
         _api_key_index: Option<u8>,
     ) -> anyhow::Result<String> {
         self.auth_token_calls.fetch_add(1, Ordering::Relaxed);
+        self.auth_token_deadlines
+            .lock()
+            .unwrap()
+            .push(deadline_unix_secs);
         Ok("test-auth-token".to_string())
     }
 
@@ -421,6 +428,63 @@ fn add_limit_order(
     order
 }
 
+fn add_post_only_limit_order(
+    cache: &Rc<RefCell<Cache>>,
+    client_order_id: &str,
+) -> nautilus_model::orders::any::OrderAny {
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(InstrumentId::from(TEST_INSTRUMENT_ID))
+        .client_order_id(ClientOrderId::from(client_order_id))
+        .trader_id(TraderId::from("TRADER-001"))
+        .strategy_id(nautilus_model::identifiers::StrategyId::from("S-001"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.1000"))
+        .price(Price::from("100000.00"))
+        .time_in_force(TimeInForce::Gtc)
+        .post_only(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("LIGHTER")), false)
+        .unwrap();
+    order
+}
+
+fn add_market_order(
+    cache: &Rc<RefCell<Cache>>,
+    client_order_id: &str,
+) -> nautilus_model::orders::any::OrderAny {
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(InstrumentId::from(TEST_INSTRUMENT_ID))
+        .client_order_id(ClientOrderId::from(client_order_id))
+        .trader_id(TraderId::from("TRADER-001"))
+        .strategy_id(nautilus_model::identifiers::StrategyId::from("S-001"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.1000"))
+        .time_in_force(TimeInForce::Ioc)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("LIGHTER")), false)
+        .unwrap();
+    order
+}
+
+fn add_quote(cache: &Rc<RefCell<Cache>>, bid: &str, ask: &str) {
+    cache
+        .borrow_mut()
+        .add_quote(QuoteTick::new(
+            InstrumentId::from(TEST_INSTRUMENT_ID),
+            Price::from(bid),
+            Price::from(ask),
+            Quantity::from("1.0000"),
+            Quantity::from("1.0000"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ))
+        .unwrap();
+}
+
 fn add_contingent_limit_order(
     cache: &Rc<RefCell<Cache>>,
     client_order_id: &str,
@@ -492,6 +556,7 @@ fn create_test_execution_client(
     let config = LighterExecClientConfig {
         account_index: Some(TEST_ACCOUNT_INDEX),
         api_key_index: Some(3),
+        maker_api_key_index: Some(4),
         base_url_http: Some(format!("http://{addr}")),
         base_url_ws: Some(format!("ws://{addr}/stream")),
         ..LighterExecClientConfig::default()
@@ -529,6 +594,14 @@ async fn test_exec_client_connect_disconnect() {
     client.connect().await.unwrap();
     assert!(client.is_connected());
     assert!(api.auth_token_calls.load(Ordering::Relaxed) >= 1);
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    {
+        let deadlines = api.auth_token_deadlines.lock().unwrap();
+        assert!(deadlines.iter().all(|deadline| *deadline > now_unix + 200));
+    }
     assert!(api.request_account_calls.load(Ordering::Relaxed) >= 1);
 
     client.disconnect().await.unwrap();
@@ -569,6 +642,78 @@ async fn test_submit_order_records_request() {
     assert_eq!(request.api_key_index, Some(3));
     assert_eq!(request.base_amount, 1000);
     assert_eq!(request.price, 10_000_000);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_market_order_uses_cached_quote() {
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    let (mut client, _rx, cache) = create_test_execution_client(addr, api.clone());
+    add_test_account(&cache, AccountId::from("LIGHTER-7"));
+    add_quote(&cache, "99999.00", "100001.00");
+    client.connect().await.unwrap();
+
+    let order = add_market_order(&cache, "O-MARKET-100");
+    let cmd = SubmitOrder::from_order(
+        &order,
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("LIGHTER")),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(cmd).unwrap();
+    wait_until_async(
+        || {
+            let api = api.clone();
+            async move { api.submit_requests.lock().unwrap().len() == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let request = api.submit_requests.lock().unwrap()[0];
+    assert_eq!(request.price, 10_000_100);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_post_only_order_uses_maker_api_key() {
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    let (mut client, _rx, cache) = create_test_execution_client(addr, api.clone());
+    add_test_account(&cache, AccountId::from("LIGHTER-7"));
+    client.connect().await.unwrap();
+
+    let order = add_post_only_limit_order(&cache, "O-MAKER-100");
+    let cmd = SubmitOrder::from_order(
+        &order,
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("LIGHTER")),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(cmd).unwrap();
+    wait_until_async(
+        || {
+            let api = api.clone();
+            async move { api.submit_requests.lock().unwrap().len() == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let request = api.submit_requests.lock().unwrap()[0];
+    assert_eq!(request.api_key_index, Some(4));
+    assert_eq!(request.time_in_force, 2);
 
     client.disconnect().await.unwrap();
 }
@@ -622,6 +767,62 @@ async fn test_submit_order_list_records_batch_request() {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].len(), 2);
         assert!(api.submit_requests.lock().unwrap().is_empty());
+    }
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_list_selects_key_per_order() {
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    let (mut client, _rx, cache) = create_test_execution_client(addr, api.clone());
+    add_test_account(&cache, AccountId::from("LIGHTER-7"));
+    client.connect().await.unwrap();
+
+    let order_1 = add_limit_order(&cache, "O-TAKER-201");
+    let order_2 = add_post_only_limit_order(&cache, "O-MAKER-202");
+    let order_list = OrderList::new(
+        OrderListId::from("OL-KEYS"),
+        InstrumentId::from(TEST_INSTRUMENT_ID),
+        StrategyId::from("S-001"),
+        vec![order_1.client_order_id(), order_2.client_order_id()],
+        UnixNanos::default(),
+    );
+    let cmd = SubmitOrderList::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("LIGHTER")),
+        StrategyId::from("S-001"),
+        order_list,
+        vec![
+            OrderInitialized::from(&order_1),
+            OrderInitialized::from(&order_2),
+        ],
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order_list(cmd).unwrap();
+    wait_until_async(
+        || {
+            let api = api.clone();
+            async move { api.submit_batch_requests.lock().unwrap().len() == 2 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    {
+        let requests = api.submit_batch_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].len(), 1);
+        assert_eq!(requests[1].len(), 1);
+        assert_eq!(requests[0][0].api_key_index, Some(3));
+        assert_eq!(requests[1][0].api_key_index, Some(4));
     }
 
     client.disconnect().await.unwrap();
@@ -733,6 +934,48 @@ async fn test_modify_order_records_request() {
     assert_eq!(request.market_index, TEST_MARKET_ID as i32);
     assert_eq!(request.order_index, 101);
     assert_eq!(request.base_amount, 2000);
+    assert_eq!(request.api_key_index, Some(3));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_modify_post_only_order_uses_maker_api_key() {
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    let (mut client, _rx, cache) = create_test_execution_client(addr, api.clone());
+    add_test_account(&cache, AccountId::from("LIGHTER-7"));
+    client.connect().await.unwrap();
+    let _order = add_post_only_limit_order(&cache, "O-MAKER-MODIFY");
+
+    let cmd = nautilus_common::messages::execution::ModifyOrder::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("LIGHTER")),
+        nautilus_model::identifiers::StrategyId::from("S-001"),
+        InstrumentId::from(TEST_INSTRUMENT_ID),
+        ClientOrderId::from("O-MAKER-MODIFY"),
+        Some(VenueOrderId::from("101")),
+        Some(Quantity::from("0.2000")),
+        Some(Price::from("100100.00")),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.modify_order(cmd).unwrap();
+    wait_until_async(
+        || {
+            let api = api.clone();
+            async move { api.modify_requests.lock().unwrap().len() == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let request = api.modify_requests.lock().unwrap()[0];
+    assert_eq!(request.api_key_index, Some(4));
 
     client.disconnect().await.unwrap();
 }
@@ -777,6 +1020,44 @@ async fn test_cancel_order_records_request() {
 
 #[rstest]
 #[tokio::test]
+async fn test_cancel_post_only_order_uses_maker_api_key() {
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    let (mut client, _rx, cache) = create_test_execution_client(addr, api.clone());
+    add_test_account(&cache, AccountId::from("LIGHTER-7"));
+    client.connect().await.unwrap();
+    let _order = add_post_only_limit_order(&cache, "O-MAKER-CANCEL");
+
+    let cmd = CancelOrder::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("LIGHTER")),
+        nautilus_model::identifiers::StrategyId::from("S-001"),
+        InstrumentId::from(TEST_INSTRUMENT_ID),
+        ClientOrderId::from("O-MAKER-CANCEL"),
+        Some(VenueOrderId::from("101")),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.cancel_order(cmd).unwrap();
+    wait_until_async(
+        || {
+            let api = api.clone();
+            async move { api.cancel_requests.lock().unwrap().len() == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let request = api.cancel_requests.lock().unwrap()[0];
+    assert_eq!(request, (TEST_MARKET_ID as i32, 101, Some(4)));
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_cancel_all_orders_uses_batch_cancel_requests() {
     let addr = start_mock_server().await;
     let api = Arc::new(MockExecutionApi::default());
@@ -790,7 +1071,7 @@ async fn test_cancel_all_orders_uses_batch_cancel_requests() {
         .unwrap();
     cache.borrow_mut().update_order(&order_1).unwrap();
 
-    let mut order_2 = add_limit_order(&cache, "O-302");
+    let mut order_2 = add_post_only_limit_order(&cache, "O-302");
     order_2
         .apply(OrderEventAny::Accepted(order_accepted(&order_2, "302")))
         .unwrap();
@@ -811,7 +1092,7 @@ async fn test_cancel_all_orders_uses_batch_cancel_requests() {
     wait_until_async(
         || {
             let api = api.clone();
-            async move { api.cancel_batch_requests.lock().unwrap().len() == 1 }
+            async move { api.cancel_batch_requests.lock().unwrap().len() == 2 }
         },
         Duration::from_secs(5),
     )
@@ -819,8 +1100,11 @@ async fn test_cancel_all_orders_uses_batch_cancel_requests() {
 
     {
         let requests = api.cancel_batch_requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].len(), 2);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].len(), 1);
+        assert_eq!(requests[1].len(), 1);
+        assert_eq!(requests[0][0].api_key_index, Some(3));
+        assert_eq!(requests[1][0].api_key_index, Some(4));
         assert_eq!(api.cancel_all_calls.load(Ordering::Relaxed), 0);
     }
 
@@ -836,7 +1120,7 @@ async fn test_batch_cancel_orders_records_batch_request() {
     add_test_account(&cache, AccountId::from("LIGHTER-7"));
     client.connect().await.unwrap();
     let _order_1 = add_limit_order(&cache, "O-401");
-    let _order_2 = add_limit_order(&cache, "O-402");
+    let _order_2 = add_post_only_limit_order(&cache, "O-402");
 
     let cancels = vec![
         CancelOrder::new(
@@ -877,7 +1161,7 @@ async fn test_batch_cancel_orders_records_batch_request() {
     wait_until_async(
         || {
             let api = api.clone();
-            async move { api.cancel_batch_requests.lock().unwrap().len() == 1 }
+            async move { api.cancel_batch_requests.lock().unwrap().len() == 2 }
         },
         Duration::from_secs(5),
     )
@@ -885,8 +1169,11 @@ async fn test_batch_cancel_orders_records_batch_request() {
 
     {
         let requests = api.cancel_batch_requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].len(), 2);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].len(), 1);
+        assert_eq!(requests[1].len(), 1);
+        assert_eq!(requests[0][0].api_key_index, Some(3));
+        assert_eq!(requests[1][0].api_key_index, Some(4));
         assert!(api.cancel_requests.lock().unwrap().is_empty());
     }
 

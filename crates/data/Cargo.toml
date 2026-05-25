@@ -22,6 +22,7 @@ crate-type = ["rlib"]
 
 [features]
 default = []
+latency-probe = ["nautilus-core/latency-probe"]
 streaming = ["nautilus-persistence"]
 ffi = [
   "nautilus-common/ffi",

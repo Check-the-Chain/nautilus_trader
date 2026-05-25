@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::asset::Asset;
-use super::de::{opt_f64_from_string_or_number, opt_i64_from_string_or_number};
+use super::de::{
+    opt_f64_from_string_or_number, opt_i64_from_string_or_number, opt_string_from_string_or_number,
+};
 
 // ---------------------------------------------------------------------------
 // /api/v1/account  (no auth)
@@ -176,6 +178,16 @@ pub struct AccountLimits {
     pub user_tier: Option<i64>,
     #[serde(default)]
     pub can_create_public_pool: Option<bool>,
+    #[serde(default, deserialize_with = "opt_string_from_string_or_number")]
+    pub user_tier_name: Option<String>,
+    #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
+    pub current_maker_fee_tick: Option<i64>,
+    #[serde(default, deserialize_with = "opt_i64_from_string_or_number")]
+    pub current_taker_fee_tick: Option<i64>,
+    #[serde(default, deserialize_with = "opt_string_from_string_or_number")]
+    pub leased_lit: Option<String>,
+    #[serde(default, deserialize_with = "opt_string_from_string_or_number")]
+    pub effective_lit_stakes: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -325,7 +337,31 @@ pub struct NextNonce {
 
 #[cfg(test)]
 mod tests {
-    use super::AccountPosition;
+    use super::{AccountLimits, AccountPosition};
+
+    #[test]
+    fn parses_account_limits_fee_tier_fields() {
+        let raw = serde_json::json!({
+            "code": 200,
+            "max_llp_percentage": 10,
+            "max_llp_amount": "1000.0",
+            "user_tier": "2",
+            "can_create_public_pool": false,
+            "user_tier_name": "premium",
+            "current_maker_fee_tick": 40,
+            "current_taker_fee_tick": "280",
+            "leased_lit": "0",
+            "effective_lit_stakes": "1000"
+        });
+
+        let limits: AccountLimits = serde_json::from_value(raw).unwrap();
+        assert_eq!(limits.user_tier, Some(2));
+        assert_eq!(limits.user_tier_name.as_deref(), Some("premium"));
+        assert_eq!(limits.current_maker_fee_tick, Some(40));
+        assert_eq!(limits.current_taker_fee_tick, Some(280));
+        assert_eq!(limits.leased_lit.as_deref(), Some("0"));
+        assert_eq!(limits.effective_lit_stakes.as_deref(), Some("1000"));
+    }
 
     #[test]
     fn parses_position_fields() {

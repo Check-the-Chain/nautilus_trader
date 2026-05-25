@@ -15,9 +15,9 @@
 
 from __future__ import annotations
 
-from nautilus_trader.common.config import PositiveInt
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
+from nautilus_trader.common.config import PositiveInt
 from nautilus_trader.core.nautilus_pyo3 import LighterEnvironment
 
 
@@ -36,8 +36,6 @@ class LighterDataClientConfig(LiveDataClientConfig, frozen=True):
     # Deprecated: use proxy_url.
     ws_proxy_url: str | None = None
     http_timeout_secs: PositiveInt = 30
-    ws_timeout_secs: PositiveInt = 30
-    update_instruments_interval_mins: PositiveInt = 60
 
 
 class LighterExecClientConfig(LiveExecClientConfig, frozen=True):

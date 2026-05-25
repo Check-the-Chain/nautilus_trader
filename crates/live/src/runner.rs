@@ -67,6 +67,10 @@ use nautilus_common::{
     },
     timer::TimeEventHandler,
 };
+#[cfg(feature = "latency-probe")]
+use nautilus_core::latency;
+#[cfg(feature = "latency-probe")]
+use nautilus_model::data::HasTsInit;
 use nautilus_model::events::OrderEventAny;
 
 /// Asynchronous implementation of `DataCommandSender` for live environments.
@@ -364,6 +368,20 @@ impl AsyncRunner {
     pub fn handle_data_event(event: DataEvent) {
         match event {
             DataEvent::Data(data) => {
+                #[cfg(feature = "latency-probe")]
+                if latency::enabled() {
+                    latency::record_since_init("runner.data_event_recv", data.ts_init());
+                    let start_ns = latency::timestamp_ns();
+                    msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
+                    latency::record_duration(
+                        "runner.data_event_dispatch",
+                        start_ns,
+                        latency::timestamp_ns(),
+                    );
+                } else {
+                    msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
+                }
+                #[cfg(not(feature = "latency-probe"))]
                 msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
             }
             DataEvent::Instrument(data) => {

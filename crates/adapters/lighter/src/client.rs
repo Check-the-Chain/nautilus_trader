@@ -257,6 +257,42 @@ impl SignerClient {
         api_key_index: Option<u8>,
         nonce: Option<i64>,
     ) -> Result<(signer::SignedTx, RespSendTx)> {
+        let (key, signed) = self
+            .sign_create_order(
+                market_index,
+                client_order_index,
+                base_amount,
+                price,
+                is_ask,
+                order_type,
+                time_in_force,
+                reduce_only,
+                trigger_price,
+                order_expiry,
+                api_key_index,
+                nonce,
+            )
+            .await?;
+        let result = self.rest.send_tx(signed.tx_type, &signed.tx_info).await;
+        self.handle_tx_result(&result, key).await;
+        Ok((signed, result?))
+    }
+
+    pub async fn sign_create_order(
+        &self,
+        market_index: i32,
+        client_order_index: i64,
+        base_amount: i64,
+        price: i32,
+        is_ask: bool,
+        order_type: i32,
+        time_in_force: i32,
+        reduce_only: bool,
+        trigger_price: i32,
+        order_expiry: i64,
+        api_key_index: Option<u8>,
+        nonce: Option<i64>,
+    ) -> Result<(u8, signer::SignedTx)> {
         let (key, n) = self.get_api_key_and_nonce(api_key_index, nonce).await?;
         let signed = signer::sign_create_order(
             market_index,
@@ -273,9 +309,7 @@ impl SignerClient {
             key as i32,
             self.account_index,
         )?;
-        let result = self.rest.send_tx(signed.tx_type, &signed.tx_info).await;
-        self.handle_tx_result(&result, key).await;
-        Ok((signed, result?))
+        Ok((key, signed))
     }
 
     pub async fn create_grouped_orders(
@@ -305,6 +339,21 @@ impl SignerClient {
         api_key_index: Option<u8>,
         nonce: Option<i64>,
     ) -> Result<(signer::SignedTx, RespSendTx)> {
+        let (key, signed) = self
+            .sign_cancel_order(market_index, order_index, api_key_index, nonce)
+            .await?;
+        let result = self.rest.send_tx(signed.tx_type, &signed.tx_info).await;
+        self.handle_tx_result(&result, key).await;
+        Ok((signed, result?))
+    }
+
+    pub async fn sign_cancel_order(
+        &self,
+        market_index: i32,
+        order_index: i64,
+        api_key_index: Option<u8>,
+        nonce: Option<i64>,
+    ) -> Result<(u8, signer::SignedTx)> {
         let (key, n) = self.get_api_key_and_nonce(api_key_index, nonce).await?;
         let signed = signer::sign_cancel_order(
             market_index,
@@ -313,9 +362,7 @@ impl SignerClient {
             key as i32,
             self.account_index,
         )?;
-        let result = self.rest.send_tx(signed.tx_type, &signed.tx_info).await;
-        self.handle_tx_result(&result, key).await;
-        Ok((signed, result?))
+        Ok((key, signed))
     }
 
     pub async fn modify_order(
@@ -328,6 +375,32 @@ impl SignerClient {
         api_key_index: Option<u8>,
         nonce: Option<i64>,
     ) -> Result<(signer::SignedTx, RespSendTx)> {
+        let (key, signed) = self
+            .sign_modify_order(
+                market_index,
+                order_index,
+                base_amount,
+                price,
+                trigger_price,
+                api_key_index,
+                nonce,
+            )
+            .await?;
+        let result = self.rest.send_tx(signed.tx_type, &signed.tx_info).await;
+        self.handle_tx_result(&result, key).await;
+        Ok((signed, result?))
+    }
+
+    pub async fn sign_modify_order(
+        &self,
+        market_index: i32,
+        order_index: i64,
+        base_amount: i64,
+        price: i64,
+        trigger_price: i64,
+        api_key_index: Option<u8>,
+        nonce: Option<i64>,
+    ) -> Result<(u8, signer::SignedTx)> {
         let (key, n) = self.get_api_key_and_nonce(api_key_index, nonce).await?;
         let signed = signer::sign_modify_order(
             market_index,
@@ -339,9 +412,7 @@ impl SignerClient {
             key as i32,
             self.account_index,
         )?;
-        let result = self.rest.send_tx(signed.tx_type, &signed.tx_info).await;
-        self.handle_tx_result(&result, key).await;
-        Ok((signed, result?))
+        Ok((key, signed))
     }
 
     pub async fn cancel_all_orders(
@@ -351,6 +422,21 @@ impl SignerClient {
         api_key_index: Option<u8>,
         nonce: Option<i64>,
     ) -> Result<(signer::SignedTx, RespSendTx)> {
+        let (key, signed) = self
+            .sign_cancel_all_orders(time_in_force, timestamp_ms, api_key_index, nonce)
+            .await?;
+        let result = self.rest.send_tx(signed.tx_type, &signed.tx_info).await;
+        self.handle_tx_result(&result, key).await;
+        Ok((signed, result?))
+    }
+
+    pub async fn sign_cancel_all_orders(
+        &self,
+        time_in_force: i32,
+        timestamp_ms: i64,
+        api_key_index: Option<u8>,
+        nonce: Option<i64>,
+    ) -> Result<(u8, signer::SignedTx)> {
         let (key, n) = self.get_api_key_and_nonce(api_key_index, nonce).await?;
         let signed = signer::sign_cancel_all_orders(
             time_in_force,
@@ -359,9 +445,7 @@ impl SignerClient {
             key as i32,
             self.account_index,
         )?;
-        let result = self.rest.send_tx(signed.tx_type, &signed.tx_info).await;
-        self.handle_tx_result(&result, key).await;
-        Ok((signed, result?))
+        Ok((key, signed))
     }
 
     pub async fn withdraw(
@@ -582,6 +666,12 @@ impl SignerClient {
         self.rest.send_tx(tx_type, tx_info).await
     }
 
+    pub async fn send_signed_tx(&self, signed_tx: &signer::SignedTx) -> Result<RespSendTx> {
+        self.rest
+            .send_tx(signed_tx.tx_type, &signed_tx.tx_info)
+            .await
+    }
+
     pub async fn send_tx_batch(&self, tx_types: &str, tx_infos: &str) -> Result<RespSendTxBatch> {
         self.rest.send_tx_batch(tx_types, tx_infos).await
     }
@@ -602,6 +692,23 @@ impl SignerClient {
         let types_json = serde_json::to_string(&tx_types)?;
         let infos_json = serde_json::to_string(&tx_infos)?;
         self.rest.send_tx_batch(&types_json, &infos_json).await
+    }
+
+    pub async fn handle_signed_tx_result(
+        &self,
+        result: &std::result::Result<RespSendTx, SdkError>,
+        api_key_index: u8,
+    ) {
+        self.handle_tx_result(result, api_key_index).await;
+    }
+
+    pub async fn handle_signed_batch_result(
+        &self,
+        result: &std::result::Result<RespSendTxBatch, SdkError>,
+        api_key_index: u8,
+        count: usize,
+    ) {
+        self.handle_batch_result(result, api_key_index, count).await;
     }
 
     /// Roll back `count` nonces for the given API key after a batch failure.
@@ -632,6 +739,17 @@ impl SignerClient {
             });
         }
 
+        let (api_key, signed_txs) = self.sign_submit_order_batch(requests).await?;
+        let result = self.sign_and_send_batch(&signed_txs).await;
+        self.handle_batch_result(&result, api_key, requests.len())
+            .await;
+        result
+    }
+
+    pub async fn sign_submit_order_batch(
+        &self,
+        requests: &[LighterSubmitOrderRequest],
+    ) -> Result<(u8, Vec<signer::SignedTx>)> {
         let batch_api_key =
             self.resolve_batch_api_key(requests.iter().map(|request| request.api_key_index))?;
         let (api_key, nonces) = self
@@ -667,10 +785,7 @@ impl SignerClient {
             }
         }
 
-        let result = self.sign_and_send_batch(&signed_txs).await;
-        self.handle_batch_result(&result, api_key, requests.len())
-            .await;
-        result
+        Ok((api_key, signed_txs))
     }
 
     pub async fn cancel_order_batch(
@@ -687,6 +802,17 @@ impl SignerClient {
             });
         }
 
+        let (api_key, signed_txs) = self.sign_cancel_order_batch(requests).await?;
+        let result = self.sign_and_send_batch(&signed_txs).await;
+        self.handle_batch_result(&result, api_key, requests.len())
+            .await;
+        result
+    }
+
+    pub async fn sign_cancel_order_batch(
+        &self,
+        requests: &[LighterCancelOrderRequest],
+    ) -> Result<(u8, Vec<signer::SignedTx>)> {
         let batch_api_key =
             self.resolve_batch_api_key(requests.iter().map(|request| request.api_key_index))?;
         let (api_key, nonces) = self
@@ -714,9 +840,6 @@ impl SignerClient {
             }
         }
 
-        let result = self.sign_and_send_batch(&signed_txs).await;
-        self.handle_batch_result(&result, api_key, requests.len())
-            .await;
-        result
+        Ok((api_key, signed_txs))
     }
 }

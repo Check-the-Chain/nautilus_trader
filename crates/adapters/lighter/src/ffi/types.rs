@@ -25,7 +25,7 @@ pub struct StrOrErr {
 
 #[repr(C)]
 pub struct FfiCreateOrderTxReq {
-    pub market_index: u8,
+    pub market_index: i16,
     pub client_order_index: i64,
     pub base_amount: i64,
     pub price: u32,

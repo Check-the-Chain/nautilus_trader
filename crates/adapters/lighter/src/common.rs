@@ -15,12 +15,11 @@
 
 //! Shared Nautilus domain parsing and metadata helpers for the Lighter adapter.
 
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
-
 use ahash::AHashMap;
+use blake2::{
+    Blake2bVar,
+    digest::{Update, VariableOutput},
+};
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     data::{
@@ -41,20 +40,21 @@ use nautilus_model::{
 use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use serde_json::Value;
 
-use crate::{
-    config::LighterDataClientConfig,
-    http::client::LighterHttpClient,
-    models::{
-        account::{AccountPosition, DetailedAccount},
-        asset::Asset,
-        candle::Candle,
-        funding::FundingRate,
-        market::PerpsMarketStats,
-        order::{Order, OrderStatus as LighterOrderStatus},
-        order_book::{PerpsOrderBookDetail, PriceLevel, SpotOrderBookDetail},
-        trade::Trade,
-        ws::WsTickerData,
-    },
+use crate::http::client::LighterHttpClient;
+use crate::models::{
+    account::{AccountPosition, DetailedAccount},
+    asset::Asset,
+    candle::Candle,
+    funding::FundingRate,
+    market::PerpsMarketStats,
+    order::{Order, OrderStatus as LighterOrderStatus},
+    order_book::{PerpsOrderBookDetail, PriceLevel, SpotOrderBookDetail},
+    trade::Trade,
+    ws::WsTickerData,
+};
+use crate::normalize::{
+    funding::{current_update_from_market_stats, historical_update_from_funding_rate_endpoint},
+    timestamp::epoch_to_unix_nanos,
 };
 
 pub const LIGHTER: &str = "LIGHTER";
@@ -62,6 +62,7 @@ pub const LIGHTER_PERP_SUFFIX: &str = "PERP";
 pub const LIGHTER_SPOT_SUFFIX: &str = "SPOT";
 pub const LIGHTER_SETTLEMENT_CURRENCY: &str = "USDC";
 pub const LIGHTER_FEE_SCALE: i64 = 1_000_000;
+pub use crate::normalize::funding::LIGHTER_FUNDING_INTERVAL_MINS;
 pub const LIGHTER_MAX_CLIENT_ORDER_INDEX: u64 = (1_u64 << 48) - 1;
 
 #[derive(Clone, Debug)]
@@ -148,30 +149,6 @@ impl LighterInstrumentRegistry {
     pub fn clear(&mut self) {
         self.by_market_id.clear();
         self.by_instrument_id.clear();
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LighterBookState {
-    pub bids: AHashMap<String, String>,
-    pub asks: AHashMap<String, String>,
-}
-
-impl LighterBookState {
-    pub fn set_snapshot(&mut self, bids: &[PriceLevel], asks: &[PriceLevel]) {
-        self.bids = bids
-            .iter()
-            .map(|level| (level.price.clone(), level.size.clone()))
-            .collect();
-        self.asks = asks
-            .iter()
-            .map(|level| (level.price.clone(), level.size.clone()))
-            .collect();
-    }
-
-    pub fn apply_delta(&mut self, bids: &[PriceLevel], asks: &[PriceLevel]) {
-        apply_book_side(&mut self.bids, bids);
-        apply_book_side(&mut self.asks, asks);
     }
 }
 
@@ -461,44 +438,31 @@ pub fn channel_market_id(channel: &str) -> Option<i64> {
 }
 
 #[must_use]
-pub fn epoch_to_unix_nanos(value: Option<i64>) -> UnixNanos {
-    let Some(value) = value else {
-        return UnixNanos::default();
-    };
-
-    let digits = value.unsigned_abs().to_string().len();
-    let nanos = if digits <= 10 {
-        value.saturating_mul(1_000_000_000)
-    } else if digits <= 13 {
-        value.saturating_mul(1_000_000)
-    } else if digits <= 16 {
-        value.saturating_mul(1_000)
-    } else {
-        value
-    };
-
-    UnixNanos::from(nanos.max(0) as u64)
-}
-
-#[must_use]
 pub fn quote_tick_from_ticker(
     instrument: &InstrumentAny,
     ticker: &WsTickerData,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> Option<QuoteTick> {
-    let (Some(bid_price), Some(ask_price), Some(bid_size), Some(ask_size)) =
-        (ticker.b.price, ticker.a.price, ticker.b.size, ticker.a.size)
+    let (Some(bid_price), Some(ask_price)) = (ticker.b.price.as_deref(), ticker.a.price.as_deref())
     else {
         return None;
     };
+    let bid_size = ticker.b.size.as_deref().map_or_else(
+        || Quantity::zero(instrument.size_precision()),
+        |size| qty_from_string(size, instrument.size_precision()),
+    );
+    let ask_size = ticker.a.size.as_deref().map_or_else(
+        || Quantity::zero(instrument.size_precision()),
+        |size| qty_from_string(size, instrument.size_precision()),
+    );
 
     Some(QuoteTick::new(
         instrument.id(),
-        price_from_f64(bid_price, instrument.price_precision()),
-        price_from_f64(ask_price, instrument.price_precision()),
-        qty_from_f64(bid_size, instrument.size_precision()),
-        qty_from_f64(ask_size, instrument.size_precision()),
+        price_from_string(bid_price, instrument.price_precision()),
+        price_from_string(ask_price, instrument.price_precision()),
+        bid_size,
+        ask_size,
         ts_event,
         ts_init,
     ))
@@ -559,18 +523,8 @@ pub fn market_stats_to_updates(
         )));
     }
 
-    let funding_rate = market.current_funding_rate.or(market.funding_rate);
-    if let Some(funding_rate) = funding_rate {
-        updates.push(LighterMarketStatUpdate::Funding(FundingRateUpdate::new(
-            instrument.id(),
-            decimal_from_f64(funding_rate),
-            None,
-            market
-                .next_funding_time
-                .map(|value| epoch_to_unix_nanos(Some(value))),
-            ts_event,
-            ts_init,
-        )));
+    if let Some(update) = current_update_from_market_stats(instrument, market, ts_event, ts_init) {
+        updates.push(LighterMarketStatUpdate::Funding(update));
     }
 
     updates
@@ -582,21 +536,54 @@ pub fn funding_rate_update_from_history(
     funding_rate: &FundingRate,
     ts_init: UnixNanos,
 ) -> Option<FundingRateUpdate> {
-    let rate = funding_rate.funding_rate?;
-    let ts_event = funding_rate
-        .settlement_time
-        .map_or(ts_init, |value| epoch_to_unix_nanos(Some(value)));
+    historical_update_from_funding_rate_endpoint(instrument.id(), funding_rate, ts_init)
+}
 
-    Some(FundingRateUpdate::new(
-        instrument.id(),
-        decimal_from_f64(rate),
-        None,
-        funding_rate
-            .settlement_time
-            .map(|value| epoch_to_unix_nanos(Some(value))),
-        ts_event,
-        ts_init,
-    ))
+#[must_use]
+pub fn funding_rate_updates_from_history(
+    instrument: &InstrumentAny,
+    funding_rates: &[FundingRate],
+    market_id: i64,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    limit: Option<usize>,
+    ts_init: UnixNanos,
+) -> Vec<FundingRateUpdate> {
+    let start = start.map(|value| value.as_u64());
+    let end = end.map(|value| value.as_u64());
+    let mut updates = Vec::new();
+
+    for funding_rate in funding_rates {
+        if funding_rate.market_id != Some(market_id) {
+            continue;
+        }
+
+        let Some(update) = funding_rate_update_from_history(instrument, funding_rate, ts_init)
+        else {
+            continue;
+        };
+        let ts_event = update.ts_event.as_u64();
+
+        if let Some(start) = start
+            && ts_event < start
+        {
+            continue;
+        }
+        if let Some(end) = end
+            && ts_event > end
+        {
+            continue;
+        }
+
+        updates.push(update);
+    }
+
+    updates.sort_unstable_by_key(|update| update.ts_event);
+    if let Some(limit) = limit {
+        updates.truncate(limit);
+    }
+
+    updates
 }
 
 pub fn candles_to_bars(
@@ -649,28 +636,38 @@ pub fn order_book_snapshot_deltas(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> OrderBookDeltas {
-    let mut deltas = vec![OrderBookDelta::clear(
-        instrument.id(),
-        sequence,
-        ts_event,
-        ts_init,
-    )];
-    deltas.extend(book_side_snapshot_deltas(
+    let total_levels = bids.len() + asks.len();
+    let mut deltas = Vec::with_capacity(total_levels + 1);
+    let mut clear = OrderBookDelta::clear(instrument.id(), sequence, ts_event, ts_init);
+    if total_levels == 0 {
+        clear.flags |= RecordFlag::F_LAST as u8;
+    }
+    deltas.push(clear);
+
+    push_book_side_snapshot_deltas(
+        &mut deltas,
         instrument,
         bids,
         OrderSide::Buy,
         sequence,
         ts_event,
         ts_init,
-    ));
-    deltas.extend(book_side_snapshot_deltas(
+    );
+    push_book_side_snapshot_deltas(
+        &mut deltas,
         instrument,
         asks,
         OrderSide::Sell,
         sequence,
         ts_event,
         ts_init,
-    ));
+    );
+
+    if total_levels > 0
+        && let Some(last) = deltas.last_mut()
+    {
+        last.flags |= RecordFlag::F_LAST as u8;
+    }
 
     OrderBookDeltas::new(instrument.id(), deltas)
 }
@@ -684,7 +681,9 @@ pub fn order_book_delta_updates(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> OrderBookDeltas {
-    let mut deltas = book_side_delta_updates(
+    let mut deltas = Vec::with_capacity(bids.len() + asks.len());
+    push_book_side_delta_updates(
+        &mut deltas,
         instrument,
         bids,
         OrderSide::Buy,
@@ -692,14 +691,19 @@ pub fn order_book_delta_updates(
         ts_event,
         ts_init,
     );
-    deltas.extend(book_side_delta_updates(
+    push_book_side_delta_updates(
+        &mut deltas,
         instrument,
         asks,
         OrderSide::Sell,
         sequence,
         ts_event,
         ts_init,
-    ));
+    );
+
+    if let Some(last) = deltas.last_mut() {
+        last.flags |= RecordFlag::F_LAST as u8;
+    }
 
     OrderBookDeltas::new(instrument.id(), deltas)
 }
@@ -715,33 +719,13 @@ pub fn populate_order_book(
     book.clear(sequence, ts_event);
 
     for level in bids {
-        let order = book_order_from_level(
-            instrument,
-            level,
-            OrderSide::Buy,
-            level.price.parse::<u64>().unwrap_or_default(),
-        );
-        book.add(
-            order,
-            RecordFlag::F_MBP as u8 | RecordFlag::F_LAST as u8,
-            sequence,
-            ts_event,
-        );
+        let order = book_order_from_level(instrument, level, OrderSide::Buy);
+        book.add(order, RecordFlag::F_MBP as u8, sequence, ts_event);
     }
 
     for level in asks {
-        let order = book_order_from_level(
-            instrument,
-            level,
-            OrderSide::Sell,
-            level.price.parse::<u64>().unwrap_or_default(),
-        );
-        book.add(
-            order,
-            RecordFlag::F_MBP as u8 | RecordFlag::F_LAST as u8,
-            sequence,
-            ts_event,
-        );
+        let order = book_order_from_level(instrument, level, OrderSide::Sell);
+        book.add(order, RecordFlag::F_MBP as u8, sequence, ts_event);
     }
 }
 
@@ -790,6 +774,7 @@ pub fn order_report_from_lighter(
     order: &Order,
     account_id: AccountId,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
     resolver: impl Fn(i64) -> Option<ClientOrderId>,
 ) -> OrderStatusReport {
     let order_status = order_status_from_lighter(&order.status_typed());
@@ -837,7 +822,7 @@ pub fn order_report_from_lighter(
         qty_from_string(&order.filled_base_amount, instrument.size_precision()),
         ts_accepted,
         ts_last,
-        ts_last,
+        ts_init,
         Some(UUID4::new()),
     )
     .with_post_only(post_only)
@@ -882,6 +867,7 @@ pub fn fill_report_from_lighter_trade(
     account_index: i64,
     account_id: AccountId,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
     resolver: impl Fn(i64) -> Option<ClientOrderId>,
 ) -> Option<FillReport> {
     let is_ask = if trade.ask_account_id == account_index {
@@ -938,7 +924,7 @@ pub fn fill_report_from_lighter_trade(
         client_order_id,
         venue_position_id,
         ts_event,
-        ts_event,
+        ts_init,
         Some(UUID4::new()),
     ))
 }
@@ -1002,9 +988,14 @@ pub fn position_reports_from_detailed_account(
 
 #[must_use]
 pub fn lighter_client_order_index(client_order_id: &ClientOrderId) -> i64 {
-    let mut hasher = DefaultHasher::new();
-    client_order_id.hash(&mut hasher);
-    let mut candidate = hasher.finish() & LIGHTER_MAX_CLIENT_ORDER_INDEX;
+    let mut digest = [0_u8; 8];
+    let mut hasher = Blake2bVar::new(8).expect("BLAKE2b supports an 8-byte variable output digest");
+    hasher.update(client_order_id.as_str().as_bytes());
+    hasher
+        .finalize_variable(&mut digest)
+        .expect("BLAKE2b output buffer has requested length");
+
+    let mut candidate = u64::from_be_bytes(digest) & LIGHTER_MAX_CLIENT_ORDER_INDEX;
     if candidate == 0 {
         candidate = 1;
     }
@@ -1023,8 +1014,11 @@ pub fn decimal_increment_qty(precision: u8) -> Quantity {
 
 #[must_use]
 pub fn price_from_string(value: &str, precision: u8) -> Price {
-    let parsed = value.parse::<f64>().unwrap_or_default();
-    price_from_f64(parsed, precision)
+    value
+        .parse::<Decimal>()
+        .ok()
+        .and_then(|value| Price::from_decimal_dp(value, precision).ok())
+        .unwrap_or_else(|| Price::from_raw(0, precision))
 }
 
 #[must_use]
@@ -1034,8 +1028,11 @@ pub fn price_from_f64(value: f64, precision: u8) -> Price {
 
 #[must_use]
 pub fn qty_from_string(value: &str, precision: u8) -> Quantity {
-    let parsed = value.parse::<f64>().unwrap_or_default();
-    qty_from_f64(parsed, precision)
+    value
+        .parse::<Decimal>()
+        .ok()
+        .and_then(|value| Quantity::from_decimal_dp(value, precision).ok())
+        .unwrap_or_else(|| Quantity::from_raw(0, precision))
 }
 
 #[must_use]
@@ -1080,102 +1077,66 @@ pub fn bar_granularity(bar_type: BarType) -> anyhow::Result<String> {
     }
 }
 
-pub fn data_http_client(config: &LighterDataClientConfig) -> anyhow::Result<LighterHttpClient> {
-    let mut client = LighterHttpClient::new_public(
-        crate::config::Config::for_environment(config.environment)
-            .with_http_base_url(config.http_url())
-            .with_ws_base_url(config.ws_url()),
-    )?;
-    let _ = &mut client;
-    Ok(client)
-}
-
-fn apply_book_side(side: &mut AHashMap<String, String>, levels: &[PriceLevel]) {
+fn push_book_side_snapshot_deltas(
+    deltas: &mut Vec<OrderBookDelta>,
+    instrument: &InstrumentAny,
+    levels: &[PriceLevel],
+    side: OrderSide,
+    sequence: u64,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) {
     for level in levels {
-        let size = level.size.parse::<f64>().unwrap_or_default();
-        if size <= 0.0 {
-            side.remove(&level.price);
-        } else {
-            side.insert(level.price.clone(), level.size.clone());
-        }
+        deltas.push(OrderBookDelta::new(
+            instrument.id(),
+            BookAction::Add,
+            book_order_from_level(instrument, level, side),
+            RecordFlag::F_SNAPSHOT as u8,
+            sequence,
+            ts_event,
+            ts_init,
+        ));
     }
 }
 
-fn book_side_snapshot_deltas(
+fn push_book_side_delta_updates(
+    deltas: &mut Vec<OrderBookDelta>,
     instrument: &InstrumentAny,
     levels: &[PriceLevel],
     side: OrderSide,
     sequence: u64,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
-) -> Vec<OrderBookDelta> {
-    levels
-        .iter()
-        .map(|level| {
-            OrderBookDelta::new(
-                instrument.id(),
-                BookAction::Add,
-                book_order_from_level(
-                    instrument,
-                    level,
-                    side,
-                    level.price.parse::<u64>().unwrap_or_default(),
-                ),
-                RecordFlag::F_MBP as u8 | RecordFlag::F_LAST as u8,
-                sequence,
-                ts_event,
-                ts_init,
-            )
-        })
-        .collect()
-}
-
-fn book_side_delta_updates(
-    instrument: &InstrumentAny,
-    levels: &[PriceLevel],
-    side: OrderSide,
-    sequence: u64,
-    ts_event: UnixNanos,
-    ts_init: UnixNanos,
-) -> Vec<OrderBookDelta> {
-    levels
-        .iter()
-        .map(|level| {
-            let size = level.size.parse::<f64>().unwrap_or_default();
-            let action = if size <= 0.0 {
-                BookAction::Delete
-            } else {
-                BookAction::Update
-            };
-            OrderBookDelta::new(
-                instrument.id(),
-                action,
-                book_order_from_level(
-                    instrument,
-                    level,
-                    side,
-                    level.price.parse::<u64>().unwrap_or_default(),
-                ),
-                RecordFlag::F_MBP as u8 | RecordFlag::F_LAST as u8,
-                sequence,
-                ts_event,
-                ts_init,
-            )
-        })
-        .collect()
+) {
+    for level in levels {
+        let size = level.size.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+        let action = if size <= Decimal::ZERO {
+            BookAction::Delete
+        } else {
+            BookAction::Update
+        };
+        deltas.push(OrderBookDelta::new(
+            instrument.id(),
+            action,
+            book_order_from_level(instrument, level, side),
+            RecordFlag::F_MBP as u8,
+            sequence,
+            ts_event,
+            ts_init,
+        ));
+    }
 }
 
 fn book_order_from_level(
     instrument: &InstrumentAny,
     level: &PriceLevel,
     side: OrderSide,
-    order_id: u64,
 ) -> nautilus_model::data::BookOrder {
     nautilus_model::data::BookOrder::new(
         side,
         price_from_string(&level.price, instrument.price_precision()),
         qty_from_string(&level.size, instrument.size_precision()),
-        order_id,
+        0,
     )
 }
 
@@ -1234,7 +1195,7 @@ fn order_status_from_lighter(value: &LighterOrderStatus) -> OrderStatus {
         | LighterOrderStatus::CanceledLiquidation
         | LighterOrderStatus::CanceledInvalidBalance => OrderStatus::Canceled,
         LighterOrderStatus::Expired => OrderStatus::Expired,
-        LighterOrderStatus::Unknown(_) => OrderStatus::Accepted,
+        LighterOrderStatus::Unknown(_) => OrderStatus::Submitted,
     }
 }
 
@@ -1264,13 +1225,53 @@ fn non_zero_i64_to_unix_nanos(value: i64) -> Option<UnixNanos> {
 #[cfg(test)]
 mod tests {
     use ahash::AHashMap;
-    use nautilus_model::{instruments::Instrument, types::Currency};
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{
+        instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
+        types::{Currency, Price, Quantity},
+    };
+    use rust_decimal::Decimal;
 
     use super::{
-        LIGHTER_SETTLEMENT_CURRENCY, LighterMarketType, account_balances_from_assets,
-        channel_market_id, instrument_meta_from_perp_detail, resolve_symbol_metadata,
+        LIGHTER_SETTLEMENT_CURRENCY, LighterMarketStatUpdate, LighterMarketType,
+        account_balances_from_assets, channel_market_id, funding_rate_update_from_history,
+        funding_rate_updates_from_history, instrument_meta_from_perp_detail,
+        lighter_client_order_index, market_stats_to_updates, quote_tick_from_ticker,
+        resolve_symbol_metadata,
     };
-    use crate::models::{asset::Asset, order_book::PerpsOrderBookDetail};
+    use crate::models::{
+        asset::Asset, funding::FundingRate, market::PerpsMarketStats,
+        order_book::PerpsOrderBookDetail, ws::WsTickerData, ws::WsTickerLevel,
+    };
+    use nautilus_model::identifiers::ClientOrderId;
+
+    fn decimal(value: &str) -> Decimal {
+        Decimal::from_str_exact(value).unwrap()
+    }
+
+    fn test_market_stats(
+        market_id: i64,
+        symbol: &str,
+        current_funding_rate: f64,
+    ) -> PerpsMarketStats {
+        PerpsMarketStats {
+            market_id: Some(market_id),
+            symbol: Some(symbol.to_string()),
+            last_trade_price: None,
+            mark_price: None,
+            index_price: None,
+            open_interest: None,
+            next_funding_time: None,
+            funding_timestamp: None,
+            current_funding_rate: Some(current_funding_rate),
+            funding_rate: None,
+            funding_countdown: None,
+            volume_24h: None,
+            high_24h: None,
+            low_24h: None,
+            change_24h: None,
+        }
+    }
 
     #[test]
     fn resolve_symbol_metadata_supports_single_token_perp_symbols() {
@@ -1291,10 +1292,229 @@ mod tests {
     }
 
     #[test]
+    fn market_stats_funding_rate_converts_lighter_percent_to_nautilus_rate() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let updates = market_stats_to_updates(
+            &instrument,
+            &test_market_stats(110, "NVDA", 0.0021),
+            0.into(),
+            0.into(),
+        );
+
+        let funding = updates
+            .into_iter()
+            .find_map(|update| match update {
+                LighterMarketStatUpdate::Funding(funding) => Some(funding),
+                _ => None,
+            })
+            .expect("funding update");
+        assert_eq!(funding.rate, decimal("0.000021"));
+        assert_eq!(funding.interval, Some(60));
+        assert_eq!(funding.next_funding_ns, None);
+    }
+
+    #[test]
+    fn market_stats_funding_rate_preserves_negative_sign() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let updates = market_stats_to_updates(
+            &instrument,
+            &test_market_stats(124, "FOGO", -0.0405),
+            0.into(),
+            0.into(),
+        );
+
+        let funding = updates
+            .into_iter()
+            .find_map(|update| match update {
+                LighterMarketStatUpdate::Funding(funding) => Some(funding),
+                _ => None,
+            })
+            .expect("funding update");
+        assert_eq!(funding.rate, decimal("-0.000405"));
+        assert_eq!(funding.interval, Some(60));
+        assert_eq!(funding.next_funding_ns, None);
+    }
+
+    #[test]
+    fn market_stats_funding_timestamp_derives_next_funding_time() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let mut market = test_market_stats(110, "NVDA", 0.0021);
+        market.funding_timestamp = Some(1_700_000_000_000);
+
+        let updates = market_stats_to_updates(&instrument, &market, 0.into(), 0.into());
+
+        let funding = updates
+            .into_iter()
+            .find_map(|update| match update {
+                LighterMarketStatUpdate::Funding(funding) => Some(funding),
+                _ => None,
+            })
+            .expect("funding update");
+        assert_eq!(
+            funding.next_funding_ns,
+            Some(UnixNanos::from(1_700_003_600_000_000_000))
+        );
+    }
+
+    #[test]
+    fn historical_funding_rate_converts_lighter_percent_to_nautilus_rate() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let funding = funding_rate_update_from_history(
+            &instrument,
+            &FundingRate {
+                market_id: Some(110),
+                exchange: None,
+                symbol: None,
+                mark_price: None,
+                index_price: None,
+                funding_rate: Some(0.0021),
+                settlement_time: Some(1_700_000_000_000),
+            },
+            0.into(),
+        )
+        .expect("funding update");
+
+        assert_eq!(funding.rate, decimal("0.000021"));
+        assert_eq!(funding.interval, Some(60));
+        assert_eq!(funding.next_funding_ns, None);
+    }
+
+    #[test]
+    fn historical_funding_rates_apply_market_window_limit_and_endpoint_shape() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let funding_rates = vec![
+            FundingRate {
+                market_id: Some(110),
+                exchange: Some("lighter".to_string()),
+                symbol: Some("NVDA".to_string()),
+                mark_price: None,
+                index_price: None,
+                funding_rate: Some(0.0030),
+                settlement_time: Some(1_700_000_003_000),
+            },
+            FundingRate {
+                market_id: Some(110),
+                exchange: Some("binance".to_string()),
+                symbol: Some("NVDA".to_string()),
+                mark_price: None,
+                index_price: None,
+                funding_rate: Some(0.0020),
+                settlement_time: Some(1_700_000_002_000),
+            },
+            FundingRate {
+                market_id: Some(110),
+                exchange: Some("lighter".to_string()),
+                symbol: Some("NVDA".to_string()),
+                mark_price: None,
+                index_price: None,
+                funding_rate: Some(0.0010),
+                settlement_time: Some(1_700_000_001_000),
+            },
+            FundingRate {
+                market_id: Some(111),
+                exchange: Some("lighter".to_string()),
+                symbol: Some("FOGO".to_string()),
+                mark_price: None,
+                index_price: None,
+                funding_rate: Some(0.0040),
+                settlement_time: Some(1_700_000_004_000),
+            },
+            FundingRate {
+                market_id: Some(110),
+                exchange: Some("lighter".to_string()),
+                symbol: Some("NVDA".to_string()),
+                mark_price: None,
+                index_price: None,
+                funding_rate: Some(0.0050),
+                settlement_time: None,
+            },
+        ];
+
+        let updates = funding_rate_updates_from_history(
+            &instrument,
+            &funding_rates,
+            110,
+            Some(UnixNanos::from(1_700_000_001_000_000_000)),
+            Some(UnixNanos::from(1_700_000_003_000_000_000)),
+            Some(1),
+            0.into(),
+        );
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].ts_event,
+            UnixNanos::from(1_700_000_001_000_000_000)
+        );
+        assert_eq!(updates[0].rate, decimal("0.00001"));
+    }
+
+    #[test]
+    fn quote_tick_uses_exchange_strings_directly() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let ticker = WsTickerData {
+            s: "ETH-USDT".to_string(),
+            a: WsTickerLevel {
+                price: Some("223.978".to_string()),
+                size: Some("94.307".to_string()),
+            },
+            b: WsTickerLevel {
+                price: Some("223.933".to_string()),
+                size: Some("2.389".to_string()),
+            },
+            last_updated_at: None,
+        };
+
+        let quote =
+            quote_tick_from_ticker(&instrument, &ticker, 1.into(), 1.into()).expect("quote tick");
+
+        assert_eq!(quote.bid_price, Price::from("223.93"));
+        assert_eq!(quote.ask_price, Price::from("223.98"));
+        assert_eq!(quote.bid_size, Quantity::from("2.38900000"));
+        assert_eq!(quote.ask_size, Quantity::from("94.30700000"));
+    }
+
+    #[test]
+    fn quote_tick_defaults_missing_ticker_sizes_to_zero() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let ticker = WsTickerData {
+            s: "ETH-USDT".to_string(),
+            a: WsTickerLevel {
+                price: Some("223.978".to_string()),
+                size: None,
+            },
+            b: WsTickerLevel {
+                price: Some("223.933".to_string()),
+                size: None,
+            },
+            last_updated_at: None,
+        };
+
+        let quote =
+            quote_tick_from_ticker(&instrument, &ticker, 1.into(), 1.into()).expect("quote tick");
+
+        assert_eq!(quote.bid_price, Price::from("223.93"));
+        assert_eq!(quote.ask_price, Price::from("223.98"));
+        assert_eq!(quote.bid_size, Quantity::zero(instrument.size_precision()));
+        assert_eq!(quote.ask_size, Quantity::zero(instrument.size_precision()));
+    }
+
+    #[test]
     fn channel_market_id_supports_slash_and_colon_channels() {
         assert_eq!(channel_market_id("order_book/2048"), Some(2048));
         assert_eq!(channel_market_id("order_book:2048"), Some(2048));
         assert_eq!(channel_market_id("market_stats:all"), None);
+    }
+
+    #[test]
+    fn client_order_index_matches_python_blake2b_mapping() {
+        assert_eq!(
+            lighter_client_order_index(&ClientOrderId::from("O-201")),
+            96_188_314_079_481
+        );
+        assert_eq!(
+            lighter_client_order_index(&ClientOrderId::from("O-MAKER-202")),
+            274_836_310_172_150
+        );
     }
 
     #[test]

@@ -1695,6 +1695,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6067,6 +6076,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "blake2",
  "bon",
  "futures-util",
  "libloading",
@@ -6075,9 +6085,9 @@ dependencies = [
  "nautilus-core",
  "nautilus-live",
  "nautilus-model",
- "nautilus-network",
  "nautilus-system",
  "nautilus-testkit",
+ "nautilus-trading",
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-stub-gen",
@@ -6408,6 +6418,7 @@ dependencies = [
  "nautilus-tardis",
  "nautilus-testkit",
  "nautilus-trading",
+ "nautilus-variational",
  "pyo3",
  "pyo3-stub-gen",
 ]
@@ -6620,6 +6631,37 @@ dependencies = [
  "serde_json",
  "strum 0.28.0",
  "ustr",
+]
+
+[[package]]
+name = "nautilus-variational"
+version = "0.56.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bon",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "nautilus-testkit",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "pyo3-stub-gen",
+ "reqwest 0.13.3",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
 ]
 
 [[package]]

@@ -228,8 +228,8 @@ class LighterDataClient(LiveMarketDataClient):
             return
 
         order_book = payload.get("order_book") or {}
-        ts_event = epoch_to_nanos(payload.get("timestamp"))
-        ts_init = ts_event or self._clock.timestamp_ns()
+        ts_init = self._clock.timestamp_ns()
+        ts_event = epoch_to_nanos(payload.get("timestamp")) or ts_init
         sequence = int(payload.get("offset") or order_book.get("offset") or 0)
         bids = order_book.get("bids") or []
         asks = order_book.get("asks") or []
@@ -243,11 +243,11 @@ class LighterDataClient(LiveMarketDataClient):
                     bids=bids,
                     asks=asks,
                     sequence=sequence,
-                    ts_event=ts_event or ts_init,
+                    ts_event=ts_event,
                     ts_init=ts_init,
                 ),
             )
-            self._publish_book_quote(market_id, instrument, ts_event or ts_init, ts_init)
+            self._publish_book_quote(market_id, instrument, ts_event, ts_init)
             return
 
         if market_id not in self._book_states:
@@ -271,11 +271,11 @@ class LighterDataClient(LiveMarketDataClient):
                 bids=bids,
                 asks=asks,
                 sequence=sequence,
-                ts_event=ts_event or ts_init,
+                ts_event=ts_event,
                 ts_init=ts_init,
             ),
         )
-        self._publish_book_quote(market_id, instrument, ts_event or ts_init, ts_init)
+        self._publish_book_quote(market_id, instrument, ts_event, ts_init)
 
     def _handle_ticker(self, payload: dict[str, Any]) -> None:
         market_id = market_id_from_channel(payload.get("channel"))

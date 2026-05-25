@@ -196,13 +196,56 @@ pub fn parse_ib_contract_to_instrument(
 fn ib_contract_info(details: &ibapi::contracts::ContractDetails) -> nautilus_core::Params {
     let mut info = nautilus_core::Params::new();
     let mut contract = serde_json::Map::new();
+    let mut contract_details = serde_json::Map::new();
 
     let contract_params = contract_to_params(&details.contract);
     for (key, value) in &contract_params {
         contract.insert(key.clone(), value.clone());
     }
 
+    contract_details.insert(
+        "timeZoneId".to_string(),
+        serde_json::Value::String(details.time_zone_id.clone()),
+    );
+    contract_details.insert(
+        "tradingHours".to_string(),
+        serde_json::Value::Array(
+            details
+                .trading_hours
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    contract_details.insert(
+        "liquidHours".to_string(),
+        serde_json::Value::Array(
+            details
+                .liquid_hours
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    contract_details.insert(
+        "marketRuleIds".to_string(),
+        serde_json::Value::Array(
+            details
+                .market_rule_ids
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+
     info.insert("contract".to_string(), serde_json::Value::Object(contract));
+    info.insert(
+        "contractDetails".to_string(),
+        serde_json::Value::Object(contract_details),
+    );
     info
 }
 
@@ -530,6 +573,53 @@ mod tests {
 
         assert_eq!(option.asset_class(), AssetClass::Index);
         assert_eq!(option.underlying(), Some(Ustr::from("^SPX")));
+    }
+
+    #[rstest]
+    fn test_parse_equity_contract_preserves_ibkr_trading_schedule_metadata() {
+        let details = ContractDetails {
+            contract: Contract {
+                symbol: Symbol::from("005930"),
+                security_type: SecurityType::Stock,
+                exchange: Exchange::from("SMART"),
+                currency: Currency::from("KRW"),
+                local_symbol: "005930".to_string(),
+                ..Default::default()
+            },
+            min_tick: 1.0,
+            time_zone_id: "Asia/Seoul".to_string(),
+            trading_hours: vec!["20260520:0900-20260520:1530".to_string()],
+            liquid_hours: vec!["20260520:0900-20260520:1530".to_string()],
+            market_rule_ids: vec!["26".to_string()],
+            ..Default::default()
+        };
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("005930"), Venue::from("XKRX"));
+
+        let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+        let InstrumentAny::Equity(equity) = instrument else {
+            panic!("expected equity");
+        };
+        let contract_details = equity
+            .info
+            .as_ref()
+            .and_then(|info| info.get("contractDetails"))
+            .and_then(|value| value.as_object())
+            .unwrap();
+
+        assert_eq!(
+            contract_details
+                .get("timeZoneId")
+                .and_then(|value| value.as_str()),
+            Some("Asia/Seoul"),
+        );
+        assert_eq!(
+            contract_details
+                .get("liquidHours")
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.first())
+                .and_then(|value| value.as_str()),
+            Some("20260520:0900-20260520:1530"),
+        );
     }
 }
 

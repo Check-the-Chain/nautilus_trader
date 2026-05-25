@@ -24,6 +24,7 @@ use crate::{
     client::{LighterCancelOrderRequest, LighterSubmitOrderRequest, SignerClient},
     config::Config,
     error::{Result, SdkError},
+    ffi::signer,
     models::{asset::Asset, order_book::OrderBook},
     nonce::NonceManagerType,
     rest::client::LighterRestClient,
@@ -169,11 +170,11 @@ impl LighterHttpClient {
 
     pub async fn create_auth_token(
         &self,
-        deadline_secs: i64,
+        deadline_unix_secs: i64,
         api_key_index: Option<u8>,
     ) -> Result<String> {
         let signer = self.ensure_signer().await?;
-        signer.create_auth_token(deadline_secs, api_key_index)
+        signer.create_auth_token(deadline_unix_secs, api_key_index)
     }
 
     pub async fn submit_order(
@@ -211,6 +212,30 @@ impl LighterHttpClient {
         serde_json::to_string(&response).map_err(Into::into)
     }
 
+    pub async fn sign_submit_order(
+        &self,
+        request: LighterSubmitOrderRequest,
+    ) -> Result<(Arc<SignerClient>, u8, signer::SignedTx)> {
+        let signer = self.ensure_signer().await?;
+        let (api_key, signed) = signer
+            .sign_create_order(
+                request.market_index,
+                request.client_order_index,
+                request.base_amount,
+                request.price,
+                request.is_ask,
+                request.order_type,
+                request.time_in_force,
+                request.reduce_only,
+                request.trigger_price,
+                request.order_expiry,
+                request.api_key_index,
+                None,
+            )
+            .await?;
+        Ok((signer, api_key, signed))
+    }
+
     pub async fn submit_order_batch(
         &self,
         requests: Vec<LighterSubmitOrderRequest>,
@@ -218,6 +243,15 @@ impl LighterHttpClient {
         let signer = self.ensure_signer().await?;
         let response = signer.submit_order_batch(&requests).await?;
         serde_json::to_string(&response).map_err(Into::into)
+    }
+
+    pub async fn sign_submit_order_batch(
+        &self,
+        requests: &[LighterSubmitOrderRequest],
+    ) -> Result<(Arc<SignerClient>, u8, Vec<signer::SignedTx>)> {
+        let signer = self.ensure_signer().await?;
+        let (api_key, signed) = signer.sign_submit_order_batch(requests).await?;
+        Ok((signer, api_key, signed))
     }
 
     pub async fn modify_order(
@@ -245,6 +279,25 @@ impl LighterHttpClient {
         serde_json::to_string(&response).map_err(Into::into)
     }
 
+    pub async fn sign_modify_order(
+        &self,
+        request: crate::client::LighterModifyOrderRequest,
+    ) -> Result<(Arc<SignerClient>, u8, signer::SignedTx)> {
+        let signer = self.ensure_signer().await?;
+        let (api_key, signed) = signer
+            .sign_modify_order(
+                request.market_index,
+                request.order_index,
+                request.base_amount,
+                request.price,
+                request.trigger_price,
+                request.api_key_index,
+                None,
+            )
+            .await?;
+        Ok((signer, api_key, signed))
+    }
+
     pub async fn cancel_order(
         &self,
         market_index: i32,
@@ -259,6 +312,19 @@ impl LighterHttpClient {
         serde_json::to_string(&response).map_err(Into::into)
     }
 
+    pub async fn sign_cancel_order(
+        &self,
+        market_index: i32,
+        order_index: i64,
+        api_key_index: Option<u8>,
+    ) -> Result<(Arc<SignerClient>, u8, signer::SignedTx)> {
+        let signer = self.ensure_signer().await?;
+        let (api_key, signed) = signer
+            .sign_cancel_order(market_index, order_index, api_key_index, None)
+            .await?;
+        Ok((signer, api_key, signed))
+    }
+
     pub async fn cancel_order_batch(
         &self,
         requests: Vec<LighterCancelOrderRequest>,
@@ -266,6 +332,15 @@ impl LighterHttpClient {
         let signer = self.ensure_signer().await?;
         let response = signer.cancel_order_batch(&requests).await?;
         serde_json::to_string(&response).map_err(Into::into)
+    }
+
+    pub async fn sign_cancel_order_batch(
+        &self,
+        requests: &[LighterCancelOrderRequest],
+    ) -> Result<(Arc<SignerClient>, u8, Vec<signer::SignedTx>)> {
+        let signer = self.ensure_signer().await?;
+        let (api_key, signed) = signer.sign_cancel_order_batch(requests).await?;
+        Ok((signer, api_key, signed))
     }
 
     pub async fn cancel_all_orders(
@@ -280,6 +355,19 @@ impl LighterHttpClient {
             .cancel_all_orders(time_in_force, timestamp_ms, api_key_index, nonce)
             .await?;
         serde_json::to_string(&response).map_err(Into::into)
+    }
+
+    pub async fn sign_cancel_all_orders(
+        &self,
+        time_in_force: i32,
+        timestamp_ms: i64,
+        api_key_index: Option<u8>,
+    ) -> Result<(Arc<SignerClient>, u8, signer::SignedTx)> {
+        let signer = self.ensure_signer().await?;
+        let (api_key, signed) = signer
+            .sign_cancel_all_orders(time_in_force, timestamp_ms, api_key_index, None)
+            .await?;
+        Ok((signer, api_key, signed))
     }
 
     pub async fn update_leverage(

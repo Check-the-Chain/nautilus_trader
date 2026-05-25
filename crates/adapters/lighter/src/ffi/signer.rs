@@ -34,6 +34,37 @@ type SignCreateOrderFn = unsafe extern "C" fn(
     i64,
     i64,
     i32,
+    i32,
+    u8,
+    i64,
+    i32,
+    i64,
+) -> SignedTxResponse;
+type SignModifyOrderFn = unsafe extern "C" fn(
+    i32,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i32,
+    i32,
+    u8,
+    i64,
+    i32,
+    i64,
+) -> SignedTxResponse;
+type SignTransferFn = unsafe extern "C" fn(
+    i64,
+    i16,
+    u8,
+    u8,
+    i64,
+    i64,
+    *mut c_char,
+    u8,
+    i64,
+    i32,
     i64,
 ) -> SignedTxResponse;
 
@@ -140,12 +171,13 @@ pub fn sign_change_pub_key(
     let lib = get_signer()?;
     let c_pub_key = CString::new(pub_key).map_err(|e| SdkError::Ffi(e.to_string()))?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(*mut c_char, i64, i32, i64) -> SignedTxResponse> =
+        let func: Symbol<unsafe extern "C" fn(*mut c_char, u8, i64, i32, i64) -> SignedTxResponse> =
             lib.lib()
                 .get(b"SignChangePubKey")
                 .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             c_pub_key.as_ptr() as *mut c_char,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -185,6 +217,10 @@ pub fn sign_create_order(
             reduce_only,
             trigger_price,
             order_expiry,
+            0,
+            0,
+            0,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -208,6 +244,10 @@ pub fn sign_create_grouped_orders(
                 i32,
                 i64,
                 i32,
+                i32,
+                u8,
+                i64,
+                i32,
                 i64,
             ) -> SignedTxResponse,
         > = lib
@@ -218,6 +258,10 @@ pub fn sign_create_grouped_orders(
             grouping_type,
             orders.as_ptr(),
             orders.len() as i32,
+            0,
+            0,
+            0,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -234,13 +278,14 @@ pub fn sign_cancel_order(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i32, i64, i64, i32, i64) -> SignedTxResponse> = lib
-            .lib()
-            .get(b"SignCancelOrder")
-            .map_err(|e| SdkError::Ffi(e.to_string()))?;
+        let func: Symbol<unsafe extern "C" fn(i32, i64, u8, i64, i32, i64) -> SignedTxResponse> =
+            lib.lib()
+                .get(b"SignCancelOrder")
+                .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             market_index,
             order_index,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -258,14 +303,17 @@ pub fn sign_withdraw(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i32, i32, u64, i64, i32, i64) -> SignedTxResponse> =
-            lib.lib()
-                .get(b"SignWithdraw")
-                .map_err(|e| SdkError::Ffi(e.to_string()))?;
+        let func: Symbol<
+            unsafe extern "C" fn(i32, i32, u64, u8, i64, i32, i64) -> SignedTxResponse,
+        > = lib
+            .lib()
+            .get(b"SignWithdraw")
+            .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             asset_index,
             route_type,
             amount,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -280,11 +328,11 @@ pub fn sign_create_sub_account(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i64, i32, i64) -> SignedTxResponse> = lib
+        let func: Symbol<unsafe extern "C" fn(u8, i64, i32, i64) -> SignedTxResponse> = lib
             .lib()
             .get(b"SignCreateSubAccount")
             .map_err(|e| SdkError::Ffi(e.to_string()))?;
-        decode_signed_tx(func(nonce, api_key_index, account_index))
+        decode_signed_tx(func(0, nonce, api_key_index, account_index))
     }
 }
 
@@ -297,13 +345,14 @@ pub fn sign_cancel_all_orders(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i32, i64, i64, i32, i64) -> SignedTxResponse> = lib
-            .lib()
-            .get(b"SignCancelAllOrders")
-            .map_err(|e| SdkError::Ffi(e.to_string()))?;
+        let func: Symbol<unsafe extern "C" fn(i32, i64, u8, i64, i32, i64) -> SignedTxResponse> =
+            lib.lib()
+                .get(b"SignCancelAllOrders")
+                .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             time_in_force,
             time,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -323,9 +372,7 @@ pub fn sign_modify_order(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<
-            unsafe extern "C" fn(i32, i64, i64, i64, i64, i64, i32, i64) -> SignedTxResponse,
-        > = lib
+        let func: Symbol<SignModifyOrderFn> = lib
             .lib()
             .get(b"SignModifyOrder")
             .map_err(|e| SdkError::Ffi(e.to_string()))?;
@@ -335,6 +382,10 @@ pub fn sign_modify_order(
             base_amount,
             price,
             trigger_price,
+            0,
+            0,
+            0,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -357,20 +408,7 @@ pub fn sign_transfer(
     let lib = get_signer()?;
     let c_memo = CString::new(memo).map_err(|e| SdkError::Ffi(e.to_string()))?;
     unsafe {
-        let func: Symbol<
-            unsafe extern "C" fn(
-                i64,
-                i16,
-                u8,
-                u8,
-                i64,
-                i64,
-                *mut c_char,
-                i64,
-                i32,
-                i64,
-            ) -> SignedTxResponse,
-        > = lib
+        let func: Symbol<SignTransferFn> = lib
             .lib()
             .get(b"SignTransfer")
             .map_err(|e| SdkError::Ffi(e.to_string()))?;
@@ -382,6 +420,7 @@ pub fn sign_transfer(
             amount,
             usdc_fee,
             c_memo.as_ptr() as *mut c_char,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -399,14 +438,17 @@ pub fn sign_create_public_pool(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i64, i32, i64, i64, i32, i64) -> SignedTxResponse> =
-            lib.lib()
-                .get(b"SignCreatePublicPool")
-                .map_err(|e| SdkError::Ffi(e.to_string()))?;
+        let func: Symbol<
+            unsafe extern "C" fn(i64, i32, i64, u8, i64, i32, i64) -> SignedTxResponse,
+        > = lib
+            .lib()
+            .get(b"SignCreatePublicPool")
+            .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             operator_fee,
             initial_total_shares,
             min_operator_share_rate,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -426,7 +468,7 @@ pub fn sign_update_public_pool(
     let lib = get_signer()?;
     unsafe {
         let func: Symbol<
-            unsafe extern "C" fn(i64, i32, i64, i32, i64, i32, i64) -> SignedTxResponse,
+            unsafe extern "C" fn(i64, i32, i64, i32, u8, i64, i32, i64) -> SignedTxResponse,
         > = lib
             .lib()
             .get(b"SignUpdatePublicPool")
@@ -436,6 +478,7 @@ pub fn sign_update_public_pool(
             status,
             operator_fee,
             min_operator_share_rate,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -452,13 +495,14 @@ pub fn sign_mint_shares(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i64, i64, i64, i32, i64) -> SignedTxResponse> = lib
-            .lib()
-            .get(b"SignMintShares")
-            .map_err(|e| SdkError::Ffi(e.to_string()))?;
+        let func: Symbol<unsafe extern "C" fn(i64, i64, u8, i64, i32, i64) -> SignedTxResponse> =
+            lib.lib()
+                .get(b"SignMintShares")
+                .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             public_pool_index,
             share_amount,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -475,13 +519,14 @@ pub fn sign_burn_shares(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i64, i64, i64, i32, i64) -> SignedTxResponse> = lib
-            .lib()
-            .get(b"SignBurnShares")
-            .map_err(|e| SdkError::Ffi(e.to_string()))?;
+        let func: Symbol<unsafe extern "C" fn(i64, i64, u8, i64, i32, i64) -> SignedTxResponse> =
+            lib.lib()
+                .get(b"SignBurnShares")
+                .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             public_pool_index,
             share_amount,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -499,14 +544,17 @@ pub fn sign_update_leverage(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i32, i32, i32, i64, i32, i64) -> SignedTxResponse> =
-            lib.lib()
-                .get(b"SignUpdateLeverage")
-                .map_err(|e| SdkError::Ffi(e.to_string()))?;
+        let func: Symbol<
+            unsafe extern "C" fn(i32, i32, i32, u8, i64, i32, i64) -> SignedTxResponse,
+        > = lib
+            .lib()
+            .get(b"SignUpdateLeverage")
+            .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             market_index,
             initial_margin_fraction,
             margin_mode,
+            0,
             nonce,
             api_key_index,
             account_index,
@@ -524,14 +572,17 @@ pub fn sign_update_margin(
 ) -> Result<SignedTx> {
     let lib = get_signer()?;
     unsafe {
-        let func: Symbol<unsafe extern "C" fn(i32, i64, i32, i64, i32, i64) -> SignedTxResponse> =
-            lib.lib()
-                .get(b"SignUpdateMargin")
-                .map_err(|e| SdkError::Ffi(e.to_string()))?;
+        let func: Symbol<
+            unsafe extern "C" fn(i32, i64, i32, u8, i64, i32, i64) -> SignedTxResponse,
+        > = lib
+            .lib()
+            .get(b"SignUpdateMargin")
+            .map_err(|e| SdkError::Ffi(e.to_string()))?;
         decode_signed_tx(func(
             market_index,
             usdc_amount,
             direction,
+            0,
             nonce,
             api_key_index,
             account_index,

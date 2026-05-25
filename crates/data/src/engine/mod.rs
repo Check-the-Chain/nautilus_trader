@@ -76,6 +76,8 @@ use nautilus_common::{
     runner::get_data_cmd_sender,
     timer::{TimeEvent, TimeEventCallback},
 };
+#[cfg(feature = "latency-probe")]
+use nautilus_core::latency;
 use nautilus_core::{
     UUID4, WeakCell,
     correctness::{
@@ -83,6 +85,8 @@ use nautilus_core::{
     },
     datetime::millis_to_nanos_unchecked,
 };
+#[cfg(feature = "latency-probe")]
+use nautilus_model::data::HasTsInit;
 #[cfg(feature = "defi")]
 use nautilus_model::defi::DefiData;
 use nautilus_model::{
@@ -952,6 +956,10 @@ impl DataEngine {
     /// Processes a `Data` enum instance, dispatching to appropriate handlers.
     pub fn process_data(&mut self, data: Data) {
         self.data_count += 1;
+        #[cfg(feature = "latency-probe")]
+        if latency::enabled() {
+            latency::record_since_init("data_engine.process_data_entry", data.ts_init());
+        }
 
         match data {
             Data::Delta(delta) => self.handle_delta(delta),
@@ -1111,6 +1119,13 @@ impl DataEngine {
     }
 
     fn handle_deltas(&mut self, deltas: OrderBookDeltas) {
+        #[cfg(feature = "latency-probe")]
+        let ts_init = deltas.ts_init;
+        #[cfg(feature = "latency-probe")]
+        if latency::enabled() {
+            latency::record_since_init("data_engine.deltas_entry", ts_init);
+        }
+
         if self.config.buffer_deltas {
             let instrument_id = deltas.instrument_id;
 
@@ -1133,12 +1148,37 @@ impl DataEngine {
                         .remove(&instrument_id)
                         .expect("buffered deltas exist");
                     let topic = switchboard::get_book_deltas_topic(instrument_id);
+                    #[cfg(feature = "latency-probe")]
+                    let publish_start_ns = latency::enabled().then(latency::timestamp_ns);
                     msgbus::publish_deltas(topic, &deltas_to_publish);
+                    #[cfg(feature = "latency-probe")]
+                    if let Some(publish_start_ns) = publish_start_ns {
+                        latency::record_duration(
+                            "msgbus.deltas_publish",
+                            publish_start_ns,
+                            latency::timestamp_ns(),
+                        );
+                        latency::record_since_init(
+                            "data_engine.deltas_after_publish",
+                            deltas_to_publish.ts_init,
+                        );
+                    }
                 }
             }
         } else {
             let topic = switchboard::get_book_deltas_topic(deltas.instrument_id);
+            #[cfg(feature = "latency-probe")]
+            let publish_start_ns = latency::enabled().then(latency::timestamp_ns);
             msgbus::publish_deltas(topic, &deltas);
+            #[cfg(feature = "latency-probe")]
+            if let Some(publish_start_ns) = publish_start_ns {
+                latency::record_duration(
+                    "msgbus.deltas_publish",
+                    publish_start_ns,
+                    latency::timestamp_ns(),
+                );
+                latency::record_since_init("data_engine.deltas_after_publish", ts_init);
+            }
         }
     }
 
@@ -1148,14 +1188,37 @@ impl DataEngine {
     }
 
     fn handle_quote(&self, quote: QuoteTick) {
+        #[cfg(feature = "latency-probe")]
+        let ts_init = quote.ts_init;
+        #[cfg(feature = "latency-probe")]
+        let cache_start_ns = latency::enabled().then(latency::timestamp_ns);
         if let Err(e) = self.cache.as_ref().borrow_mut().add_quote(quote) {
             log_error_on_cache_insert(&e);
+        }
+        #[cfg(feature = "latency-probe")]
+        if let Some(cache_start_ns) = cache_start_ns {
+            latency::record_duration(
+                "data_engine.quote_cache",
+                cache_start_ns,
+                latency::timestamp_ns(),
+            );
         }
 
         // TODO: Handle synthetics
 
         let topic = switchboard::get_quotes_topic(quote.instrument_id);
+        #[cfg(feature = "latency-probe")]
+        let publish_start_ns = latency::enabled().then(latency::timestamp_ns);
         msgbus::publish_quote(topic, &quote);
+        #[cfg(feature = "latency-probe")]
+        if let Some(publish_start_ns) = publish_start_ns {
+            latency::record_duration(
+                "msgbus.quote_publish",
+                publish_start_ns,
+                latency::timestamp_ns(),
+            );
+            latency::record_since_init("data_engine.quote_after_publish", ts_init);
+        }
     }
 
     fn handle_trade(&self, trade: TradeTick) {

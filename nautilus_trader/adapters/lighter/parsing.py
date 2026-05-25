@@ -449,7 +449,7 @@ def order_status_from_lighter(value: str) -> OrderStatus:
         return OrderStatus.CANCELED
     if raw == "expired":
         return OrderStatus.EXPIRED
-    return OrderStatus.ACCEPTED
+    return OrderStatus.SUBMITTED
 
 
 def client_order_id_from_value(
@@ -469,6 +469,7 @@ def order_report_from_lighter(
     order: dict[str, Any],
     account_id: AccountId,
     instrument: Instrument,
+    ts_init: int,
     resolver: Callable[[int], ClientOrderId | None],
 ) -> OrderStatusReport:
     order_status = order_status_from_lighter(str(order.get("status") or ""))
@@ -525,7 +526,7 @@ def order_report_from_lighter(
         cancel_reason=cancel_reason,
         ts_accepted=ts_accepted,
         ts_last=ts_last,
-        ts_init=ts_last,
+        ts_init=ts_init,
     )
 
 
@@ -534,6 +535,7 @@ def fill_report_from_lighter_trade(
     account_index: int,
     account_id: AccountId,
     instrument: Instrument,
+    ts_init: int,
     resolver: Callable[[int], ClientOrderId | None],
 ) -> FillReport | None:
     ask_account_id = int(trade.get("ask_account_id") or 0)
@@ -571,7 +573,7 @@ def fill_report_from_lighter_trade(
         liquidity_side=LiquiditySide.MAKER if is_maker else LiquiditySide.TAKER,
         report_id=UUID4(),
         ts_event=ts_event,
-        ts_init=ts_event,
+        ts_init=ts_init,
         venue_position_id=venue_position_id,
     )
 
