@@ -1425,6 +1425,30 @@ async fn test_generate_mass_status_preserves_positions_when_history_reconciliati
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_mass_status_applies_lookback_to_inactive_orders() {
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    *api.active_orders.lock().unwrap() = empty_orders();
+    api.inactive_orders.lock().unwrap().push_back(Orders {
+        code: 200,
+        message: None,
+        orders: vec![sample_order(102, "O-OLD-FILLED", "filled", "0.1000")],
+        cursor: None,
+    });
+
+    let (client, _rx, _cache) = create_test_execution_client(addr, api);
+    let status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(status.order_reports().is_empty());
+    assert_eq!(status.position_reports().len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_position_status_reports_returns_account_positions() {
     let addr = start_mock_server().await;
     let api = Arc::new(MockExecutionApi::default());

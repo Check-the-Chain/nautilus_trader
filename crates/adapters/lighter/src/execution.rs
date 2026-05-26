@@ -2439,6 +2439,10 @@ impl ExecutionClient for LighterExecutionClient {
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_init = self.clock.get_time_ns();
+        let lookback_start = lookback_mins.map(|mins| {
+            let lookback_nanos = mins.saturating_mul(60).saturating_mul(1_000_000_000);
+            UnixNanos::from(ts_init.as_u64().saturating_sub(lookback_nanos))
+        });
         let mut status = ExecutionMassStatus::new(
             self.core.client_id,
             self.core.account_id,
@@ -2447,33 +2451,78 @@ impl ExecutionClient for LighterExecutionClient {
             None,
         );
 
-        let order_reports = match self
-            .generate_order_status_reports(&GenerateOrderStatusReports::new(
-                UUID4::new(),
-                ts_init,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ))
-            .await
-        {
-            Ok(reports) => reports,
-            Err(e) if is_lighter_invalid_param(&e) => {
-                log::warn!("Skipping Lighter order report mass-status reconciliation: {e}");
-                Vec::new()
+        let order_reports = if let Some(start) = lookback_start {
+            let mut reports = match self
+                .generate_order_status_reports(&GenerateOrderStatusReports::new(
+                    UUID4::new(),
+                    ts_init,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .await
+            {
+                Ok(reports) => reports,
+                Err(e) if is_lighter_invalid_param(&e) => {
+                    log::warn!("Skipping Lighter open order mass-status reconciliation: {e}");
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            };
+            let mut historical_reports = match self
+                .generate_order_status_reports(&GenerateOrderStatusReports::new(
+                    UUID4::new(),
+                    ts_init,
+                    false,
+                    None,
+                    Some(start),
+                    None,
+                    None,
+                    None,
+                ))
+                .await
+            {
+                Ok(reports) => reports,
+                Err(e) if is_lighter_invalid_param(&e) => {
+                    log::warn!("Skipping Lighter order history mass-status reconciliation: {e}");
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            };
+            reports.append(&mut historical_reports);
+            reports
+        } else {
+            match self
+                .generate_order_status_reports(&GenerateOrderStatusReports::new(
+                    UUID4::new(),
+                    ts_init,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .await
+            {
+                Ok(reports) => reports,
+                Err(e) if is_lighter_invalid_param(&e) => {
+                    log::warn!("Skipping Lighter order report mass-status reconciliation: {e}");
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         };
-        let mut fill_reports = match self
+        let fill_reports = match self
             .generate_fill_reports(GenerateFillReports::new(
                 UUID4::new(),
                 ts_init,
                 None,
                 None,
-                None,
+                lookback_start,
                 None,
                 None,
                 None,
@@ -2498,15 +2547,6 @@ impl ExecutionClient for LighterExecutionClient {
                 None,
             ))
             .await?;
-
-        if let Some(lookback_mins) = lookback_mins {
-            let cutoff = UnixNanos::from(
-                ts_init
-                    .as_u64()
-                    .saturating_sub(lookback_mins * 60 * 1_000_000_000),
-            );
-            fill_reports.retain(|report| report.ts_event >= cutoff);
-        }
 
         status.add_order_reports(order_reports);
         status.add_fill_reports(fill_reports);
