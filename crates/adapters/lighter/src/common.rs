@@ -30,9 +30,7 @@ use nautilus_model::{
         AggressorSide, BarAggregation, BookAction, LiquiditySide, OrderSide, OrderStatus,
         OrderType, PositionSideSpecified, PriceType, RecordFlag, TimeInForce, TriggerType,
     },
-    identifiers::{
-        AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, Venue, VenueOrderId,
-    },
+    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, Venue, VenueOrderId},
     instruments::{CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
@@ -1045,11 +1043,7 @@ pub fn position_report_from_lighter(
         ts_init,
         ts_init,
         Some(UUID4::new()),
-        Some(PositionId::from(format!(
-            "{}:{}",
-            account_id,
-            instrument.id()
-        ))),
+        None,
         non_zero_decimal_from_string(&position.avg_entry_price),
     )
 }

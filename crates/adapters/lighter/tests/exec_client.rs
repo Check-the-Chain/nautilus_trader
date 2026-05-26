@@ -1399,6 +1399,10 @@ async fn test_generate_position_status_reports_returns_account_positions() {
         reports[0].instrument_id,
         InstrumentId::from(TEST_INSTRUMENT_ID)
     );
+    assert!(
+        reports[0].venue_position_id.is_none(),
+        "Lighter perps are netted positions; a venue position id makes Nautilus reconcile them as hedge-mode positions"
+    );
 }
 
 #[rstest]
