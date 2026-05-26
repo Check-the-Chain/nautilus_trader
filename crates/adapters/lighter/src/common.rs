@@ -854,6 +854,14 @@ pub fn margin_balances_from_positions(
         .collect()
 }
 
+#[must_use]
+pub fn account_position_is_nonzero(position: &AccountPosition) -> bool {
+    position
+        .position
+        .parse::<f64>()
+        .is_ok_and(|quantity| quantity != 0.0)
+}
+
 pub fn order_report_from_lighter(
     order: &Order,
     account_id: AccountId,
@@ -1058,6 +1066,7 @@ pub fn position_reports_from_detailed_account(
         .clone()
         .unwrap_or_default()
         .into_iter()
+        .filter(account_position_is_nonzero)
         .filter_map(|position| {
             let instrument = registry.instrument_for_market_id(position.market_id)?;
             Some(position_report_from_lighter(

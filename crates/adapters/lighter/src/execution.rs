@@ -54,8 +54,8 @@ use crate::{
     client::{LighterCancelOrderRequest, LighterModifyOrderRequest, LighterSubmitOrderRequest},
     common::{
         LighterInstrumentMeta, LighterInstrumentRegistry, account_balances_from_assets,
-        lighter_client_order_index, load_instrument_registry, margin_balances_from_positions,
-        order_report_from_lighter, position_report_from_lighter,
+        account_position_is_nonzero, lighter_client_order_index, load_instrument_registry,
+        margin_balances_from_positions, order_report_from_lighter, position_report_from_lighter,
         position_reports_from_detailed_account, to_lighter_price, to_lighter_size, venue,
     },
     config::{Config, LighterExecClientConfig},
@@ -1598,6 +1598,9 @@ fn emit_position_reports(
     ts_init: UnixNanos,
 ) {
     for position in positions {
+        if !account_position_is_nonzero(position) {
+            continue;
+        }
         let Some(instrument) = registry.instrument_for_market_id(position.market_id) else {
             continue;
         };
