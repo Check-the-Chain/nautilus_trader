@@ -75,6 +75,8 @@ use crate::{
     websocket::client::LighterWebSocketClient,
 };
 
+const ALL_MARKETS_ID: i64 = 255;
+
 const LIGHTER_HTTP_MAX_BATCH_TX_COUNT: usize = 50;
 const LIGHTER_WS_MAX_BATCH_TX_COUNT: usize = 15;
 const LIGHTER_MARKET_ORDER_BUY_PRICE_BUFFER: f64 = 1.01;
@@ -2237,14 +2239,15 @@ impl ExecutionClient for LighterExecutionClient {
                 .map(|meta| vec![meta.market_id])
                 .unwrap_or_default()
         } else {
-            registry.market_ids()
+            vec![ALL_MARKETS_ID]
         };
 
         let mut reports = Vec::new();
         for market_id in market_ids {
-            let Some(meta) = registry.meta_for_market_id(market_id) else {
-                continue;
-            };
+            let market_label = registry.meta_for_market_id(market_id).map_or_else(
+                || "all markets".to_string(),
+                |meta| meta.instrument.id().to_string(),
+            );
 
             let mut orders = match self
                 .api
@@ -2258,8 +2261,7 @@ impl ExecutionClient for LighterExecutionClient {
                 Ok(orders) => orders.orders,
                 Err(e) if is_lighter_invalid_param(&e) => {
                     log::warn!(
-                        "Skipping Lighter active order reconciliation for {}: {e}",
-                        meta.instrument.id()
+                        "Skipping Lighter active order reconciliation for {market_label}: {e}"
                     );
                     continue;
                 }
@@ -2282,8 +2284,7 @@ impl ExecutionClient for LighterExecutionClient {
                         Ok(inactive) => inactive,
                         Err(e) if is_lighter_invalid_param(&e) => {
                             log::warn!(
-                                "Skipping Lighter inactive order reconciliation for {}: {e}",
-                                meta.instrument.id()
+                                "Skipping Lighter inactive order reconciliation for {market_label}: {e}"
                             );
                             break;
                         }
@@ -2298,6 +2299,15 @@ impl ExecutionClient for LighterExecutionClient {
             }
 
             for order in orders {
+                let Some(meta) = registry.meta_for_market_id(order.market_index) else {
+                    continue;
+                };
+                if cmd
+                    .instrument_id
+                    .is_some_and(|instrument_id| instrument_id != meta.instrument.id())
+                {
+                    continue;
+                }
                 let ts_init = self.clock.get_time_ns();
                 let mut report = order_report_from_lighter(
                     &order,
