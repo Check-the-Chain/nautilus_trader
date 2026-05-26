@@ -783,10 +783,15 @@ async fn test_rest_client_encodes_queries_and_auth_headers() {
         .get_account_inactive_orders(7, 1, "Bearer lighter-auth", Some("cursor-1"))
         .await
         .unwrap();
+    let inactive_all_markets = rest
+        .get_account_inactive_orders(7, 255, "Bearer lighter-auth", None)
+        .await
+        .unwrap();
 
     assert_eq!(trades.trades.len(), 1);
     assert_eq!(account.accounts.len(), 1);
     assert!(inactive.orders.is_empty());
+    assert!(inactive_all_markets.orders.is_empty());
 
     let requests = state.requests.lock().await.clone();
     assert!(requests.iter().any(|(path, query, auth)| {
@@ -807,6 +812,13 @@ async fn test_rest_client_encodes_queries_and_auth_headers() {
             && query.contains("market_id=1")
             && query.contains("limit=100")
             && query.contains("cursor=cursor-1")
+            && auth.as_deref() == Some("Bearer lighter-auth")
+    }));
+    assert!(requests.iter().any(|(path, query, auth)| {
+        path == "/api/v1/accountInactiveOrders"
+            && query.contains("account_index=7")
+            && query.contains("limit=100")
+            && !query.contains("market_id=")
             && auth.as_deref() == Some("Bearer lighter-auth")
     }));
 }

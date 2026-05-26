@@ -43,15 +43,12 @@ impl LighterRestClient {
     ) -> Result<Orders> {
         let account_index = account_index.to_string();
         let market_id = market_id.to_string();
-        self.get_with_auth(
-            "/api/v1/accountActiveOrders",
-            &[
-                ("account_index", account_index.as_str()),
-                ("market_id", market_id.as_str()),
-            ],
-            auth,
-        )
-        .await
+        let mut query: Vec<(&str, &str)> = vec![("account_index", account_index.as_str())];
+        if market_id != "255" {
+            query.push(("market_id", market_id.as_str()));
+        }
+        self.get_with_auth("/api/v1/accountActiveOrders", &query, auth)
+            .await
     }
 
     pub async fn get_account_inactive_orders(
@@ -64,11 +61,11 @@ impl LighterRestClient {
         let account_index = account_index.to_string();
         let market_id = market_id.to_string();
         let limit = "100";
-        let mut query: Vec<(&str, &str)> = vec![
-            ("account_index", account_index.as_str()),
-            ("market_id", market_id.as_str()),
-            ("limit", limit),
-        ];
+        let mut query: Vec<(&str, &str)> =
+            vec![("account_index", account_index.as_str()), ("limit", limit)];
+        if market_id != "255" {
+            query.push(("market_id", market_id.as_str()));
+        }
         if let Some(c) = cursor {
             query.push(("cursor", c));
         }
