@@ -21,7 +21,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +45,7 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_lighter::{
     client::{LighterCancelOrderRequest, LighterModifyOrderRequest, LighterSubmitOrderRequest},
     config::LighterExecClientConfig,
+    error::SdkError,
     execution::{LighterExecutionApi, LighterExecutionClient},
     models::{
         account::{AccountPosition, DetailedAccount, DetailedAccounts},
@@ -82,6 +83,8 @@ struct MockExecutionApi {
     auth_token_calls: AtomicUsize,
     auth_token_deadlines: Mutex<Vec<i64>>,
     request_account_calls: AtomicUsize,
+    active_orders_invalid_param: AtomicBool,
+    trades_invalid_param: AtomicBool,
     account: Mutex<DetailedAccounts>,
     active_orders: Mutex<Orders>,
     inactive_orders: Mutex<VecDeque<Orders>>,
@@ -105,6 +108,8 @@ impl Default for MockExecutionApi {
             auth_token_calls: AtomicUsize::new(0),
             auth_token_deadlines: Mutex::new(Vec::new()),
             request_account_calls: AtomicUsize::new(0),
+            active_orders_invalid_param: AtomicBool::new(false),
+            trades_invalid_param: AtomicBool::new(false),
             account: Mutex::new(detailed_accounts_with_position()),
             active_orders: Mutex::new(Orders {
                 code: 200,
@@ -159,6 +164,10 @@ impl LighterExecutionApi for MockExecutionApi {
         _market_id: i64,
         _auth_token: &str,
     ) -> anyhow::Result<Orders> {
+        if self.active_orders_invalid_param.load(Ordering::Relaxed) {
+            return Err(lighter_invalid_param_error().into());
+        }
+
         Ok(self.active_orders.lock().unwrap().clone())
     }
 
@@ -184,6 +193,10 @@ impl LighterExecutionApi for MockExecutionApi {
         _limit: u32,
         _cursor: Option<&str>,
     ) -> anyhow::Result<Trades> {
+        if self.trades_invalid_param.load(Ordering::Relaxed) {
+            return Err(lighter_invalid_param_error().into());
+        }
+
         Ok(self
             .trades
             .lock()
@@ -264,6 +277,13 @@ fn ok_response() -> RespSendTx {
         tx_hash: Some("0xabc".to_string()),
         predicted_execution_time_ms: None,
         volume_quota_remaining: None,
+    }
+}
+
+fn lighter_invalid_param_error() -> SdkError {
+    SdkError::Api {
+        code: 20001,
+        message: "invalid param".to_string(),
     }
 }
 
@@ -1373,6 +1393,34 @@ async fn test_generate_fill_reports_returns_trade_reports() {
 
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].venue_order_id, VenueOrderId::from("101"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_preserves_positions_when_history_reconciliation_is_unavailable()
+{
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    api.active_orders_invalid_param
+        .store(true, Ordering::Relaxed);
+    api.trades_invalid_param.store(true, Ordering::Relaxed);
+
+    let (client, _rx, _cache) = create_test_execution_client(addr, api);
+    let status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(status.order_reports().is_empty());
+    assert!(status.fill_reports().is_empty());
+
+    let position_reports = status.position_reports();
+    let reports = position_reports
+        .get(&InstrumentId::from(TEST_INSTRUMENT_ID))
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].position_side, PositionSideSpecified::Long);
 }
 
 #[rstest]

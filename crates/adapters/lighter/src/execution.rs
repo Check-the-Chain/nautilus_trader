@@ -2447,7 +2447,7 @@ impl ExecutionClient for LighterExecutionClient {
             None,
         );
 
-        let order_reports = self
+        let order_reports = match self
             .generate_order_status_reports(&GenerateOrderStatusReports::new(
                 UUID4::new(),
                 ts_init,
@@ -2458,8 +2458,16 @@ impl ExecutionClient for LighterExecutionClient {
                 None,
                 None,
             ))
-            .await?;
-        let mut fill_reports = self
+            .await
+        {
+            Ok(reports) => reports,
+            Err(e) if is_lighter_invalid_param(&e) => {
+                log::warn!("Skipping Lighter order report mass-status reconciliation: {e}");
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+        let mut fill_reports = match self
             .generate_fill_reports(GenerateFillReports::new(
                 UUID4::new(),
                 ts_init,
@@ -2470,7 +2478,15 @@ impl ExecutionClient for LighterExecutionClient {
                 None,
                 None,
             ))
-            .await?;
+            .await
+        {
+            Ok(reports) => reports,
+            Err(e) if is_lighter_invalid_param(&e) => {
+                log::warn!("Skipping Lighter fill report mass-status reconciliation: {e}");
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
         let position_reports = self
             .generate_position_status_reports(&GeneratePositionStatusReports::new(
                 UUID4::new(),
