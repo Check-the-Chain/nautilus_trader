@@ -805,6 +805,7 @@ async fn test_rest_client_encodes_queries_and_auth_headers() {
         path == "/api/v1/accountInactiveOrders"
             && query.contains("account_index=7")
             && query.contains("market_id=1")
+            && query.contains("limit=100")
             && query.contains("cursor=cursor-1")
             && auth.as_deref() == Some("Bearer lighter-auth")
     }));

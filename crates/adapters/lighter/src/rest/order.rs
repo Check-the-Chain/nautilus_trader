@@ -63,9 +63,11 @@ impl LighterRestClient {
     ) -> Result<Orders> {
         let account_index = account_index.to_string();
         let market_id = market_id.to_string();
+        let limit = "100";
         let mut query: Vec<(&str, &str)> = vec![
             ("account_index", account_index.as_str()),
             ("market_id", market_id.as_str()),
+            ("limit", limit),
         ];
         if let Some(c) = cursor {
             query.push(("cursor", c));
