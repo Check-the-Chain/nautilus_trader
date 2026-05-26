@@ -39,13 +39,14 @@ use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        AccountType, ContingencyType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
+        AccountType, ContingencyType, OmsType, OrderSide, OrderStatus, OrderType,
+        PositionSideSpecified, TimeInForce,
     },
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue, VenueOrderId},
     instruments::Instrument,
     orders::{Order, any::OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Price},
+    types::{AccountBalance, MarginBalance, Price, Quantity},
 };
 use tokio::{sync::Mutex as AsyncMutex, task::JoinHandle, time::timeout};
 
@@ -54,8 +55,8 @@ use crate::{
     common::{
         LighterInstrumentMeta, LighterInstrumentRegistry, account_balances_from_assets,
         lighter_client_order_index, load_instrument_registry, margin_balances_from_positions,
-        order_report_from_lighter, position_reports_from_detailed_account, to_lighter_price,
-        to_lighter_size, venue,
+        order_report_from_lighter, position_report_from_lighter,
+        position_reports_from_detailed_account, to_lighter_price, to_lighter_size, venue,
     },
     config::{Config, LighterExecClientConfig},
     error::SdkError,
@@ -67,8 +68,8 @@ use crate::{
         trade::Trades,
         transaction::{RespSendTx, RespSendTxBatch},
         ws::{
-            Position as WsPosition, WsAccountAllOrdersUpdate, WsAccountAllTradesUpdate,
-            WsAccountAllUpdate, WsMessage,
+            Position as WsPosition, PositionWithDiscount, WsAccountAllOrdersUpdate,
+            WsAccountAllPositionsUpdate, WsAccountAllTradesUpdate, WsAccountAllUpdate, WsMessage,
         },
     },
     websocket::client::LighterWebSocketClient,
@@ -76,6 +77,8 @@ use crate::{
 
 const LIGHTER_HTTP_MAX_BATCH_TX_COUNT: usize = 50;
 const LIGHTER_WS_MAX_BATCH_TX_COUNT: usize = 15;
+const LIGHTER_MARKET_ORDER_BUY_PRICE_BUFFER: f64 = 1.01;
+const LIGHTER_MARKET_ORDER_SELL_PRICE_BUFFER: f64 = 0.99;
 
 #[derive(Clone, Copy, Debug)]
 struct LighterOrderKeyRouter {
@@ -964,11 +967,15 @@ impl LighterExecutionClient {
             return Ok(());
         };
 
-        let balances = account_balances_from_assets(account.assets.as_deref().unwrap_or(&[]));
         let registry = self.registry.read().await;
-        let margins =
-            margin_balances_from_positions(account.positions.as_deref().unwrap_or(&[]), &registry);
-        self.generate_account_state(balances, margins, true, self.clock.get_time_ns())
+        emit_account_state_from_detailed_account(
+            &self.emitter,
+            account,
+            self.core.account_id,
+            &registry,
+            self.clock.get_time_ns(),
+        );
+        Ok(())
     }
 
     fn spawn_task<F>(&self, name: &'static str, future: F)
@@ -1133,21 +1140,37 @@ impl LighterExecutionClient {
                         .iter()
                         .map(|(request, _, _)| *request)
                         .collect::<Vec<_>>();
-                    let response = api.cancel_order_batch(requests).await?;
-                    if response.code != 200 {
-                        let reason = response
-                            .message
-                            .as_deref()
-                            .unwrap_or("Lighter batch cancel failed");
-                        for (_, cancel, venue_order_id) in request_chunk {
-                            emitter.emit_order_cancel_rejected_event(
-                                cancel.strategy_id,
-                                cancel.instrument_id,
-                                cancel.client_order_id,
-                                Some(*venue_order_id),
-                                reason,
-                                clock.get_time_ns(),
-                            );
+                    match api.cancel_order_batch(requests).await {
+                        Ok(response) => {
+                            if response.code != 200 {
+                                let reason = response
+                                    .message
+                                    .as_deref()
+                                    .unwrap_or("Lighter batch cancel failed");
+                                for (_, cancel, venue_order_id) in request_chunk {
+                                    emitter.emit_order_cancel_rejected_event(
+                                        cancel.strategy_id,
+                                        cancel.instrument_id,
+                                        cancel.client_order_id,
+                                        Some(*venue_order_id),
+                                        reason,
+                                        clock.get_time_ns(),
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let reason = format!("Lighter batch cancel failed: {error}");
+                            for (_, cancel, venue_order_id) in request_chunk {
+                                emitter.emit_order_cancel_rejected_event(
+                                    cancel.strategy_id,
+                                    cancel.instrument_id,
+                                    cancel.client_order_id,
+                                    Some(*venue_order_id),
+                                    &reason,
+                                    clock.get_time_ns(),
+                                );
+                            }
                         }
                     }
                 }
@@ -1307,19 +1330,33 @@ impl LighterExecutionClient {
                                 .map(account_position_from_ws)
                                 .collect::<Vec<_>>();
                             let registry = registry.read().await;
-                            let margins = margin_balances_from_positions(&positions, &registry);
-                            emitter.emit_account_state(
-                                balances,
-                                margins,
-                                true,
+                            let ts_init = clock.get_time_ns();
+                            emit_account_state_from_positions(
+                                &emitter, balances, &positions, account_id, &registry, ts_init,
+                            );
+                        }
+                    }
+                    "update/account_all_positions" | "subscribed/account_all_positions" => {
+                        if let Ok(payload) =
+                            serde_json::from_str::<WsAccountAllPositionsUpdate>(&message)
+                        {
+                            let positions = payload
+                                .positions
+                                .into_values()
+                                .flatten()
+                                .map(account_position_from_ws_with_discount)
+                                .collect::<Vec<_>>();
+                            let registry = registry.read().await;
+                            emit_position_reports(
+                                &emitter,
+                                &positions,
+                                account_id,
+                                &registry,
                                 clock.get_time_ns(),
                             );
                         }
                     }
-                    "update/account_all_assets"
-                    | "update/account_all_positions"
-                    | "subscribed/user_stats"
-                    | "update/user_stats" => {
+                    "update/account_all_assets" | "subscribed/user_stats" | "update/user_stats" => {
                         let now = Instant::now();
                         if now < next_account_refresh {
                             continue;
@@ -1333,18 +1370,12 @@ impl LighterExecutionClient {
                         if let Ok(response) = api.request_account(account_index, &token).await
                             && let Some(account) = response.accounts.first()
                         {
-                            let balances = account_balances_from_assets(
-                                account.assets.as_deref().unwrap_or(&[]),
-                            );
                             let registry = registry.read().await;
-                            let margins = margin_balances_from_positions(
-                                account.positions.as_deref().unwrap_or(&[]),
+                            emit_account_state_from_detailed_account(
+                                &emitter,
+                                account,
+                                account_id,
                                 &registry,
-                            );
-                            emitter.emit_account_state(
-                                balances,
-                                margins,
-                                true,
                                 clock.get_time_ns(),
                             );
                         }
@@ -1529,6 +1560,56 @@ fn process_fill_report(
     emitter.send_fill_report(report);
 }
 
+fn emit_account_state_from_detailed_account(
+    emitter: &ExecutionEventEmitter,
+    account: &crate::models::account::DetailedAccount,
+    account_id: AccountId,
+    registry: &LighterInstrumentRegistry,
+    ts_init: UnixNanos,
+) {
+    let balances = account_balances_from_assets(account.assets.as_deref().unwrap_or(&[]));
+    let positions = account.positions.as_deref().unwrap_or(&[]);
+    let margins = margin_balances_from_positions(positions, registry);
+    emitter.emit_account_state(balances, margins, true, ts_init);
+
+    for report in position_reports_from_detailed_account(account, account_id, registry, ts_init) {
+        emitter.send_position_report(report);
+    }
+}
+
+fn emit_account_state_from_positions(
+    emitter: &ExecutionEventEmitter,
+    balances: Vec<AccountBalance>,
+    positions: &[AccountPosition],
+    account_id: AccountId,
+    registry: &LighterInstrumentRegistry,
+    ts_init: UnixNanos,
+) {
+    let margins = margin_balances_from_positions(positions, registry);
+    emitter.emit_account_state(balances, margins, true, ts_init);
+    emit_position_reports(emitter, positions, account_id, registry, ts_init);
+}
+
+fn emit_position_reports(
+    emitter: &ExecutionEventEmitter,
+    positions: &[AccountPosition],
+    account_id: AccountId,
+    registry: &LighterInstrumentRegistry,
+    ts_init: UnixNanos,
+) {
+    for position in positions {
+        let Some(instrument) = registry.instrument_for_market_id(position.market_id) else {
+            continue;
+        };
+        emitter.send_position_report(position_report_from_lighter(
+            position,
+            account_id,
+            &instrument,
+            ts_init,
+        ));
+    }
+}
+
 fn account_position_from_ws(position: WsPosition) -> AccountPosition {
     AccountPosition {
         market_id: position.market_id,
@@ -1548,6 +1629,31 @@ fn account_position_from_ws(position: WsPosition) -> AccountPosition {
         margin_mode: position.margin_mode,
         allocated_margin: position.allocated_margin,
     }
+}
+
+fn account_position_from_ws_with_discount(position: PositionWithDiscount) -> AccountPosition {
+    AccountPosition {
+        market_id: position.market_id,
+        symbol: position.symbol,
+        initial_margin_fraction: position.initial_margin_fraction,
+        open_order_count: position.open_order_count,
+        pending_order_count: position.pending_order_count,
+        position_tied_order_count: position.position_tied_order_count,
+        sign: position.sign,
+        position: position.position,
+        avg_entry_price: position.avg_entry_price,
+        position_value: position.position_value,
+        unrealized_pnl: position.unrealized_pnl,
+        realized_pnl: position.realized_pnl,
+        liquidation_price: position.liquidation_price,
+        total_funding_paid_out: Some(position.total_funding_paid_out),
+        margin_mode: position.margin_mode,
+        allocated_margin: position.allocated_margin,
+    }
+}
+
+fn in_time_window(ts_event: UnixNanos, start: Option<UnixNanos>, end: Option<UnixNanos>) -> bool {
+    start.is_none_or(|start| ts_event >= start) && end.is_none_or(|end| ts_event <= end)
 }
 
 #[async_trait(?Send)]
@@ -1671,25 +1777,46 @@ impl ExecutionClient for LighterExecutionClient {
 
         self.spawn_task("submit_order", async move {
             let registry = registry.read().await;
-            let meta = registry
-                .meta_for_instrument_id(&order.instrument_id())
-                .ok_or_else(|| anyhow::anyhow!("Lighter metadata missing"))?;
-            let request =
-                build_submit_order_request(&order, meta, client_order_index, price, api_key_index)?;
-            let response = api.submit_order(request).await?;
+            let result = async {
+                let meta = registry
+                    .meta_for_instrument_id(&order.instrument_id())
+                    .ok_or_else(|| anyhow::anyhow!("Lighter metadata missing"))?;
+                let request = build_submit_order_request(
+                    &order,
+                    meta,
+                    client_order_index,
+                    price,
+                    api_key_index,
+                )?;
+                api.submit_order(request).await
+            }
+            .await;
 
-            if response.code != 200 {
-                emitter.emit_order_rejected_event(
-                    order.strategy_id(),
-                    order.instrument_id(),
-                    order.client_order_id(),
-                    response
-                        .message
-                        .as_deref()
-                        .unwrap_or("Lighter submission failed"),
-                    clock.get_time_ns(),
-                    false,
-                );
+            match result {
+                Ok(response) if response.code == 200 => {}
+                Ok(response) => {
+                    emitter.emit_order_rejected_event(
+                        order.strategy_id(),
+                        order.instrument_id(),
+                        order.client_order_id(),
+                        response
+                            .message
+                            .as_deref()
+                            .unwrap_or("Lighter submission failed"),
+                        clock.get_time_ns(),
+                        false,
+                    );
+                }
+                Err(error) => {
+                    emitter.emit_order_rejected_event(
+                        order.strategy_id(),
+                        order.instrument_id(),
+                        order.client_order_id(),
+                        &format!("Lighter submission failed: {error}"),
+                        clock.get_time_ns(),
+                        false,
+                    );
+                }
             }
             Ok(())
         });
@@ -1756,13 +1883,26 @@ impl ExecutionClient for LighterExecutionClient {
                     continue;
                 };
 
-                let request = build_submit_order_request(
+                let request = match build_submit_order_request(
                     &order,
                     meta,
                     client_order_index,
                     price,
                     api_key_index,
-                )?;
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        emitter.emit_order_rejected_event(
+                            order.strategy_id(),
+                            order.instrument_id(),
+                            order.client_order_id(),
+                            &format!("Lighter submission failed: {error}"),
+                            clock.get_time_ns(),
+                            false,
+                        );
+                        continue;
+                    }
+                };
                 requests_by_key
                     .entry(api_key_index)
                     .or_default()
@@ -1775,21 +1915,37 @@ impl ExecutionClient for LighterExecutionClient {
                         .iter()
                         .map(|(request, _)| *request)
                         .collect::<Vec<_>>();
-                    let response = api.submit_order_batch(requests).await?;
-                    if response.code != 200 {
-                        let reason = response
-                            .message
-                            .as_deref()
-                            .unwrap_or("Lighter batch submission failed");
-                        for (_, order) in request_chunk {
-                            emitter.emit_order_rejected_event(
-                                order.strategy_id(),
-                                order.instrument_id(),
-                                order.client_order_id(),
-                                reason,
-                                clock.get_time_ns(),
-                                false,
-                            );
+                    match api.submit_order_batch(requests).await {
+                        Ok(response) => {
+                            if response.code != 200 {
+                                let reason = response
+                                    .message
+                                    .as_deref()
+                                    .unwrap_or("Lighter batch submission failed");
+                                for (_, order) in request_chunk {
+                                    emitter.emit_order_rejected_event(
+                                        order.strategy_id(),
+                                        order.instrument_id(),
+                                        order.client_order_id(),
+                                        reason,
+                                        clock.get_time_ns(),
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let reason = format!("Lighter batch submission failed: {error}");
+                            for (_, order) in request_chunk {
+                                emitter.emit_order_rejected_event(
+                                    order.strategy_id(),
+                                    order.instrument_id(),
+                                    order.client_order_id(),
+                                    &reason,
+                                    clock.get_time_ns(),
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -1826,25 +1982,41 @@ impl ExecutionClient for LighterExecutionClient {
 
         self.spawn_task("modify_order", async move {
             let registry = registry.read().await;
-            let meta = registry
-                .meta_for_instrument_id(&cmd.instrument_id)
-                .ok_or_else(|| anyhow::anyhow!("Lighter metadata missing"))?;
-            let request =
-                build_modify_order_request(&cmd, &order, meta, &venue_order_id, api_key_index)?;
-            let response = api.modify_order(request).await?;
+            let result = async {
+                let meta = registry
+                    .meta_for_instrument_id(&cmd.instrument_id)
+                    .ok_or_else(|| anyhow::anyhow!("Lighter metadata missing"))?;
+                let request =
+                    build_modify_order_request(&cmd, &order, meta, &venue_order_id, api_key_index)?;
+                api.modify_order(request).await
+            }
+            .await;
 
-            if response.code != 200 {
-                emitter.emit_order_modify_rejected_event(
-                    cmd.strategy_id,
-                    cmd.instrument_id,
-                    cmd.client_order_id,
-                    Some(venue_order_id),
-                    response
-                        .message
-                        .as_deref()
-                        .unwrap_or("Lighter modify failed"),
-                    clock.get_time_ns(),
-                );
+            match result {
+                Ok(response) if response.code == 200 => {}
+                Ok(response) => {
+                    emitter.emit_order_modify_rejected_event(
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        cmd.client_order_id,
+                        Some(venue_order_id),
+                        response
+                            .message
+                            .as_deref()
+                            .unwrap_or("Lighter modify failed"),
+                        clock.get_time_ns(),
+                    );
+                }
+                Err(error) => {
+                    emitter.emit_order_modify_rejected_event(
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        cmd.client_order_id,
+                        Some(venue_order_id),
+                        &format!("Lighter modify failed: {error}"),
+                        clock.get_time_ns(),
+                    );
+                }
             }
             Ok(())
         });
@@ -1880,29 +2052,44 @@ impl ExecutionClient for LighterExecutionClient {
 
         self.spawn_task("cancel_order", async move {
             let registry = registry.read().await;
-            let meta = registry
-                .meta_for_instrument_id(&cmd.instrument_id)
-                .ok_or_else(|| anyhow::anyhow!("Lighter metadata missing"))?;
-            let response = api
-                .cancel_order(
+            let result = async {
+                let meta = registry
+                    .meta_for_instrument_id(&cmd.instrument_id)
+                    .ok_or_else(|| anyhow::anyhow!("Lighter metadata missing"))?;
+                api.cancel_order(
                     meta.market_id as i32,
                     venue_order_id.as_str().parse()?,
                     api_key_index,
                 )
-                .await?;
+                .await
+            }
+            .await;
 
-            if response.code != 200 {
-                emitter.emit_order_cancel_rejected_event(
-                    cmd.strategy_id,
-                    cmd.instrument_id,
-                    cmd.client_order_id,
-                    Some(venue_order_id),
-                    response
-                        .message
-                        .as_deref()
-                        .unwrap_or("Lighter cancel failed"),
-                    clock.get_time_ns(),
-                );
+            match result {
+                Ok(response) if response.code == 200 => {}
+                Ok(response) => {
+                    emitter.emit_order_cancel_rejected_event(
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        cmd.client_order_id,
+                        Some(venue_order_id),
+                        response
+                            .message
+                            .as_deref()
+                            .unwrap_or("Lighter cancel failed"),
+                        clock.get_time_ns(),
+                    );
+                }
+                Err(error) => {
+                    emitter.emit_order_cancel_rejected_event(
+                        cmd.strategy_id,
+                        cmd.instrument_id,
+                        cmd.client_order_id,
+                        Some(venue_order_id),
+                        &format!("Lighter cancel failed: {error}"),
+                        clock.get_time_ns(),
+                    );
+                }
             }
             Ok(())
         });
@@ -2119,6 +2306,9 @@ impl ExecutionClient for LighterExecutionClient {
                 if cmd.open_only && !report.order_status.is_open() {
                     continue;
                 }
+                if !in_time_window(report.ts_last, cmd.start, cmd.end) {
+                    continue;
+                }
                 if let Some(client_order_id) = report.client_order_id
                     && let Some(cached_order) = self.core.cache().order(&client_order_id)
                 {
@@ -2174,6 +2364,7 @@ impl ExecutionClient for LighterExecutionClient {
                 ) && cmd
                     .venue_order_id
                     .is_none_or(|id| id == report.venue_order_id)
+                    && in_time_window(report.ts_event, cmd.start, cmd.end)
                 {
                     reports.push(report);
                 }
@@ -2210,6 +2401,22 @@ impl ExecutionClient for LighterExecutionClient {
         );
         if let Some(instrument_id) = cmd.instrument_id {
             reports.retain(|report| report.instrument_id == instrument_id);
+            if reports.is_empty()
+                && let Some(meta) = registry.meta_for_instrument_id(&instrument_id)
+            {
+                let ts_init = self.clock.get_time_ns();
+                reports.push(PositionStatusReport::new(
+                    self.core.account_id,
+                    instrument_id,
+                    PositionSideSpecified::Flat,
+                    Quantity::new(0.0, meta.instrument.size_precision()),
+                    ts_init,
+                    ts_init,
+                    None,
+                    None,
+                    None,
+                ));
+            }
         }
         Ok(reports)
     }
@@ -2347,13 +2554,7 @@ fn submission_price_from_cache(
             order.order_type(),
             OrderType::Market | OrderType::StopMarket | OrderType::MarketIfTouched
         ) => quote
-            .map(|quote| {
-                if order.order_side() == OrderSide::Buy {
-                    quote.ask_price
-                } else {
-                    quote.bid_price
-                }
-            })
+            .map(|quote| market_order_price_bound(order.order_side(), quote))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No cached quote for {}: subscribe to Lighter quotes before submitting market orders",
@@ -2362,6 +2563,16 @@ fn submission_price_from_cache(
             }),
         None => Err(anyhow::anyhow!("Lighter order price unavailable")),
     }
+}
+
+fn market_order_price_bound(side: OrderSide, quote: &nautilus_model::data::QuoteTick) -> Price {
+    let (reference, multiplier) = if side == OrderSide::Buy {
+        (quote.ask_price, LIGHTER_MARKET_ORDER_BUY_PRICE_BUFFER)
+    } else {
+        (quote.bid_price, LIGHTER_MARKET_ORDER_SELL_PRICE_BUFFER)
+    };
+
+    Price::new(reference.as_f64() * multiplier, reference.precision)
 }
 
 fn build_modify_order_request(
@@ -2450,9 +2661,30 @@ fn unix_now_ms(offset_secs: u64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{
+        data::QuoteTick,
+        enums::OrderSide,
+        identifiers::InstrumentId,
+        types::{Price, Quantity},
+    };
     use serde_json::json;
 
-    use super::{normalize_send_tx_response, tx_response_matches_request};
+    use super::{
+        market_order_price_bound, normalize_send_tx_response, tx_response_matches_request,
+    };
+
+    fn quote_tick() -> QuoteTick {
+        QuoteTick::new(
+            InstrumentId::from("BTC-PERP.LIGHTER"),
+            Price::from("100.00"),
+            Price::from("101.00"),
+            Quantity::from("1.0000"),
+            Quantity::from("1.0000"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+    }
 
     #[test]
     fn tx_response_matching_ignores_stale_response_ids() {
@@ -2491,5 +2723,16 @@ mod tests {
         let payload = response["data"].clone();
 
         assert!(tx_response_matches_request(&response, &payload, "0xabc"));
+    }
+
+    #[test]
+    fn market_order_price_bound_crosses_top_of_book() {
+        let quote = quote_tick();
+
+        let buy = market_order_price_bound(OrderSide::Buy, &quote);
+        let sell = market_order_price_bound(OrderSide::Sell, &quote);
+
+        assert_eq!(buy, Price::from("102.01"));
+        assert_eq!(sell, Price::from("99.00"));
     }
 }

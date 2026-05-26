@@ -25,6 +25,7 @@ pub mod client;
 pub mod common;
 pub mod config;
 pub mod constants;
+pub mod custom;
 pub mod data;
 pub mod error;
 pub mod execution;
@@ -45,6 +46,7 @@ pub use crate::{
         Config, LIGHTER_MAINNET_HOST, LIGHTER_TESTNET_HOST, LighterDataClientConfig,
         LighterExecClientConfig, lighter_http_base_url, lighter_ws_base_url,
     },
+    custom::{LighterAccountPosition, LighterAccountPositions},
     data::LighterDataClient,
     execution::LighterExecutionClient,
     factories::{

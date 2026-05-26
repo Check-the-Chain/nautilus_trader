@@ -40,6 +40,7 @@ use nautilus_model::{
 use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use serde_json::Value;
 
+use crate::constants::{CROSS_MARGIN, ISOLATED_MARGIN};
 use crate::http::client::LighterHttpClient;
 use crate::models::{
     account::{AccountPosition, DetailedAccount},
@@ -89,6 +90,40 @@ impl LighterMarketType {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LighterMarketMarginMode {
+    Cross,
+    Isolated,
+    Other(i64),
+}
+
+impl LighterMarketMarginMode {
+    #[must_use]
+    pub const fn from_raw(value: i64) -> Self {
+        if value == CROSS_MARGIN as i64 {
+            Self::Cross
+        } else if value == ISOLATED_MARGIN as i64 {
+            Self::Isolated
+        } else {
+            Self::Other(value)
+        }
+    }
+
+    #[must_use]
+    pub const fn as_raw(self) -> i64 {
+        match self {
+            Self::Cross => CROSS_MARGIN as i64,
+            Self::Isolated => ISOLATED_MARGIN as i64,
+            Self::Other(value) => value,
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_cross_margin(self) -> bool {
+        matches!(self, Self::Cross)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LighterInstrumentMeta {
     pub market_id: i64,
@@ -96,6 +131,24 @@ pub struct LighterInstrumentMeta {
     pub market_type: LighterMarketType,
     pub price_precision: u8,
     pub size_precision: u8,
+}
+
+impl LighterInstrumentMeta {
+    #[must_use]
+    pub fn market_margin_mode(&self) -> Option<LighterMarketMarginMode> {
+        instrument_info(&self.instrument)
+            .and_then(|info| info.get("market_config"))
+            .and_then(|value| value.as_object())
+            .and_then(|market_config| market_config.get("market_margin_mode"))
+            .and_then(Value::as_i64)
+            .map(LighterMarketMarginMode::from_raw)
+    }
+
+    #[must_use]
+    pub fn supports_cross_margin(&self) -> bool {
+        self.market_margin_mode()
+            .is_none_or(LighterMarketMarginMode::supports_cross_margin)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -149,6 +202,28 @@ impl LighterInstrumentRegistry {
     pub fn clear(&mut self) {
         self.by_market_id.clear();
         self.by_instrument_id.clear();
+    }
+}
+
+#[allow(clippy::missing_const_for_fn)]
+fn instrument_info(instrument: &InstrumentAny) -> Option<&Params> {
+    match instrument {
+        InstrumentAny::Betting(instrument) => instrument.info.as_ref(),
+        InstrumentAny::BinaryOption(instrument) => instrument.info.as_ref(),
+        InstrumentAny::Cfd(instrument) => instrument.info.as_ref(),
+        InstrumentAny::Commodity(instrument) => instrument.info.as_ref(),
+        InstrumentAny::CryptoFuture(instrument) => instrument.info.as_ref(),
+        InstrumentAny::CryptoOption(instrument) => instrument.info.as_ref(),
+        InstrumentAny::CryptoPerpetual(instrument) => instrument.info.as_ref(),
+        InstrumentAny::CurrencyPair(instrument) => instrument.info.as_ref(),
+        InstrumentAny::Equity(instrument) => instrument.info.as_ref(),
+        InstrumentAny::FuturesContract(instrument) => instrument.info.as_ref(),
+        InstrumentAny::FuturesSpread(instrument) => instrument.info.as_ref(),
+        InstrumentAny::IndexInstrument(instrument) => instrument.info.as_ref(),
+        InstrumentAny::OptionContract(instrument) => instrument.info.as_ref(),
+        InstrumentAny::OptionSpread(instrument) => instrument.info.as_ref(),
+        InstrumentAny::PerpetualContract(instrument) => instrument.info.as_ref(),
+        InstrumentAny::TokenizedAsset(instrument) => instrument.info.as_ref(),
     }
 }
 
@@ -738,8 +813,17 @@ pub fn account_balances_from_assets(assets: &[Asset]) -> Vec<AccountBalance> {
                 asset.symbol.as_str(),
                 Some("lighter account asset"),
             );
-            let total = asset.balance_f64().unwrap_or_default();
-            let locked = asset.locked_balance_f64().unwrap_or_default();
+            let margin_balance = (asset.symbol == LIGHTER_SETTLEMENT_CURRENCY)
+                .then(|| asset.margin_balance_f64())
+                .flatten();
+            let total = margin_balance
+                .or_else(|| asset.balance_f64())
+                .unwrap_or_default();
+            let locked = if margin_balance.is_some() {
+                0.0
+            } else {
+                asset.locked_balance_f64().unwrap_or_default()
+            };
             AccountBalance::new(
                 Money::new(total, currency),
                 Money::new(locked, currency),
@@ -1233,11 +1317,11 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        LIGHTER_SETTLEMENT_CURRENCY, LighterMarketStatUpdate, LighterMarketType,
-        account_balances_from_assets, channel_market_id, funding_rate_update_from_history,
-        funding_rate_updates_from_history, instrument_meta_from_perp_detail,
-        lighter_client_order_index, market_stats_to_updates, quote_tick_from_ticker,
-        resolve_symbol_metadata,
+        LIGHTER_SETTLEMENT_CURRENCY, LighterMarketMarginMode, LighterMarketStatUpdate,
+        LighterMarketType, account_balances_from_assets, channel_market_id,
+        funding_rate_update_from_history, funding_rate_updates_from_history,
+        instrument_meta_from_perp_detail, lighter_client_order_index, market_stats_to_updates,
+        quote_tick_from_ticker, resolve_symbol_metadata,
     };
     use crate::models::{
         asset::Asset, funding::FundingRate, market::PerpsMarketStats,
@@ -1542,16 +1626,62 @@ mod tests {
     }
 
     #[test]
+    fn instrument_meta_exposes_lighter_market_margin_mode() {
+        let detail = PerpsOrderBookDetail {
+            market_id: Some(173),
+            symbol: Some("SPACEX".to_string()),
+            price_decimals: Some(4),
+            size_decimals: Some(2),
+            market_config: Some(serde_json::Map::from_iter([(
+                "market_margin_mode".to_string(),
+                serde_json::Value::from(1),
+            )])),
+            ..serde_json::from_value(serde_json::json!({})).unwrap()
+        };
+
+        let meta = instrument_meta_from_perp_detail(&detail, &AHashMap::default())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            meta.market_margin_mode(),
+            Some(LighterMarketMarginMode::Isolated)
+        );
+        assert!(!meta.supports_cross_margin());
+    }
+
+    #[test]
     fn account_balances_register_unknown_lighter_crypto_assets() {
         let balances = account_balances_from_assets(&[Asset {
             symbol: "JUP".to_string(),
             asset_id: 1,
             balance: Some("1.5".to_string()),
             locked_balance: Some("0.25".to_string()),
+            margin_balance: None,
             extra: serde_json::Map::new(),
         }]);
 
         assert_eq!(balances[0].currency.code.as_str(), "JUP");
         assert!(Currency::try_from_str("JUP").is_some());
+    }
+
+    #[test]
+    fn account_balances_use_usdc_margin_balance_when_present() {
+        let balances = account_balances_from_assets(&[Asset {
+            symbol: LIGHTER_SETTLEMENT_CURRENCY.to_string(),
+            asset_id: 3,
+            balance: Some("49.99".to_string()),
+            locked_balance: Some("1.00".to_string()),
+            margin_balance: Some("117.43".to_string()),
+            extra: serde_json::Map::new(),
+        }]);
+
+        assert_eq!(
+            balances[0].currency.code.as_str(),
+            LIGHTER_SETTLEMENT_CURRENCY
+        );
+        assert_eq!(balances[0].total.as_f64(), 117.43);
+        assert_eq!(balances[0].locked.as_f64(), 0.0);
+        assert_eq!(balances[0].free.as_f64(), 117.43);
     }
 }

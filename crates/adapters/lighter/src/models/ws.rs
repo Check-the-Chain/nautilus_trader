@@ -68,16 +68,6 @@ where
     }
 }
 
-/// Deserialize a `HashMap<String, T>` with `null` or missing treated as empty.
-fn map_or_null<'de, D, T>(deserializer: D) -> Result<HashMap<String, T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    let opt: Option<HashMap<String, T>> = Option::deserialize(deserializer)?;
-    Ok(opt.unwrap_or_default())
-}
-
 fn looks_like_market_stats_payload(value: &serde_json::Value) -> bool {
     let Some(obj) = value.as_object() else {
         return false;
@@ -363,7 +353,6 @@ pub struct Position {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
 pub struct PositionWithDiscount {
     pub market_id: i64,
     pub symbol: String,
@@ -507,8 +496,8 @@ pub struct WsAccountAllPositionsUpdate {
     #[serde(rename = "type")]
     pub msg_type: String,
     pub channel: String,
-    #[serde(default, deserialize_with = "map_or_null")]
-    pub positions: HashMap<String, PositionWithDiscount>,
+    #[serde(default, deserialize_with = "map_vec_or_single")]
+    pub positions: HashMap<String, Vec<PositionWithDiscount>>,
     #[serde(default, deserialize_with = "vec_or_map")]
     pub shares: Vec<PoolShares>,
 }
@@ -883,7 +872,15 @@ mod tests {
         }"#;
 
         let msg: WsAccountAllPositionsUpdate = serde_json::from_str(raw).unwrap();
-        assert_eq!(msg.positions.get("89").unwrap().total_discount, "0");
+        assert_eq!(
+            msg.positions
+                .get("89")
+                .unwrap()
+                .first()
+                .unwrap()
+                .total_discount,
+            "0"
+        );
         assert_eq!(msg.shares.len(), 1);
         assert_eq!(msg.shares[0].public_pool_index, 1);
     }
@@ -956,13 +953,44 @@ mod tests {
         }"#;
 
         let msg: WsAccountAllPositionsUpdate = serde_json::from_str(raw).unwrap();
-        let pos = msg.positions.get("89").unwrap();
+        let pos = msg.positions.get("89").unwrap().first().unwrap();
         assert_eq!(pos.total_funding_paid_out, "");
         assert_eq!(pos.total_discount, "0");
     }
 
     #[test]
-    fn parses_account_all_positions_with_missing_nested_fields() {
+    fn parses_account_all_positions_with_map_values_as_arrays() {
+        let raw = r#"{
+            "type":"update/account_all_positions",
+            "channel":"account_all_positions/54255",
+            "positions":{
+                "89":[{
+                    "market_id":89,
+                    "symbol":"ETH-USDC",
+                    "initial_margin_fraction":"100",
+                    "open_order_count":0,
+                    "pending_order_count":0,
+                    "position_tied_order_count":0,
+                    "sign":1,
+                    "position":"0.53",
+                    "avg_entry_price":"76.82",
+                    "position_value":"40.7146",
+                    "unrealized_pnl":"1.1",
+                    "realized_pnl":"0.0",
+                    "liquidation_price":"70.0",
+                    "margin_mode":0,
+                    "allocated_margin":"0.0",
+                    "total_discount":"0"
+                }]
+            }
+        }"#;
+
+        let msg: WsAccountAllPositionsUpdate = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.positions.get("89").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_account_all_positions_with_missing_required_fields() {
         let raw = r#"{
             "type":"update/account_all_positions",
             "channel":"account_all_positions/54255",
@@ -978,16 +1006,7 @@ mod tests {
             ]
         }"#;
 
-        let msg: WsAccountAllPositionsUpdate = serde_json::from_str(raw).unwrap();
-        let pos = msg.positions.get("89").unwrap();
-        assert_eq!(pos.market_id, 89);
-        assert_eq!(pos.symbol, "");
-        assert_eq!(pos.position, "");
-        assert_eq!(pos.margin_mode, 0);
-        assert_eq!(msg.shares.len(), 1);
-        assert_eq!(msg.shares[0].public_pool_index, 1);
-        assert_eq!(msg.shares[0].shares_amount, 0);
-        assert_eq!(msg.shares[0].entry_usdc, "");
+        serde_json::from_str::<WsAccountAllPositionsUpdate>(raw).unwrap_err();
     }
 
     #[test]

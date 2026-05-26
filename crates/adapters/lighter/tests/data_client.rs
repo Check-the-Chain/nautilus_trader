@@ -137,8 +137,7 @@ async fn test_data_client_subscribe_mark_prices() {
 
     assert!(matches!(
         event,
-        DataEvent::Data(Data::MarkPriceUpdate(_))
-            | DataEvent::Data(Data::IndexPriceUpdate(_))
+        DataEvent::Data(Data::MarkPriceUpdate(_) | Data::IndexPriceUpdate(_))
             | DataEvent::FundingRate(_)
     ));
     client.disconnect().await.unwrap();

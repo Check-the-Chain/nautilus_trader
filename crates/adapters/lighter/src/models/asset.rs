@@ -10,6 +10,8 @@ pub struct Asset {
     pub balance: Option<String>,
     #[serde(default)]
     pub locked_balance: Option<String>,
+    #[serde(default)]
+    pub margin_balance: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -21,6 +23,10 @@ impl Asset {
 
     pub fn locked_balance_f64(&self) -> Option<f64> {
         self.locked_balance.as_deref()?.parse::<f64>().ok()
+    }
+
+    pub fn margin_balance_f64(&self) -> Option<f64> {
+        self.margin_balance.as_deref()?.parse::<f64>().ok()
     }
 }
 

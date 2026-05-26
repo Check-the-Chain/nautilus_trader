@@ -58,7 +58,10 @@ use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     data::QuoteTick,
-    enums::{AccountType, ContingencyType, OmsType, OrderSide, OrderType, TimeInForce},
+    enums::{
+        AccountType, ContingencyType, OmsType, OrderSide, OrderType, PositionSideSpecified,
+        TimeInForce,
+    },
     events::{AccountState, OrderAccepted, OrderEventAny, OrderInitialized},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId,
@@ -84,10 +87,15 @@ struct MockExecutionApi {
     inactive_orders: Mutex<VecDeque<Orders>>,
     trades: Mutex<VecDeque<Trades>>,
     submit_requests: Mutex<Vec<LighterSubmitOrderRequest>>,
+    submit_error: Mutex<Option<String>>,
     submit_batch_requests: Mutex<Vec<Vec<LighterSubmitOrderRequest>>>,
+    submit_batch_error: Mutex<Option<String>>,
     modify_requests: Mutex<Vec<LighterModifyOrderRequest>>,
+    modify_error: Mutex<Option<String>>,
     cancel_requests: Mutex<Vec<(i32, i64, Option<u8>)>>,
+    cancel_error: Mutex<Option<String>>,
     cancel_batch_requests: Mutex<Vec<Vec<LighterCancelOrderRequest>>>,
+    cancel_batch_error: Mutex<Option<String>>,
     cancel_all_calls: AtomicUsize,
 }
 
@@ -107,10 +115,15 @@ impl Default for MockExecutionApi {
             inactive_orders: Mutex::new(VecDeque::new()),
             trades: Mutex::new(VecDeque::new()),
             submit_requests: Mutex::new(Vec::new()),
+            submit_error: Mutex::new(None),
             submit_batch_requests: Mutex::new(Vec::new()),
+            submit_batch_error: Mutex::new(None),
             modify_requests: Mutex::new(Vec::new()),
+            modify_error: Mutex::new(None),
             cancel_requests: Mutex::new(Vec::new()),
+            cancel_error: Mutex::new(None),
             cancel_batch_requests: Mutex::new(Vec::new()),
+            cancel_batch_error: Mutex::new(None),
             cancel_all_calls: AtomicUsize::new(0),
         }
     }
@@ -181,6 +194,9 @@ impl LighterExecutionApi for MockExecutionApi {
 
     async fn submit_order(&self, request: LighterSubmitOrderRequest) -> anyhow::Result<RespSendTx> {
         self.submit_requests.lock().unwrap().push(request);
+        if let Some(error) = self.submit_error.lock().unwrap().clone() {
+            return Err(anyhow::anyhow!(error));
+        }
         Ok(ok_response())
     }
 
@@ -189,11 +205,17 @@ impl LighterExecutionApi for MockExecutionApi {
         requests: Vec<LighterSubmitOrderRequest>,
     ) -> anyhow::Result<RespSendTxBatch> {
         self.submit_batch_requests.lock().unwrap().push(requests);
+        if let Some(error) = self.submit_batch_error.lock().unwrap().clone() {
+            return Err(anyhow::anyhow!(error));
+        }
         Ok(ok_batch_response())
     }
 
     async fn modify_order(&self, request: LighterModifyOrderRequest) -> anyhow::Result<RespSendTx> {
         self.modify_requests.lock().unwrap().push(request);
+        if let Some(error) = self.modify_error.lock().unwrap().clone() {
+            return Err(anyhow::anyhow!(error));
+        }
         Ok(ok_response())
     }
 
@@ -207,6 +229,9 @@ impl LighterExecutionApi for MockExecutionApi {
             .lock()
             .unwrap()
             .push((market_index, order_index, api_key_index));
+        if let Some(error) = self.cancel_error.lock().unwrap().clone() {
+            return Err(anyhow::anyhow!(error));
+        }
         Ok(ok_response())
     }
 
@@ -215,6 +240,9 @@ impl LighterExecutionApi for MockExecutionApi {
         requests: Vec<LighterCancelOrderRequest>,
     ) -> anyhow::Result<RespSendTxBatch> {
         self.cancel_batch_requests.lock().unwrap().push(requests);
+        if let Some(error) = self.cancel_batch_error.lock().unwrap().clone() {
+            return Err(anyhow::anyhow!(error));
+        }
         Ok(ok_batch_response())
     }
 
@@ -299,6 +327,7 @@ fn detailed_accounts_with_position() -> DetailedAccounts {
                 asset_id: 2,
                 balance: Some("100000.00".to_string()),
                 locked_balance: Some("10.00".to_string()),
+                margin_balance: None,
                 extra: serde_json::Map::default(),
             }]),
         }],
@@ -648,6 +677,62 @@ async fn test_submit_order_records_request() {
 
 #[rstest]
 #[tokio::test]
+async fn test_submit_order_rejects_on_async_api_failure() {
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    *api.submit_error.lock().unwrap() = Some("network unavailable".to_string());
+    let (mut client, mut rx, cache) = create_test_execution_client(addr, api.clone());
+    add_test_account(&cache, AccountId::from("LIGHTER-7"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    while rx.try_recv().is_ok() {}
+
+    let order = add_limit_order(&cache, "O-ASYNC-FAIL");
+    let cmd = SubmitOrder::from_order(
+        &order,
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("LIGHTER")),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(cmd).unwrap();
+
+    let mut saw_submitted = false;
+    let mut rejection_reason = None;
+    for _ in 0..3 {
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            ExecutionEvent::Order(OrderEventAny::Submitted(submitted))
+                if submitted.client_order_id == order.client_order_id() =>
+            {
+                saw_submitted = true;
+            }
+            ExecutionEvent::Order(OrderEventAny::Rejected(rejected))
+                if rejected.client_order_id == order.client_order_id() =>
+            {
+                rejection_reason = Some(rejected.reason.to_string());
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_submitted);
+    assert_eq!(
+        rejection_reason.as_deref(),
+        Some("Lighter submission failed: network unavailable")
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_submit_market_order_uses_cached_quote() {
     let addr = start_mock_server().await;
     let api = Arc::new(MockExecutionApi::default());
@@ -677,7 +762,7 @@ async fn test_submit_market_order_uses_cached_quote() {
     .await;
 
     let request = api.submit_requests.lock().unwrap()[0];
-    assert_eq!(request.price, 10_000_100);
+    assert_eq!(request.price, 10_100_101);
 
     client.disconnect().await.unwrap();
 }
@@ -1314,6 +1399,38 @@ async fn test_generate_position_status_reports_returns_account_positions() {
         reports[0].instrument_id,
         InstrumentId::from(TEST_INSTRUMENT_ID)
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_position_status_reports_returns_flat_for_missing_instrument_position() {
+    let addr = start_mock_server().await;
+    let api = Arc::new(MockExecutionApi::default());
+    {
+        let mut account = api.account.lock().unwrap();
+        account.accounts[0].positions = Some(Vec::new());
+    }
+    let (client, _rx, _cache) = create_test_execution_client(addr, api);
+    let reports: Vec<PositionStatusReport> = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from(TEST_INSTRUMENT_ID)),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].instrument_id,
+        InstrumentId::from(TEST_INSTRUMENT_ID)
+    );
+    assert_eq!(reports[0].position_side, PositionSideSpecified::Flat);
+    assert!(reports[0].is_flat());
 }
 
 #[rstest]

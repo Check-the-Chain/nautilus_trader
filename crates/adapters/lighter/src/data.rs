@@ -30,11 +30,11 @@ use nautilus_common::{
             BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
             InstrumentsResponse, QuotesResponse, RequestBars, RequestBookSnapshot,
             RequestFundingRates, RequestInstrument, RequestInstruments, RequestQuotes,
-            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeFundingRates,
-            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstruments, SubscribeMarkPrices,
-            SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeFundingRates, UnsubscribeIndexPrices,
-            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeCustomData,
+            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            UnsubscribeBookDeltas, UnsubscribeCustomData, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -58,9 +58,14 @@ use crate::{
         populate_order_book, quote_tick_from_ticker, trade_tick_from_trade, venue,
     },
     config::{Config, LighterDataClientConfig},
+    custom::{
+        LIGHTER_ACCOUNT_POSITIONS_TYPE, LighterAccountPositions, account_index_from_channel,
+        account_index_from_data_type, account_index_from_params, account_positions_channel,
+    },
     http::client::LighterHttpClient,
     models::ws::{
-        WsMarketStatsUpdate, WsMessage, WsOrderBookMessage, WsTickerUpdate, WsTradeUpdate,
+        WsAccountAllPositionsUpdate, WsMarketStatsUpdate, WsMessage, WsOrderBookMessage,
+        WsTickerUpdate, WsTradeUpdate,
     },
     normalize::timestamp::{epoch_to_unix_nanos, message_event_time, ticker_event_time},
     websocket::client::LighterWebSocketClient,
@@ -536,6 +541,54 @@ impl DataClient for LighterDataClient {
         Ok(())
     }
 
+    fn subscribe(&mut self, subscription: SubscribeCustomData) -> anyhow::Result<()> {
+        if subscription.data_type.type_name() != LIGHTER_ACCOUNT_POSITIONS_TYPE {
+            anyhow::bail!(
+                "unsupported Lighter custom data type: {}",
+                subscription.data_type.type_name()
+            );
+        }
+        let account_index = account_index_from_data_type(&subscription.data_type)
+            .or_else(|| account_index_from_params(subscription.params.as_ref()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Lighter account position subscriptions require account_index metadata"
+                )
+            })?;
+        log::info!("Subscribing to Lighter account positions for account {account_index}");
+        let ws = self.ws_client.clone();
+        get_runtime().spawn(async move {
+            if let Err(error) = ws.subscribe(account_positions_channel(account_index), None).await
+            {
+                log::error!(
+                    "Failed to subscribe to Lighter account positions for account {account_index}: {error}"
+                );
+            }
+        });
+        Ok(())
+    }
+
+    fn unsubscribe(&mut self, subscription: &UnsubscribeCustomData) -> anyhow::Result<()> {
+        if subscription.data_type.type_name() != LIGHTER_ACCOUNT_POSITIONS_TYPE {
+            return Ok(());
+        }
+        if let Some(account_index) = account_index_from_data_type(&subscription.data_type)
+            .or_else(|| account_index_from_params(subscription.params.as_ref()))
+        {
+            log::info!("Unsubscribing from Lighter account positions for account {account_index}");
+            let ws = self.ws_client.clone();
+            get_runtime().spawn(async move {
+                if let Err(error) = ws.unsubscribe(account_positions_channel(account_index)).await
+                {
+                    log::error!(
+                        "Failed to unsubscribe from Lighter account positions for account {account_index}: {error}"
+                    );
+                }
+            });
+        }
+        Ok(())
+    }
+
     fn subscribe_book_deltas(&mut self, subscription: SubscribeBookDeltas) -> anyhow::Result<()> {
         if subscription.book_type != BookType::L2_MBP {
             anyhow::bail!("Lighter only supports L2_MBP order book data");
@@ -785,6 +838,34 @@ fn handle_ws_message(
     }
 
     match header.msg_type.as_str() {
+        "subscribed/account_all_positions" | "update/account_all_positions" => {
+            #[cfg(feature = "latency-probe")]
+            let payload_parse_start_ns = latency::timestamp_ns();
+            let payload: WsAccountAllPositionsUpdate = serde_json::from_str(message)?;
+            #[cfg(feature = "latency-probe")]
+            latency::record_duration(
+                "lighter.adapter.account_positions_payload_parse",
+                payload_parse_start_ns,
+                latency::timestamp_ns(),
+            );
+            let Some(account_index) = account_index_from_channel(&payload.channel) else {
+                return Ok(());
+            };
+            let ts_init = adapter_ts_init(
+                clock,
+                #[cfg(feature = "latency-probe")]
+                raw_received_ns,
+            );
+            let custom = LighterAccountPositions::try_from_ws_update(
+                account_index,
+                payload,
+                ts_init,
+                ts_init,
+            )?
+            .into_custom_data();
+            let _ = sender.send(DataEvent::Data(Data::Custom(custom)));
+            return Ok(());
+        }
         "subscribed/order_book" | "update/order_book" => {
             #[cfg(feature = "latency-probe")]
             let payload_parse_start_ns = latency::timestamp_ns();
