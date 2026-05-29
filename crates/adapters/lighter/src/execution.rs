@@ -48,7 +48,11 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Price, Quantity},
 };
-use tokio::{sync::Mutex as AsyncMutex, task::JoinHandle, time::timeout};
+use tokio::{
+    sync::Mutex as AsyncMutex,
+    task::JoinHandle,
+    time::{interval, timeout},
+};
 
 use crate::{
     client::{LighterCancelOrderRequest, LighterModifyOrderRequest, LighterSubmitOrderRequest},
@@ -352,10 +356,15 @@ struct LighterWsTxExecutionApi {
 }
 
 impl LighterWsTxExecutionApi {
-    fn new(client: LighterHttpClient, ws_url: String, response_timeout: Duration) -> Self {
+    fn new(
+        client: LighterHttpClient,
+        ws_url: String,
+        proxy_url: Option<String>,
+        response_timeout: Duration,
+    ) -> Self {
         Self {
             http: LighterHttpExecutionApi { client },
-            tx_ws_client: LighterWebSocketClient::new(ws_url, None),
+            tx_ws_client: LighterWebSocketClient::new(ws_url, None).with_proxy_url(proxy_url),
             send_lock: Arc::new(AsyncMutex::new(())),
             response_timeout,
         }
@@ -876,6 +885,7 @@ impl LighterExecutionClient {
         let api: Arc<dyn LighterExecutionApi> = Arc::new(LighterWsTxExecutionApi::new(
             private_client,
             config.ws_url(),
+            config.proxy_url.clone(),
             Duration::from_secs(config.ws_timeout_secs),
         ));
 
@@ -888,7 +898,8 @@ impl LighterExecutionClient {
         public_http_client: LighterHttpClient,
         api: Arc<dyn LighterExecutionApi>,
     ) -> anyhow::Result<Self> {
-        let ws_client = LighterWebSocketClient::new(config.readonly_ws_url(), None);
+        let ws_client = LighterWebSocketClient::new(config.readonly_ws_url(), None)
+            .with_proxy_url(config.proxy_url.clone());
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
             clock,
@@ -940,22 +951,43 @@ impl LighterExecutionClient {
         Ok(deadline.as_secs() as i64)
     }
 
-    async fn ensure_auth_token(&self, min_ttl_secs: u64) -> anyhow::Result<String> {
-        if let Some((token, expires_at)) = self.auth_token.lock().expect(MUTEX_POISONED).clone()
+    fn auth_token_refresh_interval(ttl_secs: u64) -> Duration {
+        Duration::from_secs(ttl_secs.saturating_sub(30).clamp(30, 300))
+    }
+
+    async fn ensure_auth_token_for(
+        api: &Arc<dyn LighterExecutionApi>,
+        auth_token: &Arc<Mutex<Option<(String, Instant)>>>,
+        api_key_index: Option<u8>,
+        default_ttl_secs: u64,
+        min_ttl_secs: u64,
+    ) -> anyhow::Result<String> {
+        if let Some((token, expires_at)) = auth_token.lock().expect(MUTEX_POISONED).clone()
             && expires_at > Instant::now() + Duration::from_secs(min_ttl_secs)
         {
             return Ok(token);
         }
 
-        let ttl = self.config.default_auth_token_ttl_secs.max(min_ttl_secs);
+        let ttl = default_ttl_secs.max(min_ttl_secs);
         let deadline_unix_secs = Self::auth_token_deadline_unix_secs(ttl)?;
-        let token = self
-            .api
-            .create_auth_token(deadline_unix_secs, self.config.api_key_index)
+        let token = api
+            .create_auth_token(deadline_unix_secs, api_key_index)
             .await?;
-        self.ws_client.set_auth_token(Some(token.clone())).await;
-        *self.auth_token.lock().expect(MUTEX_POISONED) =
+        *auth_token.lock().expect(MUTEX_POISONED) =
             Some((token.clone(), Instant::now() + Duration::from_secs(ttl)));
+        Ok(token)
+    }
+
+    async fn ensure_auth_token(&self, min_ttl_secs: u64) -> anyhow::Result<String> {
+        let token = Self::ensure_auth_token_for(
+            &self.api,
+            &self.auth_token,
+            self.config.api_key_index,
+            self.config.default_auth_token_ttl_secs,
+            min_ttl_secs,
+        )
+        .await?;
+        self.ws_client.set_auth_token(Some(token.clone())).await;
         Ok(token)
     }
 
@@ -1192,35 +1224,15 @@ impl LighterExecutionClient {
             return Ok(());
         }
 
-        let token = self.ensure_auth_token(30).await?;
-        self.ws_client.set_auth_token(Some(token)).await;
-        self.ws_client.connect().await?;
         let account_index = self.config.account_index.unwrap_or_default();
-        self.ws_client
-            .subscribe(format!("account_all/{account_index}"), None)
-            .await?;
-        self.ws_client
-            .subscribe(format!("account_all_orders/{account_index}"), None)
-            .await?;
-        self.ws_client
-            .subscribe(format!("account_all_trades/{account_index}"), None)
-            .await?;
-        self.ws_client
-            .subscribe(format!("account_all_positions/{account_index}"), None)
-            .await?;
-        self.ws_client
-            .subscribe(format!("account_all_assets/{account_index}"), None)
-            .await?;
-        self.ws_client
-            .subscribe(format!("user_stats/{account_index}"), None)
-            .await?;
 
         let ws_client = self.ws_client.clone();
         let registry = Arc::clone(&self.registry);
         let emitter = self.emitter.clone();
         let api = Arc::clone(&self.api);
+        let api_key_index = self.config.api_key_index;
+        let default_auth_token_ttl_secs = self.config.default_auth_token_ttl_secs;
         let account_id = self.core.account_id;
-        let account_index = self.config.account_index.unwrap_or_default();
         let auth_token = Arc::clone(&self.auth_token);
         let client_order_index_to_id = Arc::clone(&self.client_order_index_to_id);
         let tracked_orders = Arc::clone(&self.tracked_orders);
@@ -1231,158 +1243,225 @@ impl LighterExecutionClient {
         let recent_order_state_queue = Arc::clone(&self.recent_order_state_queue);
         let clock = self.clock;
 
+        let token = Self::ensure_auth_token_for(
+            &api,
+            &auth_token,
+            api_key_index,
+            default_auth_token_ttl_secs,
+            30,
+        )
+        .await?;
+        ws_client.set_auth_token(Some(token)).await;
+        ws_client.connect().await?;
+
+        for channel in [
+            format!("account_all/{account_index}"),
+            format!("account_all_orders/{account_index}"),
+            format!("account_all_trades/{account_index}"),
+            format!("account_all_positions/{account_index}"),
+            format!("account_all_assets/{account_index}"),
+            format!("user_stats/{account_index}"),
+        ] {
+            ws_client.subscribe(channel, None).await?;
+        }
+
         let handle = get_runtime().spawn(async move {
             let account_refresh_interval = Duration::from_millis(250);
             let mut next_account_refresh = Instant::now();
+            let mut auth_refresh_interval =
+                interval(Self::auth_token_refresh_interval(default_auth_token_ttl_secs));
 
-            while let Some(message) = ws_client.next_message().await {
-                let Ok(header) = serde_json::from_str::<WsMessage>(&message) else {
-                    continue;
-                };
-                match header.msg_type.as_str() {
-                    "update/account_all_orders" | "subscribed/account_all_orders" => {
-                        if let Ok(payload) =
-                            serde_json::from_str::<WsAccountAllOrdersUpdate>(&message)
+            loop {
+                tokio::select! {
+                    _ = auth_refresh_interval.tick() => {
+                        match Self::ensure_auth_token_for(
+                            &api,
+                            &auth_token,
+                            api_key_index,
+                            default_auth_token_ttl_secs,
+                            30,
+                        )
+                        .await
                         {
-                            let registry = registry.read().await;
-                            for (market_id, orders) in payload.orders {
-                                let Ok(market_id) = market_id.parse::<i64>() else {
-                                    continue;
-                                };
-                                let Some(meta) = registry.meta_for_market_id(market_id) else {
-                                    continue;
-                                };
-                                for order in orders {
-                                    let ts_init = clock.get_time_ns();
-                                    let report = order_report_from_lighter(
-                                        &order,
-                                        account_id,
-                                        &meta.instrument,
-                                        ts_init,
-                                        |value| {
-                                            client_order_index_to_id
-                                                .lock()
-                                                .expect(MUTEX_POISONED)
-                                                .get(&value)
-                                                .copied()
-                                        },
-                                    );
-                                    process_order_report(
-                                        &emitter,
-                                        &tracked_orders,
-                                        &venue_order_id_by_client_order_id,
-                                        &recent_order_states,
-                                        &recent_order_state_queue,
-                                        report,
-                                    );
-                                }
+                            Ok(token) => ws_client.set_auth_token(Some(token)).await,
+                            Err(error) => {
+                                log::warn!("Lighter execution websocket auth token refresh failed: {error}");
                             }
                         }
                     }
-                    "update/account_all_trades" | "subscribed/account_all_trades" => {
-                        if let Ok(payload) =
-                            serde_json::from_str::<WsAccountAllTradesUpdate>(&message)
-                        {
-                            let registry = registry.read().await;
-                            for (market_id, trades) in payload.trades {
-                                let Ok(market_id) = market_id.parse::<i64>() else {
-                                    continue;
-                                };
-                                let Some(meta) = registry.meta_for_market_id(market_id) else {
-                                    continue;
-                                };
-                                for trade in trades {
-                                    let ts_init = clock.get_time_ns();
-                                    if let Some(report) =
-                                        crate::common::fill_report_from_lighter_trade(
-                                            &trade,
-                                            account_index,
-                                            account_id,
-                                            &meta.instrument,
-                                            ts_init,
-                                            |value| {
-                                                client_order_index_to_id
-                                                    .lock()
-                                                    .expect(MUTEX_POISONED)
-                                                    .get(&value)
-                                                    .copied()
-                                            },
-                                        )
-                                    {
-                                        process_fill_report(
-                                            &emitter,
-                                            &tracked_orders,
-                                            &venue_order_id_by_client_order_id,
-                                            &processed_trade_ids,
-                                            &processed_trade_queue,
-                                            report,
-                                        );
+                    message = ws_client.next_message() => {
+                        let Some(message) = message else {
+                            log::warn!("Lighter execution websocket stream ended");
+                            break;
+                        };
+                        let Ok(header) = serde_json::from_str::<WsMessage>(&message) else {
+                            continue;
+                        };
+                        match header.msg_type.as_str() {
+                            "update/account_all_orders" | "subscribed/account_all_orders" => {
+                                if let Ok(payload) =
+                                    serde_json::from_str::<WsAccountAllOrdersUpdate>(&message)
+                                {
+                                    let registry = registry.read().await;
+                                    for (market_id, orders) in payload.orders {
+                                        let Ok(market_id) = market_id.parse::<i64>() else {
+                                            continue;
+                                        };
+                                        let Some(meta) = registry.meta_for_market_id(market_id) else {
+                                            continue;
+                                        };
+                                        for order in orders {
+                                            let ts_init = clock.get_time_ns();
+                                            let report = order_report_from_lighter(
+                                                &order,
+                                                account_id,
+                                                &meta.instrument,
+                                                ts_init,
+                                                |value| {
+                                                    client_order_index_to_id
+                                                        .lock()
+                                                        .expect(MUTEX_POISONED)
+                                                        .get(&value)
+                                                        .copied()
+                                                },
+                                            );
+                                            process_order_report(
+                                                &emitter,
+                                                &tracked_orders,
+                                                &venue_order_id_by_client_order_id,
+                                                &recent_order_states,
+                                                &recent_order_state_queue,
+                                                report,
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }
-                    "update/account_all" | "subscribed/account_all" => {
-                        if let Ok(payload) = serde_json::from_str::<WsAccountAllUpdate>(&message) {
-                            let balances = account_balances_from_assets(&payload.assets);
-                            let positions = payload
-                                .positions
-                                .into_values()
-                                .flatten()
-                                .map(account_position_from_ws)
-                                .collect::<Vec<_>>();
-                            let registry = registry.read().await;
-                            let ts_init = clock.get_time_ns();
-                            emit_account_state_from_positions(
-                                &emitter, balances, &positions, account_id, &registry, ts_init,
-                            );
-                        }
-                    }
-                    "update/account_all_positions" | "subscribed/account_all_positions" => {
-                        if let Ok(payload) =
-                            serde_json::from_str::<WsAccountAllPositionsUpdate>(&message)
-                        {
-                            let positions = payload
-                                .positions
-                                .into_values()
-                                .flatten()
-                                .map(account_position_from_ws_with_discount)
-                                .collect::<Vec<_>>();
-                            let registry = registry.read().await;
-                            emit_position_reports(
-                                &emitter,
-                                &positions,
-                                account_id,
-                                &registry,
-                                clock.get_time_ns(),
-                            );
-                        }
-                    }
-                    "update/account_all_assets" | "subscribed/user_stats" | "update/user_stats" => {
-                        let now = Instant::now();
-                        if now < next_account_refresh {
-                            continue;
-                        }
-                        next_account_refresh = now + account_refresh_interval;
+                            "update/account_all_trades" | "subscribed/account_all_trades" => {
+                                if let Ok(payload) =
+                                    serde_json::from_str::<WsAccountAllTradesUpdate>(&message)
+                                {
+                                    let registry = registry.read().await;
+                                    for (market_id, trades) in payload.trades {
+                                        let Ok(market_id) = market_id.parse::<i64>() else {
+                                            continue;
+                                        };
+                                        let Some(meta) = registry.meta_for_market_id(market_id) else {
+                                            continue;
+                                        };
+                                        for trade in trades {
+                                            let ts_init = clock.get_time_ns();
+                                            if let Some(report) =
+                                                crate::common::fill_report_from_lighter_trade(
+                                                    &trade,
+                                                    account_index,
+                                                    account_id,
+                                                    &meta.instrument,
+                                                    ts_init,
+                                                    |value| {
+                                                        client_order_index_to_id
+                                                            .lock()
+                                                            .expect(MUTEX_POISONED)
+                                                            .get(&value)
+                                                            .copied()
+                                                    },
+                                                )
+                                            {
+                                                process_fill_report(
+                                                    &emitter,
+                                                    &tracked_orders,
+                                                    &venue_order_id_by_client_order_id,
+                                                    &processed_trade_ids,
+                                                    &processed_trade_queue,
+                                                    report,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            "update/account_all" | "subscribed/account_all" => {
+                                if let Ok(payload) =
+                                    serde_json::from_str::<WsAccountAllUpdate>(&message)
+                                {
+                                    let balances = account_balances_from_assets(&payload.assets);
+                                    let positions = payload
+                                        .positions
+                                        .into_values()
+                                        .flatten()
+                                        .map(account_position_from_ws)
+                                        .collect::<Vec<_>>();
+                                    let registry = registry.read().await;
+                                    let ts_init = clock.get_time_ns();
+                                    emit_account_state_from_positions(
+                                        &emitter, balances, &positions, account_id, &registry, ts_init,
+                                    );
+                                }
+                            }
+                            "update/account_all_positions" | "subscribed/account_all_positions" => {
+                                if let Ok(payload) =
+                                    serde_json::from_str::<WsAccountAllPositionsUpdate>(&message)
+                                {
+                                    let positions = payload
+                                        .positions
+                                        .into_values()
+                                        .flatten()
+                                        .map(account_position_from_ws_with_discount)
+                                        .collect::<Vec<_>>();
+                                    let registry = registry.read().await;
+                                    emit_position_reports(
+                                        &emitter,
+                                        &positions,
+                                        account_id,
+                                        &registry,
+                                        clock.get_time_ns(),
+                                    );
+                                }
+                            }
+                            "update/account_all_assets"
+                            | "subscribed/user_stats"
+                            | "update/user_stats" => {
+                                let now = Instant::now();
+                                if now < next_account_refresh {
+                                    continue;
+                                }
+                                next_account_refresh = now + account_refresh_interval;
 
-                        let Some((token, _)) = auth_token.lock().expect(MUTEX_POISONED).clone()
-                        else {
-                            continue;
-                        };
-                        if let Ok(response) = api.request_account(account_index, &token).await
-                            && let Some(account) = response.accounts.first()
-                        {
-                            let registry = registry.read().await;
-                            emit_account_state_from_detailed_account(
-                                &emitter,
-                                account,
-                                account_id,
-                                &registry,
-                                clock.get_time_ns(),
-                            );
+                                let token = match Self::ensure_auth_token_for(
+                                    &api,
+                                    &auth_token,
+                                    api_key_index,
+                                    default_auth_token_ttl_secs,
+                                    30,
+                                )
+                                .await
+                                {
+                                    Ok(token) => token,
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Lighter execution websocket account refresh auth failed: {error}"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                ws_client.set_auth_token(Some(token.clone())).await;
+
+                                if let Ok(response) = api.request_account(account_index, &token).await
+                                    && let Some(account) = response.accounts.first()
+                                {
+                                    let registry = registry.read().await;
+                                    emit_account_state_from_detailed_account(
+                                        &emitter,
+                                        account,
+                                        account_id,
+                                        &registry,
+                                        clock.get_time_ns(),
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
                 }
             }
         });

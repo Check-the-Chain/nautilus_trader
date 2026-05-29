@@ -13,88 +13,69 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Raw WebSocket transport for the Lighter adapter.
+//! Lighter WebSocket session backed by the Nautilus network WebSocket client.
 
 use std::{
     collections::HashMap,
     sync::{
         Arc, Once,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
+    time::Duration,
 };
 
-use futures_util::{SinkExt, StreamExt};
-#[cfg(feature = "latency-probe")]
-use nautilus_core::time::get_atomic_clock_realtime;
+use arc_swap::ArcSwap;
+use nautilus_network::{
+    mode::ConnectionMode,
+    websocket::{TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler},
+};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
-use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio_tungstenite::tungstenite::{
-    Error as TungsteniteError, Message, client::IntoClientRequest, http::HeaderValue,
-};
 
-use crate::error::{Result, SdkError};
+use crate::{
+    error::{Result, SdkError},
+    websocket::handler::{HandlerCommand, LighterWsFeedHandler, WsEvent, WsEventHandler},
+};
 
 static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
 
-type WsEventHandler = Box<dyn FnMut(WsEvent) + Send + 'static>;
+const WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const WS_RECONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WS_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const WS_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+const WS_RECONNECT_JITTER: Duration = Duration::from_millis(200);
 
-#[derive(Debug)]
-enum WsCommand {
-    Json {
-        value: serde_json::Value,
-        completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
-    },
-    Close,
-}
-
-#[derive(Debug)]
-pub(crate) struct WsEvent {
-    pub(crate) text: String,
-    #[cfg(feature = "latency-probe")]
-    pub(crate) received_ns: u64,
-}
-
-impl WsEvent {
-    fn new(text: String) -> Self {
-        Self {
-            text,
-            #[cfg(feature = "latency-probe")]
-            received_ns: get_atomic_clock_realtime().get_time_ns().as_u64(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct WsPingProbe<'a> {
-    #[serde(rename = "type", borrow)]
-    msg_type: &'a str,
-}
-
-/// Raw Lighter WebSocket client that forwards venue messages to Python without
-/// imposing Nautilus-specific parsing in Rust.
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.lighter", from_py_object)
 )]
 pub struct LighterWebSocketClient {
     url: String,
+    proxy_url: Option<String>,
+    transport_backend: TransportBackend,
     default_auth_token: Arc<Mutex<Option<String>>>,
     subscriptions: Arc<Mutex<HashMap<String, Option<String>>>>,
-    command_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WsCommand>>>>,
+    command_tx: Arc<Mutex<Option<mpsc::UnboundedSender<HandlerCommand>>>>,
     event_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<WsEvent>>>>,
-    is_active: Arc<AtomicBool>,
+    connection_mode: Arc<ArcSwap<AtomicU8>>,
+    task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    keepalive_interval: Duration,
 }
 
 impl Clone for LighterWebSocketClient {
     fn clone(&self) -> Self {
         Self {
             url: self.url.clone(),
+            proxy_url: self.proxy_url.clone(),
+            transport_backend: self.transport_backend,
             default_auth_token: Arc::clone(&self.default_auth_token),
             subscriptions: Arc::clone(&self.subscriptions),
             command_tx: Arc::clone(&self.command_tx),
             event_rx: Arc::clone(&self.event_rx),
-            is_active: Arc::clone(&self.is_active),
+            connection_mode: Arc::clone(&self.connection_mode),
+            task_handle: Arc::clone(&self.task_handle),
+            keepalive_interval: self.keepalive_interval,
         }
     }
 }
@@ -103,6 +84,7 @@ impl std::fmt::Debug for LighterWebSocketClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LighterWebSocketClient")
             .field("url", &self.url)
+            .field("proxy_url", &self.proxy_url)
             .field("is_active", &self.is_active())
             .finish()
     }
@@ -113,12 +95,36 @@ impl LighterWebSocketClient {
     pub fn new(url: String, auth_token: Option<String>) -> Self {
         Self {
             url,
+            proxy_url: None,
+            transport_backend: TransportBackend::default(),
             default_auth_token: Arc::new(Mutex::new(auth_token)),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             command_tx: Arc::new(Mutex::new(None)),
             event_rx: Arc::new(Mutex::new(None)),
-            is_active: Arc::new(AtomicBool::new(false)),
+            connection_mode: Arc::new(ArcSwap::new(Arc::new(AtomicU8::new(
+                ConnectionMode::Closed.as_u8(),
+            )))),
+            task_handle: Arc::new(Mutex::new(None)),
+            keepalive_interval: WS_KEEPALIVE_INTERVAL,
         }
+    }
+
+    #[must_use]
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
+    #[must_use]
+    pub fn with_transport_backend(mut self, transport_backend: TransportBackend) -> Self {
+        self.transport_backend = transport_backend;
+        self
+    }
+
+    #[must_use]
+    pub fn with_keepalive_interval(mut self, keepalive_interval: Duration) -> Self {
+        self.keepalive_interval = keepalive_interval.max(Duration::from_millis(1));
+        self
     }
 
     #[must_use]
@@ -128,7 +134,7 @@ impl LighterWebSocketClient {
 
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.is_active.load(Ordering::SeqCst)
+        ConnectionMode::from_u8(self.connection_mode.load().load(Ordering::Relaxed)).is_active()
     }
 
     pub async fn set_auth_token(&self, token: Option<String>) {
@@ -147,19 +153,14 @@ impl LighterWebSocketClient {
         self.connect_inner(Some(Box::new(handler))).await
     }
 
-    async fn connect_inner(&self, mut event_handler: Option<WsEventHandler>) -> Result<()> {
+    async fn connect_inner(&self, event_handler: Option<WsEventHandler>) -> Result<()> {
         if self.is_active() {
             return Ok(());
         }
 
         install_crypto_provider();
-        let request = websocket_request(&self.url)?;
-        let (stream, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(websocket_connect_error)?;
-        let (mut write, mut read) = stream.split();
 
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<WsCommand>();
+        let (command_tx, command_rx) = mpsc::unbounded_channel::<HandlerCommand>();
         let (event_tx, event_rx) = if event_handler.is_none() {
             let (tx, rx) = mpsc::unbounded_channel::<WsEvent>();
             (Some(tx), Some(rx))
@@ -176,103 +177,105 @@ impl LighterWebSocketClient {
             *rx_guard = event_rx;
         }
 
-        self.is_active.store(true, Ordering::SeqCst);
-
-        let is_active_writer = Arc::clone(&self.is_active);
-        tokio::spawn(async move {
-            while let Some(command) = command_rx.recv().await {
-                let result = match command {
-                    WsCommand::Json { value, completion } => {
-                        let result = write.send(Message::Text(value.to_string().into())).await;
-                        if let Some(completion) = completion {
-                            let completion_result = match &result {
-                                Ok(()) => Ok(()),
-                                Err(error) => Err(error.to_string()),
-                            };
-                            let _ = completion.send(completion_result);
-                        }
-                        result
-                    }
-                    WsCommand::Close => {
-                        let _ = write.close().await;
-                        break;
-                    }
-                };
-
-                if result.is_err() {
-                    break;
-                }
-            }
-
-            is_active_writer.store(false, Ordering::SeqCst);
+        let (message_handler, raw_rx) = channel_message_handler();
+        let ping_tx = command_tx.clone();
+        let ping_handler = Arc::new(move |payload: Vec<u8>| {
+            let _ = ping_tx.send(HandlerCommand::SendPong(payload));
         });
 
-        let is_active_reader = Arc::clone(&self.is_active);
-        let command_tx_reader = command_tx.clone();
-        tokio::spawn(async move {
-            while let Some(message) = read.next().await {
-                let Ok(message) = message else {
-                    break;
-                };
+        let cfg = WebSocketConfig {
+            url: self.url.clone(),
+            headers: websocket_headers(&self.url),
+            heartbeat: Some(self.keepalive_interval.as_secs().max(1)),
+            heartbeat_msg: None,
+            reconnect_timeout_ms: Some(WS_RECONNECT_TIMEOUT.as_millis() as u64),
+            reconnect_delay_initial_ms: Some(WS_RECONNECT_INITIAL_DELAY.as_millis() as u64),
+            reconnect_delay_max_ms: Some(WS_RECONNECT_MAX_DELAY.as_millis() as u64),
+            reconnect_backoff_factor: Some(2.0),
+            reconnect_jitter_ms: Some(WS_RECONNECT_JITTER.as_millis() as u64),
+            reconnect_max_attempts: None,
+            idle_timeout_ms: Some(
+                self.keepalive_interval
+                    .saturating_mul(3)
+                    .max(WS_IDLE_TIMEOUT)
+                    .as_millis() as u64,
+            ),
+            backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
+        };
+        let client = WebSocketClient::connect(
+            cfg,
+            Some(message_handler),
+            Some(ping_handler),
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .map_err(|error| SdkError::Other(format!("WebSocket connect failed: {error}")))?;
+        self.connection_mode.store(client.connection_mode_atomic());
 
-                match message {
-                    Message::Text(text) => {
-                        let text_string = text.to_string();
-                        if is_ping_message(&text_string) {
-                            let _ = command_tx_reader.send(WsCommand::Json {
-                                value: serde_json::json!({"type": "pong"}),
-                                completion: None,
-                            });
-                        }
-                        dispatch_event(&mut event_handler, &event_tx, text_string);
-                    }
-                    Message::Binary(bytes) => {
-                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                            dispatch_event(&mut event_handler, &event_tx, text);
-                        }
-                    }
-                    Message::Close(_) => break,
-                    _ => {}
-                }
-            }
+        let client = Arc::new(client);
+        command_tx
+            .send(HandlerCommand::SetClient(client))
+            .map_err(|e| SdkError::Other(format!("Failed to initialize WebSocket handler: {e}")))?;
 
-            is_active_reader.store(false, Ordering::SeqCst);
+        let connection_mode = Arc::clone(&self.connection_mode);
+        let mut handler = LighterWsFeedHandler::new(
+            command_rx,
+            raw_rx,
+            Arc::clone(&self.default_auth_token),
+            Arc::clone(&self.subscriptions),
+            event_handler,
+            event_tx,
+        );
+        let handle = tokio::spawn(async move {
+            handler.run().await;
+            connection_mode.store(Arc::new(AtomicU8::new(ConnectionMode::Closed.as_u8())));
         });
+        *self.task_handle.lock().await = Some(handle);
 
-        let initial_subscriptions = self.subscriptions.lock().await.clone();
-        for (channel, auth) in initial_subscriptions {
-            let _ = command_tx.send(WsCommand::Json {
-                value: subscription_message(&channel, auth),
-                completion: None,
-            });
-        }
-
+        let _ = command_tx.send(HandlerCommand::ReplaySubscriptions);
         Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
-        if let Some(tx) = self.command_tx.lock().await.as_ref() {
-            let _ = tx.send(WsCommand::Close);
+        if let Some(tx) = self.command_tx.lock().await.as_ref().cloned() {
+            let _ = tx.send(HandlerCommand::Disconnect);
         }
-        self.is_active.store(false, Ordering::SeqCst);
+
+        if let Some(handle) = self.task_handle.lock().await.take() {
+            let abort_handle = handle.abort_handle();
+            tokio::select! {
+                result = handle => {
+                    if let Err(error) = result
+                        && !error.is_cancelled()
+                    {
+                        log::warn!("Lighter websocket handler task failed: {error}");
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_secs(2)) => {
+                    abort_handle.abort();
+                }
+            }
+        }
+
+        *self.command_tx.lock().await = None;
+        self.connection_mode
+            .store(Arc::new(AtomicU8::new(ConnectionMode::Closed.as_u8())));
         Ok(())
     }
 
     pub async fn subscribe(&self, channel: String, auth_token: Option<String>) -> Result<()> {
-        let resolved_auth = match auth_token {
-            Some(token) => Some(token),
-            None => self.default_auth_token.lock().await.clone(),
-        };
-
         self.subscriptions
             .lock()
             .await
-            .insert(channel.clone(), resolved_auth.clone());
+            .insert(channel.clone(), auth_token.clone());
 
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
-            tx.send(WsCommand::Json {
-                value: subscription_message(&channel, resolved_auth),
-                completion: None,
+            tx.send(HandlerCommand::Subscribe {
+                channel,
+                auth_token,
             })
             .map_err(|e| SdkError::Other(format!("Failed to send subscribe command: {e}")))?;
         }
@@ -284,14 +287,8 @@ impl LighterWebSocketClient {
         self.subscriptions.lock().await.remove(&channel);
 
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
-            tx.send(WsCommand::Json {
-                value: serde_json::json!({
-                    "type": "unsubscribe",
-                    "channel": channel,
-                }),
-                completion: None,
-            })
-            .map_err(|e| SdkError::Other(format!("Failed to send unsubscribe command: {e}")))?;
+            tx.send(HandlerCommand::Unsubscribe { channel })
+                .map_err(|e| SdkError::Other(format!("Failed to send unsubscribe command: {e}")))?;
         }
 
         Ok(())
@@ -303,8 +300,8 @@ impl LighterWebSocketClient {
         };
 
         let (completion_tx, completion_rx) = oneshot::channel();
-        tx.send(WsCommand::Json {
-            value,
+        tx.send(HandlerCommand::SendText {
+            text: value.to_string(),
             completion: Some(completion_tx),
         })
         .map_err(|e| SdkError::Other(format!("Failed to send WebSocket command: {e}")))?;
@@ -328,19 +325,6 @@ impl LighterWebSocketClient {
     }
 }
 
-fn dispatch_event(
-    event_handler: &mut Option<WsEventHandler>,
-    event_tx: &Option<mpsc::UnboundedSender<WsEvent>>,
-    text: String,
-) {
-    let event = WsEvent::new(text);
-    if let Some(handler) = event_handler.as_mut() {
-        handler(event);
-    } else if let Some(event_tx) = event_tx {
-        let _ = event_tx.send(event);
-    }
-}
-
 fn install_crypto_provider() {
     INSTALL_CRYPTO_PROVIDER.call_once(|| {
         if CryptoProvider::get_default().is_none() {
@@ -349,25 +333,10 @@ fn install_crypto_provider() {
     });
 }
 
-fn is_ping_message(text: &str) -> bool {
-    text.contains("ping")
-        && serde_json::from_str::<WsPingProbe<'_>>(text)
-            .is_ok_and(|message| message.msg_type == "ping")
-}
-
-fn websocket_request(
-    url: &str,
-) -> std::result::Result<
-    tokio_tungstenite::tungstenite::handshake::client::Request,
-    tokio_tungstenite::tungstenite::Error,
-> {
-    let mut request = url.into_client_request()?;
-    if let Some(origin) = origin_for_ws_url(url)
-        && let Ok(header) = HeaderValue::from_str(&origin)
-    {
-        request.headers_mut().insert("Origin", header);
-    }
-    Ok(request)
+fn websocket_headers(url: &str) -> Vec<(String, String)> {
+    origin_for_ws_url(url)
+        .map(|origin| vec![("Origin".to_string(), origin)])
+        .unwrap_or_default()
 }
 
 fn origin_for_ws_url(url: &str) -> Option<String> {
@@ -384,32 +353,4 @@ fn origin_for_ws_url(url: &str) -> Option<String> {
         .next()
         .filter(|authority| !authority.is_empty())?;
     Some(format!("{origin_scheme}://{authority}"))
-}
-
-fn websocket_connect_error(error: TungsteniteError) -> SdkError {
-    match error {
-        TungsteniteError::Http(response) => {
-            let status = response.status();
-            let body = response
-                .body()
-                .as_ref()
-                .map(|body| String::from_utf8_lossy(body).into_owned())
-                .unwrap_or_default();
-            SdkError::Other(format!("WebSocket HTTP error {status}: {body}"))
-        }
-        other => SdkError::from(other),
-    }
-}
-
-fn subscription_message(channel: &str, auth_token: Option<String>) -> serde_json::Value {
-    let mut message = serde_json::json!({
-        "type": "subscribe",
-        "channel": channel,
-    });
-
-    if let Some(token) = auth_token {
-        message["auth"] = serde_json::Value::String(token);
-    }
-
-    message
 }

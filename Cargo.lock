@@ -6074,6 +6074,7 @@ version = "0.56.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "blake2",
@@ -6085,6 +6086,7 @@ dependencies = [
  "nautilus-core",
  "nautilus-live",
  "nautilus-model",
+ "nautilus-network",
  "nautilus-system",
  "nautilus-testkit",
  "nautilus-trading",

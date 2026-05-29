@@ -14,7 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -47,8 +47,7 @@ use nautilus_model::{
     identifiers::{ClientId, Venue},
     orderbook::OrderBook,
 };
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use nautilus_network::websocket::SubscriptionState;
 
 use crate::{
     common::{
@@ -77,11 +76,9 @@ pub struct LighterDataClient {
     http_client: LighterHttpClient,
     ws_client: LighterWebSocketClient,
     is_connected: AtomicBool,
-    cancellation_token: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     registry: Arc<tokio::sync::RwLock<LighterInstrumentRegistry>>,
-    market_stats_refcount: usize,
+    subscription_state: SubscriptionState,
     clock: &'static nautilus_core::time::AtomicTime,
 }
 
@@ -97,22 +94,47 @@ impl LighterDataClient {
         runtime_config = runtime_config.with_timeout_secs(config.http_timeout_secs);
 
         let http_client = LighterHttpClient::new_public(runtime_config)?;
-        let ws_client = LighterWebSocketClient::new(config.ws_url(), None);
+        let ws_client = LighterWebSocketClient::new(config.ws_url(), None)
+            .with_proxy_url(config.proxy_url.clone());
 
         Ok(Self {
             client_id,
             http_client,
             ws_client,
             is_connected: AtomicBool::new(false),
-            cancellation_token: CancellationToken::new(),
-            tasks: Vec::new(),
             data_sender: get_data_event_sender(),
             registry: Arc::new(tokio::sync::RwLock::new(
                 LighterInstrumentRegistry::default(),
             )),
-            market_stats_refcount: 0,
+            subscription_state: SubscriptionState::new('/'),
             clock: get_atomic_clock_realtime(),
         })
+    }
+
+    fn subscribe_topic(&self, topic: String) {
+        if !self.subscription_state.add_reference(&topic) {
+            return;
+        }
+        self.subscription_state.mark_subscribe(&topic);
+        let ws = self.ws_client.clone();
+        get_runtime().spawn(async move {
+            if let Err(error) = ws.subscribe(topic.clone(), None).await {
+                log::error!("Failed to subscribe to Lighter websocket topic {topic}: {error}");
+            }
+        });
+    }
+
+    fn unsubscribe_topic(&self, topic: String) {
+        if !self.subscription_state.remove_reference(&topic) {
+            return;
+        }
+        self.subscription_state.mark_unsubscribe(&topic);
+        let ws = self.ws_client.clone();
+        get_runtime().spawn(async move {
+            if let Err(error) = ws.unsubscribe(topic.clone()).await {
+                log::error!("Failed to unsubscribe from Lighter websocket topic {topic}: {error}");
+            }
+        });
     }
 
     async fn bootstrap_instruments(
@@ -126,35 +148,33 @@ impl LighterDataClient {
         Ok(instruments)
     }
 
-    async fn spawn_ws_loop(&self) -> anyhow::Result<()> {
-        let ws_client = self.ws_client.clone();
-        let cancellation_token = self.cancellation_token.clone();
+    async fn connect_ws(&self) -> anyhow::Result<()> {
         let sender = self.data_sender.clone();
-        let registry = self.registry.read().await.clone();
+        let registry_snapshot = self.registry.read().await.clone();
         let clock = self.clock;
-        let mut book_offsets = AHashMap::new();
+        let book_offsets = Arc::new(StdMutex::new(AHashMap::new()));
 
-        ws_client
-            .connect_with_event_handler(move |event| {
-                if cancellation_token.is_cancelled() {
-                    return;
-                }
+        self.ws_client
+            .connect_with_event_handler({
+                let book_offsets = Arc::clone(&book_offsets);
+                move |event| {
+                    let mut book_offsets = book_offsets.lock().expect("book offsets lock poisoned");
 
-                if let Err(error) = handle_ws_message(
-                    &event.text,
-                    &sender,
-                    &registry,
-                    &mut book_offsets,
-                    clock,
-                    #[cfg(feature = "latency-probe")]
-                    event.received_ns,
-                ) {
-                    log::warn!("Failed to handle Lighter websocket message: {error}");
+                    if let Err(error) = handle_ws_message(
+                        &event.text,
+                        &sender,
+                        &registry_snapshot,
+                        &mut book_offsets,
+                        clock,
+                        #[cfg(feature = "latency-probe")]
+                        event.received_ns,
+                    ) {
+                        log::warn!("Failed to handle Lighter websocket message: {error}");
+                    }
                 }
             })
             .await
-            .context("failed to connect Lighter websocket")?;
-        Ok(())
+            .context("failed to connect Lighter websocket")
     }
 
     fn send_response(&self, response: DataResponse) {
@@ -179,17 +199,19 @@ impl DataClient for LighterDataClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        self.cancellation_token.cancel();
         self.is_connected.store(false, Ordering::Release);
+        let ws_client = self.ws_client.clone();
+        get_runtime().spawn(async move {
+            if let Err(error) = ws_client.close().await {
+                log::warn!("Failed to close Lighter websocket on stop: {error}");
+            }
+        });
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
         self.is_connected.store(false, Ordering::Release);
-        self.cancellation_token = CancellationToken::new();
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
+        self.subscription_state.clear();
         self.registry
             .try_write()
             .expect("instrument registry lock poisoned")
@@ -221,7 +243,7 @@ impl DataClient for LighterDataClient {
             }
         }
 
-        self.spawn_ws_loop().await?;
+        self.connect_ws().await?;
         self.is_connected.store(true, Ordering::Release);
         Ok(())
     }
@@ -231,10 +253,6 @@ impl DataClient for LighterDataClient {
             return Ok(());
         }
 
-        self.cancellation_token.cancel();
-        for task in self.tasks.drain(..) {
-            let _ = task.await;
-        }
         self.ws_client.close().await?;
         self.reset()?;
         self.is_connected.store(false, Ordering::Release);
@@ -556,15 +574,7 @@ impl DataClient for LighterDataClient {
                 )
             })?;
         log::info!("Subscribing to Lighter account positions for account {account_index}");
-        let ws = self.ws_client.clone();
-        get_runtime().spawn(async move {
-            if let Err(error) = ws.subscribe(account_positions_channel(account_index), None).await
-            {
-                log::error!(
-                    "Failed to subscribe to Lighter account positions for account {account_index}: {error}"
-                );
-            }
-        });
+        self.subscribe_topic(account_positions_channel(account_index));
         Ok(())
     }
 
@@ -576,15 +586,7 @@ impl DataClient for LighterDataClient {
             .or_else(|| account_index_from_params(subscription.params.as_ref()))
         {
             log::info!("Unsubscribing from Lighter account positions for account {account_index}");
-            let ws = self.ws_client.clone();
-            get_runtime().spawn(async move {
-                if let Err(error) = ws.unsubscribe(account_positions_channel(account_index)).await
-                {
-                    log::error!(
-                        "Failed to unsubscribe from Lighter account positions for account {account_index}: {error}"
-                    );
-                }
-            });
+            self.unsubscribe_topic(account_positions_channel(account_index));
         }
         Ok(())
     }
@@ -600,12 +602,7 @@ impl DataClient for LighterDataClient {
             .meta_for_instrument_id(&subscription.instrument_id)
             .cloned()
         {
-            let ws = self.ws_client.clone();
-            get_runtime().spawn(async move {
-                let _ = ws
-                    .subscribe(format!("order_book/{}", meta.market_id), None)
-                    .await;
-            });
+            self.subscribe_topic(format!("order_book/{}", meta.market_id));
         }
         Ok(())
     }
@@ -621,12 +618,7 @@ impl DataClient for LighterDataClient {
             .meta_for_instrument_id(&subscription.instrument_id)
             .cloned()
         {
-            let ws = self.ws_client.clone();
-            get_runtime().spawn(async move {
-                let _ = ws
-                    .unsubscribe(format!("order_book/{}", meta.market_id))
-                    .await;
-            });
+            self.unsubscribe_topic(format!("order_book/{}", meta.market_id));
         }
         Ok(())
     }
@@ -639,12 +631,7 @@ impl DataClient for LighterDataClient {
             .meta_for_instrument_id(&subscription.instrument_id)
             .cloned()
         {
-            let ws = self.ws_client.clone();
-            get_runtime().spawn(async move {
-                let _ = ws
-                    .subscribe(format!("ticker/{}", meta.market_id), None)
-                    .await;
-            });
+            self.subscribe_topic(format!("ticker/{}", meta.market_id));
         }
         Ok(())
     }
@@ -657,10 +644,7 @@ impl DataClient for LighterDataClient {
             .meta_for_instrument_id(&subscription.instrument_id)
             .cloned()
         {
-            let ws = self.ws_client.clone();
-            get_runtime().spawn(async move {
-                let _ = ws.unsubscribe(format!("ticker/{}", meta.market_id)).await;
-            });
+            self.unsubscribe_topic(format!("ticker/{}", meta.market_id));
         }
         Ok(())
     }
@@ -673,12 +657,7 @@ impl DataClient for LighterDataClient {
             .meta_for_instrument_id(&subscription.instrument_id)
             .cloned()
         {
-            let ws = self.ws_client.clone();
-            get_runtime().spawn(async move {
-                let _ = ws
-                    .subscribe(format!("trade/{}", meta.market_id), None)
-                    .await;
-            });
+            self.subscribe_topic(format!("trade/{}", meta.market_id));
         }
         Ok(())
     }
@@ -691,10 +670,7 @@ impl DataClient for LighterDataClient {
             .meta_for_instrument_id(&subscription.instrument_id)
             .cloned()
         {
-            let ws = self.ws_client.clone();
-            get_runtime().spawn(async move {
-                let _ = ws.unsubscribe(format!("trade/{}", meta.market_id)).await;
-            });
+            self.unsubscribe_topic(format!("trade/{}", meta.market_id));
         }
         Ok(())
     }
@@ -707,13 +683,7 @@ impl DataClient for LighterDataClient {
             .meta_for_instrument_id(&subscription.instrument_id)
             .is_some_and(|meta| meta.market_type.is_perp())
         {
-            self.market_stats_refcount += 1;
-            if self.market_stats_refcount == 1 {
-                let ws = self.ws_client.clone();
-                get_runtime().spawn(async move {
-                    let _ = ws.subscribe("market_stats/all".to_string(), None).await;
-                });
-            }
+            self.subscribe_topic("market_stats/all".to_string());
         }
         Ok(())
     }
@@ -728,15 +698,8 @@ impl DataClient for LighterDataClient {
             .expect("instrument registry lock poisoned")
             .meta_for_instrument_id(&subscription.instrument_id)
             .is_some_and(|meta| meta.market_type.is_perp())
-            && self.market_stats_refcount > 0
         {
-            self.market_stats_refcount -= 1;
-            if self.market_stats_refcount == 0 {
-                let ws = self.ws_client.clone();
-                get_runtime().spawn(async move {
-                    let _ = ws.unsubscribe("market_stats/all".to_string()).await;
-                });
-            }
+            self.unsubscribe_topic("market_stats/all".to_string());
         }
         Ok(())
     }

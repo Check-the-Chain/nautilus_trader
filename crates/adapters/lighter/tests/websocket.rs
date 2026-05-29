@@ -32,7 +32,7 @@ use axum::{
     response::Response,
     routing::get,
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use nautilus_lighter::websocket::client::LighterWebSocketClient;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
@@ -44,6 +44,8 @@ struct TestWsState {
     origins: Arc<Mutex<Vec<String>>>,
     send_initial_ping: Arc<AtomicBool>,
     received_pong: Arc<AtomicBool>,
+    received_protocol_ping_count: Arc<AtomicUsize>,
+    close_after_next_subscribe: Arc<AtomicBool>,
 }
 
 async fn spawn_server(router: Router) -> SocketAddr {
@@ -77,26 +79,41 @@ async fn handle_socket(mut socket: WebSocket, state: TestWsState) {
 
     while let Some(message) = socket.next().await {
         let Ok(message) = message else { break };
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let payload: Value = serde_json::from_str(&text).unwrap();
-        state.received.lock().await.push(payload.clone());
+        match message {
+            Message::Text(text) => {
+                let payload: Value = serde_json::from_str(&text).unwrap();
+                state.received.lock().await.push(payload.clone());
 
-        if payload.get("type").and_then(Value::as_str) == Some("pong") {
-            state.received_pong.store(true, Ordering::Relaxed);
-            continue;
-        }
+                if payload.get("type").and_then(Value::as_str) == Some("pong") {
+                    state.received_pong.store(true, Ordering::Relaxed);
+                    continue;
+                }
 
-        if payload.get("type").and_then(Value::as_str) == Some("subscribe") {
-            let channel = payload.get("channel").and_then(Value::as_str).unwrap();
-            let _ = socket
-                .send(Message::Text(
-                    json!({"type": "ack", "channel": channel})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
+                if payload.get("type").and_then(Value::as_str) == Some("subscribe") {
+                    let channel = payload.get("channel").and_then(Value::as_str).unwrap();
+                    let _ = socket
+                        .send(Message::Text(
+                            json!({"type": "ack", "channel": channel})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await;
+                    if state
+                        .close_after_next_subscribe
+                        .swap(false, Ordering::Relaxed)
+                    {
+                        let _ = socket.close().await;
+                        break;
+                    }
+                }
+            }
+            Message::Ping(payload) => {
+                state
+                    .received_protocol_ping_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = socket.send(Message::Pong(payload)).await;
+            }
+            _ => {}
         }
     }
 }
@@ -127,6 +144,45 @@ async fn wait_for_received_len(state: &TestWsState, expected: usize) {
     timeout(Duration::from_secs(3), async {
         loop {
             if state.received.lock().await.len() >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_for_received<F>(state: &TestWsState, predicate: F)
+where
+    F: Fn(&Value) -> bool,
+{
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if state.received.lock().await.iter().any(&predicate) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_for_received_count<F>(state: &TestWsState, expected: usize, predicate: F)
+where
+    F: Fn(&Value) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let matching = state
+                .received
+                .lock()
+                .await
+                .iter()
+                .filter(|v| predicate(v))
+                .count();
+            if matching >= expected {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -215,6 +271,28 @@ async fn test_client_replies_to_ping_messages() {
 }
 
 #[tokio::test]
+async fn test_client_sends_protocol_ping_keepalive() {
+    let state = TestWsState::default();
+    let addr = spawn_server(build_router(state.clone())).await;
+    let client = LighterWebSocketClient::new(format!("ws://{addr}/stream"), None)
+        .with_keepalive_interval(Duration::from_millis(20));
+
+    client.connect().await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if state.received_protocol_ping_count.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_unsubscribe_sends_command() {
     let state = TestWsState::default();
     let addr = spawn_server(build_router(state.clone())).await;
@@ -228,13 +306,77 @@ async fn test_unsubscribe_sends_command() {
         .unwrap();
     client.unsubscribe("trade/1".to_string()).await.unwrap();
 
-    wait_for_received_len(&state, 2).await;
+    wait_for_received(&state, |payload| {
+        payload["type"] == "unsubscribe" && payload["channel"] == "trade/1"
+    })
+    .await;
     let received = state.received.lock().await.clone();
     assert!(
         received
             .iter()
             .any(|payload| { payload["type"] == "unsubscribe" && payload["channel"] == "trade/1" })
     );
+
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_subscription_replayed_after_reconnect() {
+    let state = TestWsState::default();
+    state
+        .close_after_next_subscribe
+        .store(true, Ordering::Relaxed);
+
+    let addr = spawn_server(build_router(state.clone())).await;
+    let client = LighterWebSocketClient::new(format!("ws://{addr}/stream"), None);
+
+    client.connect().await.unwrap();
+    client.subscribe("trade/1".to_string(), None).await.unwrap();
+
+    wait_for(|| state.connection_count.load(Ordering::Relaxed) >= 2).await;
+    wait_for_received_count(&state, 2, |payload| {
+        payload["type"] == "subscribe" && payload["channel"] == "trade/1"
+    })
+    .await;
+
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_subscription_replay_uses_refreshed_default_auth() {
+    let state = TestWsState::default();
+    let addr = spawn_server(build_router(state.clone())).await;
+    let client =
+        LighterWebSocketClient::new(format!("ws://{addr}/stream"), Some("old-auth".to_string()));
+
+    client.connect().await.unwrap();
+    client
+        .subscribe("account_all/7".to_string(), None)
+        .await
+        .unwrap();
+    wait_for_received(&state, |payload| {
+        payload["type"] == "subscribe"
+            && payload["channel"] == "account_all/7"
+            && payload["auth"] == "old-auth"
+    })
+    .await;
+
+    client.set_auth_token(Some("new-auth".to_string())).await;
+    state
+        .close_after_next_subscribe
+        .store(true, Ordering::Relaxed);
+    client
+        .subscribe("account_all_orders/7".to_string(), None)
+        .await
+        .unwrap();
+
+    wait_for(|| state.connection_count.load(Ordering::Relaxed) >= 2).await;
+    wait_for_received(&state, |payload| {
+        payload["type"] == "subscribe"
+            && payload["channel"] == "account_all/7"
+            && payload["auth"] == "new-auth"
+    })
+    .await;
 
     client.close().await.unwrap();
 }
