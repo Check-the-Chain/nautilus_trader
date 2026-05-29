@@ -1299,9 +1299,8 @@ impl LighterExecutionClient {
                         };
                         match header.msg_type.as_str() {
                             "update/account_all_orders" | "subscribed/account_all_orders" => {
-                                if let Ok(payload) =
-                                    serde_json::from_str::<WsAccountAllOrdersUpdate>(&message)
-                                {
+                                match serde_json::from_str::<WsAccountAllOrdersUpdate>(&message) {
+                                    Ok(payload) => {
                                     let registry = registry.read().await;
                                     for (market_id, orders) in payload.orders {
                                         let Ok(market_id) = market_id.parse::<i64>() else {
@@ -1335,12 +1334,17 @@ impl LighterExecutionClient {
                                             );
                                         }
                                     }
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Failed to parse Lighter account_all_orders websocket message: {error}"
+                                        );
+                                    }
                                 }
                             }
                             "update/account_all_trades" | "subscribed/account_all_trades" => {
-                                if let Ok(payload) =
-                                    serde_json::from_str::<WsAccountAllTradesUpdate>(&message)
-                                {
+                                match serde_json::from_str::<WsAccountAllTradesUpdate>(&message) {
+                                    Ok(payload) => {
                                     let registry = registry.read().await;
                                     for (market_id, trades) in payload.trades {
                                         let Ok(market_id) = market_id.parse::<i64>() else {
@@ -1377,6 +1381,12 @@ impl LighterExecutionClient {
                                                 );
                                             }
                                         }
+                                    }
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Failed to parse Lighter account_all_trades websocket message: {error}"
+                                        );
                                     }
                                 }
                             }

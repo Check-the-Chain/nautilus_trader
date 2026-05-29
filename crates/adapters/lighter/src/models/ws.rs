@@ -485,9 +485,13 @@ pub struct WsAccountAllTradesUpdate {
     pub msg_type: String,
     pub channel: String,
     pub trades: HashMap<String, Vec<Trade>>,
+    #[serde(default)]
     pub total_volume: f64,
+    #[serde(default)]
     pub monthly_volume: f64,
+    #[serde(default)]
     pub weekly_volume: f64,
+    #[serde(default)]
     pub daily_volume: f64,
 }
 
@@ -834,6 +838,19 @@ mod tests {
         let msg: WsAccountAllTradesUpdate = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.msg_type, "update/account_all_trades");
         assert_eq!(msg.daily_volume, 5000.0);
+    }
+
+    #[test]
+    fn parses_account_all_trades_update_without_volume_counters() {
+        let raw = r#"{
+            "type":"update/account_all_trades",
+            "channel":"account_all_trades/54255",
+            "trades":{}
+        }"#;
+
+        let msg: WsAccountAllTradesUpdate = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.msg_type, "update/account_all_trades");
+        assert_eq!(msg.total_volume, 0.0);
     }
 
     #[test]

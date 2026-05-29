@@ -873,6 +873,9 @@ pub fn order_report_from_lighter(
     let client_order_id = if order.client_order_index != 0 {
         resolver(order.client_order_index)
             .or_else(|| Some(ClientOrderId::from(order.client_order_index.to_string())))
+    } else if let Ok(client_order_index) = order.client_order_id.parse::<i64>() {
+        resolver(client_order_index)
+            .or_else(|| Some(ClientOrderId::from(order.client_order_id.as_str())))
     } else if !order.client_order_id.is_empty() {
         Some(ClientOrderId::from(order.client_order_id.as_str()))
     } else {
@@ -960,9 +963,15 @@ pub fn fill_report_from_lighter_trade(
     ts_init: UnixNanos,
     resolver: impl Fn(i64) -> Option<ClientOrderId>,
 ) -> Option<FillReport> {
+    let ask_client_order_id = trade.ask_client_id.and_then(&resolver);
+    let bid_client_order_id = trade.bid_client_id.and_then(&resolver);
     let is_ask = if trade.ask_account_id == account_index {
         true
     } else if trade.bid_account_id == account_index {
+        false
+    } else if ask_client_order_id.is_some() {
+        true
+    } else if bid_client_order_id.is_some() {
         false
     } else {
         return None;
@@ -981,9 +990,9 @@ pub fn fill_report_from_lighter_trade(
         / LIGHTER_FEE_SCALE as f64;
 
     let client_order_id = if is_ask {
-        trade.ask_client_id.and_then(&resolver)
+        ask_client_order_id
     } else {
-        trade.bid_client_id.and_then(&resolver)
+        bid_client_order_id
     };
     let venue_order_id = if is_ask {
         VenueOrderId::from(trade.ask_id.to_string())
@@ -1314,6 +1323,7 @@ mod tests {
     use ahash::AHashMap;
     use nautilus_core::UnixNanos;
     use nautilus_model::{
+        identifiers::AccountId,
         instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
         types::{Currency, Price, Quantity},
     };
@@ -1322,13 +1332,14 @@ mod tests {
     use super::{
         LIGHTER_SETTLEMENT_CURRENCY, LighterMarketMarginMode, LighterMarketStatUpdate,
         LighterMarketType, account_balances_from_assets, channel_market_id,
-        funding_rate_update_from_history, funding_rate_updates_from_history,
-        instrument_meta_from_perp_detail, lighter_client_order_index, market_stats_to_updates,
+        fill_report_from_lighter_trade, funding_rate_update_from_history,
+        funding_rate_updates_from_history, instrument_meta_from_perp_detail,
+        lighter_client_order_index, market_stats_to_updates, order_report_from_lighter,
         quote_tick_from_ticker, resolve_symbol_metadata,
     };
     use crate::models::{
-        asset::Asset, funding::FundingRate, market::PerpsMarketStats,
-        order_book::PerpsOrderBookDetail, ws::WsTickerData, ws::WsTickerLevel,
+        asset::Asset, funding::FundingRate, market::PerpsMarketStats, order::Order,
+        order_book::PerpsOrderBookDetail, trade::Trade, ws::WsTickerData, ws::WsTickerLevel,
     };
     use nautilus_model::identifiers::ClientOrderId;
 
@@ -1602,6 +1613,110 @@ mod tests {
             lighter_client_order_index(&ClientOrderId::from("O-MAKER-202")),
             274_836_310_172_150
         );
+    }
+
+    #[test]
+    fn order_report_resolves_numeric_client_order_id_string() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let client_order_id = ClientOrderId::from("O-20260529-123418-001-001-375");
+        let client_order_index = lighter_client_order_index(&client_order_id);
+        let order = Order {
+            order_index: 12_345,
+            client_order_index: 0,
+            order_id: "12345".to_string(),
+            client_order_id: client_order_index.to_string(),
+            market_index: 0,
+            owner_account_index: 713_543,
+            initial_base_amount: "0.01".to_string(),
+            price: "1000".to_string(),
+            nonce: 0,
+            remaining_base_amount: "0.01".to_string(),
+            is_ask: false,
+            base_size: 0,
+            base_price: 0,
+            filled_base_amount: "0".to_string(),
+            filled_quote_amount: "0".to_string(),
+            side: "bid".to_string(),
+            order_type: "limit".to_string(),
+            time_in_force: "good-till-time".to_string(),
+            reduce_only: false,
+            trigger_price: String::new(),
+            order_expiry: 0,
+            status: "open".to_string(),
+            trigger_status: String::new(),
+            trigger_time: 0,
+            parent_order_index: 0,
+            parent_order_id: String::new(),
+            to_trigger_order_id_0: String::new(),
+            to_trigger_order_id_1: String::new(),
+            to_cancel_order_id_0: String::new(),
+            block_height: 0,
+            timestamp: 1,
+            created_at: 1,
+            updated_at: 1,
+            transaction_time: 1,
+        };
+
+        let report = order_report_from_lighter(
+            &order,
+            AccountId::from("LIGHTER-713543"),
+            &instrument,
+            1.into(),
+            |value| (value == client_order_index).then_some(client_order_id),
+        );
+
+        assert_eq!(report.client_order_id, Some(client_order_id));
+    }
+
+    #[test]
+    fn fill_report_infers_side_from_known_client_id_when_account_ids_are_missing() {
+        let instrument = InstrumentAny::from(crypto_perpetual_ethusdt());
+        let client_order_id = ClientOrderId::from("O-20260529-123418-001-001-375");
+        let client_order_index = lighter_client_order_index(&client_order_id);
+        let trade = Trade {
+            trade_id: 99,
+            tx_hash: String::new(),
+            trade_type: "trade".to_string(),
+            market_id: 0,
+            size: "0.01".to_string(),
+            price: "1000".to_string(),
+            usd_amount: "10".to_string(),
+            ask_id: 44,
+            bid_id: 45,
+            ask_client_id: Some(client_order_index),
+            bid_client_id: Some(123),
+            ask_account_id: 0,
+            bid_account_id: 0,
+            is_maker_ask: false,
+            block_height: 0,
+            timestamp: 1,
+            taker_fee: Some(0),
+            taker_position_size_before: None,
+            taker_entry_quote_before: None,
+            taker_initial_margin_fraction_before: None,
+            taker_position_sign_changed: None,
+            maker_fee: Some(0),
+            maker_position_size_before: None,
+            maker_entry_quote_before: None,
+            maker_initial_margin_fraction_before: None,
+            maker_position_sign_changed: None,
+            transaction_time: 1,
+            ask_account_pnl: None,
+            bid_account_pnl: None,
+        };
+
+        let report = fill_report_from_lighter_trade(
+            &trade,
+            713_543,
+            AccountId::from("LIGHTER-713543"),
+            &instrument,
+            1.into(),
+            |value| (value == client_order_index).then_some(client_order_id),
+        )
+        .expect("fill report");
+
+        assert_eq!(report.client_order_id, Some(client_order_id));
+        assert_eq!(report.venue_order_id.to_string(), "44");
     }
 
     #[test]
