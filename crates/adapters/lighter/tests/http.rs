@@ -13,1250 +13,1595 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+//! Integration tests for the Lighter HTTP client using a mock Axum server.
+
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use axum::{
     Router,
     body::Bytes,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Json, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{TimeZone, Utc};
+use nautilus_core::UnixNanos;
 use nautilus_lighter::{
-    config::Config, error::SdkError, http::client::LighterHttpClient,
-    rest::client::LighterRestClient,
+    common::enums::{
+        LighterCandleResolution, LighterEnvironment, LighterFundingResolution, LighterMarketStatus,
+        LighterOrderBookFilter, LighterTxType,
+    },
+    http::{
+        client::{
+            LIGHTER_CANDLES_MAX_LIMIT, LIGHTER_REST_PAGE_SIZE, LighterHttpClient,
+            LighterRawHttpClient,
+        },
+        error::LighterHttpError,
+        models::{LighterSendTxBatchRequest, LighterSendTxRequest},
+        query::{
+            LighterAccountActiveOrdersQuery, LighterAccountActiveOrdersQueryBuilder,
+            LighterAccountInactiveOrdersQuery, LighterAccountInactiveOrdersQueryBuilder,
+            LighterAccountLookup, LighterAccountQuery, LighterCandlesQuery,
+            LighterCandlesQueryBuilder, LighterFundingsQuery, LighterMakerOnlyApiKeysQueryBuilder,
+            LighterNextNonceQuery, LighterOrderBookDetailsQuery,
+            LighterOrderBookDetailsQueryBuilder, LighterOrderBookOrdersQuery,
+            LighterOrderBooksQuery, LighterOrderBooksQueryBuilder, LighterRecentTradesQuery,
+            LighterSortDirection, LighterTradeQueryType, LighterTradeRole, LighterTradeSortBy,
+            LighterTradesQuery, LighterTradesQueryBuilder,
+        },
+    },
 };
-use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::Mutex};
+use nautilus_model::{
+    data::{BarSpecification, BarType},
+    enums::{
+        AggregationSource, AggressorSide, BarAggregation, BookAction, OrderSide, PriceType,
+        RecordFlag,
+    },
+    identifiers::{InstrumentId, Symbol, Venue},
+    instruments::{CryptoPerpetual, Instrument, InstrumentAny},
+    types::{Price, Quantity, currency::Currency},
+};
+use nautilus_network::retry::{RetryConfig, RetryManager};
+use rust_decimal::Decimal;
 
-type RequestLog = Arc<Mutex<Vec<(String, String, Option<String>)>>>;
+const HTTP_NEXT_NONCE: &str = include_str!("../test_data/http_next_nonce.json");
+const HTTP_ORDER_BOOK_DETAILS: &str = include_str!("../test_data/http_order_book_details.json");
+const HTTP_ORDER_BOOK_ORDERS: &str = include_str!("../test_data/http_order_book_orders.json");
+const HTTP_ORDER_BOOKS: &str = include_str!("../test_data/http_order_books.json");
+const HTTP_ORDERS: &str = include_str!("../test_data/http_orders.json");
+const HTTP_RECENT_TRADES: &str = include_str!("../test_data/http_recent_trades.json");
+const HTTP_CANDLES: &str = include_str!("../test_data/http_candles.json");
+const HTTP_FUNDINGS: &str = include_str!("../test_data/http_fundings.json");
+const HTTP_ACCOUNT: &str = include_str!("../test_data/http_account.json");
+const MINUTE_MS: i64 = 60_000;
 
-#[derive(Clone, Default)]
-struct TestServerState {
-    requests: RequestLog,
+#[derive(Clone)]
+struct IncompleteCandlesState {
+    completed_start_ms: i64,
+    incomplete_start_ms: i64,
 }
 
-async fn spawn_server(router: Router) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    addr
+#[derive(Clone)]
+struct LatestCandlesState {
+    end_ms: i64,
 }
 
-fn test_config(addr: SocketAddr) -> Config {
-    Config::for_network(false)
-        .with_http_base_url(format!("http://{addr}"))
-        .with_ws_base_url(format!("ws://{addr}/stream"))
+#[derive(Clone)]
+struct PaginatedCandlesState {
+    start_ms: i64,
+    calls: Arc<AtomicUsize>,
 }
 
-async fn record_request(
-    state: &TestServerState,
-    path: &str,
-    query: &HashMap<String, String>,
-    headers: &HeaderMap,
-) {
-    state.requests.lock().await.push((
-        path.to_string(),
-        serde_urlencoded::to_string(query).unwrap(),
-        headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string),
+#[tokio::test]
+async fn raw_client_get_order_books_sends_query_and_parses_response() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/orderBooks", get(handle_order_books))).await;
+    let client =
+        LighterRawHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let query = LighterOrderBooksQueryBuilder::default()
+        .market_id(0)
+        .filter(LighterOrderBookFilter::Perp)
+        .build()
+        .unwrap();
+
+    let response = client.get_order_books(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.order_books.len(), 1);
+    assert_eq!(response.order_books[0].market_id, 0);
+}
+
+#[tokio::test]
+async fn raw_client_get_order_book_details_sends_query_and_parses_response() {
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/orderBookDetails",
+        get(handle_order_book_details_filtered),
+    ))
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBookDetailsQueryBuilder::default()
+        .market_id(0)
+        .filter(LighterOrderBookFilter::Perp)
+        .build()
+        .unwrap();
+
+    let response = client.get_order_book_details(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.order_book_details.len(), 1);
+    assert_eq!(response.order_book_details[0].order_book.market_id, 0);
+}
+
+#[tokio::test]
+async fn raw_client_get_order_book_orders_sends_query_and_parses_response() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/orderBookOrders", get(handle_order_book_orders)))
+            .await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBookOrdersQuery {
+        market_id: 0,
+        limit: 25,
+    };
+
+    let response = client.get_order_book_orders(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.asks.len(), 1);
+    assert_eq!(response.bids.len(), 1);
+}
+
+#[tokio::test]
+async fn raw_client_get_trades_sends_paginated_query_and_parses_response() {
+    let base_url = spawn_server(Router::new().route("/api/v1/trades", get(handle_trades))).await;
+    let client = raw_client(base_url);
+    let query = LighterTradesQueryBuilder::default()
+        .authorization("bearer-token")
+        .market_id(0)
+        .account_index(712_440)
+        .order_index(281_476_929_510_110)
+        .sort_by(LighterTradeSortBy::Timestamp)
+        .sort_dir(LighterSortDirection::Desc)
+        .cursor("cursor-1")
+        .from_timestamp(1_700_000_000_000)
+        .ask_filter(1)
+        .role(LighterTradeRole::Maker)
+        .trade_type(LighterTradeQueryType::Trade)
+        .limit(50)
+        .aggregate(true)
+        .build()
+        .unwrap();
+
+    let response = client.get_trades(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.trades.len(), 1);
+}
+
+#[tokio::test]
+async fn raw_client_get_candles_sends_query_and_parses_response() {
+    let base_url = spawn_server(Router::new().route("/api/v1/candles", get(handle_candles))).await;
+    let client = raw_client(base_url);
+    let query = LighterCandlesQueryBuilder::default()
+        .market_id(0)
+        .resolution(LighterCandleResolution::OneMinute)
+        .start_timestamp(1_700_000_000_000)
+        .end_timestamp(1_700_000_120_000)
+        .count_back(i64::from(LIGHTER_CANDLES_MAX_LIMIT))
+        .set_timestamp_to_end(false)
+        .build()
+        .unwrap();
+
+    let response = client.get_candles(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.resolution, LighterCandleResolution::OneMinute);
+    assert_eq!(response.candles.len(), 2);
+    assert_eq!(response.candles[0].timestamp, 1_700_000_000_000);
+}
+
+#[tokio::test]
+async fn raw_client_get_fundings_sends_query_and_parses_response() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/fundings", get(handle_fundings))).await;
+    let client = raw_client(base_url);
+    let query = LighterFundingsQuery {
+        market_id: 0,
+        resolution: LighterFundingResolution::OneHour,
+        start_timestamp: 1_778_702_400_000,
+        end_timestamp: 1_778_706_000_000,
+        count_back: 2,
+    };
+
+    let response = client.get_fundings(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.resolution, LighterFundingResolution::OneHour);
+    assert_eq!(response.fundings.len(), 2);
+}
+
+#[tokio::test]
+async fn raw_client_get_trades_serializes_lighter_rest_page_size() {
+    // Anchors the venue's `limit <= 100` contract through URL serialization.
+    let base_url = spawn_server(
+        Router::new().route("/api/v1/trades", get(handle_trades_with_page_size_limit)),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterTradesQueryBuilder::default()
+        .auth("auth-token")
+        .market_id(0)
+        .account_index(712_440)
+        .sort_by(LighterTradeSortBy::Timestamp)
+        .sort_dir(LighterSortDirection::Desc)
+        .limit(LIGHTER_REST_PAGE_SIZE)
+        .build()
+        .unwrap();
+
+    let response = client.get_trades(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(LIGHTER_REST_PAGE_SIZE, 100); // venue contract.
+}
+
+#[tokio::test]
+async fn raw_client_get_account_orders_sends_auth_queries_and_parses_response() {
+    let base_url = spawn_server(
+        Router::new()
+            .route(
+                "/api/v1/accountActiveOrders",
+                get(handle_account_active_orders),
+            )
+            .route(
+                "/api/v1/accountInactiveOrders",
+                get(handle_account_inactive_orders),
+            ),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let active_query = LighterAccountActiveOrdersQueryBuilder::default()
+        .auth("auth-token")
+        .account_index(712_440)
+        .market_id(0)
+        .build()
+        .unwrap();
+    let inactive_query = LighterAccountInactiveOrdersQueryBuilder::default()
+        .authorization("bearer-token")
+        .account_index(712_440)
+        .market_id(0)
+        .ask_filter(1)
+        .between_timestamps("1700000000000,1700000001000")
+        .cursor("cursor-1")
+        .limit(50)
+        .build()
+        .unwrap();
+
+    let active = client
+        .get_account_active_orders(&active_query)
+        .await
+        .unwrap();
+    let inactive = client
+        .get_account_inactive_orders(&inactive_query)
+        .await
+        .unwrap();
+
+    assert_eq!(active.orders.len(), 1);
+    assert_eq!(inactive.next_cursor.as_deref(), Some("cursor-1"));
+}
+
+#[tokio::test]
+async fn raw_client_get_next_nonce_sends_query_and_parses_response() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/nextNonce", get(handle_next_nonce))).await;
+    let client = raw_client(base_url);
+    let query = LighterNextNonceQuery {
+        account_index: 12_345,
+        api_key_index: 5,
+    };
+
+    let response = client.get_next_nonce(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.nonce, 1_234_567_890);
+}
+
+#[tokio::test]
+async fn domain_client_get_maker_only_api_keys_sends_authorization_header() {
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/getMakerOnlyApiKeys",
+        get(handle_maker_only_api_keys),
+    ))
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+
+    let response = client
+        .get_maker_only_api_keys(712_440, "auth-token")
+        .await
+        .unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.api_key_indexes, vec![5]);
+}
+
+#[tokio::test]
+async fn raw_client_get_maker_only_api_keys_maps_auth_query_field_to_authorization_header() {
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/getMakerOnlyApiKeys",
+        get(handle_maker_only_api_keys),
+    ))
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterMakerOnlyApiKeysQueryBuilder::default()
+        .auth("auth-token")
+        .account_index(712_440)
+        .build()
+        .unwrap();
+
+    let response = client.get_maker_only_api_keys(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.api_key_indexes, vec![5]);
+}
+
+#[tokio::test]
+async fn raw_client_send_tx_posts_form_and_parses_response() {
+    let base_url = spawn_server(Router::new().route("/api/v1/sendTx", post(handle_send_tx))).await;
+    let client = raw_client(base_url);
+    let request = LighterSendTxRequest::new(
+        LighterTxType::CreateOrder as u8,
+        r#"{"AccountIndex":1,"Nonce":2,"Sig":"0xsig"}"#,
+    )
+    .with_price_protection(true);
+
+    let response = client.send_tx(&request).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.tx_hash, "0xabc");
+    assert_eq!(response.predicted_execution_time_ms, 1_751_465_474);
+    assert_eq!(response.volume_quota_remaining, Some(123));
+}
+
+#[tokio::test]
+async fn raw_client_send_tx_posts_false_price_protection() {
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/sendTx",
+        post(handle_send_tx_false_price_protection),
+    ))
+    .await;
+    let client = raw_client(base_url);
+    let request = LighterSendTxRequest::new(
+        LighterTxType::CreateOrder as u8,
+        r#"{"AccountIndex":1,"Nonce":2,"Sig":"0xsig"}"#,
+    )
+    .with_price_protection(false);
+
+    let response = client.send_tx(&request).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.tx_hash, "0xabc");
+    assert_eq!(response.predicted_execution_time_ms, 1_751_465_474);
+    assert_eq!(response.volume_quota_remaining, Some(123));
+}
+
+#[tokio::test]
+async fn raw_client_send_tx_batch_posts_form_and_parses_response() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/sendTxBatch", post(handle_send_tx_batch))).await;
+    let client = raw_client(base_url);
+    let request = LighterSendTxBatchRequest::new(
+        format!(
+            "[{},{}]",
+            LighterTxType::CreateOrder as u8,
+            LighterTxType::CancelOrder as u8,
+        ),
+        r#"[{"AccountIndex":1},{"AccountIndex":1}]"#,
+    );
+
+    let response = client.send_tx_batch(&request).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(
+        response.tx_hash,
+        vec!["0xabc".to_string(), "0xdef".to_string()]
+    );
+    assert_eq!(response.predicted_execution_time_ms, 1_751_465_475);
+    assert_eq!(response.volume_quota_remaining, Some(122));
+}
+
+#[tokio::test]
+async fn raw_client_send_tx_batch_parses_missing_volume_quota_remaining() {
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/sendTxBatch",
+        post(handle_send_tx_batch_without_volume_quota),
+    ))
+    .await;
+    let client = raw_client(base_url);
+    let request = LighterSendTxBatchRequest::new(
+        format!(
+            "[{},{}]",
+            LighterTxType::CreateOrder as u8,
+            LighterTxType::CancelOrder as u8
+        ),
+        r#"[{"AccountIndex":1},{"AccountIndex":1}]"#,
+    );
+
+    let response = client.send_tx_batch(&request).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.volume_quota_remaining, None);
+}
+
+#[tokio::test]
+async fn raw_client_send_tx_maps_success_body_errors() {
+    let base_url = spawn_server(
+        Router::new()
+            .route(
+                "/api/v1/sendTx",
+                post(handle_send_tx_success_body_venue_error),
+            )
+            .route(
+                "/api/v1/sendTxBatch",
+                post(handle_send_tx_batch_success_body_rate_limit),
+            ),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let request = LighterSendTxRequest::new(
+        LighterTxType::CreateOrder as u8,
+        r#"{"AccountIndex":1,"Nonce":2,"Sig":"0xsig"}"#,
+    );
+    let batch_request = LighterSendTxBatchRequest::new("[14,15]", "[]");
+
+    let venue_error = client.send_tx(&request).await.unwrap_err();
+    let rate_limit_error = client.send_tx_batch(&batch_request).await.unwrap_err();
+
+    assert!(matches!(
+        venue_error,
+        LighterHttpError::Venue { code: 1001, message } if message == "invalid tx"
+    ));
+    assert!(matches!(
+        rate_limit_error,
+        LighterHttpError::RateLimit(message) if message == "slow down"
     ));
 }
 
-async fn handle_order_books(State(state): State<TestServerState>, headers: HeaderMap) -> Response {
-    record_request(&state, "/api/v1/orderBooks", &HashMap::new(), &headers).await;
-    Json(json!({
-        "code": 200,
-        "order_books": [
-            {"market_id": 1, "symbol": "BTC-USDC", "market_type": "perp"},
-            {"market_id": 2048, "symbol": "ETH-USDC", "market_type": "spot"}
-        ]
-    }))
-    .into_response()
-}
-
-async fn handle_asset_details(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/assetDetails", &HashMap::new(), &headers).await;
-    Json(json!({
-        "code": 200,
-        "asset_details": [
-            {"asset_id": 1, "symbol": "BTC", "decimals": 8, "index_price": "68421.4"},
-            {"asset_id": 2, "symbol": "USDC", "decimals": 6, "index_price": "1.0"},
-            {"asset_id": 3, "symbol": "ETH", "decimals": 8, "index_price": "3412.1"}
-        ]
-    }))
-    .into_response()
-}
-
-async fn handle_order_book_details(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/orderBookDetails", &query, &headers).await;
-    let payload = match query.get("market_id").map(String::as_str) {
-        None => json!({
-            "code": 200,
-            "order_book_details": [{
-                "market_id": 1,
-                "symbol": "BTC-USDC",
-                "market_type": "perp",
-                "base_asset_id": 1,
-                "quote_asset_id": 2,
-                "price_decimals": 2,
-                "size_decimals": 4,
-                "supported_price_decimals": 2,
-                "supported_size_decimals": 4,
-                "default_initial_margin_fraction": 500,
-                "maintenance_margin_fraction": 250
-            }],
-            "spot_order_book_details": [{
-                "market_id": 2048,
-                "symbol": "ETH-USDC",
-                "market_type": "spot",
-                "base_asset_id": 3,
-                "quote_asset_id": 2,
-                "price_decimals": 2,
-                "size_decimals": 4,
-                "supported_price_decimals": 2,
-                "supported_size_decimals": 4
-            }]
-        }),
-        Some("1") => json!({
-            "code": 200,
-            "order_book_details": [{
-                "market_id": 1,
-                "symbol": "BTC-USDC",
-                "market_type": "perp",
-                "base_asset_id": 1,
-                "quote_asset_id": 2,
-                "price_decimals": 2,
-                "size_decimals": 4,
-                "supported_price_decimals": 2,
-                "supported_size_decimals": 4,
-                "default_initial_margin_fraction": 500,
-                "maintenance_margin_fraction": 250
-            }],
-            "spot_order_book_details": []
-        }),
-        Some("2048") => json!({
-            "code": 200,
-            "order_book_details": [],
-            "spot_order_book_details": [{
-                "market_id": 2048,
-                "symbol": "ETH-USDC",
-                "market_type": "spot",
-                "base_asset_id": 3,
-                "quote_asset_id": 2,
-                "price_decimals": 2,
-                "size_decimals": 4,
-                "supported_price_decimals": 2,
-                "supported_size_decimals": 4
-            }]
-        }),
-        _ => json!({"code": 404, "message": "unknown market"}),
+#[tokio::test]
+async fn raw_client_maps_rate_limit_status() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/recentTrades", get(handle_rate_limit))).await;
+    let client = raw_client(base_url);
+    let query = LighterRecentTradesQuery {
+        market_id: 0,
+        limit: 10,
     };
-    Json(payload).into_response()
+
+    let error = client.get_recent_trades(&query).await.unwrap_err();
+
+    assert!(matches!(error, LighterHttpError::RateLimit(_)));
 }
 
-async fn handle_recent_trades(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/recentTrades", &query, &headers).await;
-    Json(json!({
-    "code": 200,
-        "trades": [{
-            "trade_id": 1,
-            "market_id": 1,
-            "size": "0.1",
-            "price": "100000.0",
-            "is_maker_ask": false,
-            "timestamp": 1704067200000i64
-        }]
-    }))
-    .into_response()
+#[tokio::test]
+async fn raw_client_maps_structured_venue_error() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/orderBooks", get(handle_venue_error))).await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let error = client.get_order_books(&query).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        LighterHttpError::Venue { code: 1001, message } if message == "invalid market"
+    ));
 }
 
-async fn handle_account(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/account", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "accounts": [{
-            "account_index": 7,
-            "assets": [
-                {"asset_id": 2, "symbol": "USDC", "balance": "100000", "locked_balance": "10"}
-            ],
-            "positions": [{
-                "market_id": 1,
-                "symbol": "BTC-USDC",
-                "initial_margin_fraction": "500",
-                "open_order_count": 0,
-                "pending_order_count": 0,
-                "position_tied_order_count": 0,
-                "sign": 1,
-                "position": "0.5",
-                "avg_entry_price": "100000.0",
-                "position_value": "50000.0",
-                "unrealized_pnl": "10.0",
-                "realized_pnl": "5.0",
-                "liquidation_price": "80000.0",
-                "margin_mode": 0,
-                "allocated_margin": "1000.0"
-            }]
-        }]
-    }))
-    .into_response()
+#[tokio::test]
+async fn raw_client_maps_http_method_not_allowed_status() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/orderBooks", get(handle_method_not_allowed)))
+            .await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let error = client.get_order_books(&query).await.unwrap_err();
+
+    assert!(matches!(error, LighterHttpError::Http { status: 405, .. }));
 }
 
-async fn handle_inactive_orders(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/accountInactiveOrders", &query, &headers).await;
-    Json(json!({"code": 200, "orders": [], "cursor": null})).into_response()
+#[tokio::test]
+async fn raw_client_maps_structured_rate_limit_code() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/orderBooks", get(handle_body_rate_limit))).await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let error = client.get_order_books(&query).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        LighterHttpError::RateLimit(message) if message == "slow down"
+    ));
 }
 
-async fn handle_l1_metadata(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/l1Metadata", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "l1_address": query.get("l1_address").cloned().unwrap_or_default(),
-        "nickname": "primary"
-    }))
-    .into_response()
-}
-
-async fn handle_public_pools_metadata(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/publicPoolsMetadata", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "pools": [{
-            "public_pool_index": 11,
-            "account_index": query.get("account_index").and_then(|value| value.parse::<i64>().ok()).unwrap_or(7),
-            "info": {
-                "operator_fee": "10",
-                "min_operator_share_rate": "5"
-            }
-        }]
-    }))
-    .into_response()
-}
-
-async fn handle_tx_from_l1_tx_hash(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/txFromL1TxHash", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "hash": query.get("hash").cloned().unwrap_or_default(),
-        "status": 1
-    }))
-    .into_response()
-}
-
-async fn handle_tokens(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/tokens", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "tokens": [{
-            "token_id": 11,
-            "name": "reporting"
-        }]
-    }))
-    .into_response()
-}
-
-async fn handle_tokens_create(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/tokens/create", &form, &headers).await;
-    Json(json!({
-        "code": 200,
-        "token_id": 11,
-        "api_token": "ro:7:all:1767139200:deadbeef"
-    }))
-    .into_response()
-}
-
-async fn handle_tokens_revoke(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/tokens/revoke", &form, &headers).await;
-    Json(json!({"code": 200, "message": "ok"})).into_response()
-}
-
-async fn handle_notification_ack(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/notification/ack", &form, &headers).await;
-    Json(json!({"code": 200, "message": "ok"})).into_response()
-}
-
-async fn handle_referral_user_referrals(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/referral/userReferrals", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "cursor": 2,
-        "referrals": [{
-            "l1_address": query.get("l1_address").cloned().unwrap_or_default(),
-            "referral_code": "LIGHTER7",
-            "used_at": 1704067200000i64
-        }]
-    }))
-    .into_response()
-}
-
-async fn handle_referral_get(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/referral/get", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "referral_code": "LIGHTER7",
-        "remaining_usage": 3
-    }))
-    .into_response()
-}
-
-async fn handle_referral_create(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/referral/create", &form, &headers).await;
-    Json(json!({
-        "code": 200,
-        "referral_code": "LIGHTER7",
-        "remaining_usage": 3
-    }))
-    .into_response()
-}
-
-async fn handle_referral_update(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/referral/update", &form, &headers).await;
-    Json(json!({"code": 200, "success": true})).into_response()
-}
-
-async fn handle_referral_kickback_update(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/referral/kickback/update", &form, &headers).await;
-    Json(json!({"code": 200, "success": true})).into_response()
-}
-
-async fn handle_referral_use(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/referral/use", &form, &headers).await;
-    Json(json!({"code": 200, "message": "ok"})).into_response()
-}
-
-async fn handle_liquidations(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/liquidations", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "liquidations": [{
-            "id": 1,
-            "market_id": query.get("market_id").and_then(|value| value.parse::<i64>().ok()).unwrap_or(1),
-            "type": "partial",
-            "trade": {
-                "price": "100000.0",
-                "size": "0.1000",
-                "taker_fee": "5.0",
-                "maker_fee": "2.5",
-                "transaction_time": 1704067200000i64
-            },
-            "info": {
-                "positions": [{
-                    "market_id": 1,
-                    "symbol": "BTC-USDC",
-                    "initial_margin_fraction": "500",
-                    "open_order_count": 0,
-                    "pending_order_count": 0,
-                    "position_tied_order_count": 0,
-                    "sign": 1,
-                    "position": "0.5",
-                    "avg_entry_price": "100000.0",
-                    "position_value": "50000.0",
-                    "unrealized_pnl": "10.0",
-                    "realized_pnl": "5.0",
-                    "liquidation_price": "80000.0",
-                    "margin_mode": 0,
-                    "allocated_margin": "1000.0"
-                }],
-                "risk_info_before": {
-                    "cross_risk_parameters": {
-                        "market_id": 1,
-                        "collateral": "100000.0",
-                        "total_account_value": "101000.0",
-                        "initial_margin_req": "5000.0",
-                        "maintenance_margin_req": "2500.0",
-                        "close_out_margin_req": "2000.0"
-                    },
-                    "isolated_risk_parameters": []
-                },
-                "risk_info_after": {
-                    "cross_risk_parameters": {
-                        "market_id": 1,
-                        "collateral": "99000.0",
-                        "total_account_value": "100000.0",
-                        "initial_margin_req": "4500.0",
-                        "maintenance_margin_req": "2250.0",
-                        "close_out_margin_req": "1800.0"
-                    },
-                    "isolated_risk_parameters": []
-                },
-                "mark_prices": {
-                    "1": 100001.0
-                }
-            },
-            "executed_at": 1704067260000i64
-        }],
-        "next_cursor": "cursor-2"
-    }))
-    .into_response()
-}
-
-async fn handle_transfer_fee_info(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/transferFeeInfo", &query, &headers).await;
-    Json(json!({"code": 200, "transfer_fee_usdc": 15})).into_response()
-}
-
-async fn handle_withdrawal_delay(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/withdrawalDelay", &HashMap::new(), &headers).await;
-    Json(json!({"seconds": 86400})).into_response()
-}
-
-async fn handle_announcement(State(state): State<TestServerState>, headers: HeaderMap) -> Response {
-    record_request(&state, "/api/v1/announcement", &HashMap::new(), &headers).await;
-    Json(json!({"code": 200, "announcements": [{"title": "listing"}]})).into_response()
-}
-
-async fn handle_status(State(state): State<TestServerState>, headers: HeaderMap) -> Response {
-    record_request(&state, "/", &HashMap::new(), &headers).await;
-    Json(json!({"status": 1, "network_id": 1, "timestamp": 1704067200})).into_response()
-}
-
-async fn handle_system_config(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/systemConfig", &HashMap::new(), &headers).await;
-    Json(json!({"code": 200, "liquidity_pool_index": 1})).into_response()
-}
-
-async fn handle_exchange_metrics(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/exchangeMetrics", &query, &headers).await;
-    Json(json!({"code": 200, "metrics": [{"period": query.get("period"), "kind": query.get("kind")}] }))
-        .into_response()
-}
-
-async fn handle_execute_stats(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/executeStats", &query, &headers).await;
-    Json(json!({"code": 200, "period": query.get("period"), "result": {"success": 99.9}}))
-        .into_response()
-}
-
-async fn handle_layer1_basic_info(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/layer1BasicInfo", &HashMap::new(), &headers).await;
-    Json(json!({"code": 200, "validator_info": {"status": "ok"}})).into_response()
-}
-
-async fn handle_info(State(state): State<TestServerState>, headers: HeaderMap) -> Response {
-    record_request(&state, "/info", &HashMap::new(), &headers).await;
-    Json(json!({"address": "0xcontract", "contract_address": "0xcontract"})).into_response()
-}
-
-async fn handle_create_intent_address(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/createIntentAddress", &form, &headers).await;
-    Json(json!({"code": 200, "intent_address": "0xintent"})).into_response()
-}
-
-async fn handle_fastbridge_info(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/fastbridge/info", &HashMap::new(), &headers).await;
-    Json(json!({"code": 200, "fast_bridge_limit": "50000"})).into_response()
-}
-
-async fn handle_deposit_latest(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/deposit/latest", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "source": "bridge",
-        "intent_address": "0xintent",
-        "status": "settled",
-        "description": "done"
-    }))
-    .into_response()
-}
-
-async fn handle_deposit_networks(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(
-        &state,
-        "/api/v1/deposit/networks",
-        &HashMap::new(),
-        &headers,
+#[tokio::test]
+async fn raw_client_maps_success_body_errors() {
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBooks", get(handle_success_body_venue_error))
+            .route("/api/v1/recentTrades", get(handle_success_body_rate_limit)),
     )
     .await;
-    Json(json!({"code": 200, "networks": [{"chain_id": 1, "name": "Ethereum"}]})).into_response()
+    let client = raw_client(base_url);
+    let order_books_query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+    let recent_trades_query = LighterRecentTradesQuery {
+        market_id: 0,
+        limit: 10,
+    };
+
+    let venue_error = client
+        .get_order_books(&order_books_query)
+        .await
+        .unwrap_err();
+    let rate_limit_error = client
+        .get_recent_trades(&recent_trades_query)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        venue_error,
+        LighterHttpError::Venue { code: 1001, message } if message == "invalid market"
+    ));
+    assert!(matches!(
+        rate_limit_error,
+        LighterHttpError::RateLimit(message) if message == "slow down"
+    ));
 }
 
-async fn handle_fastwithdraw_info(
-    State(state): State<TestServerState>,
+#[tokio::test]
+async fn raw_client_retries_transient_5xx_then_succeeds() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = TransientFailureState {
+        calls: calls.clone(),
+        fail_until: 2,
+        fail_status: StatusCode::SERVICE_UNAVAILABLE,
+        success_body: HTTP_ORDER_BOOKS,
+    };
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBooks", get(handle_transient_failure))
+            .with_state(state),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let response = client.get_order_books(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn raw_client_retries_429_rate_limit_then_succeeds() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = TransientFailureState {
+        calls: calls.clone(),
+        fail_until: 1,
+        fail_status: StatusCode::TOO_MANY_REQUESTS,
+        success_body: HTTP_ORDER_BOOKS,
+    };
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBooks", get(handle_transient_failure))
+            .with_state(state),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let response = client.get_order_books(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn raw_client_does_not_retry_4xx_other_than_429() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = TransientFailureState {
+        calls: calls.clone(),
+        fail_until: u32::MAX,
+        fail_status: StatusCode::BAD_REQUEST,
+        success_body: HTTP_ORDER_BOOKS,
+    };
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBooks", get(handle_transient_failure))
+            .with_state(state),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let error = client.get_order_books(&query).await.unwrap_err();
+
+    assert!(matches!(error, LighterHttpError::Http { status: 400, .. }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn raw_client_retries_5xx_carrying_structured_venue_body() {
+    // Pins the status-first guard: a 5xx with a `{code,message}` body
+    // must not collapse to non-retryable Venue.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = StructuredFailureState {
+        calls: calls.clone(),
+        fail_until: 2,
+        fail_status: StatusCode::SERVICE_UNAVAILABLE,
+        fail_body: r#"{"code":50001,"message":"server busy"}"#,
+        success_body: HTTP_ORDER_BOOKS,
+    };
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBooks", get(handle_structured_failure))
+            .with_state(state),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let response = client.get_order_books(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn raw_client_retries_429_carrying_unrelated_venue_body() {
+    // Same shape as the 5xx case: 429 must classify by status, not by a
+    // non-429 venue code in the body.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = StructuredFailureState {
+        calls: calls.clone(),
+        fail_until: 1,
+        fail_status: StatusCode::TOO_MANY_REQUESTS,
+        fail_body: r#"{"code":1001,"message":"slow down"}"#,
+        success_body: HTTP_ORDER_BOOKS,
+    };
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBooks", get(handle_structured_failure))
+            .with_state(state),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let response = client.get_order_books(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn raw_client_send_tx_post_is_single_shot_on_5xx() {
+    // sendTx POST must not auto-retry: signed-nonce idempotency.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = TransientFailureState {
+        calls: calls.clone(),
+        fail_until: u32::MAX,
+        fail_status: StatusCode::SERVICE_UNAVAILABLE,
+        success_body: "",
+    };
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/sendTx", post(handle_transient_post))
+            .with_state(state),
+    )
+    .await;
+    let client = raw_client(base_url);
+    let request = LighterSendTxRequest::new(LighterTxType::CreateOrder as u8, "{}".to_string());
+
+    let error = client.send_tx(&request).await.unwrap_err();
+
+    assert!(matches!(error, LighterHttpError::Http { status: 503, .. }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn domain_client_registers_markets_and_parses_recent_trades() {
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBookDetails", get(handle_order_book_details))
+            .route("/api/v1/orderBookOrders", get(handle_order_book_orders))
+            .route("/api/v1/recentTrades", get(handle_recent_trades)),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument = create_test_instrument();
+
+    client
+        .get_order_book_details(&LighterOrderBookDetailsQuery::default())
+        .await
+        .unwrap();
+    let instruments = client.request_instruments().await.unwrap();
+    let instruments_with_status = client.request_instruments_with_status().await.unwrap();
+    let requested_instrument = client.request_instrument(instrument.id()).await.unwrap();
+    let (requested_with_status, requested_status) = client
+        .request_instrument_with_status(instrument.id())
+        .await
+        .unwrap();
+    let ticks = client.request_recent_trades(&instrument, 10).await.unwrap();
+    let deltas = client
+        .request_order_book_snapshot(&instrument, 25)
+        .await
+        .unwrap();
+
+    assert_eq!(client.market_registry().len(), 1);
+    assert_eq!(instruments.len(), 1);
+    assert_eq!(instruments[0].id(), instrument.id());
+    assert_eq!(instruments_with_status.len(), 1);
+    assert_eq!(instruments_with_status[0].0.id(), instrument.id());
+    assert_eq!(instruments_with_status[0].1, LighterMarketStatus::Active);
+    assert_eq!(requested_instrument.id(), instrument.id());
+    assert_eq!(requested_with_status.id(), instrument.id());
+    assert_eq!(requested_status, LighterMarketStatus::Active);
+
+    match &instruments[0] {
+        InstrumentAny::CryptoPerpetual(perp) => {
+            assert_eq!(perp.raw_symbol.as_str(), "ETH");
+            assert_eq!(perp.base_currency, Currency::from("ETH"));
+            assert_eq!(perp.quote_currency, Currency::from("USDC"));
+            assert_eq!(perp.settlement_currency, Currency::from("USDC"));
+            assert_eq!(perp.price_increment, Price::from("0.01"));
+            assert_eq!(perp.size_increment, Quantity::from("0.0001"));
+            assert_eq!(perp.min_quantity, Some(Quantity::from("0.0050")));
+        }
+        other => panic!("expected crypto perpetual, was {other:?}"),
+    }
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].instrument_id, instrument.id());
+    assert_eq!(ticks[0].price, Price::from("2361.31"));
+    assert_eq!(ticks[0].size, Quantity::from("0.0005"));
+    assert_eq!(deltas.instrument_id, instrument.id());
+    assert_eq!(deltas.deltas.len(), 3);
+    assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+    assert_eq!(deltas.deltas[0].sequence, 0);
+    assert_eq!(deltas.deltas[1].action, BookAction::Add);
+    assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+    assert_eq!(deltas.deltas[1].order.price, Price::from("2361.17"));
+    assert_eq!(deltas.deltas[1].order.size, Quantity::from("3.4125"));
+    assert_eq!(deltas.deltas[1].sequence, 1);
+    assert_eq!(deltas.deltas[2].action, BookAction::Add);
+    assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+    assert_eq!(deltas.deltas[2].order.price, Price::from("2361.32"));
+    assert_eq!(deltas.deltas[2].order.size, Quantity::from("0.0317"));
+    assert_eq!(deltas.deltas[2].sequence, 2);
+    assert_eq!(
+        deltas.deltas[2].flags & RecordFlag::F_LAST as u8,
+        RecordFlag::F_LAST as u8
+    );
+}
+
+#[tokio::test]
+async fn domain_client_request_trades_fills_market_id_and_parses_ticks() {
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBookDetails", get(handle_order_book_details))
+            .route("/api/v1/trades", get(handle_domain_trades)),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument = create_test_instrument();
+
+    client
+        .get_order_book_details(&LighterOrderBookDetailsQuery::default())
+        .await
+        .unwrap();
+    let ticks = client
+        .request_trades(
+            &instrument,
+            LighterTradesQuery {
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].instrument_id, instrument.id());
+    assert_eq!(ticks[0].price, Price::from("2361.31"));
+    assert_eq!(ticks[0].size, Quantity::from("0.0005"));
+    assert_eq!(ticks[0].aggressor_side, AggressorSide::Seller);
+    assert_eq!(ticks[0].trade_id.to_string(), "19211490282");
+}
+
+#[tokio::test]
+async fn domain_client_request_bars_fills_market_id_and_parses_bars() {
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBookDetails", get(handle_order_book_details))
+            .route("/api/v1/candles", get(handle_domain_candles)),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument = create_test_instrument();
+    let bar_type = BarType::new(
+        instrument.id(),
+        BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+        AggregationSource::External,
+    );
+    let start = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let end = Utc.timestamp_millis_opt(1_700_000_120_000).unwrap();
+
+    client
+        .get_order_book_details(&LighterOrderBookDetailsQuery::default())
+        .await
+        .unwrap();
+    let bars = client
+        .request_bars(&instrument, bar_type, Some(start), Some(end), Some(2))
+        .await
+        .unwrap();
+
+    assert_eq!(bars.len(), 2);
+    assert_eq!(bars[0].bar_type, bar_type);
+    assert_eq!(bars[0].open, Price::from("2361.11"));
+    assert_eq!(bars[0].high, Price::from("2362.22"));
+    assert_eq!(bars[0].low, Price::from("2360.00"));
+    assert_eq!(bars[0].close, Price::from("2361.31"));
+    assert_eq!(bars[0].volume, Quantity::from("1.2345"));
+    assert_eq!(bars[0].ts_event, UnixNanos::from(1_700_000_000_000_000_000));
+}
+
+#[tokio::test]
+async fn domain_client_request_funding_rates_parses_signed_rates() {
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBookDetails", get(handle_order_book_details))
+            .route("/api/v1/fundings", get(handle_fundings)),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument = create_test_instrument();
+    let start = Utc
+        .timestamp_millis_opt(1_778_702_400_000)
+        .single()
+        .unwrap();
+    let end = Utc
+        .timestamp_millis_opt(1_778_706_000_000)
+        .single()
+        .unwrap();
+
+    client
+        .get_order_book_details(&LighterOrderBookDetailsQuery::default())
+        .await
+        .unwrap();
+    let funding_rates = client
+        .request_funding_rates(&instrument, Some(start), Some(end), Some(2))
+        .await
+        .unwrap();
+
+    assert_eq!(funding_rates.len(), 2);
+    assert_eq!(funding_rates[0].instrument_id, instrument.id());
+    assert_eq!(funding_rates[0].rate, Decimal::new(12, 4));
+    assert_eq!(funding_rates[0].interval, Some(60));
+    assert_eq!(
+        funding_rates[0].ts_event,
+        UnixNanos::from(1_778_702_400_000_000_000),
+    );
+    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 4));
+}
+
+#[tokio::test]
+async fn domain_client_request_bars_filters_incomplete_candle() {
+    let now_ms = Utc::now().timestamp_millis();
+    let state = IncompleteCandlesState {
+        completed_start_ms: now_ms - 2 * MINUTE_MS,
+        incomplete_start_ms: now_ms - MINUTE_MS / 2,
+    };
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBookDetails", get(handle_order_book_details))
+            .route("/api/v1/candles", get(handle_incomplete_candles))
+            .with_state(state.clone()),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument = create_test_instrument();
+    let bar_type = one_minute_bar_type(instrument.id());
+    let start = Utc
+        .timestamp_millis_opt(state.completed_start_ms)
+        .single()
+        .unwrap();
+    let end = Utc
+        .timestamp_millis_opt(now_ms + MINUTE_MS)
+        .single()
+        .unwrap();
+
+    client
+        .get_order_book_details(&LighterOrderBookDetailsQuery::default())
+        .await
+        .unwrap();
+    let bars = client
+        .request_bars(&instrument, bar_type, Some(start), Some(end), Some(2))
+        .await
+        .unwrap();
+
+    assert_eq!(bars.len(), 1);
+    assert_eq!(
+        bars[0].ts_event,
+        millis_to_unix_nanos(state.completed_start_ms),
+    );
+    assert_eq!(bars[0].close, Price::from("10.25"));
+}
+
+#[tokio::test]
+async fn domain_client_request_bars_without_start_returns_latest_completed_limit() {
+    let state = LatestCandlesState {
+        end_ms: 1_700_000_180_000,
+    };
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBookDetails", get(handle_order_book_details))
+            .route("/api/v1/candles", get(handle_latest_candles))
+            .with_state(state.clone()),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument = create_test_instrument();
+    let bar_type = one_minute_bar_type(instrument.id());
+    let end = Utc.timestamp_millis_opt(state.end_ms).single().unwrap();
+
+    client
+        .get_order_book_details(&LighterOrderBookDetailsQuery::default())
+        .await
+        .unwrap();
+    let bars = client
+        .request_bars(&instrument, bar_type, None, Some(end), Some(2))
+        .await
+        .unwrap();
+
+    assert_eq!(bars.len(), 2);
+    assert_eq!(
+        bars[0].ts_event,
+        millis_to_unix_nanos(state.end_ms - 2 * MINUTE_MS)
+    );
+    assert_eq!(bars[0].close, Price::from("11.25"));
+    assert_eq!(
+        bars[1].ts_event,
+        millis_to_unix_nanos(state.end_ms - MINUTE_MS)
+    );
+    assert_eq!(bars[1].close, Price::from("12.25"));
+}
+
+#[tokio::test]
+async fn domain_client_request_bars_paginates_range() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = PaginatedCandlesState {
+        start_ms: 1_700_000_000_000,
+        calls: Arc::clone(&calls),
+    };
+    let end_ms = state.start_ms + (i64::from(LIGHTER_CANDLES_MAX_LIMIT) + 1) * MINUTE_MS;
+    let base_url = spawn_server(
+        Router::new()
+            .route("/api/v1/orderBookDetails", get(handle_order_book_details))
+            .route("/api/v1/candles", get(handle_paginated_candles))
+            .with_state(state.clone()),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument = create_test_instrument();
+    let bar_type = one_minute_bar_type(instrument.id());
+    let start = Utc.timestamp_millis_opt(state.start_ms).single().unwrap();
+    let end = Utc.timestamp_millis_opt(end_ms).single().unwrap();
+
+    client
+        .get_order_book_details(&LighterOrderBookDetailsQuery::default())
+        .await
+        .unwrap();
+    let bars = client
+        .request_bars(&instrument, bar_type, Some(start), Some(end), None)
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(bars.len(), 2);
+    assert_eq!(bars[0].ts_event, millis_to_unix_nanos(state.start_ms));
+    assert_eq!(
+        bars[1].ts_event,
+        millis_to_unix_nanos(state.start_ms + i64::from(LIGHTER_CANDLES_MAX_LIMIT) * MINUTE_MS),
+    );
+}
+
+#[tokio::test]
+async fn domain_client_request_bars_rejects_unsupported_bar_type() {
+    let base_url = spawn_server(
+        Router::new().route("/api/v1/orderBookDetails", get(handle_order_book_details)),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument = create_test_instrument();
+    let bar_type = unsupported_three_minute_bar_type(instrument.id());
+    let start = Utc
+        .timestamp_millis_opt(1_700_000_000_000)
+        .single()
+        .unwrap();
+    let end = Utc
+        .timestamp_millis_opt(1_700_000_060_000)
+        .single()
+        .unwrap();
+
+    client
+        .get_order_book_details(&LighterOrderBookDetailsQuery::default())
+        .await
+        .unwrap();
+    let error = client
+        .request_bars(&instrument, bar_type, Some(start), Some(end), Some(1))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        LighterHttpError::Parse(message)
+            if message == "unsupported Lighter candle minute step: 3"
+    ));
+}
+
+#[tokio::test]
+async fn domain_client_request_instrument_errors_when_not_found() {
+    let base_url = spawn_server(
+        Router::new().route("/api/v1/orderBookDetails", get(handle_order_book_details)),
+    )
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    let instrument_id = InstrumentId::new(Symbol::new("BTC-PERP"), Venue::new("LIGHTER"));
+
+    let error = client.request_instrument(instrument_id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        LighterHttpError::Parse(message)
+            if message == "instrument BTC-PERP.LIGHTER not found"
+    ));
+}
+
+#[tokio::test]
+async fn domain_client_get_account_detail_queries_by_index_and_parses_first_account() {
+    let base_url = spawn_server(Router::new().route("/api/v1/account", get(handle_account))).await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+
+    let detail = client.get_account_detail(123_456).await.unwrap();
+
+    assert_eq!(detail.account_index, 123_456);
+    assert_eq!(detail.account_type, 0);
+    assert_eq!(detail.status, 1);
+}
+
+#[tokio::test]
+async fn domain_client_get_account_detail_errors_on_empty_accounts() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/account", get(handle_account_empty))).await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+
+    let error = client.get_account_detail(123_456).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        LighterHttpError::Parse(message)
+            if message == "no account returned for index 123456"
+    ));
+}
+
+async fn handle_next_nonce(Query(query): Query<LighterNextNonceQuery>) -> Response {
+    assert_eq!(query.account_index, 12_345);
+    assert_eq!(query.api_key_index, 5);
+    (StatusCode::OK, HTTP_NEXT_NONCE).into_response()
+}
+
+async fn handle_maker_only_api_keys(
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
 ) -> Response {
-    record_request(&state, "/api/v1/fastwithdraw/info", &query, &headers).await;
-    Json(json!({
-        "code": 200,
-        "to_account_index": 17,
-        "withdraw_limit": "1000",
-        "max_withdrawal_amount": "800"
-    }))
-    .into_response()
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+
+    if authorization != Some("auth-token")
+        || query.get("account_index").map(String::as_str) != Some("712440")
+        || query.contains_key("auth")
+        || query.contains_key("authorization")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"{"code":400,"message":"unexpected maker-only request"}"#,
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, r#"{"code":200,"api_key_indexes":[5]}"#).into_response()
 }
 
-async fn handle_fastwithdraw(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/fastwithdraw", &form, &headers).await;
-    Json(json!({"code": 200, "message": "ok"})).into_response()
-}
-
-async fn handle_lease_options(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/leaseOptions", &HashMap::new(), &headers).await;
-    Json(json!({
-        "code": 200,
-        "options": [{"duration_days": 30, "apr_bps": 100}],
-        "lit_incentives_account_index": 99
-    }))
-    .into_response()
-}
-
-async fn handle_leases(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/leases", &query, &headers).await;
-    Json(json!({"code": 200, "leases": [{"lease_id": 1}], "next_cursor": null})).into_response()
-}
-
-async fn handle_lit_lease(
-    State(state): State<TestServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&body).unwrap();
-    record_request(&state, "/api/v1/litLease", &form, &headers).await;
-    Json(json!({"code": 200, "tx_hash": "0xlease"})).into_response()
-}
-
-async fn handle_export(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/export", &query, &headers).await;
-    Json(json!({"code": 200, "data_url": "https://example.com/export.csv"})).into_response()
-}
-
-async fn handle_txs(
-    State(state): State<TestServerState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    record_request(&state, "/api/v1/txs", &query, &headers).await;
-    Json(json!({"code": 200, "txs": [{"hash": "0xabc"}]})).into_response()
-}
-
-async fn handle_funding_rates_error() -> Response {
+async fn handle_send_tx(headers: HeaderMap, body: Bytes) -> Response {
+    let body = assert_lighter_multipart_body(&headers, &body);
+    assert!(body.contains("name=\"tx_type\"\r\n\r\n14\r\n"));
+    assert!(body.contains(
+        "name=\"tx_info\"\r\n\r\n{\"AccountIndex\":1,\"Nonce\":2,\"Sig\":\"0xsig\"}\r\n"
+    ));
+    assert!(body.contains("name=\"price_protection\"\r\n\r\ntrue\r\n"));
     (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(json!({"code": 429, "message": "rate limit exceeded"})),
+        StatusCode::OK,
+        r#"{"code":200,"tx_hash":"0xabc","predicted_execution_time_ms":1751465474,"volume_quota_remaining":123}"#,
     )
         .into_response()
 }
 
-fn build_router(state: TestServerState) -> Router {
-    Router::new()
-        .route("/", get(handle_status))
-        .route("/api/v1/orderBooks", get(handle_order_books))
-        .route("/api/v1/assetDetails", get(handle_asset_details))
-        .route("/api/v1/orderBookDetails", get(handle_order_book_details))
-        .route("/api/v1/recentTrades", get(handle_recent_trades))
-        .route("/api/v1/systemConfig", get(handle_system_config))
-        .route("/api/v1/account", get(handle_account))
-        .route("/api/v1/accountInactiveOrders", get(handle_inactive_orders))
-        .route("/api/v1/layer1BasicInfo", get(handle_layer1_basic_info))
-        .route("/info", get(handle_info))
-        .route("/api/v1/l1Metadata", get(handle_l1_metadata))
-        .route(
-            "/api/v1/publicPoolsMetadata",
-            get(handle_public_pools_metadata),
-        )
-        .route("/api/v1/txFromL1TxHash", get(handle_tx_from_l1_tx_hash))
-        .route("/api/v1/tokens", get(handle_tokens))
-        .route("/api/v1/tokens/create", post(handle_tokens_create))
-        .route("/api/v1/tokens/revoke", post(handle_tokens_revoke))
-        .route("/api/v1/notification/ack", post(handle_notification_ack))
-        .route(
-            "/api/v1/referral/userReferrals",
-            get(handle_referral_user_referrals),
-        )
-        .route("/api/v1/referral/get", get(handle_referral_get))
-        .route("/api/v1/referral/create", post(handle_referral_create))
-        .route("/api/v1/referral/update", post(handle_referral_update))
-        .route(
-            "/api/v1/referral/kickback/update",
-            post(handle_referral_kickback_update),
-        )
-        .route("/api/v1/referral/use", post(handle_referral_use))
-        .route("/api/v1/liquidations", get(handle_liquidations))
-        .route("/api/v1/transferFeeInfo", get(handle_transfer_fee_info))
-        .route("/api/v1/withdrawalDelay", get(handle_withdrawal_delay))
-        .route("/api/v1/announcement", get(handle_announcement))
-        .route("/api/v1/exchangeMetrics", get(handle_exchange_metrics))
-        .route("/api/v1/executeStats", get(handle_execute_stats))
-        .route(
-            "/api/v1/createIntentAddress",
-            post(handle_create_intent_address),
-        )
-        .route("/api/v1/fastbridge/info", get(handle_fastbridge_info))
-        .route("/api/v1/deposit/latest", get(handle_deposit_latest))
-        .route("/api/v1/deposit/networks", get(handle_deposit_networks))
-        .route("/api/v1/fastwithdraw/info", get(handle_fastwithdraw_info))
-        .route("/api/v1/fastwithdraw", post(handle_fastwithdraw))
-        .route("/api/v1/leaseOptions", get(handle_lease_options))
-        .route("/api/v1/leases", get(handle_leases))
-        .route("/api/v1/litLease", post(handle_lit_lease))
-        .route("/api/v1/export", get(handle_export))
-        .route("/api/v1/txs", get(handle_txs))
-        .route("/api/v1/funding-rates", get(handle_funding_rates_error))
-        .with_state(state)
+async fn handle_send_tx_false_price_protection(headers: HeaderMap, body: Bytes) -> Response {
+    let body = assert_lighter_multipart_body(&headers, &body);
+    assert!(body.contains("name=\"tx_type\"\r\n\r\n14\r\n"));
+    assert!(body.contains(
+        "name=\"tx_info\"\r\n\r\n{\"AccountIndex\":1,\"Nonce\":2,\"Sig\":\"0xsig\"}\r\n"
+    ));
+    assert!(body.contains("name=\"price_protection\"\r\n\r\nfalse\r\n"));
+    (
+        StatusCode::OK,
+        r#"{"code":200,"tx_hash":"0xabc","predicted_execution_time_ms":1751465474,"volume_quota_remaining":123}"#,
+    )
+        .into_response()
 }
 
-#[tokio::test]
-async fn test_load_market_metadata_json_flattens_perp_and_spot_details() {
-    let state = TestServerState::default();
-    let addr = spawn_server(build_router(state.clone())).await;
-    let client = LighterHttpClient::new_public(test_config(addr)).unwrap();
-
-    let payload = client.load_market_metadata_json().await.unwrap();
-    let payload: Value = serde_json::from_str(&payload).unwrap();
-
-    assert_eq!(payload["assets"].as_array().unwrap().len(), 3);
-    assert_eq!(payload["details"].as_array().unwrap().len(), 2);
-    assert_eq!(payload["details"][0]["market_id"], 1);
-    assert_eq!(payload["details"][1]["market_id"], 2048);
-
-    let requests = state.requests.lock().await.clone();
+async fn handle_send_tx_batch(headers: HeaderMap, body: Bytes) -> Response {
+    let body = assert_lighter_multipart_body(&headers, &body);
+    assert!(body.contains("name=\"tx_types\"\r\n\r\n[14,15]\r\n"));
     assert!(
-        requests
-            .iter()
-            .any(|(path, _, _)| path == "/api/v1/orderBooks")
+        body.contains("name=\"tx_infos\"\r\n\r\n[{\"AccountIndex\":1},{\"AccountIndex\":1}]\r\n")
     );
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, _)| path == "/api/v1/assetDetails")
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|(path, _, _)| path == "/api/v1/orderBookDetails")
-            .count(),
-        1,
-    );
+    (
+        StatusCode::OK,
+        concat!(
+            r#"{"code":200,"tx_hash":["0xabc","0xdef"],"#,
+            r#""predicted_execution_time_ms":1751465475,"volume_quota_remaining":122}"#,
+        ),
+    )
+        .into_response()
 }
 
-#[tokio::test]
-async fn test_rest_client_encodes_queries_and_auth_headers() {
-    let state = TestServerState::default();
-    let addr = spawn_server(build_router(state.clone())).await;
-    let rest = LighterRestClient::new(&test_config(addr)).unwrap();
-
-    let trades = rest.get_recent_trades(1, 50).await.unwrap();
-    let account = rest
-        .get_detailed_account_by_index(7, "Bearer lighter-auth")
-        .await
-        .unwrap();
-    let inactive = rest
-        .get_account_inactive_orders(7, 1, "Bearer lighter-auth", Some("cursor-1"))
-        .await
-        .unwrap();
-    let inactive_all_markets = rest
-        .get_account_inactive_orders(7, 255, "Bearer lighter-auth", None)
-        .await
-        .unwrap();
-
-    assert_eq!(trades.trades.len(), 1);
-    assert_eq!(account.accounts.len(), 1);
-    assert!(inactive.orders.is_empty());
-    assert!(inactive_all_markets.orders.is_empty());
-
-    let requests = state.requests.lock().await.clone();
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/recentTrades"
-            && query.contains("market_id=1")
-            && query.contains("limit=50")
-            && auth.is_none()
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/account"
-            && query.contains("by=index")
-            && query.contains("value=7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/accountInactiveOrders"
-            && query.contains("account_index=7")
-            && query.contains("market_id=1")
-            && query.contains("limit=100")
-            && query.contains("cursor=cursor-1")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/accountInactiveOrders"
-            && query.contains("account_index=7")
-            && query.contains("limit=100")
-            && !query.contains("market_id=")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
+async fn handle_send_tx_batch_without_volume_quota(headers: HeaderMap, body: Bytes) -> Response {
+    let body = assert_lighter_multipart_body(&headers, &body);
+    assert!(body.contains("name=\"tx_types\"\r\n\r\n[14,15]\r\n"));
+    (
+        StatusCode::OK,
+        r#"{"code":200,"tx_hash":["0xabc","0xdef"],"predicted_execution_time_ms":1751465475}"#,
+    )
+        .into_response()
 }
 
-#[tokio::test]
-async fn test_rest_client_surfaces_api_errors() {
-    let state = TestServerState::default();
-    let addr = spawn_server(build_router(state)).await;
-    let rest = LighterRestClient::new(&test_config(addr)).unwrap();
+async fn handle_send_tx_success_body_venue_error(headers: HeaderMap, body: Bytes) -> Response {
+    let body = assert_lighter_multipart_body(&headers, &body);
+    assert!(body.contains("name=\"tx_type\"\r\n\r\n14\r\n"));
+    assert!(body.contains("name=\"tx_info\"\r\n\r\n"));
+    assert!(!body.contains("name=\"price_protection\""));
+    (StatusCode::OK, r#"{"code":1001,"message":"invalid tx"}"#).into_response()
+}
 
-    let error = rest.get_funding_rates(1, None).await.unwrap_err();
+async fn handle_send_tx_batch_success_body_rate_limit(headers: HeaderMap, body: Bytes) -> Response {
+    let body = assert_lighter_multipart_body(&headers, &body);
+    assert!(body.contains("name=\"tx_types\"\r\n\r\n[14,15]\r\n"));
+    assert!(body.contains("name=\"tx_infos\"\r\n\r\n[]\r\n"));
+    (StatusCode::OK, r#"{"code":429,"message":"slow down"}"#).into_response()
+}
 
-    match error {
-        SdkError::Api { code, message } => {
-            assert_eq!(code, 429);
-            assert_eq!(message, "rate limit exceeded");
+async fn handle_order_books(Query(query): Query<LighterOrderBooksQuery>) -> Response {
+    assert_eq!(query.market_id, Some(0));
+    assert_eq!(query.filter, Some(LighterOrderBookFilter::Perp));
+    (StatusCode::OK, HTTP_ORDER_BOOKS).into_response()
+}
+
+async fn handle_order_book_details_filtered(
+    Query(query): Query<LighterOrderBookDetailsQuery>,
+) -> Response {
+    assert_eq!(query.market_id, Some(0));
+    assert_eq!(query.filter, Some(LighterOrderBookFilter::Perp));
+    (StatusCode::OK, HTTP_ORDER_BOOK_DETAILS).into_response()
+}
+
+async fn handle_order_book_details() -> Response {
+    (StatusCode::OK, HTTP_ORDER_BOOK_DETAILS).into_response()
+}
+
+async fn handle_order_book_orders(Query(query): Query<LighterOrderBookOrdersQuery>) -> Response {
+    assert_eq!(query.market_id, 0);
+    assert_eq!(query.limit, 25);
+    (StatusCode::OK, HTTP_ORDER_BOOK_ORDERS).into_response()
+}
+
+async fn handle_recent_trades(Query(query): Query<LighterRecentTradesQuery>) -> Response {
+    assert_eq!(query.market_id, 0);
+    assert_eq!(query.limit, 10);
+    (StatusCode::OK, HTTP_RECENT_TRADES).into_response()
+}
+
+async fn handle_domain_trades(Query(query): Query<LighterTradesQuery>) -> Response {
+    assert_eq!(query.authorization, None);
+    assert_eq!(query.auth, None);
+    assert_eq!(query.market_id, Some(0));
+    assert_eq!(query.account_index, None);
+    assert_eq!(query.order_index, None);
+    assert_eq!(query.sort_by, LighterTradeSortBy::TradeId);
+    assert_eq!(query.sort_dir, None);
+    assert_eq!(query.cursor, None);
+    assert_eq!(query.from_timestamp, None);
+    assert_eq!(query.ask_filter, None);
+    assert_eq!(query.role, None);
+    assert_eq!(query.trade_type, None);
+    assert_eq!(query.limit, 50);
+    assert_eq!(query.aggregate, None);
+    (StatusCode::OK, HTTP_RECENT_TRADES).into_response()
+}
+
+async fn handle_candles(Query(query): Query<LighterCandlesQuery>) -> Response {
+    assert_eq!(query.market_id, 0);
+    assert_eq!(query.resolution, LighterCandleResolution::OneMinute);
+    assert_eq!(query.start_timestamp, 1_700_000_000_000);
+    assert_eq!(query.end_timestamp, 1_700_000_120_000);
+    assert_eq!(query.count_back, i64::from(LIGHTER_CANDLES_MAX_LIMIT));
+    assert_eq!(query.set_timestamp_to_end, Some(false));
+    (StatusCode::OK, HTTP_CANDLES).into_response()
+}
+
+async fn handle_fundings(Query(query): Query<LighterFundingsQuery>) -> Response {
+    assert_eq!(query.market_id, 0);
+    assert_eq!(query.resolution, LighterFundingResolution::OneHour);
+    assert_eq!(query.start_timestamp, 1_778_702_400_000);
+    assert_eq!(query.end_timestamp, 1_778_706_000_000);
+    assert_eq!(query.count_back, 2);
+    (StatusCode::OK, HTTP_FUNDINGS).into_response()
+}
+
+async fn handle_domain_candles(Query(query): Query<LighterCandlesQuery>) -> Response {
+    assert_eq!(query.market_id, 0);
+    assert_eq!(query.resolution, LighterCandleResolution::OneMinute);
+    assert_eq!(query.start_timestamp, 1_700_000_000_000);
+    assert_eq!(query.end_timestamp, 1_700_000_120_000);
+    assert_eq!(query.count_back, i64::from(LIGHTER_CANDLES_MAX_LIMIT));
+    assert_eq!(query.set_timestamp_to_end, Some(false));
+    (StatusCode::OK, HTTP_CANDLES).into_response()
+}
+
+async fn handle_incomplete_candles(
+    State(state): State<IncompleteCandlesState>,
+    Query(query): Query<LighterCandlesQuery>,
+) -> Response {
+    assert_candles_query_common(&query);
+    assert_eq!(query.start_timestamp, state.completed_start_ms);
+    assert!(query.end_timestamp > state.incomplete_start_ms);
+    let body = candles_response(&[
+        (state.completed_start_ms, "10.25"),
+        (state.incomplete_start_ms, "99.99"),
+    ]);
+    (StatusCode::OK, body).into_response()
+}
+
+async fn handle_latest_candles(
+    State(state): State<LatestCandlesState>,
+    Query(query): Query<LighterCandlesQuery>,
+) -> Response {
+    assert_candles_query_common(&query);
+    assert_eq!(query.start_timestamp, state.end_ms - 3 * MINUTE_MS);
+    assert_eq!(query.end_timestamp, state.end_ms);
+    let body = candles_response(&[
+        (state.end_ms - 3 * MINUTE_MS, "10.25"),
+        (state.end_ms - 2 * MINUTE_MS, "11.25"),
+        (state.end_ms - MINUTE_MS, "12.25"),
+    ]);
+    (StatusCode::OK, body).into_response()
+}
+
+async fn handle_paginated_candles(
+    State(state): State<PaginatedCandlesState>,
+    Query(query): Query<LighterCandlesQuery>,
+) -> Response {
+    assert_candles_query_common(&query);
+    let page = state.calls.fetch_add(1, Ordering::SeqCst);
+    let page_span_ms = i64::from(LIGHTER_CANDLES_MAX_LIMIT) * MINUTE_MS;
+
+    match page {
+        0 => {
+            assert_eq!(query.start_timestamp, state.start_ms);
+            assert_eq!(query.end_timestamp, state.start_ms + page_span_ms);
+            let body = candles_response(&[(state.start_ms, "10.25")]);
+            (StatusCode::OK, body).into_response()
         }
-        other => panic!("unexpected error variant: {other:?}"),
+        1 => {
+            assert_eq!(query.start_timestamp, state.start_ms + page_span_ms);
+            assert_eq!(
+                query.end_timestamp,
+                state.start_ms + page_span_ms + MINUTE_MS
+            );
+            let body = candles_response(&[
+                (state.start_ms, "99.99"),
+                (state.start_ms + page_span_ms, "11.25"),
+            ]);
+            (StatusCode::OK, body).into_response()
+        }
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "unexpected candle page").into_response(),
     }
 }
 
-#[tokio::test]
-async fn test_rest_client_forwards_token_and_notification_requests() {
-    let state = TestServerState::default();
-    let addr = spawn_server(build_router(state.clone())).await;
-    let rest = LighterRestClient::new(&test_config(addr)).unwrap();
-
-    let tokens = rest.get_tokens(7, "Bearer lighter-auth").await.unwrap();
-    let created = rest
-        .create_token(
-            "reporting",
-            7,
-            1_767_139_200,
-            true,
-            "read.*",
-            "Bearer lighter-auth",
-        )
-        .await
-        .unwrap();
-    let revoked = rest
-        .revoke_token(11, 7, "Bearer lighter-auth")
-        .await
-        .unwrap();
-    let acked = rest
-        .ack_notification("notif-1", 7, "Bearer lighter-auth")
-        .await
-        .unwrap();
-
-    assert_eq!(tokens["tokens"][0]["token_id"], 11);
-    assert_eq!(created["token_id"], 11);
-    assert_eq!(revoked["code"], 200);
-    assert_eq!(acked["code"], 200);
-
-    let requests = state.requests.lock().await.clone();
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/tokens"
-            && query.contains("account_index=7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/tokens/create"
-            && query.contains("name=reporting")
-            && query.contains("account_index=7")
-            && query.contains("expiry=1767139200")
-            && query.contains("sub_account_access=true")
-            && (query.contains("scopes=read.%2A") || query.contains("scopes=read.*"))
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/tokens/revoke"
-            && query.contains("token_id=11")
-            && query.contains("account_index=7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/notification/ack"
-            && query.contains("notif_id=notif-1")
-            && query.contains("account_index=7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
+async fn handle_trades(Query(query): Query<LighterTradesQuery>) -> Response {
+    assert_eq!(query.authorization.as_deref(), Some("bearer-token"));
+    assert_eq!(query.market_id, Some(0));
+    assert_eq!(query.account_index, Some(712_440));
+    assert_eq!(query.order_index, Some(281_476_929_510_110));
+    assert_eq!(query.sort_by, LighterTradeSortBy::Timestamp);
+    assert_eq!(query.sort_dir, Some(LighterSortDirection::Desc));
+    assert_eq!(query.cursor.as_deref(), Some("cursor-1"));
+    assert_eq!(query.from_timestamp, Some(1_700_000_000_000));
+    assert_eq!(query.ask_filter, Some(1));
+    assert_eq!(query.role, Some(LighterTradeRole::Maker));
+    assert_eq!(query.trade_type, Some(LighterTradeQueryType::Trade));
+    assert_eq!(query.limit, 50);
+    assert_eq!(query.aggregate, Some(true));
+    (StatusCode::OK, HTTP_RECENT_TRADES).into_response()
 }
 
-#[tokio::test]
-async fn test_rest_client_supports_pool_l1_and_l1_tx_queries() {
-    let state = TestServerState::default();
-    let addr = spawn_server(build_router(state.clone())).await;
-    let rest = LighterRestClient::new(&test_config(addr)).unwrap();
-
-    let l1 = rest
-        .get_l1_metadata("0xabc", Some("Bearer lighter-auth"))
-        .await
-        .unwrap();
-    let pools = rest
-        .get_public_pools_metadata("account_index", 5, 25, Some(7), Some("Bearer lighter-auth"))
-        .await
-        .unwrap();
-    let tx = rest.get_tx_from_l1_tx_hash("0xl1").await.unwrap();
-
-    assert_eq!(l1["l1_address"], "0xabc");
-    assert_eq!(pools.pools.len(), 1);
-    assert_eq!(tx["hash"], "0xl1");
-
-    let requests = state.requests.lock().await.clone();
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/l1Metadata"
-            && query.contains("l1_address=0xabc")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/publicPoolsMetadata"
-            && query.contains("filter=account_index")
-            && query.contains("index=5")
-            && query.contains("limit=25")
-            && query.contains("account_index=7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/txFromL1TxHash" && query.contains("hash=0xl1") && auth.is_none()
-    }));
+async fn handle_trades_with_page_size_limit(Query(query): Query<LighterTradesQuery>) -> Response {
+    assert_eq!(query.limit, LIGHTER_REST_PAGE_SIZE);
+    (StatusCode::OK, HTTP_RECENT_TRADES).into_response()
 }
 
-#[tokio::test]
-async fn test_rest_client_supports_referral_and_account_info_requests() {
-    let state = TestServerState::default();
-    let addr = spawn_server(build_router(state.clone())).await;
-    let rest = LighterRestClient::new(&test_config(addr)).unwrap();
-
-    let referrals = rest
-        .get_user_referrals("0xabc", Some(2), Some("Bearer lighter-auth"))
-        .await
-        .unwrap();
-    let referral = rest
-        .get_referral_code(7, Some("Bearer lighter-auth"))
-        .await
-        .unwrap();
-    let created = rest
-        .create_referral_code(7, Some("Bearer lighter-auth"))
-        .await
-        .unwrap();
-    let updated = rest
-        .update_referral_code(7, "LIGHTER7", Some("Bearer lighter-auth"))
-        .await
-        .unwrap();
-    let kickback = rest
-        .update_referral_kickback(7, 25.0, Some("Bearer lighter-auth"))
-        .await
-        .unwrap();
-    let used = rest
-        .use_referral_code(
-            "0xabc",
-            "LIGHTER7",
-            "x_user",
-            Some("discord#7"),
-            None,
-            None,
-            Some("Bearer lighter-auth"),
-        )
-        .await
-        .unwrap();
-    let liquidations = rest
-        .get_liquidations(
-            7,
-            25,
-            Some(1),
-            Some("cursor-1"),
-            Some("Bearer lighter-auth"),
-        )
-        .await
-        .unwrap();
-    let transfer_fee = rest
-        .get_transfer_fee_info(7, Some(9), Some("Bearer lighter-auth"))
-        .await
-        .unwrap();
-    let withdrawal_delay = rest.get_withdrawal_delay().await.unwrap();
-
-    assert_eq!(referrals.referrals.len(), 1);
-    assert_eq!(referral.referral_code.as_deref(), Some("LIGHTER7"));
-    assert_eq!(created.remaining_usage, Some(3));
-    assert_eq!(updated.success, Some(true));
-    assert_eq!(kickback.success, Some(true));
-    assert_eq!(used.code, 200);
-    assert_eq!(liquidations.liquidations.len(), 1);
-    assert_eq!(transfer_fee.transfer_fee_usdc, Some(15));
-    assert_eq!(withdrawal_delay.seconds, Some(86400));
-
-    let requests = state.requests.lock().await.clone();
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/referral/userReferrals"
-            && query.contains("l1_address=0xabc")
-            && query.contains("cursor=2")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/referral/get"
-            && query.contains("account_index=7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/referral/create"
-            && query.contains("account_index=7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/referral/update"
-            && query.contains("account_index=7")
-            && query.contains("new_referral_code=LIGHTER7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/referral/kickback/update"
-            && query.contains("account_index=7")
-            && query.contains("kickback_percentage=25")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/referral/use"
-            && query.contains("l1_address=0xabc")
-            && query.contains("referral_code=LIGHTER7")
-            && query.contains("x=x_user")
-            && query.contains("discord=discord%237")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/liquidations"
-            && query.contains("account_index=7")
-            && query.contains("limit=25")
-            && query.contains("market_id=1")
-            && query.contains("cursor=cursor-1")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/transferFeeInfo"
-            && query.contains("account_index=7")
-            && query.contains("to_account_index=9")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/api/v1/withdrawalDelay" && auth.is_none() })
-    );
+async fn handle_account_active_orders(
+    Query(query): Query<LighterAccountActiveOrdersQuery>,
+) -> Response {
+    assert_eq!(query.auth.as_deref(), Some("auth-token"));
+    assert_eq!(query.account_index, 712_440);
+    assert_eq!(query.market_id, 0);
+    (StatusCode::OK, HTTP_ORDERS).into_response()
 }
 
-#[tokio::test]
-async fn test_rest_client_supports_public_info_bridge_and_lease_requests() {
-    let state = TestServerState::default();
-    let addr = spawn_server(build_router(state.clone())).await;
-    let rest = LighterRestClient::new(&test_config(addr)).unwrap();
-
-    let announcements = rest.get_announcements().await.unwrap();
-    let metrics = rest
-        .get_exchange_metrics("d", "volume", Some("byMarket"), Some("BTC-USDC"))
-        .await
-        .unwrap();
-    let execute_stats = rest.get_execute_stats("d").await.unwrap();
-    let intent = rest
-        .create_intent_address("1", "0xabc", "1000", true)
-        .await
-        .unwrap();
-    let fast_bridge = rest.get_fast_bridge_info().await.unwrap();
-    let deposit_latest = rest.get_deposit_latest("0xabc").await.unwrap();
-    let deposit_networks = rest.get_deposit_networks().await.unwrap();
-    let fast_withdraw_info = rest
-        .get_fast_withdraw_info(7, "Bearer lighter-auth")
-        .await
-        .unwrap();
-    let fast_withdraw = rest
-        .fast_withdraw("{\"nonce\":1}", "0xdef", "Bearer lighter-auth")
-        .await
-        .unwrap();
-    let lease_options = rest.get_lease_options().await.unwrap();
-    let leases = rest
-        .get_leases(7, "Bearer lighter-auth", Some("cursor-1"), Some(25))
-        .await
-        .unwrap();
-    let lit_lease = rest
-        .lit_lease(
-            "{\"nonce\":2}",
-            Some("2500"),
-            Some(30),
-            "Bearer lighter-auth",
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(announcements.announcements.len(), 1);
-    assert_eq!(metrics["code"], 200);
-    assert_eq!(execute_stats["code"], 200);
-    assert_eq!(intent["intent_address"], "0xintent");
-    assert_eq!(fast_bridge["code"], 200);
-    assert_eq!(deposit_latest["code"], 200);
-    assert_eq!(deposit_networks["code"], 200);
-    assert_eq!(fast_withdraw_info["code"], 200);
-    assert_eq!(fast_withdraw["code"], 200);
-    assert_eq!(lease_options["code"], 200);
-    assert_eq!(leases["code"], 200);
-    assert_eq!(lit_lease["tx_hash"], "0xlease");
-
-    let requests = state.requests.lock().await.clone();
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/api/v1/announcement" && auth.is_none() })
+async fn handle_account_inactive_orders(
+    Query(query): Query<LighterAccountInactiveOrdersQuery>,
+) -> Response {
+    assert_eq!(query.authorization.as_deref(), Some("bearer-token"));
+    assert_eq!(query.account_index, 712_440);
+    assert_eq!(query.market_id, Some(0));
+    assert_eq!(query.ask_filter, Some(1));
+    assert_eq!(
+        query.between_timestamps.as_deref(),
+        Some("1700000000000,1700000001000"),
     );
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/exchangeMetrics"
-            && query.contains("period=d")
-            && query.contains("kind=volume")
-            && query.contains("filter=byMarket")
-            && query.contains("value=BTC-USDC")
-            && auth.is_none()
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/executeStats" && query.contains("period=d") && auth.is_none()
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/createIntentAddress"
-            && query.contains("chain_id=1")
-            && query.contains("from_addr=0xabc")
-            && query.contains("amount=1000")
-            && query.contains("is_external_deposit=true")
-            && auth.is_none()
-    }));
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/api/v1/fastbridge/info" && auth.is_none() })
-    );
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/deposit/latest" && query.contains("l1_address=0xabc") && auth.is_none()
-    }));
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/api/v1/deposit/networks" && auth.is_none() })
-    );
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/fastwithdraw/info"
-            && query.contains("account_index=7")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/fastwithdraw"
-            && query.contains("tx_info=%7B%22nonce%22%3A1%7D")
-            && query.contains("to_address=0xdef")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/api/v1/leaseOptions" && auth.is_none() })
-    );
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/leases"
-            && query.contains("account_index=7")
-            && query.contains("cursor=cursor-1")
-            && query.contains("limit=25")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/litLease"
-            && query.contains("tx_info=%7B%22nonce%22%3A2%7D")
-            && query.contains("lease_amount=2500")
-            && query.contains("duration_days=30")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
+    assert_eq!(query.cursor.as_deref(), Some("cursor-1"));
+    assert_eq!(query.limit, 50);
+    (StatusCode::OK, HTTP_ORDERS).into_response()
 }
 
-#[tokio::test]
-async fn test_rest_client_supports_status_export_and_tx_history_requests() {
-    let state = TestServerState::default();
-    let addr = spawn_server(build_router(state.clone())).await;
-    let rest = LighterRestClient::new(&test_config(addr)).unwrap();
+async fn handle_account(Query(query): Query<LighterAccountQuery>) -> Response {
+    assert_eq!(query.by, LighterAccountLookup::Index);
+    assert_eq!(query.value, "123456");
+    (StatusCode::OK, HTTP_ACCOUNT).into_response()
+}
 
-    let status = rest.get_status().await.unwrap();
-    let system_config = rest.get_system_config().await.unwrap();
-    let layer1_basic_info = rest.get_layer1_basic_info().await.unwrap();
-    let info = rest.get_zk_lighter_info().await.unwrap();
-    let export = rest
-        .get_export(
-            "trade",
-            Some("Bearer lighter-auth"),
-            Some(7),
-            Some(1),
-            Some(10),
-            Some(20),
-            Some("long"),
-            Some("maker"),
-            Some("trade"),
-        )
-        .await
-        .unwrap();
-    let txs = rest.get_txs(25, Some(10)).await.unwrap();
+async fn handle_account_empty() -> Response {
+    (StatusCode::OK, r#"{"code":200,"total":0,"accounts":[]}"#).into_response()
+}
 
-    assert_eq!(status["status"], 1);
-    assert_eq!(system_config["code"], 200);
-    assert_eq!(layer1_basic_info["code"], 200);
-    assert_eq!(info.address.as_deref(), Some("0xcontract"));
-    assert_eq!(export["data_url"], "https://example.com/export.csv");
-    assert_eq!(txs["code"], 200);
+async fn handle_rate_limit() -> Response {
+    (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response()
+}
 
-    let requests = state.requests.lock().await.clone();
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/" && auth.is_none() })
-    );
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/api/v1/systemConfig" && auth.is_none() })
-    );
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/api/v1/layer1BasicInfo" && auth.is_none() })
-    );
-    assert!(
-        requests
-            .iter()
-            .any(|(path, _, auth)| { path == "/info" && auth.is_none() })
-    );
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/export"
-            && query.contains("type=trade")
-            && query.contains("account_index=7")
-            && query.contains("market_id=1")
-            && query.contains("start_timestamp=10")
-            && query.contains("end_timestamp=20")
-            && query.contains("side=long")
-            && query.contains("role=maker")
-            && query.contains("trade_type=trade")
-            && auth.as_deref() == Some("Bearer lighter-auth")
-    }));
-    assert!(requests.iter().any(|(path, query, auth)| {
-        path == "/api/v1/txs"
-            && query.contains("limit=25")
-            && query.contains("index=10")
-            && auth.is_none()
-    }));
+#[derive(Clone)]
+struct TransientFailureState {
+    calls: Arc<AtomicUsize>,
+    fail_until: u32,
+    fail_status: StatusCode,
+    success_body: &'static str,
+}
+
+async fn handle_transient_failure(State(state): State<TransientFailureState>) -> Response {
+    let call = state.calls.fetch_add(1, Ordering::SeqCst) as u32;
+    if call < state.fail_until {
+        (state.fail_status, "").into_response()
+    } else {
+        (StatusCode::OK, state.success_body).into_response()
+    }
+}
+
+async fn handle_transient_post(State(state): State<TransientFailureState>) -> Response {
+    let call = state.calls.fetch_add(1, Ordering::SeqCst) as u32;
+    if call < state.fail_until {
+        (state.fail_status, "").into_response()
+    } else {
+        (StatusCode::OK, state.success_body).into_response()
+    }
+}
+
+#[derive(Clone)]
+struct StructuredFailureState {
+    calls: Arc<AtomicUsize>,
+    fail_until: u32,
+    fail_status: StatusCode,
+    fail_body: &'static str,
+    success_body: &'static str,
+}
+
+async fn handle_structured_failure(State(state): State<StructuredFailureState>) -> Response {
+    let call = state.calls.fetch_add(1, Ordering::SeqCst) as u32;
+    if call < state.fail_until {
+        (state.fail_status, state.fail_body).into_response()
+    } else {
+        (StatusCode::OK, state.success_body).into_response()
+    }
+}
+
+async fn handle_venue_error() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        r#"{"code":1001,"message":"invalid market"}"#,
+    )
+        .into_response()
+}
+
+async fn handle_method_not_allowed() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response()
+}
+
+async fn handle_body_rate_limit() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        r#"{"code":429,"message":"slow down"}"#,
+    )
+        .into_response()
+}
+
+async fn handle_success_body_venue_error() -> Response {
+    (
+        StatusCode::OK,
+        r#"{"code":1001,"message":"invalid market","order_books":[]}"#,
+    )
+        .into_response()
+}
+
+async fn handle_success_body_rate_limit() -> Response {
+    (
+        StatusCode::OK,
+        r#"{"code":429,"message":"slow down","next_cursor":null,"trades":[]}"#,
+    )
+        .into_response()
+}
+
+fn raw_client(base_url: String) -> LighterRawHttpClient {
+    let mut client =
+        LighterRawHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+    client.set_retry_manager(fast_retry_manager(3));
+    client
+}
+
+// Compressed retry timings keep retry-path assertions in the millisecond range.
+fn fast_retry_manager(max_retries: u32) -> RetryManager<LighterHttpError> {
+    RetryManager::new(RetryConfig {
+        max_retries,
+        initial_delay_ms: 1,
+        max_delay_ms: 1,
+        backoff_factor: 1.0,
+        jitter_ms: 0,
+        operation_timeout_ms: Some(60_000),
+        immediate_first: true,
+        max_elapsed_ms: Some(60_000),
+    })
+}
+
+fn assert_lighter_multipart_body<'a>(headers: &HeaderMap, body: &'a Bytes) -> &'a str {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(content_type.starts_with("multipart/form-data; boundary="));
+
+    let body = std::str::from_utf8(body).unwrap();
+    assert!(body.contains("--nautilus-lighter-form-boundary\r\n"));
+    assert!(body.ends_with("--nautilus-lighter-form-boundary--\r\n"));
+    body
+}
+
+fn assert_candles_query_common(query: &LighterCandlesQuery) {
+    assert_eq!(query.market_id, 0);
+    assert_eq!(query.resolution, LighterCandleResolution::OneMinute);
+    assert_eq!(query.count_back, i64::from(LIGHTER_CANDLES_MAX_LIMIT));
+    assert_eq!(query.set_timestamp_to_end, Some(false));
+}
+
+fn candles_response(candles: &[(i64, &str)]) -> String {
+    let entries = candles
+        .iter()
+        .map(|(timestamp, close)| {
+            format!(
+                r#"{{"t":{timestamp},"o":{close},"h":{close},"l":{close},"c":{close},"v":1.0000,"V":100.0,"i":1}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(r#"{{"code":200,"r":"1m","c":[{entries}]}}"#)
+}
+
+fn one_minute_bar_type(instrument_id: InstrumentId) -> BarType {
+    BarType::new(
+        instrument_id,
+        BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+        AggregationSource::External,
+    )
+}
+
+fn unsupported_three_minute_bar_type(instrument_id: InstrumentId) -> BarType {
+    BarType::new(
+        instrument_id,
+        BarSpecification::new(3, BarAggregation::Minute, PriceType::Last),
+        AggregationSource::External,
+    )
+}
+
+fn millis_to_unix_nanos(timestamp_ms: i64) -> UnixNanos {
+    let timestamp_ms = u64::try_from(timestamp_ms).unwrap();
+    UnixNanos::from(timestamp_ms * 1_000_000)
+}
+
+async fn spawn_server(router: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    format!("http://{addr}")
+}
+
+fn create_test_instrument() -> InstrumentAny {
+    let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), Venue::new("LIGHTER"));
+
+    InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
+        instrument_id,
+        Symbol::new("ETH-PERP"),
+        Currency::from("ETH"),
+        Currency::from("USDC"),
+        Currency::from("USDC"),
+        false,
+        2,
+        4,
+        Price::from("0.01"),
+        Quantity::from("0.0001"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ))
 }

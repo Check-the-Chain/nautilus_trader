@@ -36,8 +36,8 @@ class InteractiveBrokersClientErrorMixin(BaseMixin):
 
     WARNING_CODES: Final[set[int]] = {1101, 1102, 110, 165, 202, 399, 404, 434, 492, 10167}
     CLIENT_ERRORS: Final[set[int]] = {502, 503, 504, 10038, 10182, 1100, 2110}
-    CONNECTIVITY_LOST_CODES: Final[set[int]] = {326, 1100, 1300, 2110}
-    CONNECTIVITY_RESTORED_CODES: Final[set[int]] = {1101, 1102}
+    CONNECTIVITY_LOST_CODES: Final[set[int]] = {326, 1100, 1300, 2103, 2110}
+    CONNECTIVITY_RESTORED_CODES: Final[set[int]] = {1101, 1102, 2104}
     ORDER_REJECTION_CODES: Final[set[int]] = {201, 203, 321, 10289, 10293}
     SUPPRESS_ERROR_LOGGING_CODES: Final[set[int]] = {200}
 
@@ -112,6 +112,13 @@ class InteractiveBrokersClientErrorMixin(BaseMixin):
             else:
                 self._log.warning(f"Unhandled error: {error_code} for req_id {req_id}")
         elif error_code in self.CLIENT_ERRORS or error_code in self.CONNECTIVITY_LOST_CODES:
+            if error_code == 326:
+                self._randomize_client_id_on_next_connect = True
+                self._fetch_all_open_orders = True
+                self._log.warning(
+                    "Enabling `fetch_all_open_orders` for client ID fallback after IB error 326",
+                )
+
             if self._is_ib_connected.is_set():
                 self._log.debug(
                     f"`_is_ib_connected` unset by code {error_code} in `_process_error`",
@@ -124,6 +131,7 @@ class InteractiveBrokersClientErrorMixin(BaseMixin):
                 LogColor.BLUE,
             )
             self._is_ib_connected.set()
+            self._had_ib_connection = True
 
     async def _handle_subscription_error(
         self,

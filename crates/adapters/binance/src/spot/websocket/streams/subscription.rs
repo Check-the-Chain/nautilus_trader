@@ -19,8 +19,8 @@
 //!
 //! - `<symbol>@trade` - Trade stream
 //! - `<symbol>@bestBidAsk` - Best bid/ask stream (with auto-culling)
-//! - `<symbol>@depth` - Diff depth stream (50ms updates)
-//! - `<symbol>@depth20` - Partial book depth (top 20 levels, 50ms updates)
+//! - `<symbol>@depth` - SBE diff depth stream (25ms)
+//! - `<symbol>@depth20` - SBE partial book depth, top 20 levels (50ms)
 //!
 //! ## Connection URL Patterns
 //!

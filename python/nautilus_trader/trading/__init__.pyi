@@ -6,8 +6,10 @@ import typing
 
 from nautilus_trader import common
 from nautilus_trader import model
+from nautilus_trader import portfolio
 
 __all__ = [
+    "ExecutionAlgorithmConfig",
     "ForexSession",
     "ImportableExecAlgorithmConfig",
     "ImportableStrategyConfig",
@@ -19,6 +21,21 @@ __all__ = [
     "fx_prev_end",
     "fx_prev_start",
 ]
+
+@typing.final
+class ExecutionAlgorithmConfig:
+    def __init__(
+        self,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        log_events: bool = True,
+        log_commands: bool = True,
+    ) -> None: ...
+    @property
+    def exec_algorithm_id(self) -> model.ExecAlgorithmId | None: ...
+    @property
+    def log_events(self) -> bool: ...
+    @property
+    def log_commands(self) -> bool: ...
 
 @typing.final
 class ImportableExecAlgorithmConfig:
@@ -52,6 +69,8 @@ class Strategy:
     @property
     def cache(self) -> common.Cache: ...
     @property
+    def portfolio(self) -> portfolio.Portfolio: ...
+    @property
     def log(self) -> common.Logger: ...
     def state(self) -> common.ComponentState: ...
     def is_ready(self) -> bool: ...
@@ -76,7 +95,7 @@ class Strategy:
     ) -> None: ...
     def modify_order(
         self,
-        order: typing.Any,
+        client_order_id: model.ClientOrderId,
         quantity: model.Quantity | None = None,
         price: model.Price | None = None,
         trigger_price: model.Price | None = None,
@@ -84,11 +103,14 @@ class Strategy:
         params: dict | None = None,
     ) -> None: ...
     def cancel_order(
-        self, order: typing.Any, client_id: model.ClientId | None = None, params: dict | None = None
+        self,
+        client_order_id: model.ClientOrderId,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
     ) -> None: ...
     def cancel_orders(
         self,
-        orders: typing.Sequence[typing.Any],
+        client_order_ids: typing.Sequence[model.ClientOrderId],
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...

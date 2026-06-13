@@ -27,6 +27,12 @@ Instrument definitions for tradable assets and contracts.
 
 User-defined instruments whose prices are computed by evaluating a numeric expression over component instrument prices.
 
+## Continuous Futures
+
+Splicing consecutive futures contracts into one adjusted bar series via an explicit roll
+table, including the four adjustment modes, request and subscription flow, and the mid-bar
+roll boundary policy.
+
 ## Value Types
 
 The immutable numeric types (`Price`, `Quantity`, `Money`) used throughout the platform,
@@ -41,6 +47,11 @@ Built-in data types for the trading domain, and how to work with custom data.
 The event types that drive the system: order events, position events, account
 events, and time events. Covers handler dispatch, the causal chain from order
 fills to position events, and tracing orders to positions.
+
+## Event Sourcing
+
+The durable event-store log for state-affecting messages, including capture boundaries,
+correlation headers, replay modes, recovery anchors, and verifier behavior.
 
 ## Options
 
@@ -123,6 +134,12 @@ convention, builder patterns, and common fields shared across adapters and engin
 
 Deploying backtested strategies in real-time without code changes, and the key differences
 between backtesting and live trading.
+
+## Plugins
+
+The Rust plug-in system loaded by a live node, covering the C-ABI boundary, manifest validation,
+plug-point surfaces (custom data, actors, strategies), host callback routing, configuration, and
+the lifecycle from `dlopen` through adapter registration.
 
 ## Adapters
 

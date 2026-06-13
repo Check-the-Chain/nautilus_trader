@@ -42,7 +42,10 @@ pub fn trading(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<strategy::PyStrategy>()?;
     m.add_class::<crate::strategy::StrategyConfig>()?;
     m.add_class::<crate::strategy::ImportableStrategyConfig>()?;
+    m.add_class::<crate::algorithm::ExecutionAlgorithmConfig>()?;
     m.add_class::<crate::algorithm::ImportableExecAlgorithmConfig>()?;
+    #[cfg(feature = "examples")]
+    m.add_class::<crate::examples::strategies::CompositeMarketMakerConfig>()?;
     #[cfg(feature = "examples")]
     m.add_class::<crate::examples::strategies::EmaCrossConfig>()?;
     #[cfg(feature = "examples")]

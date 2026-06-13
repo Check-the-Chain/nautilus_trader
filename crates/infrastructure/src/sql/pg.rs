@@ -15,7 +15,8 @@
 
 use derive_builder::Builder;
 use regex::Regex;
-use sqlx::{ConnectOptions, PgPool, postgres::PgConnectOptions};
+use serde::{Deserialize, Serialize};
+use sqlx::{AssertSqlSafe, ConnectOptions, PgPool, postgres::PgConnectOptions};
 
 fn validate_sql_identifier(value: &str, label: &str) -> anyhow::Result<()> {
     if value.is_empty() {
@@ -34,7 +35,8 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-#[derive(Debug, Clone, Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(deny_unknown_fields)]
 #[builder(default)]
 #[cfg_attr(
     feature = "python",
@@ -46,6 +48,10 @@ fn escape_sql_string(value: &str) -> String {
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.infrastructure")
+)]
+#[allow(
+    clippy::unsafe_derive_deserialize,
+    reason = "config type deserializes plain field values; unsafe PyO3 methods are unrelated"
 )]
 pub struct PostgresConnectOptions {
     pub host: String,
@@ -214,6 +220,10 @@ fn get_schema_dir() -> anyhow::Result<String> {
 /// # Panics
 ///
 /// Panics if `schema_dir` is missing and cannot be determined or if other unwraps fail.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Postgres initialization follows the ordered schema and role setup steps"
+)]
 pub async fn init_postgres(
     pg: &PgPool,
     database: String,
@@ -235,9 +245,9 @@ pub async fn init_postgres(
 
     // Create role if not exists
     let escaped_password = escape_sql_string(&password);
-    match sqlx::query(
-        format!("CREATE ROLE {database} PASSWORD '{escaped_password}' LOGIN;").as_str(),
-    )
+    match sqlx::query(AssertSqlSafe(format!(
+        "CREATE ROLE {database} PASSWORD '{escaped_password}' LOGIN;"
+    )))
     .execute(pg)
     .await
     {
@@ -283,7 +293,7 @@ pub async fn init_postgres(
         };
 
         for sql_statement in sql_statements {
-            sqlx::query(&sql_statement)
+            sqlx::query(AssertSqlSafe(sql_statement.as_str()))
                 .execute(pg)
                 .await
                 .map_err(|e| {
@@ -298,27 +308,31 @@ pub async fn init_postgres(
     }
 
     // Grant connect
-    match sqlx::query(format!("GRANT CONNECT ON DATABASE {database} TO {database};").as_str())
-        .execute(pg)
-        .await
+    match sqlx::query(AssertSqlSafe(format!(
+        "GRANT CONNECT ON DATABASE {database} TO {database};"
+    )))
+    .execute(pg)
+    .await
     {
         Ok(_) => log::info!("Connect privileges granted to role {database}"),
         Err(e) => log::error!("Error granting connect privileges to role {database}: {e:?}"),
     }
 
     // Grant all schema privileges to the role
-    match sqlx::query(format!("GRANT ALL PRIVILEGES ON SCHEMA public TO {database};").as_str())
-        .execute(pg)
-        .await
+    match sqlx::query(AssertSqlSafe(format!(
+        "GRANT ALL PRIVILEGES ON SCHEMA public TO {database};"
+    )))
+    .execute(pg)
+    .await
     {
         Ok(_) => log::info!("All schema privileges granted to role {database}"),
         Err(e) => log::error!("Error granting all privileges to role {database}: {e:?}"),
     }
 
     // Grant all table privileges to the role
-    match sqlx::query(
-        format!("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {database};").as_str(),
-    )
+    match sqlx::query(AssertSqlSafe(format!(
+        "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {database};"
+    )))
     .execute(pg)
     .await
     {
@@ -327,9 +341,9 @@ pub async fn init_postgres(
     }
 
     // Grant all sequence privileges to the role
-    match sqlx::query(
-        format!("GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {database};").as_str(),
-    )
+    match sqlx::query(AssertSqlSafe(format!(
+        "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {database};"
+    )))
     .execute(pg)
     .await
     {
@@ -338,9 +352,9 @@ pub async fn init_postgres(
     }
 
     // Grant all function privileges to the role
-    match sqlx::query(
-        format!("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {database};").as_str(),
-    )
+    match sqlx::query(AssertSqlSafe(format!(
+        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {database};"
+    )))
     .execute(pg)
     .await
     {
@@ -360,7 +374,7 @@ pub async fn drop_postgres(pg: &PgPool, database: String) -> anyhow::Result<()> 
     validate_sql_identifier(&database, "database")?;
 
     // Execute drop owned
-    match sqlx::query(format!("DROP OWNED BY {database}").as_str())
+    match sqlx::query(AssertSqlSafe(format!("DROP OWNED BY {database}")))
         .execute(pg)
         .await
     {
@@ -376,18 +390,20 @@ pub async fn drop_postgres(pg: &PgPool, database: String) -> anyhow::Result<()> 
     }
 
     // Revoke connect
-    match sqlx::query(format!("REVOKE CONNECT ON DATABASE {database} FROM {database};").as_str())
-        .execute(pg)
-        .await
+    match sqlx::query(AssertSqlSafe(format!(
+        "REVOKE CONNECT ON DATABASE {database} FROM {database};"
+    )))
+    .execute(pg)
+    .await
     {
         Ok(_) => log::info!("Revoked connect privileges from role {database}"),
         Err(e) => log::error!("Error revoking connect privileges from role {database}: {e:?}"),
     }
 
     // Revoke privileges
-    match sqlx::query(
-        format!("REVOKE ALL PRIVILEGES ON DATABASE {database} FROM {database};").as_str(),
-    )
+    match sqlx::query(AssertSqlSafe(format!(
+        "REVOKE ALL PRIVILEGES ON DATABASE {database} FROM {database};"
+    )))
     .execute(pg)
     .await
     {
@@ -405,7 +421,7 @@ pub async fn drop_postgres(pg: &PgPool, database: String) -> anyhow::Result<()> 
     }
 
     // Drop role
-    match sqlx::query(format!("DROP ROLE IF EXISTS {database};").as_str())
+    match sqlx::query(AssertSqlSafe(format!("DROP ROLE IF EXISTS {database};")))
         .execute(pg)
         .await
     {
@@ -420,4 +436,30 @@ pub async fn drop_postgres(pg: &PgPool, database: String) -> anyhow::Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_postgres_connect_options_toml_round_trip() {
+        let config: PostgresConnectOptions = toml::from_str(
+            r#"
+host = "localhost"
+port = 5432
+username = "nautilus"
+password = "secret"
+database = "nautilus"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.port, 5432);
+        assert_eq!(config.username, "nautilus");
+        assert_eq!(config.database, "nautilus");
+    }
 }

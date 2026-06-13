@@ -25,6 +25,7 @@ use nautilus_execution::engine::config::ExecutionEngineConfig;
 use nautilus_model::identifiers::TraderId;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
+use serde::{Deserialize, Serialize};
 
 /// Configuration trait for a `NautilusKernel` core system instance.
 pub trait NautilusKernelConfig: Debug {
@@ -36,6 +37,10 @@ pub trait NautilusKernelConfig: Debug {
     fn load_state(&self) -> bool;
     /// Returns if trading strategy state should be saved to the database on stop.
     fn save_state(&self) -> bool;
+    /// Returns if the system should request shutdown when an error log is emitted.
+    ///
+    /// Filtered or bypassed error logs still request shutdown.
+    fn shutdown_on_error(&self) -> bool;
     /// Returns the logging configuration for the kernel.
     fn logging(&self) -> LoggerConfig;
     /// Returns the unique instance identifier for the kernel.
@@ -83,13 +88,18 @@ pub struct KernelConfig {
     /// If trading strategy state should be saved to the database on stop.
     #[builder(default)]
     pub save_state: bool,
+    /// If the system should request shutdown when an error log is emitted.
+    ///
+    /// Filtered or bypassed error logs still request shutdown.
+    #[builder(default)]
+    pub shutdown_on_error: bool,
     /// The logging configuration for the kernel.
     #[builder(default)]
     pub logging: LoggerConfig,
     /// The unique instance identifier for the kernel
     pub instance_id: Option<UUID4>,
     /// The timeout for all clients to connect and initialize.
-    #[builder(default = Duration::from_secs(120))]
+    #[builder(default = Duration::from_mins(1))]
     pub timeout_connection: Duration,
     /// The timeout for execution state to reconcile.
     #[builder(default = Duration::from_secs(30))]
@@ -137,6 +147,10 @@ impl NautilusKernelConfig for KernelConfig {
 
     fn save_state(&self) -> bool {
         self.save_state
+    }
+
+    fn shutdown_on_error(&self) -> bool {
+        self.shutdown_on_error
     }
 
     fn logging(&self) -> LoggerConfig {
@@ -207,7 +221,8 @@ impl Default for KernelConfig {
 }
 
 /// Configuration for file rotation in streaming output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RotationConfig {
     /// Rotate based on file size.
     Size {
@@ -231,7 +246,8 @@ pub enum RotationConfig {
 }
 
 /// Configuration for streaming live or backtest runs to the catalog in feather format.
-#[derive(Debug, Clone, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
 pub struct StreamingConfig {
     /// The path to the data catalog.
     pub catalog_path: String,
@@ -262,5 +278,63 @@ impl StreamingConfig {
             replace_existing,
             rotation_config,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_kernel_config_default_connection_timeout() {
+        let config = KernelConfig::default();
+
+        assert_eq!(config.timeout_connection, Duration::from_mins(1));
+    }
+
+    #[rstest]
+    fn test_streaming_config_toml_round_trip() {
+        let config: StreamingConfig = toml::from_str(
+            r#"
+catalog_path = "/data/catalog"
+fs_protocol = "file"
+flush_interval_ms = 1000
+replace_existing = false
+
+[rotation_config.size]
+max_size = 1048576
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.catalog_path, "/data/catalog");
+        assert_eq!(config.fs_protocol, "file");
+        assert_eq!(config.flush_interval_ms, 1000);
+        assert!(!config.replace_existing);
+        assert!(matches!(
+            config.rotation_config,
+            RotationConfig::Size {
+                max_size: 1_048_576
+            }
+        ));
+    }
+
+    #[rstest]
+    fn test_streaming_config_with_no_rotation_toml() {
+        let config: StreamingConfig = toml::from_str(
+            r#"
+catalog_path = "/data/catalog"
+fs_protocol = "file"
+flush_interval_ms = 500
+replace_existing = true
+rotation_config = "no_rotation"
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(config.rotation_config, RotationConfig::NoRotation));
+        assert!(config.replace_existing);
     }
 }

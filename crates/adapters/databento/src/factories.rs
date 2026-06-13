@@ -18,7 +18,7 @@
 use std::{any::Any, cell::RefCell, fmt::Debug, path::PathBuf, rc::Rc};
 
 use nautilus_common::{
-    cache::Cache,
+    cache::CacheView,
     clients::DataClient,
     clock::Clock,
     factories::{ClientConfig, DataClientFactory},
@@ -30,7 +30,7 @@ use nautilus_core::{
 use nautilus_model::identifiers::ClientId;
 
 use crate::{
-    common::Credential,
+    common::{Credential, DATABENTO},
     data::{DatabentoDataClient, DatabentoDataClientConfig},
     historical::DatabentoHistoricalClient,
 };
@@ -46,7 +46,7 @@ use crate::{
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.databento")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.databento")
 )]
 pub struct DatabentoLiveClientConfig {
     /// Databento API credential.
@@ -117,7 +117,7 @@ impl ClientConfig for DatabentoLiveClientConfig {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.databento")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.databento")
 )]
 pub struct DatabentoDataClientFactory;
 
@@ -176,7 +176,7 @@ impl DataClientFactory for DatabentoDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let databento_config = config
@@ -201,7 +201,7 @@ impl DataClientFactory for DatabentoDataClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "DATABENTO"
+        DATABENTO
     }
 
     fn config_type(&self) -> &'static str {

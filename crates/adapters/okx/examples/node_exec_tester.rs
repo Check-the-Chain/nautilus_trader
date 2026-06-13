@@ -18,14 +18,16 @@
 //! Run with: `cargo run --example okx-exec-tester --package nautilus-okx --features examples`
 
 use nautilus_common::enums::Environment;
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
-use nautilus_network::websocket::TransportBackend;
 use nautilus_okx::{
-    common::enums::{OKXEnvironment, OKXInstrumentType},
+    common::{
+        consts::OKX_CLIENT_ID,
+        enums::{OKXEnvironment, OKXInstrumentType},
+    },
     config::{OKXDataClientConfig, OKXExecClientConfig},
     factories::{OKXDataClientFactory, OKXExecutionClientFactory},
 };
@@ -40,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("OKX-001");
     let node_name = "OKX-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("OKX");
+    let client_id = *OKX_CLIENT_ID;
     let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
 
     let data_config = OKXDataClientConfig {
@@ -49,7 +51,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_passphrase: None, // Will use 'OKX_API_PASSPHRASE' env var
         instrument_types: vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap],
         environment: OKXEnvironment::Live,
-        transport_backend: TransportBackend::Sockudo,
         ..Default::default()
     };
 
@@ -61,20 +62,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_passphrase: None, // Will use 'OKX_API_PASSPHRASE' env var
         instrument_types: vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap],
         environment: OKXEnvironment::Live,
-        transport_backend: TransportBackend::Sockudo,
         ..Default::default()
     };
 
     let data_factory = OKXDataClientFactory::new();
     let exec_factory = OKXExecutionClientFactory::new();
+    let exec_engine_config = LiveExecEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)
         .with_delay_post_stop_secs(5)
         .build()?;
+
+    let order_qty = Quantity::from("0.01");
 
     let tester_config = ExecTesterConfig::builder()
         .base(StrategyConfig {
@@ -86,7 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .instrument_id(instrument_id)
         .client_id(client_id)
-        .order_qty(Quantity::from("0.01"))
+        .order_qty(order_qty)
+        .open_position_on_start_qty(order_qty.as_decimal())
         .log_data(false)
         // .enable_limit_buys(false)
         // .enable_limit_sells(false)

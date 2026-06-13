@@ -167,6 +167,30 @@ The `BacktestEngine` enforces important invariants to ensure data integrity:
 
 This design ensures data integrity while enabling performance optimizations for large datasets.
 
+## Funding
+
+Backtests settle perpetual funding at funding boundaries from `FundingRateUpdate` data.
+When an update has `next_funding_ns`, the simulated exchange stores the latest rate and the
+backtest clock emits one `FundingSettlement` at that timestamp. Without `next_funding_ns`, the
+exchange settles only when `ts_event` lands on the `interval` boundary. Updates without a boundary
+remain strategy data and do not create funding payments.
+
+```mermaid
+flowchart LR
+    A[FundingRateUpdate] --> B[SimulatedExchange stores latest rate]
+    B --> C[Backtest clock reaches funding boundary]
+    C --> D[FundingSettlement]
+    D --> E[Open positions]
+    E --> F[PositionAdjusted: Funding]
+    E --> G[AccountState]
+    F --> H[Portfolio]
+    G --> H
+```
+
+`PositionAdjusted` remains the position accounting event. A positive funding rate debits long
+positions and credits short positions. The resulting adjustment changes realized PnL, and the
+matching account balance update records the cash movement.
+
 ## High-level API
 
 The high-level API centers around a `BacktestNode`, which orchestrates the management of multiple `BacktestEngine` instances,
@@ -182,18 +206,41 @@ Each `BacktestRunConfig` object consists of the following:
 - An optional `ImportableControllerConfig` object.
 - An optional `BacktestEngineConfig` object, with a default configuration if not specified.
 
+## Shutdown on error
+
+Set `BacktestEngineConfig.shutdown_on_error=True` so that a Rust error log ends the
+backtest run. The Rust logger records the first `log::error!` emitted after the kernel
+starts, and the kernel converts that trigger into a `ShutdownSystem` command the next time
+the backtest loop checks for shutdown.
+
+The shutdown request follows the normal backtest stop path. It stops the trader and
+engines, then returns the backtest results collected up to the shutdown point. It does not
+abort the process.
+
+```python
+from nautilus_trader.backtest import BacktestEngineConfig
+
+config = BacktestEngineConfig(shutdown_on_error=True)
+```
+
+Error logs suppressed by component filters or `bypass_logging=True` still request shutdown.
+The trigger is cleared and re-armed when a new kernel run starts, so a process can run
+another backtest without reinitializing the logging system. Shutdown-on-error observes Rust
+`log` records, not Python `logging.error(...)` calls.
+
 ## Repeated runs
 
 When conducting multiple backtest runs, it's important to understand how components reset to avoid unexpected behavior.
 
 ### BacktestEngine.reset()
 
-The `.reset()` method returns all stateful fields to their **initial value**, except for data and instruments which persist.
+The `.reset()` method returns engine state and loaded component state to their **initial value**.
+It keeps loaded components, data, instruments, and venues registered.
 
 **What gets reset:**
 
 - All trading state (orders, positions, account balances).
-- Strategy instances are removed (you must re-add strategies before the next run).
+- Loaded actors, strategies, and execution algorithms are reset in place.
 - Engine counters and timestamps.
 
 **What persists:**
@@ -201,6 +248,7 @@ The `.reset()` method returns all stateful fields to their **initial value**, ex
 - Data added via `.add_data()` (use `.clear_data()` to remove).
 - Instruments (must match the persisted data).
 - Venue configurations.
+- Loaded actors, strategies, and execution algorithms.
 
 **Instrument handling:**
 
@@ -251,14 +299,14 @@ engine.add_data(data)
 engine.add_strategy(strategy1)
 engine.run()
 
-# Reset and run 2 - instruments and data persist
+# Reset and run 2 with the same loaded strategy
 engine.reset()
-engine.add_strategy(strategy2)
 engine.run()
 
-# Reset and run 3
+# Reset and run 3 with a different strategy
 engine.reset()
-engine.add_strategy(strategy3)
+engine.clear_strategies()
+engine.add_strategy(strategy2)
 engine.run()
 ```
 
@@ -269,7 +317,8 @@ Instruments and data persist across resets by default for `BacktestEngine`, maki
 :::tip[Best practices]
 
 - **For production backtesting:** Use `BacktestNode` with configuration objects.
-- **For parameter optimizations:** Use `BacktestEngine.reset()` to run multiple strategies against the same data.
+- **For parameter optimizations:** Use `BacktestEngine.reset()` to keep data and instruments,
+  then call `clear_strategies()` before adding a replacement strategy instance.
 - **For quick experiments:** Either approach works - choose based on individual use case.
 
 :::
@@ -446,6 +495,25 @@ When a `LatencyModel` is configured, commands are placed in the venue's inflight
 timestamp derived from the simulated latency. The settle loop considers inflight commands that are due
 at the current timestamp as pending, so zero-latency or same-tick latency configurations still settle
 correctly. Commands with future timestamps are deferred and processed when the engine reaches that time.
+
+#### Shutdown semantics
+
+`BacktestEngine::end()` invokes each strategy's `on_stop` handler, drains and settles any commands
+it emits (e.g. `close_all_positions`, `cancel_all_orders`), then stops the engines.
+
+- `on_stop` commands use normal venue queueing and latency. They do not get priority over earlier inflight commands.
+- If a pre-stop order reaches the venue before an `on_stop` cancel, it may still fill. A later
+  reduce-only close can then reject if the fill changed net exposure.
+- Strategies that need deterministic flattening should enter an exit-only state before stopping and
+  avoid new opening orders while cancel and close commands are in-flight.
+- Strategy event handlers do not fire for the resulting events: the strategy is already `Stopped`,
+  so `OrderFilled` and similar events log but bypass `on_order_filled` and friends. Logic that
+  reacts to fills must run before `on_stop` returns.
+- Simulation modules do not re-run at shutdown. `SimulationModule::process` is once per timestamp;
+  re-invoking would double-apply side effects like FX rollover interest.
+- A `LatencyModel` adds its configured delay to trailing commands (those emitted on the final
+  data tick or in `on_stop`). The shutdown path advances the engine clock to the latest inflight
+  arrival timestamp so those commands still settle before the engines stop.
 
 ### Fill modeling philosophy
 
@@ -770,7 +838,7 @@ to simulate queue position probabilistically.
 the engine uses this as fill evidence. However, this represents liquidity that existed momentarily and may
 not reflect sustained availability.
 
-### Trade based execution
+### Trade-based execution
 
 Trade tick data triggers order fills by default (`trade_execution=True`). A trade tick indicates that liquidity
 was accessed at the trade price, allowing resting limit orders to match. This mirrors the default behavior
@@ -856,8 +924,8 @@ When using L2 order book data (e.g., 100ms throttled depth snapshots) combined w
 **Common misconception**: Users sometimes expect every trade tick to trigger fills. Remember:
 
 - Only trades on the **opposite** side can fill your orders.
-- SELLER trades → potential BUY fills.
-- BUYER trades → potential SELL fills.
+- SELLER trades -> potential BUY fills.
+- BUYER trades -> potential SELL fills.
 - Book UPDATE events move the market but only trigger fills if prices cross your order.
 
 #### Queue position tracking
@@ -906,9 +974,9 @@ venue_config = BacktestVenueConfig(
 
 1. Order book shows 100 units at bid 100.00.
 2. You place a BUY LIMIT at 100.00 for 50 units. Queue ahead = 100.
-3. SELLER trade of 80 units at 100.00 → queue ahead = 20. No fill yet.
-4. SELLER trade of 30 units at 100.00 → queue clears with 10 excess. Fill = 10 units.
-5. Next SELLER trade of 50 units → fill remaining 40 units.
+3. SELLER trade of 80 units at 100.00 -> queue ahead = 20. No fill yet.
+4. SELLER trade of 30 units at 100.00 -> queue clears with 10 excess. Fill = 10 units.
+5. Next SELLER trade of 50 units -> fill remaining 40 units.
 
 **Limitations:**
 
@@ -949,7 +1017,7 @@ behavior depends on many factors (order priority rules, hidden orders, etc.) tha
 perfectly reconstructed from historical data.
 :::
 
-### Bar based execution
+### Bar-based execution
 
 Bar data provides a summary of market activity with four key prices for each time period (assuming bars are aggregated by trades):
 
@@ -972,7 +1040,7 @@ granular data such as quotes, trades, or bars (although the simulation will only
 :::warning
 When using bars for execution simulation (enabled by default with `bar_execution=True` in venue configurations),
 Nautilus strictly expects the initialization timestamp (`ts_init`) of each bar to represent its **closing time**.
-This ensures accurate chronological processing, prevents look-ahead bias, and aligns market updates (Open → High → Low → Close) with the moment the bar is complete.
+This ensures accurate chronological processing, prevents look-ahead bias, and aligns market updates (Open -> High -> Low -> Close) with the moment the bar is complete.
 
 The event timestamp (`ts_event`) can represent either the open or close time of the bar:
 
@@ -1022,7 +1090,7 @@ In these cases, bars will still be received by strategies for analytics and deci
 
 2. **Price processing**:
    - The platform converts each bar's OHLC prices into a sequence of market updates.
-   - By default, updates follow the order: Open → High → Low → Close (configurable via `bar_adaptive_high_low_ordering`).
+   - By default, updates follow the order: Open -> High -> Low -> Close (configurable via `bar_adaptive_high_low_ordering`).
    - If you provide multiple timeframes (like both 1-minute and 5-minute bars), the platform uses the more granular data for highest accuracy.
 
 3. **Executions**:
@@ -1051,13 +1119,13 @@ How these price points are sequenced can be controlled via the `bar_adaptive_hig
 Nautilus supports two modes of bar processing:
 
 1. **Fixed ordering** (`bar_adaptive_high_low_ordering=False`, default)
-   - Processes every bar in a fixed sequence: `Open → High → Low → Close`.
+   - Processes every bar in a fixed sequence: `Open -> High -> Low -> Close`.
    - Simple and deterministic approach.
 
 2. **Adaptive ordering** (`bar_adaptive_high_low_ordering=True`)
    - Uses bar structure to estimate likely price path:
-     - If Open is closer to High: processes as `Open → High → Low → Close`.
-     - If Open is closer to Low: processes as `Open → Low → High → Close`.
+     - If Open is closer to High: processes as `Open -> High -> Low -> Close`.
+     - If Open is closer to Low: processes as `Open -> Low -> High -> Close`.
    - [Research](https://gist.github.com/stefansimik/d387e1d9ff784a8973feca0cde51e363) shows this approach achieves ~75-85% accuracy in predicting correct High/Low sequence (compared to statistical ~50% accuracy with fixed ordering).
    - This is particularly important when both take-profit and stop-loss levels occur within the same bar - as the sequence determines which order fills first.
 
@@ -1080,6 +1148,37 @@ engine.add_venue(
     bar_adaptive_high_low_ordering=True,  # Enable adaptive ordering of High/Low bar prices
 )
 ```
+
+#### Order submission timing
+
+Bar N's OHLC sequence processes before `on_bar(N)` fires. Without a `LatencyModel`,
+an order submitted from `on_bar` settles immediately and matches against the current
+book, whose top reflects bar N's close.
+
+Attach a `LatencyModel` to the venue to defer the order's effective arrival. With
+bar-only data and no intervening timer events, the order settles after the next bar's
+OHLC sweep, so the fill price is that bar's close (or a later bar's close if latency
+exceeds the bar interval). Finer-grained data (quotes, trades) or timer-driven
+settlement between bars can drain the order earlier, against the book as it stands at
+that point:
+
+```python
+from nautilus_trader.backtest.models import LatencyModel
+
+engine.add_venue(
+    venue=venue,
+    oms_type=OmsType.NETTING,
+    account_type=AccountType.CASH,
+    starting_balances=[Money(10_000, Currency.from_str("USDT"))],
+    latency_model=LatencyModel(base_latency_nanos=1_000_000_000),  # 1 second
+)
+```
+
+:::note
+A native "next-bar-open" execution mode is not provided. A bar's `ts_init` is its
+close timestamp, so the open price is only known once the bar arrives. Filling at
+that open from a signal generated on the prior bar would require look-ahead.
+:::
 
 ### Internal bar aggregation timing
 
@@ -1310,7 +1409,7 @@ Also verify that:
 
 ## Accounts
 
-Every backtest venue is attached with one of three `account_type` values —
+Every backtest venue is attached with one of three `account_type` values:
 `CASH`, `MARGIN`, or `BETTING`. For the full data model, query API, and margin
 model reference, see [Accounting](accounting.md).
 

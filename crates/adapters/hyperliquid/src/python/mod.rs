@@ -29,19 +29,25 @@ pub mod websocket;
 
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::identifiers::ClientOrderId;
+use nautilus_model::{data::ensure_rust_extractor_registered, identifiers::ClientOrderId};
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 use crate::{
+    account::resolve_execution_account_address,
     common::{
-        consts::HYPERLIQUID_POST_ONLY_WOULD_MATCH,
+        builder_fee::{approve_from_env, revoke_from_env},
+        consts::{HYPERLIQUID, HYPERLIQUID_POST_ONLY_WOULD_MATCH},
         enums::{
             HyperliquidConditionalOrderType, HyperliquidEnvironment, HyperliquidProductType,
             HyperliquidTpSl, HyperliquidTrailingOffsetType,
         },
     },
     config::{HyperliquidDataClientConfig, HyperliquidExecClientConfig},
+    data_types::{
+        HyperliquidAllDexsAssetCtxs, HyperliquidAllMids, HyperliquidOpenInterest,
+        register_hyperliquid_custom_data,
+    },
     factories::{
         HyperliquidDataClientFactory, HyperliquidExecFactoryConfig,
         HyperliquidExecutionClientFactory,
@@ -50,12 +56,70 @@ use crate::{
     websocket::HyperliquidWebSocketClient,
 };
 
-/// Compute the cloid (hex hash) from a client_order_id.
+/// Approve the Nautilus builder fee for Hyperliquid trading.
 ///
-/// The cloid is a keccak256 hash of the client_order_id, truncated to 16 bytes,
-/// represented as a hex string with `0x` prefix.
+/// One-time setup signing an `ApproveBuilderFee` action at a 0% max fee rate,
+/// enabling the zero-fee builder attribution. Reads the private key from
+/// `HYPERLIQUID_PK` (mainnet) or `HYPERLIQUID_TESTNET_PK` (testnet); set
+/// `HYPERLIQUID_TESTNET=true` to use testnet.
+///
+/// Does not prompt for confirmation; review the active environment variables
+/// before calling.
+///
+/// # Errors
+///
+/// Returns an error if the async runtime cannot be created.
 #[pyfunction]
-#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.hyperliquid")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.hyperliquid")]
+#[pyo3(name = "builder_fee_approve")]
+fn py_builder_fee_approve() -> PyResult<bool> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| to_pyruntime_err(format!("Failed to create runtime: {e}")))?;
+
+        Ok(runtime.block_on(approve_from_env(true)))
+    })
+    .join()
+    .map_err(|_| to_pyruntime_err("Thread panicked"))?
+}
+
+/// Revoke the Nautilus builder fee approval for Hyperliquid trading.
+///
+/// Signs an `ApproveBuilderFee` action at a 0% max fee rate, capping any
+/// previously approved builder fee at zero. Reads the private key from
+/// `HYPERLIQUID_PK` (mainnet) or `HYPERLIQUID_TESTNET_PK` (testnet); set
+/// `HYPERLIQUID_TESTNET=true` to use testnet.
+///
+/// Does not prompt for confirmation; review the active environment variables
+/// before calling.
+///
+/// # Errors
+///
+/// Returns an error if the async runtime cannot be created.
+#[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.hyperliquid")]
+#[pyo3(name = "builder_fee_revoke")]
+fn py_builder_fee_revoke() -> PyResult<bool> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| to_pyruntime_err(format!("Failed to create runtime: {e}")))?;
+
+        Ok(runtime.block_on(revoke_from_env(true)))
+    })
+    .join()
+    .map_err(|_| to_pyruntime_err("Thread panicked"))?
+}
+
+/// Compute the deterministic CLOID from a client_order_id.
+///
+/// The CLOID is derived from a keccak256 hash of the client_order_id,
+/// truncated to 16 bytes, represented as a hex string with `0x` prefix.
+#[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.hyperliquid")]
 #[pyo3(name = "hyperliquid_cloid_from_client_order_id")]
 fn py_hyperliquid_cloid_from_client_order_id(client_order_id: ClientOrderId) -> String {
     Cloid::from_client_order_id(client_order_id).to_hex()
@@ -67,10 +131,28 @@ fn py_hyperliquid_cloid_from_client_order_id(client_order_id: ClientOrderId) -> 
 ///
 /// Returns an error if the symbol does not contain a valid Hyperliquid product type suffix.
 #[pyfunction]
-#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.hyperliquid")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.hyperliquid")]
 #[pyo3(name = "hyperliquid_product_type_from_symbol")]
 fn py_hyperliquid_product_type_from_symbol(symbol: &str) -> PyResult<HyperliquidProductType> {
     HyperliquidProductType::from_symbol(symbol).map_err(to_pyvalue_err)
+}
+
+/// Resolve the Hyperliquid execution account address for REST queries and WebSocket subscriptions.
+///
+/// # Errors
+///
+/// Returns an error if the selected vault address or private key is invalid.
+#[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.hyperliquid")]
+#[pyo3(name = "hyperliquid_resolve_execution_account_address", signature = (private_key=None, vault_address=None, account_address=None, environment=HyperliquidEnvironment::Mainnet))]
+fn py_hyperliquid_resolve_execution_account_address(
+    private_key: Option<&str>,
+    vault_address: Option<&str>,
+    account_address: Option<&str>,
+    environment: HyperliquidEnvironment,
+) -> PyResult<Option<String>> {
+    resolve_execution_account_address(private_key, vault_address, account_address, environment)
+        .map_err(to_pyvalue_err)
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -149,26 +231,39 @@ pub fn hyperliquid(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py_hyperliquid_cloid_from_client_order_id,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(
+        py_hyperliquid_resolve_execution_account_address,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(py_builder_fee_approve, m)?)?;
+    m.add_function(wrap_pyfunction!(py_builder_fee_revoke, m)?)?;
     m.add_class::<HyperliquidDataClientConfig>()?;
     m.add_class::<HyperliquidExecClientConfig>()?;
     m.add_class::<HyperliquidExecFactoryConfig>()?;
     m.add_class::<HyperliquidDataClientFactory>()?;
     m.add_class::<HyperliquidExecutionClientFactory>()?;
+    m.add_class::<HyperliquidAllDexsAssetCtxs>()?;
+    m.add_class::<HyperliquidAllMids>()?;
+    m.add_class::<HyperliquidOpenInterest>()?;
+
+    register_hyperliquid_custom_data();
+    let _result = ensure_rust_extractor_registered::<HyperliquidAllDexsAssetCtxs>();
+    let _result = ensure_rust_extractor_registered::<HyperliquidAllMids>();
+    let _result = ensure_rust_extractor_registered::<HyperliquidOpenInterest>();
 
     let registry = get_global_pyo3_registry();
 
     if let Err(e) = registry
-        .register_factory_extractor("HYPERLIQUID".to_string(), extract_hyperliquid_data_factory)
+        .register_factory_extractor(HYPERLIQUID.to_string(), extract_hyperliquid_data_factory)
     {
         return Err(to_pyruntime_err(format!(
             "Failed to register Hyperliquid data factory extractor: {e}"
         )));
     }
 
-    if let Err(e) = registry.register_exec_factory_extractor(
-        "HYPERLIQUID".to_string(),
-        extract_hyperliquid_exec_factory,
-    ) {
+    if let Err(e) = registry
+        .register_exec_factory_extractor(HYPERLIQUID.to_string(), extract_hyperliquid_exec_factory)
+    {
         return Err(to_pyruntime_err(format!(
             "Failed to register Hyperliquid exec factory extractor: {e}"
         )));

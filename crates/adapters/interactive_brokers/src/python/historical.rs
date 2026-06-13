@@ -15,8 +15,6 @@
 
 //! Python bindings for the Interactive Brokers historical data client.
 
-use std::sync::Arc;
-
 use chrono::{DateTime, Utc};
 use ibapi::contracts::Contract;
 use nautilus_common::live::get_runtime;
@@ -30,7 +28,8 @@ use nautilus_model::{
 use pyo3::{prelude::*, types::PyList};
 
 use crate::{
-    historical::HistoricalInteractiveBrokersClient, python::conversion::py_list_to_contracts,
+    common::enums::IbHistoricalTickType, historical::HistoricalInteractiveBrokersClient,
+    python::conversion::py_list_to_contracts,
 };
 
 #[pymethods]
@@ -41,19 +40,9 @@ impl HistoricalInteractiveBrokersClient {
         instrument_provider: crate::providers::instruments::InteractiveBrokersInstrumentProvider,
         config: crate::config::InteractiveBrokersDataClientConfig,
     ) -> PyResult<Self> {
-        let shared_client = get_runtime()
-            .block_on(crate::common::shared_client::get_or_connect(
-                &config.host,
-                config.port,
-                config.client_id,
-                config.connection_timeout,
-            ))
-            .map_err(to_pyruntime_err)?;
-
-        Ok(Self::new(
-            Arc::clone(shared_client.as_arc()),
-            Arc::new(instrument_provider),
-        ))
+        get_runtime()
+            .block_on(Self::connect_with_provider(instrument_provider, config))
+            .map_err(to_pyruntime_err)
     }
 
     fn __repr__(&self) -> String {
@@ -130,27 +119,29 @@ impl HistoricalInteractiveBrokersClient {
     ///
     /// # Arguments
     ///
-    /// * `tick_type` - Type of ticks: "TRADES" or "BID_ASK"
+    /// * `tick_type` - Historical tick type.
     /// * `start_date_time` - Start date for ticks
     /// * `end_date_time` - End date for ticks
     /// * `contracts` - Optional list of IB contracts (dicts with symbol, sec_type, exchange, currency, etc.)
     /// * `instrument_ids` - Optional list of instrument IDs
     /// * `use_rth` - Use regular trading hours only
     /// * `timeout` - Request timeout in seconds
-    #[pyo3(signature = (tick_type, start_date_time, end_date_time, contracts=None, instrument_ids=None, use_rth=true, timeout=60))]
+    /// * `limit` - Maximum number of ticks to return, or 0 for no explicit limit
+    #[pyo3(signature = (tick_type, start_date_time, end_date_time, contracts=None, instrument_ids=None, use_rth=true, timeout=60, limit=0))]
     #[pyo3(name = "request_ticks")]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::needless_pass_by_value)]
     fn py_request_ticks<'py>(
         &self,
         py: Python<'py>,
-        tick_type: String,
+        tick_type: IbHistoricalTickType,
         start_date_time: DateTime<Utc>,
         end_date_time: DateTime<Utc>,
         contracts: Option<Py<PyList>>,
         instrument_ids: Option<Vec<InstrumentId>>,
         use_rth: bool,
         timeout: u64,
+        limit: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -170,13 +161,14 @@ impl HistoricalInteractiveBrokersClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let data_vec: Vec<Data> = client
                 .request_ticks(
-                    &tick_type,
+                    tick_type,
                     start_date_time,
                     end_date_time,
                     contracts_vec,
                     instrument_ids,
                     use_rth,
                     timeout,
+                    limit,
                 )
                 .await
                 .map_err(to_pyruntime_err)?;

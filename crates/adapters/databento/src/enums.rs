@@ -52,7 +52,7 @@ use strum::{AsRefStr, Display, EnumIter, EnumString, FromRepr};
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.databento")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.databento")
 )]
 pub enum DatabentoStatisticType {
     OpeningPrice = 1,
@@ -68,6 +68,13 @@ pub enum DatabentoStatisticType {
     ClosePrice = 11,
     NetChange = 12,
     Vwap = 13,
+    Volatility = 14,
+    Delta = 15,
+    UncrossingPrice = 16,
+    UpperPriceLimit = 17,
+    LowerPriceLimit = 18,
+    BlockVolume = 19,
+    IndicativeClosePrice = 20,
 }
 
 impl FromU8 for DatabentoStatisticType {
@@ -86,6 +93,13 @@ impl FromU8 for DatabentoStatisticType {
             11 => Some(Self::ClosePrice),
             12 => Some(Self::NetChange),
             13 => Some(Self::Vwap),
+            14 => Some(Self::Volatility),
+            15 => Some(Self::Delta),
+            16 => Some(Self::UncrossingPrice),
+            17 => Some(Self::UpperPriceLimit),
+            18 => Some(Self::LowerPriceLimit),
+            19 => Some(Self::BlockVolume),
+            20 => Some(Self::IndicativeClosePrice),
             _ => None,
         }
     }
@@ -122,7 +136,7 @@ impl FromU8 for DatabentoStatisticType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.databento")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.databento")
 )]
 pub enum DatabentoStatisticUpdateAction {
     Added = 1,

@@ -18,13 +18,14 @@ use std::{collections::HashMap, fs, io::Write, str::FromStr, sync::Arc};
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     data::{
-        Bar, BarSpecification, BarType, BookOrder, CustomData, Data, DataType, HasTsInit,
-        IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
-        depth::DEPTH10_LEN, is_monotonically_increasing_by_init, to_variant,
+        Bar, BarSpecification, BarType, BookOrder, CustomData, Data, DataType, FundingRateUpdate,
+        HasTsInit, IndexPriceUpdate, MarkPriceUpdate, OptionGreekValues, OptionGreeks,
+        OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick, depth::DEPTH10_LEN,
+        is_monotonically_increasing_by_init, to_variant,
     },
     enums::{
-        AggregationSource, AggressorSide, BarAggregation, BookAction, CurrencyType, OrderSide,
-        PriceType,
+        AggregationSource, AggressorSide, BarAggregation, BookAction, CurrencyType,
+        GreeksConvention, OrderSide, PriceType,
     },
     identifiers::{InstrumentId, Symbol, TradeId},
     instruments::{
@@ -38,7 +39,10 @@ use nautilus_persistence::{
         catalog::ParquetDataCatalog,
         session::{DataBackendSession, QueryResult},
     },
-    test_data::{MacroYieldCurveData, RustTestCustomData, RustTestParamsCustomData},
+    test_data::{
+        MacroYieldCurveData, RustTestCustomData, RustTestHashMapCustomData,
+        RustTestParamsCustomData, RustTestPriceMapCustomData,
+    },
 };
 use nautilus_serialization::{arrow::ArrowSchemaProvider, ensure_custom_data_registered};
 use nautilus_testkit::common::get_nautilus_test_data_file_path;
@@ -60,7 +64,9 @@ fn ensure_test_custom_data_registered() {
     ONCE.call_once(|| {
         ensure_custom_data_registered::<MacroYieldCurveData>();
         ensure_custom_data_registered::<RustTestCustomData>();
+        ensure_custom_data_registered::<RustTestHashMapCustomData>();
         ensure_custom_data_registered::<RustTestParamsCustomData>();
+        ensure_custom_data_registered::<RustTestPriceMapCustomData>();
     });
 }
 
@@ -216,6 +222,38 @@ fn create_index_price_update(ts_init: u64) -> IndexPriceUpdate {
         UnixNanos::from(0),
         UnixNanos::from(ts_init),
     )
+}
+
+fn create_funding_rate_update(ts_init: u64) -> FundingRateUpdate {
+    FundingRateUpdate::new(
+        ethusdt_binance_id(),
+        Decimal::from_str("0.0001").unwrap(),
+        Some(480),
+        Some(UnixNanos::from(ts_init + 1)),
+        UnixNanos::from(ts_init),
+        UnixNanos::from(ts_init),
+    )
+}
+
+fn create_option_greeks(ts_init: u64) -> OptionGreeks {
+    OptionGreeks {
+        instrument_id: ethusdt_binance_id(),
+        convention: GreeksConvention::PriceAdjusted,
+        greeks: OptionGreekValues {
+            delta: 0.55,
+            gamma: 0.012,
+            vega: 3.4,
+            theta: -1.2,
+            rho: 0.01,
+        },
+        mark_iv: Some(0.64),
+        bid_iv: None,
+        ask_iv: Some(0.66),
+        underlying_price: Some(100_000.0),
+        open_interest: None,
+        ts_event: UnixNanos::from(ts_init - 1),
+        ts_init: UnixNanos::from(ts_init),
+    }
 }
 
 fn create_bar(ts_init: u64) -> Bar {
@@ -954,6 +992,11 @@ fn test_rust_query_files_with_multiple_files() {
         .unwrap();
 
     assert_eq!(files.len(), 3);
+    assert_eq!(files, {
+        let mut sorted = files.clone();
+        sorted.sort();
+        sorted
+    });
 }
 
 #[rstest]
@@ -1417,6 +1460,58 @@ fn test_generic_query_typed_data_bars() {
 }
 
 #[rstest]
+fn test_write_data_enum_option_greeks_round_trip() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+    let greeks = vec![create_option_greeks(1000), create_option_greeks(2000)];
+    let data: Vec<Data> = greeks.iter().copied().map(Data::OptionGreeks).collect();
+
+    catalog
+        .write_data_enum(&data, None, None, Some(false))
+        .unwrap();
+
+    let result = catalog
+        .query_typed_data::<OptionGreeks>(
+            Some(vec!["ETH/USDT.BINANCE".to_string()]),
+            Some(UnixNanos::from(500)),
+            Some(UnixNanos::from(2500)),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(result, greeks);
+}
+
+#[rstest]
+fn test_write_data_enum_funding_rates_round_trip() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+    let funding_rates = vec![
+        create_funding_rate_update(1000),
+        create_funding_rate_update(2000),
+    ];
+    let data: Vec<Data> = funding_rates
+        .iter()
+        .copied()
+        .map(Data::FundingRateUpdate)
+        .collect();
+
+    catalog
+        .write_data_enum(&data, None, None, Some(false))
+        .unwrap();
+
+    let result = catalog
+        .funding_rates(
+            Some(vec!["ETH/USDT.BINANCE".to_string()]),
+            Some(UnixNanos::from(500)),
+            Some(UnixNanos::from(2500)),
+        )
+        .unwrap();
+
+    assert_eq!(result, funding_rates);
+}
+
+#[rstest]
 fn test_generic_query_typed_data_empty_result() {
     let (_temp_dir, mut catalog) = create_temp_catalog();
 
@@ -1526,6 +1621,53 @@ fn test_generic_consolidate_data_by_period_bars() {
     // should have fewer files after consolidation
     let final_intervals = catalog.get_intervals("bars", Some(&bar_type)).unwrap();
     assert!(final_intervals.len() <= initial_intervals.len());
+}
+
+#[rstest]
+fn test_generic_consolidate_data_by_period_keeps_skipped_target() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let period = 10;
+    let file1_ts = [3, 6];
+    let file2_ts = [12, 14];
+    let file3_ts = [16];
+
+    for timestamps in [&file1_ts[..], &file2_ts[..], &file3_ts[..]] {
+        let bars: Vec<Bar> = timestamps.iter().copied().map(create_bar).collect();
+        catalog
+            .write_to_parquet(bars, None, None, Some(true))
+            .unwrap();
+    }
+
+    let bar_type = create_bar(file1_ts[0]).bar_type.to_string();
+    catalog
+        .consolidate_data_by_period_generic::<Bar>(
+            Some(bar_type.as_str()),
+            Some(period),
+            None,
+            None,
+            Some(false),
+        )
+        .unwrap();
+
+    let bars = catalog
+        .query_typed_data::<Bar>(Some(vec![bar_type.clone()]), None, None, None, None, true)
+        .unwrap();
+    let timestamps: Vec<u64> = bars.iter().map(|bar| bar.ts_init.as_u64()).collect();
+
+    assert_eq!(
+        timestamps,
+        vec![
+            file1_ts[0],
+            file1_ts[1],
+            file2_ts[0],
+            file2_ts[1],
+            file3_ts[0]
+        ]
+    );
+    let intervals = catalog.get_intervals("bars", Some(&bar_type)).unwrap();
+    assert!(intervals.contains(&(file1_ts[0], file1_ts[1])));
+    assert!(intervals.contains(&(file2_ts[0], file3_ts[0])));
 }
 
 #[rstest]
@@ -1848,8 +1990,8 @@ fn test_extract_data_cls_and_identifier_from_path_moved() {
     assert_eq!(identifier, None);
 }
 
-/// Ensures custom data path built by make_path_custom_data (via custom module) matches
-/// the format expected by extract_data_cls_and_identifier_from_path (catalog behavior unchanged after extraction).
+/// Ensures custom data path built by `make_path_custom_data` (via custom module) matches
+/// the format expected by `extract_data_cls_and_identifier_from_path`.
 #[rstest]
 fn test_make_path_custom_data_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1953,7 +2095,7 @@ fn test_prepare_consolidation_queries_basic_moved() {
 
     // Test basic period consolidation
     let intervals = vec![(1000, 5000), (5001, 10000)];
-    let period_nanos = 86400000000000; // 1 day
+    let period_nanos = 86_400_000_000_000; // 1 day
 
     let queries = catalog
         .prepare_consolidation_queries("quotes", None, &intervals, period_nanos, None, None, true)
@@ -1981,7 +2123,7 @@ fn test_prepare_consolidation_queries_with_splits_moved() {
     // File: [1000, 5000], Request: start=2000, end=4000
     // Should result in split queries for [1000, 1999] and [4001, 5000], plus consolidation for [2000, 4000]
     let intervals = vec![(1000, 5000)];
-    let period_nanos = 86400000000000; // 1 day
+    let period_nanos = 86_400_000_000_000; // 1 day
     let start = Some(UnixNanos::from(2000));
     let end = Some(UnixNanos::from(4000));
 
@@ -2851,6 +2993,10 @@ fn test_make_sql_safe_identifier() {
     // Test identifier with spaces (like option symbols)
     let safe_id = make_sql_safe_identifier("ESM4 P5230.XCME");
     assert_eq!(safe_id, "esm4_p5230_xcme");
+
+    // Test identifier with ampersand
+    let safe_id = make_sql_safe_identifier("M&M.NSE");
+    assert_eq!(safe_id, "m_m_nse");
 }
 
 #[rstest]
@@ -2996,6 +3142,41 @@ fn test_query_directory_based_registration() {
 
     // Verify data is properly ordered
     assert!(is_monotonically_increasing_by_init(&data));
+}
+
+#[rstest]
+fn test_query_directory_based_registration_preserves_equal_timestamp_order() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+
+    catalog
+        .write_to_parquet(
+            create_quote_ticks_for_instrument("ETH/USDT.BINANCE", 1000, 1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    catalog
+        .write_to_parquet(
+            create_quote_ticks_for_instrument("AUD/USD.SIM", 1000, 1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    let result = catalog
+        .query::<QuoteTick>(None, None, None, None, None, true)
+        .unwrap();
+    let instrument_ids: Vec<String> = result
+        .map(|data| match data {
+            Data::Quote(quote) => quote.instrument_id.to_string(),
+            _ => panic!("Invalid test"),
+        })
+        .collect();
+
+    assert_eq!(instrument_ids, vec!["AUD/USD.SIM", "ETH/USDT.BINANCE"]);
 }
 
 #[rstest]
@@ -3344,8 +3525,233 @@ fn test_rust_custom_data_roundtrip_with_params_field() {
     }
 }
 
-/// Regression: write_data_enum groups custom data by full DataType (type_name + identifier + metadata).
-/// Same type_name with different identifiers must produce separate batches and be readable back.
+#[rstest]
+fn test_query_custom_data_dynamic_with_explicit_files() {
+    use std::sync::Arc;
+
+    use nautilus_model::data::{CustomData, Data, DataType};
+
+    ensure_test_custom_data_registered();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let instrument_id = InstrumentId::from("RUST.EXPLICIT");
+    let data_type = DataType::new("RustTestCustomData", None, Some(instrument_id.to_string()));
+
+    let first = RustTestCustomData {
+        instrument_id,
+        value: 1.0,
+        flag: true,
+        ts_event: UnixNanos::from(1),
+        ts_init: UnixNanos::from(1),
+    };
+    let second = RustTestCustomData {
+        instrument_id,
+        value: 2.0,
+        flag: false,
+        ts_event: UnixNanos::from(2),
+        ts_init: UnixNanos::from(2),
+    };
+
+    let first_path = catalog
+        .write_custom_data_batch(
+            vec![CustomData::new(Arc::new(first), data_type.clone())],
+            None,
+            None,
+            Some(false),
+        )
+        .unwrap();
+    let second_path = catalog
+        .write_custom_data_batch(
+            vec![CustomData::new(Arc::new(second), data_type)],
+            None,
+            None,
+            Some(false),
+        )
+        .unwrap();
+
+    let loaded = catalog
+        .query_custom_data_dynamic(
+            "RustTestCustomData",
+            None,
+            None,
+            None,
+            None,
+            Some(vec![
+                first_path.to_string_lossy().to_string(),
+                second_path.to_string_lossy().to_string(),
+            ]),
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(loaded.len(), 2);
+    let values: Vec<f64> = loaded
+        .iter()
+        .map(|item| match item {
+            Data::Custom(custom) => {
+                custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<RustTestCustomData>()
+                    .expect("Expected RustTestCustomData")
+                    .value
+            }
+            other => panic!("Expected Data::Custom variant, was {other:?}"),
+        })
+        .collect();
+    assert_eq!(values, vec![1.0, 2.0]);
+}
+
+#[rstest]
+fn test_rust_custom_data_roundtrip_with_indexmap_price_field() {
+    use std::sync::Arc;
+
+    use indexmap::IndexMap;
+    use nautilus_model::data::{CustomData, Data, DataType};
+
+    ensure_test_custom_data_registered();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let data_type = DataType::new("RustTestPriceMapCustomData", None, None);
+    let audusd = InstrumentId::from("AUD/USD.SIM");
+    let btcusdt = InstrumentId::from("BTCUSDT.BINANCE");
+
+    let mut prices_a = IndexMap::new();
+    prices_a.insert(audusd, Price::from("1.23456"));
+    prices_a.insert(btcusdt, Price::from("65432.10"));
+
+    let mut prices_b = IndexMap::new();
+    prices_b.insert(btcusdt, Price::from("65433.20"));
+    prices_b.insert(audusd, Price::from("1.23457"));
+
+    let original_data = [
+        RustTestPriceMapCustomData {
+            name: "first".to_string(),
+            prices: prices_a,
+            ts_event: UnixNanos::from(10),
+            ts_init: UnixNanos::from(10),
+        },
+        RustTestPriceMapCustomData {
+            name: "second".to_string(),
+            prices: prices_b,
+            ts_event: UnixNanos::from(20),
+            ts_init: UnixNanos::from(20),
+        },
+    ];
+
+    let custom_data: Vec<CustomData> = original_data
+        .iter()
+        .cloned()
+        .map(|item| CustomData::new(Arc::new(item), data_type.clone()))
+        .collect();
+
+    catalog
+        .write_custom_data_batch(custom_data, None, None, Some(false))
+        .unwrap();
+
+    let loaded: Vec<Data> = catalog
+        .query_custom_data_dynamic(
+            "RustTestPriceMapCustomData",
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(loaded.len(), original_data.len());
+
+    for (expected, actual) in original_data.iter().zip(loaded.iter()) {
+        if let Data::Custom(custom) = actual {
+            assert_eq!(custom.data_type.type_name(), "RustTestPriceMapCustomData");
+            let rust: &RustTestPriceMapCustomData = custom
+                .data
+                .as_any()
+                .downcast_ref::<RustTestPriceMapCustomData>()
+                .expect("Expected RustTestPriceMapCustomData");
+            assert_eq!(expected, rust);
+        } else {
+            panic!("Expected Data::Custom variant");
+        }
+    }
+}
+
+#[rstest]
+fn test_rust_custom_data_roundtrip_with_hashmap_price_field() {
+    use std::sync::Arc;
+
+    use nautilus_model::data::{CustomData, Data, DataType};
+
+    ensure_test_custom_data_registered();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let data_type = DataType::new("RustTestHashMapCustomData", None, None);
+
+    let original_data = [
+        RustTestHashMapCustomData {
+            name: "first".to_string(),
+            prices: HashMap::from([
+                ("AUD/USD.SIM".to_string(), Price::from("1.23456")),
+                ("BTCUSDT.BINANCE".to_string(), Price::from("65432.10")),
+            ]),
+            ts_event: UnixNanos::from(10),
+            ts_init: UnixNanos::from(10),
+        },
+        RustTestHashMapCustomData {
+            name: "second".to_string(),
+            prices: HashMap::from([
+                ("AUD/USD.SIM".to_string(), Price::from("1.23457")),
+                ("BTCUSDT.BINANCE".to_string(), Price::from("65433.20")),
+            ]),
+            ts_event: UnixNanos::from(20),
+            ts_init: UnixNanos::from(20),
+        },
+    ];
+
+    let custom_data: Vec<CustomData> = original_data
+        .iter()
+        .cloned()
+        .map(|item| CustomData::new(Arc::new(item), data_type.clone()))
+        .collect();
+
+    catalog
+        .write_custom_data_batch(custom_data, None, None, Some(false))
+        .unwrap();
+
+    let loaded: Vec<Data> = catalog
+        .query_custom_data_dynamic(
+            "RustTestHashMapCustomData",
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(loaded.len(), original_data.len());
+
+    for (expected, actual) in original_data.iter().zip(loaded.iter()) {
+        if let Data::Custom(custom) = actual {
+            assert_eq!(custom.data_type.type_name(), "RustTestHashMapCustomData");
+            let rust: &RustTestHashMapCustomData = custom
+                .data
+                .as_any()
+                .downcast_ref::<RustTestHashMapCustomData>()
+                .expect("Expected RustTestHashMapCustomData");
+            assert_eq!(expected, rust);
+        } else {
+            panic!("Expected Data::Custom variant");
+        }
+    }
+}
+
+/// Regression: `write_data_enum` groups custom data by full `DataType`
+/// (`type_name` + identifier + metadata).
+/// Same `type_name` with different identifiers must produce separate batches and be readable back.
 #[rstest]
 #[ignore = "Slow regression test (>120s) for custom data identifier batching; run manually when changing catalog custom data write/query paths"]
 fn test_write_data_enum_mixed_custom_data_identifiers() {
@@ -3843,6 +4249,449 @@ fn test_convert_stream_to_data_no_files() {
         catalog.convert_stream_to_data("test_instance", "quotes", Some("backtest"), None, false);
 
     assert!(result.is_ok(), "Should return Ok when no files found");
+}
+
+#[rstest]
+fn test_convert_stream_to_data_unknown_type_no_files() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let result = catalog.convert_stream_to_data(
+        "test_instance",
+        "unknown_data_type",
+        Some("backtest"),
+        None,
+        false,
+    );
+
+    assert!(
+        result.is_ok(),
+        "Unknown stream data types should be ignored when no files exist",
+    );
+}
+
+#[rstest]
+fn test_convert_stream_to_data_unknown_type_with_files_errors() {
+    let (temp_dir, mut catalog) = create_temp_catalog();
+    let feather_dir = temp_dir
+        .path()
+        .join("backtest")
+        .join("test_instance")
+        .join("unknown_data_type");
+    fs::create_dir_all(&feather_dir).unwrap();
+    fs::File::create(feather_dir.join("unknown_0.feather")).unwrap();
+
+    let result = catalog.convert_stream_to_data(
+        "test_instance",
+        "unknown_data_type",
+        Some("backtest"),
+        None,
+        false,
+    );
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown data class"),
+        "Should error once unknown stream files are present",
+    );
+}
+
+#[rstest]
+fn test_convert_stream_to_data_writes_flat_stream_file() {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema},
+        ipc::writer::StreamWriter,
+        record_batch::RecordBatch,
+    };
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let (temp_dir, mut catalog) = create_temp_catalog();
+    let feather_dir = temp_dir.path().join("backtest").join("test_instance_flat");
+    fs::create_dir_all(&feather_dir).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts_init", DataType::UInt64, false),
+        Field::new("ts_event", DataType::UInt64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![200, 100])),
+            Arc::new(UInt64Array::from(vec![20, 10])),
+            Arc::new(StringArray::from(vec!["b", "a"])),
+        ],
+    )
+    .unwrap();
+
+    let feather_path = feather_dir.join("account_state_0.feather");
+    let mut feather_file = fs::File::create(feather_path).unwrap();
+    let mut writer = StreamWriter::try_new(&mut feather_file, &schema).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    catalog
+        .convert_stream_to_data(
+            "test_instance_flat",
+            "account_state",
+            Some("backtest"),
+            None,
+            false,
+        )
+        .unwrap();
+
+    let files = catalog
+        .query_files("account_state", None, None, None)
+        .unwrap();
+    assert_eq!(files.len(), 1);
+
+    let parquet_path = std::path::PathBuf::from(&files[0]);
+    let parquet_path = if parquet_path.is_absolute() {
+        parquet_path
+    } else {
+        temp_dir.path().join(parquet_path)
+    };
+    let parquet_file = fs::File::open(parquet_path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+    let mut reader = builder.build().unwrap();
+    let parquet_batch = reader.next().unwrap().unwrap();
+
+    let ts_init = parquet_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let payload = parquet_batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(ts_init.value(0), 100);
+    assert_eq!(ts_init.value(1), 200);
+    assert_eq!(payload.value(0), "a");
+    assert_eq!(payload.value(1), "b");
+}
+
+#[rstest]
+fn test_convert_stream_to_data_keeps_flat_stream_file_with_identifiers() {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema},
+        ipc::writer::StreamWriter,
+        record_batch::RecordBatch,
+    };
+
+    let (temp_dir, mut catalog) = create_temp_catalog();
+    let feather_dir = temp_dir
+        .path()
+        .join("backtest")
+        .join("test_instance_flat_filter");
+    fs::create_dir_all(&feather_dir).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts_init", DataType::UInt64, false),
+        Field::new("ts_event", DataType::UInt64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![100])),
+            Arc::new(UInt64Array::from(vec![100])),
+            Arc::new(StringArray::from(vec!["account"])),
+        ],
+    )
+    .unwrap();
+
+    let feather_path = feather_dir.join("account_state_0.feather");
+    let mut feather_file = fs::File::create(feather_path).unwrap();
+    let mut writer = StreamWriter::try_new(&mut feather_file, &schema).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let identifiers = vec!["AUD/USD.SIM".to_string()];
+    catalog
+        .convert_stream_to_data(
+            "test_instance_flat_filter",
+            "account_state",
+            Some("backtest"),
+            Some(&identifiers),
+            false,
+        )
+        .unwrap();
+
+    let files = catalog
+        .query_files("account_state", None, None, None)
+        .unwrap();
+    assert_eq!(files.len(), 1);
+}
+
+#[rstest]
+fn test_convert_stream_to_data_ignores_flat_stream_file_with_non_timestamp_suffix() {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema},
+        ipc::writer::StreamWriter,
+        record_batch::RecordBatch,
+    };
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let (temp_dir, mut catalog) = create_temp_catalog();
+    let feather_dir = temp_dir
+        .path()
+        .join("backtest")
+        .join("test_instance_flat_suffix");
+    fs::create_dir_all(&feather_dir).unwrap();
+
+    for (filename, ts_init, payload) in [
+        ("account_state_0.feather", 100, "valid"),
+        ("account_state_extra_0.feather", 200, "invalid"),
+    ] {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts_init", DataType::UInt64, false),
+            Field::new("ts_event", DataType::UInt64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![ts_init])),
+                Arc::new(UInt64Array::from(vec![ts_init])),
+                Arc::new(StringArray::from(vec![payload])),
+            ],
+        )
+        .unwrap();
+
+        let feather_path = feather_dir.join(filename);
+        let mut feather_file = fs::File::create(feather_path).unwrap();
+        let mut writer = StreamWriter::try_new(&mut feather_file, &schema).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+
+    catalog
+        .convert_stream_to_data(
+            "test_instance_flat_suffix",
+            "account_state",
+            Some("backtest"),
+            None,
+            false,
+        )
+        .unwrap();
+
+    let files = catalog
+        .query_files("account_state", None, None, None)
+        .unwrap();
+    assert_eq!(files.len(), 1);
+
+    let parquet_path = std::path::PathBuf::from(&files[0]);
+    let parquet_path = if parquet_path.is_absolute() {
+        parquet_path
+    } else {
+        temp_dir.path().join(parquet_path)
+    };
+    let parquet_file = fs::File::open(parquet_path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+    let mut reader = builder.build().unwrap();
+    let parquet_batch = reader.next().unwrap().unwrap();
+
+    let ts_init = parquet_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let payload = parquet_batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(ts_init.value(0), 100);
+    assert_eq!(payload.value(0), "valid");
+}
+
+#[rstest]
+fn test_convert_stream_to_data_writes_arrow_batches_without_deserializing() {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{Array, StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema},
+        ipc::writer::StreamWriter,
+        record_batch::RecordBatch,
+    };
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let (temp_dir, mut catalog) = create_temp_catalog();
+    let feather_dir = temp_dir
+        .path()
+        .join("backtest")
+        .join("test_instance")
+        .join("quotes")
+        .join("AUDUSD.SIM");
+    fs::create_dir_all(&feather_dir).unwrap();
+
+    let mut metadata = HashMap::new();
+    metadata.insert("instrument_id".to_string(), "AUD/USD.SIM".to_string());
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("ts_init", DataType::UInt64, false),
+            Field::new("ts_event", DataType::UInt64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ],
+        metadata,
+    ));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![300, 100, 200])),
+            Arc::new(UInt64Array::from(vec![30, 10, 20])),
+            Arc::new(StringArray::from(vec!["c", "a", "b"])),
+        ],
+    )
+    .unwrap();
+
+    let feather_path = feather_dir.join("AUDUSD.SIM_0.feather");
+    let mut feather_file = fs::File::create(feather_path).unwrap();
+    let mut writer = StreamWriter::try_new(&mut feather_file, &schema).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    catalog
+        .convert_stream_to_data("test_instance", "quotes", Some("backtest"), None, false)
+        .unwrap();
+
+    let files = catalog
+        .query_files("quotes", Some(vec!["AUD/USD.SIM".to_string()]), None, None)
+        .unwrap();
+    assert_eq!(files.len(), 1);
+
+    let parquet_path = std::path::PathBuf::from(&files[0]);
+    let parquet_path = if parquet_path.is_absolute() {
+        parquet_path
+    } else {
+        temp_dir.path().join(parquet_path)
+    };
+    let parquet_file = fs::File::open(parquet_path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+    let parquet_schema = builder.schema().clone();
+    assert_eq!(
+        parquet_schema.metadata().get("instrument_id"),
+        Some(&"AUD/USD.SIM".to_string()),
+    );
+
+    let mut reader = builder.build().unwrap();
+    let parquet_batch = reader.next().unwrap().unwrap();
+    assert_eq!(parquet_batch.num_rows(), 3);
+    assert_eq!(parquet_batch.num_columns(), 3);
+
+    let ts_init = parquet_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(ts_init.value(0), 100);
+    assert_eq!(ts_init.value(1), 200);
+    assert_eq!(ts_init.value(2), 300);
+
+    let payload = parquet_batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(payload.value(0), "a");
+    assert_eq!(payload.value(1), "b");
+    assert_eq!(payload.value(2), "c");
+}
+
+#[rstest]
+fn test_convert_stream_to_data_converts_bar_type_metadata_to_external() {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema},
+        ipc::writer::StreamWriter,
+        record_batch::RecordBatch,
+    };
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let (temp_dir, mut catalog) = create_temp_catalog();
+    let bar_type_internal = BarType::new(
+        audusd_sim_id(),
+        BarSpecification::new(1, BarAggregation::Minute, PriceType::Bid),
+        AggregationSource::Internal,
+    )
+    .to_string();
+    let bar_type_external = BarType::new(
+        audusd_sim_id(),
+        BarSpecification::new(1, BarAggregation::Minute, PriceType::Bid),
+        AggregationSource::External,
+    )
+    .to_string();
+    let feather_dir = temp_dir
+        .path()
+        .join("backtest")
+        .join("test_instance_bars")
+        .join("bars")
+        .join(bar_type_internal.replace('/', ""));
+    fs::create_dir_all(&feather_dir).unwrap();
+
+    let mut metadata = HashMap::new();
+    metadata.insert("bar_type".to_string(), bar_type_internal);
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("ts_init", DataType::UInt64, false),
+            Field::new("ts_event", DataType::UInt64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ],
+        metadata,
+    ));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![100])),
+            Arc::new(UInt64Array::from(vec![100])),
+            Arc::new(StringArray::from(vec!["bar"])),
+        ],
+    )
+    .unwrap();
+
+    let feather_path = feather_dir.join("bars_0.feather");
+    let mut feather_file = fs::File::create(feather_path).unwrap();
+    let mut writer = StreamWriter::try_new(&mut feather_file, &schema).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    catalog
+        .convert_stream_to_data("test_instance_bars", "bars", Some("backtest"), None, false)
+        .unwrap();
+
+    let files = catalog
+        .query_files("bars", Some(vec![bar_type_external.clone()]), None, None)
+        .unwrap();
+    assert_eq!(files.len(), 1);
+
+    let parquet_path = std::path::PathBuf::from(&files[0]);
+    let parquet_path = if parquet_path.is_absolute() {
+        parquet_path
+    } else {
+        temp_dir.path().join(parquet_path)
+    };
+    let parquet_file = fs::File::open(parquet_path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+    assert_eq!(
+        builder.schema().metadata().get("bar_type"),
+        Some(&bar_type_external),
+    );
 }
 
 #[rstest]

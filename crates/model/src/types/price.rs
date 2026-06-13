@@ -59,7 +59,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::fixed::{
     FIXED_PRECISION, FIXED_SCALAR, check_fixed_precision, mantissa_exponent_to_fixed_i128,
-    raw_scales_match,
+    mantissa_exponent_to_raw_checked, raw_scales_match,
 };
 #[cfg(feature = "high-precision")]
 use super::fixed::{PRECISION_DIFF_SCALAR, f64_to_fixed_i128, fixed_i128_to_f64};
@@ -87,25 +87,25 @@ pub type PriceRaw = i64;
 ///
 /// # Safety
 ///
-/// This value is computed at compile time from `PRICE_MAX` * `FIXED_SCALAR`.
-/// The multiplication is guaranteed not to overflow because `PRICE_MAX` and `FIXED_SCALAR`
-/// are chosen such that their product fits within `PriceRaw`'s range in both
-/// high-precision (i128) and standard-precision (i64) modes.
+/// `PRICE_MAX` and `FIXED_SCALAR` are cast to `PriceRaw` before multiplying, so the
+/// scaling uses exact integer arithmetic rather than a lossy `f64` product. The result
+/// fits within `PriceRaw`'s range in both high-precision (i128) and standard-precision
+/// (i64) modes, so the multiplication cannot overflow.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub static PRICE_RAW_MAX: PriceRaw = (PRICE_MAX * FIXED_SCALAR) as PriceRaw;
+pub static PRICE_RAW_MAX: PriceRaw = (PRICE_MAX as PriceRaw) * (FIXED_SCALAR as PriceRaw);
 
 /// The minimum raw price integer value.
 ///
 /// # Safety
 ///
-/// This value is computed at compile time from `PRICE_MIN` * `FIXED_SCALAR`.
-/// The multiplication is guaranteed not to overflow because `PRICE_MIN` and `FIXED_SCALAR`
-/// are chosen such that their product fits within `PriceRaw`'s range in both
-/// high-precision (i128) and standard-precision (i64) modes.
+/// `PRICE_MIN` and `FIXED_SCALAR` are cast to `PriceRaw` before multiplying, so the
+/// scaling uses exact integer arithmetic rather than a lossy `f64` product. The result
+/// fits within `PriceRaw`'s range in both high-precision (i128) and standard-precision
+/// (i64) modes, so the multiplication cannot overflow.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub static PRICE_RAW_MIN: PriceRaw = (PRICE_MIN * FIXED_SCALAR) as PriceRaw;
+pub static PRICE_RAW_MIN: PriceRaw = (PRICE_MIN as PriceRaw) * (FIXED_SCALAR as PriceRaw);
 
 /// The sentinel value for an unset or null price.
 pub const PRICE_UNDEF: PriceRaw = PriceRaw::MAX;
@@ -545,6 +545,29 @@ impl Price {
 
         Self { raw, precision }
     }
+
+    /// Checked variant of [`Price::from_mantissa_exponent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the precision is invalid or the resulting raw value
+    /// exceeds the `PriceRaw` bounds.
+    pub fn from_mantissa_exponent_checked(
+        mantissa: i64,
+        exponent: i8,
+        precision: u8,
+    ) -> CorrectnessResult<Self> {
+        let raw = mantissa_exponent_to_raw_checked::<PriceRaw>(
+            i128::from(mantissa),
+            exponent,
+            precision,
+            "Price::from_mantissa_exponent",
+            "PriceRaw",
+            "Price",
+        )?;
+
+        Self::from_raw_checked(raw, precision)
+    }
 }
 
 impl FromStr for Price {
@@ -776,9 +799,8 @@ impl<'de> Deserialize<'de> for Price {
     where
         D: Deserializer<'de>,
     {
-        let price_str: &str = Deserialize::deserialize(deserializer)?;
-        let price: Self = price_str.into();
-        Ok(price)
+        let price_str: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+        Self::from_str(price_str.as_ref()).map_err(serde::de::Error::custom)
     }
 }
 
@@ -827,6 +849,19 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[rstest]
+    fn test_extreme_prices_round_trip_through_raw() {
+        // Regression: a lossy `f64` scalar previously left `PRICE_RAW_MAX`/`PRICE_RAW_MIN`
+        // beyond the raw produced by `new` at the bounds, causing spurious panics and errors.
+        let max = Price::new(PRICE_MAX, 0);
+        let min = Price::new(PRICE_MIN, 0);
+
+        assert_eq!(max.raw, PRICE_RAW_MAX);
+        assert_eq!(min.raw, PRICE_RAW_MIN);
+        assert!(Price::from_raw_checked(max.raw, 0).is_ok());
+        assert!(Price::from_raw_checked(min.raw, 0).is_ok());
+    }
 
     #[rstest]
     #[cfg(all(not(feature = "defi"), not(feature = "high-precision")))]
@@ -1482,6 +1517,32 @@ mod tests {
     }
 
     #[rstest]
+    fn test_price_serde_json_from_value_round_trip() {
+        let price = Price::new(1.0500, 4);
+        let value = serde_json::to_value(price).unwrap();
+
+        let deserialized: Price = serde_json::from_value(value).unwrap();
+        assert_eq!(deserialized, price);
+        assert_eq!(deserialized.precision, 4);
+    }
+
+    #[rstest]
+    fn test_price_deserialize_invalid_string_returns_error() {
+        let result = serde_json::from_str::<Price>("\"not-a-price\"");
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("Error parsing"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[rstest]
+    fn test_price_deserialize_out_of_range_returns_error() {
+        let result = serde_json::from_str::<Price>("\"99999999999999999999.99\"");
+        assert!(result.is_err());
+    }
+
+    #[rstest]
     fn test_from_mantissa_exponent_exact_precision() {
         let price = Price::from_mantissa_exponent(12345, -2, 2);
         assert_eq!(price.as_f64(), 123.45);
@@ -1520,7 +1581,40 @@ mod tests {
     }
 
     #[rstest]
-    #[should_panic(expected = "Overflow")]
+    fn test_from_mantissa_exponent_checked_exact_precision() {
+        let price = Price::from_mantissa_exponent_checked(12345, -2, 2).unwrap();
+        assert_eq!(price.as_decimal(), dec!(123.45));
+    }
+
+    #[rstest]
+    fn test_from_mantissa_exponent_checked_zero_with_large_exponent() {
+        let price = Price::from_mantissa_exponent_checked(0, 119, 2).unwrap();
+        assert_eq!(price.as_decimal(), dec!(0.00));
+    }
+
+    #[rstest]
+    fn test_from_mantissa_exponent_checked_invalid_precision() {
+        #[cfg(feature = "defi")]
+        let invalid_precision = crate::defi::WEI_PRECISION + 1;
+        #[cfg(not(feature = "defi"))]
+        let invalid_precision = FIXED_PRECISION + 1;
+
+        let error = Price::from_mantissa_exponent_checked(1, 0, invalid_precision).unwrap_err();
+        assert!(error.to_string().contains("`precision` exceeded maximum"));
+    }
+
+    #[rstest]
+    fn test_from_mantissa_exponent_checked_overflow_returns_error() {
+        let error = Price::from_mantissa_exponent_checked(i64::MAX, 100, 0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Overflow in Price::from_mantissa_exponent")
+        );
+    }
+
+    #[rstest]
+    #[should_panic(expected = "Price::from_mantissa_exponent")]
     fn test_from_mantissa_exponent_overflow_panics() {
         let _ = Price::from_mantissa_exponent(i64::MAX, 9, 0);
     }

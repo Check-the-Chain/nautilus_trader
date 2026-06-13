@@ -7,23 +7,31 @@
 //  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
 // -------------------------------------------------------------------------------------------------
 
+use std::{cell::RefCell, rc::Rc, str::FromStr};
+
 use ibapi::{
-    contracts::{Contract, Currency as IBCurrency, Exchange, SecurityType, Symbol as IBSymbol},
+    contracts::{
+        Contract, Currency as IBCurrency, Exchange, LegAction, OptionRight, SecurityType,
+        Symbol as IBSymbol,
+    },
     orders::{
-        CommissionReport, Execution, ExecutionData, Liquidity, Order as IBOrder,
-        OrderData as IBOrderData, OrderState, OrderStatus as IBOrderStatus, OrderUpdate,
+        CommissionReport, Execution, ExecutionData, ExecutionSide, Liquidity, Order as IBOrder,
+        OrderData as IBOrderData, OrderState, OrderStatus as IBOrderStatus, OrderStatusKind,
+        OrderUpdate,
     },
     subscriptions::Subscription,
 };
-use nautilus_common::cache::Cache;
+use nautilus_common::{cache::Cache, live::runner::replace_exec_event_sender};
+use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AssetClass, LiquiditySide, OrderSide, OrderType},
+    enums::{AccountType, AssetClass, LiquiditySide, OmsType, OrderSide, OrderType},
+    events::OrderInitialized,
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId, TraderId, Venue,
-        VenueOrderId,
+        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
+        Venue, VenueOrderId,
     },
     instruments::{InstrumentAny, OptionSpread, stubs::equity_aapl},
-    orders::builder::OrderTestBuilder,
+    orders::{OrderList, builder::OrderTestBuilder},
     types::{Currency, Money, Price, Quantity},
 };
 use rstest::rstest;
@@ -31,10 +39,42 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::*;
+use crate::common::consts::{IB_CLIENT_ID, IB_VENUE};
 
 fn create_test_instrument_provider() -> Arc<InteractiveBrokersInstrumentProvider> {
     let config = crate::config::InteractiveBrokersInstrumentProviderConfig::default();
     Arc::new(InteractiveBrokersInstrumentProvider::new(config))
+}
+
+fn create_test_execution_client() -> (
+    InteractiveBrokersExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    let trader_id = TraderId::from("TESTER-001");
+    let account_id = AccountId::from("IB-001");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let core = ExecutionClientCore::new(
+        trader_id,
+        *IB_CLIENT_ID,
+        *IB_VENUE,
+        OmsType::Netting,
+        account_id,
+        AccountType::Margin,
+        None,
+        cache.clone(),
+    );
+    let instrument_provider = create_test_instrument_provider();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_exec_event_sender(tx);
+    let client = InteractiveBrokersExecutionClient::new(
+        core,
+        InteractiveBrokersExecClientConfig::default(),
+        instrument_provider,
+    )
+    .unwrap();
+
+    (client, rx, cache)
 }
 
 fn create_test_spread_instrument() -> InstrumentId {
@@ -46,6 +86,230 @@ fn create_test_spread_instrument() -> InstrumentId {
 
 fn create_test_leg_instrument() -> InstrumentId {
     InstrumentId::new(Symbol::from("SPY C400"), Venue::from("SMART"))
+}
+
+fn create_test_stock_instrument() -> InstrumentId {
+    InstrumentId::new(Symbol::from("AAPL"), Venue::from("SMART"))
+}
+
+fn create_test_limit_order(client_order_id: ClientOrderId) -> OrderAny {
+    OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(create_test_stock_instrument())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from(1))
+        .submit(true)
+        .build()
+}
+
+fn next_order_event(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+) -> OrderEventAny {
+    match rx.try_recv().unwrap() {
+        ExecutionEvent::Order(event) => event,
+        event => panic!("Expected order event, was {event:?}"),
+    }
+}
+
+#[rstest]
+#[case(1, 0, 1)]
+#[case(1, 310, 310_000_001)]
+#[case(42, 1_402, 402_000_042)]
+#[case(450_000_123, 402, 450_000_123)]
+#[case(1, -12, 12_000_001)]
+fn apply_client_order_id_floor(
+    #[case] next_id: i32,
+    #[case] client_id: i32,
+    #[case] expected: i32,
+) {
+    assert_eq!(
+        InteractiveBrokersExecutionClient::apply_client_order_id_floor(next_id, client_id),
+        expected
+    );
+}
+
+#[rstest]
+fn ib_order_selector_parses_numeric_venue_order_id() {
+    let selector = IbOrderSelector::from_venue_order_id(&VenueOrderId::from("123")).unwrap();
+
+    assert_eq!(selector, IbOrderSelector::OrderId(123));
+    assert!(selector.matches(123, 456));
+    assert!(!selector.matches(124, 456));
+    assert_eq!(selector.venue_order_id(), VenueOrderId::from("123"));
+}
+
+#[rstest]
+fn ib_order_selector_parses_perm_venue_order_id() {
+    let selector = IbOrderSelector::from_venue_order_id(&VenueOrderId::from("PERM-456")).unwrap();
+
+    assert_eq!(selector, IbOrderSelector::PermId(456));
+    assert!(selector.matches(0, 456));
+    assert!(selector.matches(123, 456));
+    assert!(!selector.matches(123, 457));
+    assert_eq!(selector.venue_order_id(), VenueOrderId::from("PERM-456"));
+}
+
+#[rstest]
+fn submit_order_denies_when_client_not_ready() {
+    let (client, mut rx, _) = create_test_execution_client();
+    let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
+    let cmd = SubmitOrder::from_order(
+        &order,
+        client.core.trader_id,
+        Some(client.core.client_id),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(cmd).unwrap();
+
+    match next_order_event(&mut rx) {
+        OrderEventAny::Denied(event) => {
+            assert_eq!(event.client_order_id, order.client_order_id());
+            assert_eq!(
+                event.reason.to_string(),
+                "Interactive Brokers client is not ready; refusing to submit order"
+            );
+        }
+        event => panic!("Expected OrderDenied, was {event:?}"),
+    }
+}
+
+#[rstest]
+fn submit_order_list_denies_all_orders_when_client_not_ready() {
+    let (client, mut rx, _) = create_test_execution_client();
+    let order1 = create_test_limit_order(ClientOrderId::from("O-IB-001"));
+    let order2 = create_test_limit_order(ClientOrderId::from("O-IB-002"));
+    let order_list = OrderList::new(
+        OrderListId::from("OL-IB-001"),
+        order1.instrument_id(),
+        order1.strategy_id(),
+        vec![order1.client_order_id(), order2.client_order_id()],
+        UnixNanos::default(),
+    );
+    let cmd = SubmitOrderList::new(
+        client.core.trader_id,
+        Some(client.core.client_id),
+        order1.strategy_id(),
+        order_list,
+        vec![
+            OrderInitialized::from(&order1),
+            OrderInitialized::from(&order2),
+        ],
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.submit_order_list(cmd).unwrap();
+
+    for expected_client_order_id in [order1.client_order_id(), order2.client_order_id()] {
+        match next_order_event(&mut rx) {
+            OrderEventAny::Denied(event) => {
+                assert_eq!(event.client_order_id, expected_client_order_id);
+                assert_eq!(
+                    event.reason.to_string(),
+                    "Interactive Brokers client is not ready; refusing to submit order list"
+                );
+            }
+            event => panic!("Expected OrderDenied, was {event:?}"),
+        }
+    }
+}
+
+#[rstest]
+fn modify_order_emits_no_event_when_client_not_ready() {
+    let (client, mut rx, _) = create_test_execution_client();
+    let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
+    let cmd = ModifyOrder::new(
+        client.core.trader_id,
+        Some(client.core.client_id),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        Some(VenueOrderId::from("1001")),
+        Some(Quantity::from(2)),
+        Some(Price::from("101.00")),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+
+    client.modify_order(cmd).unwrap();
+
+    // Local validation failure: no rejection event, awaiting in-flight resolution
+    assert!(rx.try_recv().is_err(), "expected no event");
+}
+
+#[rstest]
+fn cancel_order_emits_no_event_when_client_not_ready() {
+    let (client, mut rx, _) = create_test_execution_client();
+    let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
+    let cmd = CancelOrder::new(
+        client.core.trader_id,
+        Some(client.core.client_id),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        Some(VenueOrderId::from("1001")),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+
+    client.cancel_order(cmd).unwrap();
+
+    // Local validation failure: no rejection event, awaiting in-flight resolution
+    assert!(rx.try_recv().is_err(), "expected no event");
+}
+
+#[rstest]
+fn cancel_all_orders_emits_no_events_when_client_not_ready() {
+    let (client, mut rx, cache) = create_test_execution_client();
+    let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
+    let accepted = OrderEventAny::Accepted(OrderAccepted::new(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        VenueOrderId::from("1001"),
+        client.core.account_id,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        false,
+    ));
+    {
+        let mut cache = cache.borrow_mut();
+        cache
+            .add_order(order.clone(), None, Some(client.core.client_id), false)
+            .unwrap();
+        cache.update_order(&accepted).unwrap();
+    }
+    let cmd = CancelAllOrders::new(
+        client.core.trader_id,
+        Some(client.core.client_id),
+        order.strategy_id(),
+        order.instrument_id(),
+        OrderSide::NoOrderSide,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+
+    client.cancel_all_orders(cmd).unwrap();
+
+    // A whole-request local failure must not become one rejection per order
+    assert!(rx.try_recv().is_err(), "expected no events");
 }
 
 fn create_test_execution_data(
@@ -61,7 +325,7 @@ fn create_test_execution_data(
         security_type: SecurityType::Option,
         last_trade_date_or_contract_month: String::from("20250101"),
         strike: 400.0,
-        right: String::from("C"),
+        right: Some(OptionRight::Call),
         multiplier: String::from("100"),
         exchange: Exchange::from("SMART"),
         currency: IBCurrency::from("USD"),
@@ -75,7 +339,11 @@ fn create_test_execution_data(
         execution_id: execution_id.to_string(),
         order_id,
         time: String::from("20250101 08:00:00"),
-        side: side.to_string(),
+        side: if side == "BOT" {
+            ExecutionSide::Bought
+        } else {
+            ExecutionSide::Sold
+        },
         shares,
         price,
         perm_id: 0,
@@ -86,6 +354,112 @@ fn create_test_execution_data(
         cumulative_quantity: shares,
         average_price: price,
         order_reference: String::new(),
+        ev_rule: String::new(),
+        ev_multiplier: None,
+        model_code: String::new(),
+        last_liquidity: Liquidity::None,
+        pending_price_revision: false,
+        submitter: String::new(),
+    };
+
+    ExecutionData {
+        request_id: 0,
+        contract,
+        execution,
+    }
+}
+
+fn create_test_stock_execution_data(
+    contract_id: i32,
+    order_id: i32,
+    execution_id: &str,
+) -> ExecutionData {
+    let contract = Contract {
+        contract_id,
+        symbol: IBSymbol::from("AAPL"),
+        security_type: SecurityType::Stock,
+        exchange: Exchange::from("SMART"),
+        currency: IBCurrency::from("USD"),
+        ..Default::default()
+    };
+
+    let execution = Execution {
+        execution_id: execution_id.to_string(),
+        order_id,
+        time: String::from("20250101 08:00:00"),
+        side: ExecutionSide::Bought,
+        shares: 10.0,
+        price: 150.25,
+        perm_id: 0,
+        client_id: 0,
+        liquidation: 0,
+        account_number: String::new(),
+        exchange: String::new(),
+        cumulative_quantity: 10.0,
+        average_price: 150.25,
+        order_reference: String::from("O-IB-001"),
+        ev_rule: String::new(),
+        ev_multiplier: None,
+        model_code: String::new(),
+        last_liquidity: Liquidity::None,
+        pending_price_revision: false,
+        submitter: String::new(),
+    };
+
+    ExecutionData {
+        request_id: 0,
+        contract,
+        execution,
+    }
+}
+
+fn create_test_bag_execution_data(order_id: i32, execution_id: &str) -> ExecutionData {
+    let contract = Contract {
+        contract_id: 0,
+        symbol: IBSymbol::from("SPY"),
+        security_type: SecurityType::Spread,
+        exchange: Exchange::from("SMART"),
+        currency: IBCurrency::from("USD"),
+        combo_legs: vec![
+            ibapi::contracts::ComboLeg {
+                contract_id: 12345,
+                ratio: 1,
+                action: LegAction::Buy,
+                exchange: String::from("SMART"),
+                open_close: ibapi::contracts::ComboLegOpenClose::Same,
+                short_sale_slot: 0,
+                designated_location: String::new(),
+                exempt_code: 0,
+            },
+            ibapi::contracts::ComboLeg {
+                contract_id: 67890,
+                ratio: 1,
+                action: LegAction::Sell,
+                exchange: String::from("SMART"),
+                open_close: ibapi::contracts::ComboLegOpenClose::Same,
+                short_sale_slot: 0,
+                designated_location: String::new(),
+                exempt_code: 0,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let execution = Execution {
+        execution_id: execution_id.to_string(),
+        order_id,
+        time: String::from("20250101 08:00:00"),
+        side: ExecutionSide::Bought,
+        shares: 1.0,
+        price: 1.25,
+        perm_id: 0,
+        client_id: 0,
+        liquidation: 0,
+        account_number: String::new(),
+        exchange: String::new(),
+        cumulative_quantity: 1.0,
+        average_price: 1.25,
+        order_reference: String::from("O-IB-SPREAD"),
         ev_rule: String::new(),
         ev_multiplier: None,
         model_code: String::new(),
@@ -154,16 +528,16 @@ fn create_test_option_spread() -> OptionSpread {
 fn create_test_order_status(order_id: i32, status: &str) -> IBOrderStatus {
     IBOrderStatus {
         order_id,
-        status: status.to_string(),
+        status: OrderStatusKind::from_str(status).unwrap(),
         filled: 0.0,
         remaining: 0.0,
-        average_fill_price: 0.0,
+        average_fill_price: Some(0.0),
         perm_id: 0,
         parent_id: 0,
-        last_fill_price: 0.0,
+        last_fill_price: Some(0.0),
         client_id: 0,
         why_held: String::new(),
-        market_cap_price: 0.0,
+        market_cap_price: Some(0.0),
     }
 }
 
@@ -183,7 +557,7 @@ fn create_test_open_order(order_id: i32, status: &str, order_ref: &str) -> IBOrd
             ..Default::default()
         },
         order_state: OrderState {
-            status: status.to_string(),
+            status: OrderStatusKind::from_str(status).unwrap(),
             ..Default::default()
         },
     }
@@ -250,7 +624,7 @@ async fn test_get_leg_instrument_id_and_ratio() {
         security_type: SecurityType::Option,
         last_trade_date_or_contract_month: String::from("20250101"),
         strike: 400.0,
-        right: String::from("C"),
+        right: Some(OptionRight::Call),
         multiplier: String::from("100"),
         exchange: Exchange::from("SMART"),
         currency: IBCurrency::from("USD"),
@@ -259,7 +633,7 @@ async fn test_get_leg_instrument_id_and_ratio() {
         combo_legs: vec![ibapi::contracts::ComboLeg {
             contract_id: 12345,
             ratio: 1,
-            action: String::from("BUY"),
+            action: LegAction::Buy,
             exchange: String::from("SMART"),
             open_close: ibapi::contracts::ComboLegOpenClose::Same,
             short_sale_slot: 0,
@@ -292,7 +666,7 @@ async fn test_get_leg_instrument_id_and_ratio_with_sell_action() {
         security_type: SecurityType::Option,
         last_trade_date_or_contract_month: String::from("20250101"),
         strike: 400.0,
-        right: String::from("C"),
+        right: Some(OptionRight::Call),
         multiplier: String::from("100"),
         exchange: Exchange::from("SMART"),
         currency: IBCurrency::from("USD"),
@@ -301,7 +675,7 @@ async fn test_get_leg_instrument_id_and_ratio_with_sell_action() {
         combo_legs: vec![ibapi::contracts::ComboLeg {
             contract_id: 12345,
             ratio: 2,
-            action: String::from("SELL"),
+            action: LegAction::Sell,
             exchange: String::from("SMART"),
             open_close: ibapi::contracts::ComboLegOpenClose::Same,
             short_sale_slot: 0,
@@ -373,6 +747,71 @@ fn test_cached_spread_instrument_ids_for_preload_ignores_non_spread_orders() {
     );
 
     assert!(spread_ids.is_empty());
+}
+
+#[rstest]
+fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
+    let (client, _, _) = create_test_execution_client();
+    let equity = equity_aapl();
+    let instrument_id = equity.id();
+    client
+        .instrument_provider
+        .insert_test_instrument(InstrumentAny::from(equity), 265598, 1);
+    let exec_data = create_test_stock_execution_data(0, 123, "exec-aapl-001");
+    let cmd = GenerateFillReportsBuilder::default()
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
+
+    let report = client
+        .parse_historical_fill_report(&cmd, &exec_data, 1.25, "USD", UnixNanos::default())
+        .unwrap();
+
+    assert_eq!(report.instrument_id, instrument_id);
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("O-IB-001"))
+    );
+    assert_eq!(report.trade_id, TradeId::from("exec-aapl-001"));
+    assert_eq!(report.venue_order_id, VenueOrderId::from("123"));
+    assert_eq!(report.last_qty, Quantity::from(10));
+    assert_eq!(report.last_px, Price::from("150.25"));
+}
+
+#[rstest]
+fn test_parse_historical_fill_report_uses_cached_bag_spread_id() {
+    let (client, _, _) = create_test_execution_client();
+    let spread = create_test_option_spread();
+    let instrument_id = spread.id;
+    client
+        .instrument_provider
+        .insert_test_instrument(InstrumentAny::from(spread), 54321, 1);
+    client
+        .instrument_provider
+        .insert_test_contract_id_mapping(12345, create_test_leg_instrument());
+    client.instrument_provider.insert_test_contract_id_mapping(
+        67890,
+        InstrumentId::new(Symbol::from("SPY C410"), Venue::from("SMART")),
+    );
+    let exec_data = create_test_bag_execution_data(7001, "exec-spread-001");
+    let cmd = GenerateFillReportsBuilder::default()
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
+
+    let report = client
+        .parse_historical_fill_report(&cmd, &exec_data, 2.00, "USD", UnixNanos::default())
+        .unwrap();
+
+    assert_eq!(report.instrument_id, instrument_id);
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("O-IB-SPREAD"))
+    );
+    assert_eq!(report.trade_id, TradeId::from("exec-spread-001"));
+    assert_eq!(report.venue_order_id, VenueOrderId::from("7001"));
+    assert_eq!(report.last_qty, Quantity::from(1));
+    assert_eq!(report.last_px, Price::from("1.25"));
 }
 
 #[tokio::test]
@@ -799,6 +1238,10 @@ async fn test_handle_order_status_canceled_emits_canceled_event() {
     let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
     let accepted_orders = Arc::new(Mutex::new(ahash::AHashSet::new()));
     let pending_cancel_orders = Arc::new(Mutex::new(ahash::AHashSet::new()));
+    let order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let spread_fill_tracking = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_live_exec_data = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_terminal_orders = Arc::new(Mutex::new(AHashMap::new()));
     let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
     let order_id = 7001;
     let client_order_id = ClientOrderId::from("O-CANCEL-002");
@@ -808,6 +1251,10 @@ async fn test_handle_order_status_canceled_emits_canceled_event() {
         .lock()
         .unwrap()
         .insert(order_id, client_order_id);
+    order_id_map
+        .lock()
+        .unwrap()
+        .insert(client_order_id, order_id);
     instrument_id_map
         .lock()
         .unwrap()
@@ -827,7 +1274,7 @@ async fn test_handle_order_status_canceled_emits_canceled_event() {
 
     InteractiveBrokersExecutionClient::handle_order_status(
         &create_test_order_status(order_id, "Cancelled"),
-        &Arc::new(Mutex::new(AHashMap::new())),
+        &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
         &exec_sender,
@@ -842,6 +1289,9 @@ async fn test_handle_order_status_canceled_emits_canceled_event() {
         &order_fill_progress,
         &accepted_orders,
         &pending_cancel_orders,
+        &spread_fill_tracking,
+        &pending_live_exec_data,
+        &pending_terminal_orders,
     )
     .await
     .unwrap();
@@ -860,6 +1310,11 @@ async fn test_handle_order_status_canceled_emits_canceled_event() {
             .unwrap()
             .contains(&client_order_id)
     );
+    assert!(order_id_map.lock().unwrap().is_empty());
+    assert!(venue_order_id_map.lock().unwrap().is_empty());
+    assert!(instrument_id_map.lock().unwrap().is_empty());
+    assert!(trader_id_map.lock().unwrap().is_empty());
+    assert!(strategy_id_map.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1004,6 +1459,9 @@ async fn test_process_order_update_stream_emits_fill_after_commission_report() {
     exec_data.execution.order_reference = client_order_id.to_string();
 
     update_sender
+        .send(Ok(OrderUpdate::ExecutionData(exec_data)))
+        .unwrap();
+    update_sender
         .send(Ok(OrderUpdate::CommissionReport(CommissionReport {
             execution_id: String::from("exec-stream-001"),
             commission: 1.25,
@@ -1012,9 +1470,6 @@ async fn test_process_order_update_stream_emits_fill_after_commission_report() {
             yields: None,
             yield_redemption_date: String::new(),
         })))
-        .unwrap();
-    update_sender
-        .send(Ok(OrderUpdate::ExecutionData(exec_data)))
         .unwrap();
     drop(update_sender);
 
@@ -1051,6 +1506,97 @@ async fn test_process_order_update_stream_emits_fill_after_commission_report() {
         }
         other => panic!("unexpected event: {other:?}"),
     }
+    assert!(commission_cache.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_process_order_update_stream_learns_order_ref_from_execution() {
+    let instrument_provider = create_test_instrument_provider();
+    let equity = equity_aapl();
+    let order_id = 7004;
+    let contract_id = 12346;
+    let client_order_id = ClientOrderId::from("O-STREAM-EXEC-REF");
+    let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let trader_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let strategy_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let order_avg_prices = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fills = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fill_avgs = Arc::new(Mutex::new(AHashMap::new()));
+    let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
+    let accepted_orders = Arc::new(Mutex::new(ahash::AHashSet::new()));
+    let pending_cancel_orders = Arc::new(Mutex::new(ahash::AHashSet::new()));
+    let spread_fill_tracking = Arc::new(Mutex::new(AHashMap::new()));
+    let commission_cache = Arc::new(Mutex::new(AHashMap::new()));
+    let order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (update_sender, update_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut subscription = Subscription::new(update_receiver);
+
+    let instrument_id = equity.id();
+    instrument_provider.insert_test_instrument(InstrumentAny::from(equity), contract_id, 1);
+
+    let mut exec_data = create_test_execution_data(order_id, "exec-stream-002", 100.0, 50.0, "BOT");
+    exec_data.contract.contract_id = contract_id;
+    exec_data.contract.security_type = SecurityType::Stock;
+    exec_data.contract.symbol = IBSymbol::from("AAPL");
+    exec_data.contract.exchange = Exchange::from("SMART");
+    exec_data.contract.currency = IBCurrency::from("USD");
+    exec_data.execution.order_reference = client_order_id.to_string();
+
+    update_sender
+        .send(Ok(OrderUpdate::ExecutionData(exec_data)))
+        .unwrap();
+    update_sender
+        .send(Ok(OrderUpdate::CommissionReport(CommissionReport {
+            execution_id: String::from("exec-stream-002"),
+            commission: 1.25,
+            currency: String::from("USD"),
+            realized_pnl: None,
+            yields: None,
+            yield_redemption_date: String::new(),
+        })))
+        .unwrap();
+    drop(update_sender);
+
+    InteractiveBrokersExecutionClient::process_order_update_stream(
+        &mut subscription,
+        &order_id_map,
+        &venue_order_id_map,
+        &instrument_provider,
+        &exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+        AccountId::from("IB-001"),
+        &commission_cache,
+        &instrument_id_map,
+        &trader_id_map,
+        &strategy_id_map,
+        &spread_fill_tracking,
+        &order_avg_prices,
+        &pending_combo_fills,
+        &pending_combo_fill_avgs,
+        &order_fill_progress,
+        &accepted_orders,
+        &pending_cancel_orders,
+    )
+    .await;
+
+    let fill_event = exec_receiver.try_recv().unwrap();
+    match fill_event {
+        ExecutionEvent::Report(ExecutionReport::Fill(fill)) => {
+            assert_eq!(fill.client_order_id, Some(client_order_id));
+            assert_eq!(fill.instrument_id, instrument_id);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert_eq!(
+        venue_order_id_map.lock().unwrap().get(&order_id),
+        Some(&client_order_id)
+    );
+    assert_eq!(
+        order_id_map.lock().unwrap().get(&client_order_id),
+        Some(&order_id)
+    );
 }
 
 #[rstest]

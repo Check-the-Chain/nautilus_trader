@@ -35,7 +35,7 @@ use nautilus_model::defi::{
 use nautilus_model::{
     data::{
         Bar, BarType, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         close::InstrumentClose,
         option_chain::{OptionChainSlice, OptionGreeks, StrikeRange},
     },
@@ -67,32 +67,33 @@ use crate::{
     logging::{CMD, RECV, REQ, SEND},
     messages::{
         data::{
-            BarsResponse, BookResponse, CustomDataResponse, DataCommand, FundingRatesResponse,
-            InstrumentResponse, InstrumentsResponse, QuotesResponse, RequestBars,
-            RequestBookSnapshot, RequestCommand, RequestCustomData, RequestFundingRates,
-            RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookSnapshots, SubscribeCommand, SubscribeCustomData,
-            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
-            SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
-            SubscribeMarkPrices, SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes,
-            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-            UnsubscribeBookSnapshots, UnsubscribeCommand, UnsubscribeCustomData,
-            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
-            UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
-            UnsubscribeMarkPrices, UnsubscribeOptionChain, UnsubscribeOptionGreeks,
-            UnsubscribeQuotes, UnsubscribeTrades,
+            BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
+            DataCommand, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
+            QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot,
+            RequestCommand, RequestCustomData, RequestFundingRates, RequestInstrument,
+            RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas,
+            SubscribeBookSnapshots, SubscribeCommand, SubscribeCustomData, SubscribeFundingRates,
+            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
+            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
+            SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookSnapshots,
+            UnsubscribeCommand, UnsubscribeCustomData, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstrumentClose,
+            UnsubscribeInstrumentStatus, UnsubscribeInstruments, UnsubscribeMarkPrices,
+            UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+            is_parent_subscription,
         },
         system::ShutdownSystem,
     },
     msgbus::{
         self, MStr, Pattern, ShareableMessageHandler, Topic, TypedHandler, get_message_bus,
         switchboard::{
-            MessagingSwitchboard, get_bars_topic, get_book_deltas_topic, get_book_snapshots_topic,
-            get_custom_topic, get_funding_rate_topic, get_index_price_topic,
-            get_instrument_close_topic, get_instrument_status_topic, get_instrument_topic,
-            get_instruments_pattern, get_mark_price_topic, get_option_chain_topic,
-            get_option_greeks_topic, get_order_cancels_topic, get_order_fills_topic,
-            get_quotes_topic, get_signal_pattern, get_trades_topic,
+            MessagingSwitchboard, get_bars_topic, get_book_deltas_pattern, get_book_deltas_topic,
+            get_book_snapshots_topic, get_custom_topic, get_funding_rate_topic,
+            get_index_price_topic, get_instrument_close_topic, get_instrument_status_topic,
+            get_instrument_topic, get_instruments_pattern, get_mark_price_topic,
+            get_option_chain_topic, get_option_greeks_topic, get_order_cancels_topic,
+            get_order_fills_topic, get_quotes_topic, get_signal_pattern, get_trades_topic,
         },
     },
     signal::Signal,
@@ -516,6 +517,26 @@ pub trait DataActor:
         Ok(())
     }
 
+    /// Actions to be performed when receiving historical book deltas.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the historical book deltas fails.
+    #[allow(unused_variables)]
+    fn on_historical_book_deltas(&mut self, deltas: &[OrderBookDelta]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Actions to be performed when receiving historical book depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the historical book depth fails.
+    #[allow(unused_variables)]
+    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth10]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Actions to be performed when receiving historical quotes.
     ///
     /// # Errors
@@ -533,19 +554,6 @@ pub trait DataActor:
     /// Returns an error if handling the historical trades fails.
     #[allow(unused_variables)]
     fn on_historical_trades(&mut self, trades: &[TradeTick]) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Actions to be performed when receiving historical funding rates.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if handling the historical funding rates fails.
-    #[allow(unused_variables)]
-    fn on_historical_funding_rates(
-        &mut self,
-        funding_rates: &[FundingRateUpdate],
-    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -578,6 +586,19 @@ pub trait DataActor:
     fn on_historical_index_prices(
         &mut self,
         index_prices: &[IndexPriceUpdate],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Actions to be performed when receiving historical funding rates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the historical funding rates fails.
+    #[allow(unused_variables)]
+    fn on_historical_funding_rates(
+        &mut self,
+        funding_rates: &[FundingRateUpdate],
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -967,7 +988,8 @@ pub trait DataActor:
 
     /// Handles an instruments response.
     fn handle_instruments_response(&mut self, resp: &InstrumentsResponse) {
-        log_received(&resp);
+        log_received_bulk("InstrumentsResponse", &resp.correlation_id, resp.data.len());
+        log::trace!("{RECV} {resp:?}");
 
         for inst in &resp.data {
             if let Err(e) = self.on_instrument(inst) {
@@ -985,9 +1007,30 @@ pub trait DataActor:
         }
     }
 
+    /// Handles a book deltas response.
+    fn handle_book_deltas_response(&mut self, resp: &BookDeltasResponse) {
+        log_received_bulk("BookDeltasResponse", &resp.correlation_id, resp.data.len());
+        log::trace!("{RECV} {resp:?}");
+
+        if let Err(e) = self.on_historical_book_deltas(&resp.data) {
+            log_error(&e);
+        }
+    }
+
+    /// Handles a book depth response.
+    fn handle_book_depth_response(&mut self, resp: &BookDepthResponse) {
+        log_received_bulk("BookDepthResponse", &resp.correlation_id, resp.data.len());
+        log::trace!("{RECV} {resp:?}");
+
+        if let Err(e) = self.on_historical_book_depth(&resp.data) {
+            log_error(&e);
+        }
+    }
+
     /// Handles a quotes response.
     fn handle_quotes_response(&mut self, resp: &QuotesResponse) {
-        log_received(&resp);
+        log_received_bulk("QuotesResponse", &resp.correlation_id, resp.data.len());
+        log::trace!("{RECV} {resp:?}");
 
         if let Err(e) = self.on_historical_quotes(&resp.data) {
             log_error(&e);
@@ -996,27 +1039,34 @@ pub trait DataActor:
 
     /// Handles a trades response.
     fn handle_trades_response(&mut self, resp: &TradesResponse) {
-        log_received(&resp);
+        log_received_bulk("TradesResponse", &resp.correlation_id, resp.data.len());
+        log::trace!("{RECV} {resp:?}");
 
         if let Err(e) = self.on_historical_trades(&resp.data) {
             log_error(&e);
         }
     }
 
-    /// Handles a funding rates response.
-    fn handle_funding_rates_response(&mut self, resp: &FundingRatesResponse) {
-        log_received(&resp);
+    /// Handles a bars response.
+    fn handle_bars_response(&mut self, resp: &BarsResponse) {
+        log_received_bulk("BarsResponse", &resp.correlation_id, resp.data.len());
+        log::trace!("{RECV} {resp:?}");
 
-        if let Err(e) = self.on_historical_funding_rates(&resp.data) {
+        if let Err(e) = self.on_historical_bars(&resp.data) {
             log_error(&e);
         }
     }
 
-    /// Handles a bars response.
-    fn handle_bars_response(&mut self, resp: &BarsResponse) {
-        log_received(&resp);
+    /// Handles a funding rates response.
+    fn handle_funding_rates_response(&mut self, resp: &FundingRatesResponse) {
+        log_received_bulk(
+            "FundingRatesResponse",
+            &resp.correlation_id,
+            resp.data.len(),
+        );
+        log::trace!("{RECV} {resp:?}");
 
-        if let Err(e) = self.on_historical_bars(&resp.data) {
+        if let Err(e) = self.on_historical_funding_rates(&resp.data) {
             log_error(&e);
         }
     }
@@ -1041,7 +1091,18 @@ pub trait DataActor:
     /// Subscribe to [`Signal`] data by `name`.
     ///
     /// An empty `name` subscribes to every signal.
-    fn subscribe_signal(&mut self, name: &str)
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: signal name to subscribe to.
+    /// - `priority`: optional dispatch priority. Pass `None` for default
+    ///   ordering (by pattern then handler ID). Pass `Some(p)` when actors
+    ///   sharing a signal need deterministic ordering: higher-priority
+    ///   handlers receive the message before lower-priority handlers.
+    ///
+    /// Re-subscribing does not update an existing priority; call
+    /// [`unsubscribe_signal`](Self::unsubscribe_signal) first.
+    fn subscribe_signal(&mut self, name: &str, priority: Option<u32>)
     where
         Self: 'static + Debug + Sized,
     {
@@ -1058,7 +1119,7 @@ pub trait DataActor:
             }
         });
 
-        DataActorCore::subscribe_signal(self, handler, name);
+        DataActorCore::subscribe_signal(self, handler, name, priority);
     }
 
     /// Subscribe to streaming [`QuoteTick`] data for the `instrument_id`.
@@ -1096,7 +1157,7 @@ pub trait DataActor:
         let actor_id = self.actor_id().inner();
         let pattern = get_instruments_pattern(venue);
 
-        let handler = ShareableMessageHandler::from_typed(move |instrument: &InstrumentAny| {
+        let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_instrument(instrument);
             } else {
@@ -1119,7 +1180,7 @@ pub trait DataActor:
         let actor_id = self.actor_id().inner();
         let topic = get_instrument_topic(instrument_id);
 
-        let handler = ShareableMessageHandler::from_typed(move |instrument: &InstrumentAny| {
+        let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_instrument(instrument);
             } else {
@@ -1143,7 +1204,12 @@ pub trait DataActor:
         Self: 'static + Debug + Sized,
     {
         let actor_id = self.actor_id().inner();
-        let topic = get_book_deltas_topic(instrument_id);
+        let is_parent = is_parent_subscription(params.as_ref());
+        let pattern = if is_parent {
+            get_book_deltas_pattern(instrument_id)
+        } else {
+            get_book_deltas_topic(instrument_id).into()
+        };
 
         let handler = TypedHandler::from(move |deltas: &OrderBookDeltas| {
             get_actor_unchecked::<Self>(&actor_id).handle_book_deltas(deltas);
@@ -1151,7 +1217,7 @@ pub trait DataActor:
 
         DataActorCore::subscribe_book_deltas(
             self,
-            topic,
+            pattern,
             handler,
             instrument_id,
             book_type,
@@ -1995,6 +2061,77 @@ pub trait DataActor:
         DataActorCore::request_book_snapshot(self, instrument_id, depth, client_id, params, handler)
     }
 
+    /// Request historical [`OrderBookDelta`] data for the given `instrument_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input parameters are invalid.
+    fn request_book_deltas(
+        &mut self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+    ) -> anyhow::Result<UUID4>
+    where
+        Self: 'static + Debug + Sized,
+    {
+        let actor_id = self.actor_id().inner();
+        let handler = ShareableMessageHandler::from_typed(move |resp: &BookDeltasResponse| {
+            get_actor_unchecked::<Self>(&actor_id).handle_book_deltas_response(resp);
+        });
+
+        DataActorCore::request_book_deltas(
+            self,
+            instrument_id,
+            start,
+            end,
+            limit,
+            client_id,
+            params,
+            handler,
+        )
+    }
+
+    /// Request historical [`OrderBookDepth10`] data for the given `instrument_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input parameters are invalid.
+    #[expect(clippy::too_many_arguments)]
+    fn request_book_depth(
+        &mut self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
+        depth: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+    ) -> anyhow::Result<UUID4>
+    where
+        Self: 'static + Debug + Sized,
+    {
+        let actor_id = self.actor_id().inner();
+        let handler = ShareableMessageHandler::from_typed(move |resp: &BookDepthResponse| {
+            get_actor_unchecked::<Self>(&actor_id).handle_book_depth_response(resp);
+        });
+
+        DataActorCore::request_book_depth(
+            self,
+            instrument_id,
+            start,
+            end,
+            limit,
+            depth,
+            client_id,
+            params,
+            handler,
+        )
+    }
+
     /// Request historical [`QuoteTick`] data for the given `instrument_id`.
     ///
     /// # Errors
@@ -2063,6 +2200,33 @@ pub trait DataActor:
         )
     }
 
+    /// Request historical [`Bar`] data for the given `bar_type`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input parameters are invalid.
+    fn request_bars(
+        &mut self,
+        bar_type: BarType,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+    ) -> anyhow::Result<UUID4>
+    where
+        Self: 'static + Debug + Sized,
+    {
+        let actor_id = self.actor_id().inner();
+        let handler = ShareableMessageHandler::from_typed(move |resp: &BarsResponse| {
+            get_actor_unchecked::<Self>(&actor_id).handle_bars_response(resp);
+        });
+
+        DataActorCore::request_bars(
+            self, bar_type, start, end, limit, client_id, params, handler,
+        )
+    }
+
     /// Request historical [`FundingRateUpdate`] data for the given `instrument_id`.
     ///
     /// # Errors
@@ -2094,33 +2258,6 @@ pub trait DataActor:
             client_id,
             params,
             handler,
-        )
-    }
-
-    /// Request historical [`Bar`] data for the given `bar_type`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if input parameters are invalid.
-    fn request_bars(
-        &mut self,
-        bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
-        limit: Option<NonZeroUsize>,
-        client_id: Option<ClientId>,
-        params: Option<Params>,
-    ) -> anyhow::Result<UUID4>
-    where
-        Self: 'static + Debug + Sized,
-    {
-        let actor_id = self.actor_id().inner();
-        let handler = ShareableMessageHandler::from_typed(move |resp: &BarsResponse| {
-            get_actor_unchecked::<Self>(&actor_id).handle_bars_response(resp);
-        });
-
-        DataActorCore::request_bars(
-            self, bar_type, start, end, limit, client_id, params, handler,
         )
     }
 }
@@ -2159,7 +2296,7 @@ where
 
     fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
         self.state = self.state.transition(&trigger)?;
-        log::info!("{}", self.state.variant_name());
+        log::info!(component = self.component_id().as_str(); "{}", self.state.variant_name());
         Ok(())
     }
 
@@ -2231,8 +2368,9 @@ pub struct DataActorCore {
     cache: Option<Rc<RefCell<Cache>>>,     // Wired up on registration
     state: ComponentState,
     topic_handlers: AHashMap<MStr<Pattern>, ShareableMessageHandler>,
-    deltas_handlers: AHashMap<MStr<Topic>, TypedHandler<OrderBookDeltas>>,
-    depth10_handlers: AHashMap<MStr<Topic>, TypedHandler<OrderBookDepth10>>,
+    instrument_handlers: AHashMap<MStr<Pattern>, TypedHandler<InstrumentAny>>,
+    deltas_handlers: AHashMap<MStr<Pattern>, TypedHandler<OrderBookDeltas>>,
+    depth10_handlers: AHashMap<MStr<Pattern>, TypedHandler<OrderBookDepth10>>,
     book_handlers: AHashMap<MStr<Topic>, TypedHandler<OrderBook>>,
     quote_handlers: AHashMap<MStr<Topic>, TypedHandler<QuoteTick>>,
     trade_handlers: AHashMap<MStr<Topic>, TypedHandler<TradeTick>>,
@@ -2400,71 +2538,71 @@ impl DataActorCore {
 
     pub(crate) fn add_deltas_subscription(
         &mut self,
-        topic: MStr<Topic>,
+        pattern: MStr<Pattern>,
         handler: TypedHandler<OrderBookDeltas>,
     ) {
-        if self.deltas_handlers.contains_key(&topic) {
+        if self.deltas_handlers.contains_key(&pattern) {
             log::warn!(
-                "Actor {} attempted duplicate deltas subscription to '{topic}'",
+                "Actor {} attempted duplicate deltas subscription to '{pattern}'",
                 self.actor_id
             );
             return;
         }
-        self.deltas_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_book_deltas(topic.into(), handler, None);
+        self.deltas_handlers.insert(pattern, handler.clone());
+        msgbus::subscribe_book_deltas(pattern, handler, None);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn remove_deltas_subscription(&mut self, topic: MStr<Topic>) {
-        if let Some(handler) = self.deltas_handlers.remove(&topic) {
-            msgbus::unsubscribe_book_deltas(topic.into(), &handler);
+    pub(crate) fn remove_deltas_subscription(&mut self, pattern: MStr<Pattern>) {
+        if let Some(handler) = self.deltas_handlers.remove(&pattern) {
+            msgbus::unsubscribe_book_deltas(pattern, &handler);
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn add_depth10_subscription(
         &mut self,
-        topic: MStr<Topic>,
+        pattern: MStr<Pattern>,
         handler: TypedHandler<OrderBookDepth10>,
     ) {
-        if self.depth10_handlers.contains_key(&topic) {
+        if self.depth10_handlers.contains_key(&pattern) {
             log::warn!(
-                "Actor {} attempted duplicate depth10 subscription to '{topic}'",
+                "Actor {} attempted duplicate depth10 subscription to '{pattern}'",
                 self.actor_id
             );
             return;
         }
-        self.depth10_handlers.insert(topic, handler.clone());
-        msgbus::subscribe_book_depth10(topic.into(), handler, None);
+        self.depth10_handlers.insert(pattern, handler.clone());
+        msgbus::subscribe_book_depth10(pattern, handler, None);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn remove_depth10_subscription(&mut self, topic: MStr<Topic>) {
-        if let Some(handler) = self.depth10_handlers.remove(&topic) {
-            msgbus::unsubscribe_book_depth10(topic.into(), &handler);
+    pub(crate) fn remove_depth10_subscription(&mut self, pattern: MStr<Pattern>) {
+        if let Some(handler) = self.depth10_handlers.remove(&pattern) {
+            msgbus::unsubscribe_book_depth10(pattern, &handler);
         }
     }
 
     pub(crate) fn add_instrument_subscription(
         &mut self,
         pattern: MStr<Pattern>,
-        handler: ShareableMessageHandler,
+        handler: TypedHandler<InstrumentAny>,
     ) {
-        if self.topic_handlers.contains_key(&pattern) {
+        if self.instrument_handlers.contains_key(&pattern) {
             log::warn!(
                 "Actor {} attempted duplicate instrument subscription to '{pattern}'",
                 self.actor_id
             );
             return;
         }
-        self.topic_handlers.insert(pattern, handler.clone());
-        msgbus::subscribe_any(pattern, handler, None);
+        self.instrument_handlers.insert(pattern, handler.clone());
+        msgbus::subscribe_instruments(pattern, handler, None);
     }
 
     #[allow(dead_code)]
     pub(crate) fn remove_instrument_subscription(&mut self, pattern: MStr<Pattern>) {
-        if let Some(handler) = self.topic_handlers.remove(&pattern) {
-            msgbus::unsubscribe_any(pattern, &handler);
+        if let Some(handler) = self.instrument_handlers.remove(&pattern) {
+            msgbus::unsubscribe_instruments(pattern, &handler);
         }
     }
 
@@ -2794,6 +2932,7 @@ impl DataActorCore {
             cache: None,     // None until registered
             state: ComponentState::default(),
             topic_handlers: AHashMap::new(),
+            instrument_handlers: AHashMap::new(),
             deltas_handlers: AHashMap::new(),
             depth10_handlers: AHashMap::new(),
             book_handlers: AHashMap::new(),
@@ -3031,6 +3170,7 @@ impl DataActorCore {
             reason,
             UUID4::new(),
             self.timestamp_ns(),
+            None, // correlation_id
         );
 
         let topic = MessagingSwitchboard::shutdown_system_topic();
@@ -3171,7 +3311,12 @@ impl DataActorCore {
     /// # Panics
     ///
     /// Panics if the actor is not registered with a trader.
-    pub fn subscribe_signal(&mut self, handler: ShareableMessageHandler, name: &str) {
+    pub fn subscribe_signal(
+        &mut self,
+        handler: ShareableMessageHandler,
+        name: &str,
+        priority: Option<u32>,
+    ) {
         self.check_registered();
 
         let pattern = get_signal_pattern(name);
@@ -3183,7 +3328,7 @@ impl DataActorCore {
             return;
         }
         self.topic_handlers.insert(pattern, handler.clone());
-        msgbus::subscribe_any(pattern, handler, None);
+        msgbus::subscribe_any(pattern, handler, priority);
     }
 
     /// Helper method for registering quotes subscriptions from the trait.
@@ -3216,7 +3361,7 @@ impl DataActorCore {
     pub fn subscribe_instruments(
         &mut self,
         pattern: MStr<Pattern>,
-        handler: ShareableMessageHandler,
+        handler: TypedHandler<InstrumentAny>,
         venue: Venue,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -3241,7 +3386,7 @@ impl DataActorCore {
     pub fn subscribe_instrument(
         &mut self,
         topic: MStr<Topic>,
-        handler: ShareableMessageHandler,
+        handler: TypedHandler<InstrumentAny>,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         params: Option<Params>,
@@ -3267,7 +3412,7 @@ impl DataActorCore {
     #[expect(clippy::too_many_arguments)]
     pub fn subscribe_book_deltas(
         &mut self,
-        topic: MStr<Topic>,
+        pattern: MStr<Pattern>,
         handler: TypedHandler<OrderBookDeltas>,
         instrument_id: InstrumentId,
         book_type: BookType,
@@ -3278,7 +3423,7 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        self.add_deltas_subscription(topic, handler);
+        self.add_deltas_subscription(pattern, handler);
 
         let command = SubscribeCommand::BookDeltas(SubscribeBookDeltas {
             instrument_id,
@@ -3538,7 +3683,10 @@ impl DataActorCore {
     }
 
     /// Helper method for subscribing to option chain snapshots from the trait.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "subscription command mirrors the option chain request fields"
+    )]
     pub fn subscribe_option_chain(
         &mut self,
         topic: MStr<Topic>,
@@ -3693,8 +3841,12 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        let topic = get_book_deltas_topic(instrument_id);
-        self.remove_deltas_subscription(topic);
+        let pattern = if is_parent_subscription(params.as_ref()) {
+            get_book_deltas_pattern(instrument_id)
+        } else {
+            get_book_deltas_topic(instrument_id).into()
+        };
+        self.remove_deltas_subscription(pattern);
 
         let command = UnsubscribeCommand::BookDeltas(UnsubscribeBookDeltas {
             instrument_id,
@@ -4153,6 +4305,92 @@ impl DataActorCore {
         Ok(request_id)
     }
 
+    /// Helper method for requesting book deltas.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input parameters are invalid.
+    #[expect(clippy::too_many_arguments)]
+    pub fn request_book_deltas(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        handler: ShareableMessageHandler,
+    ) -> anyhow::Result<UUID4> {
+        self.check_registered();
+
+        let now = self.clock_ref().utc_now();
+        check_timestamps(now, start, end)?;
+
+        let request_id = UUID4::new();
+        let command = RequestCommand::BookDeltas(RequestBookDeltas {
+            instrument_id,
+            start,
+            end,
+            limit,
+            client_id,
+            request_id,
+            ts_init: now.into(),
+            params,
+        });
+
+        get_message_bus()
+            .borrow_mut()
+            .register_response_handler(command.request_id(), handler)?;
+
+        self.send_data_cmd(DataCommand::Request(command));
+
+        Ok(request_id)
+    }
+
+    /// Sends a request for historical book depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input parameters are invalid.
+    #[expect(clippy::too_many_arguments)]
+    pub fn request_book_depth(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
+        depth: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        handler: ShareableMessageHandler,
+    ) -> anyhow::Result<UUID4> {
+        self.check_registered();
+
+        let now = self.clock_ref().utc_now();
+        check_timestamps(now, start, end)?;
+
+        let request_id = UUID4::new();
+        let command = RequestCommand::BookDepth(RequestBookDepth {
+            instrument_id,
+            start,
+            end,
+            limit,
+            depth,
+            client_id,
+            request_id,
+            ts_init: now.into(),
+            params,
+        });
+
+        get_message_bus()
+            .borrow_mut()
+            .register_response_handler(command.request_id(), handler)?;
+
+        self.send_data_cmd(DataCommand::Request(command));
+
+        Ok(request_id)
+    }
+
     /// Helper method for requesting quotes.
     ///
     /// # Errors
@@ -4237,48 +4475,6 @@ impl DataActorCore {
         Ok(request_id)
     }
 
-    /// Helper method for requesting funding rates.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if input parameters are invalid.
-    #[expect(clippy::too_many_arguments)]
-    pub fn request_funding_rates(
-        &self,
-        instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
-        limit: Option<NonZeroUsize>,
-        client_id: Option<ClientId>,
-        params: Option<Params>,
-        handler: ShareableMessageHandler,
-    ) -> anyhow::Result<UUID4> {
-        self.check_registered();
-
-        let now = self.clock_ref().utc_now();
-        check_timestamps(now, start, end)?;
-
-        let request_id = UUID4::new();
-        let command = RequestCommand::FundingRates(RequestFundingRates {
-            instrument_id,
-            start,
-            end,
-            limit,
-            client_id,
-            request_id,
-            ts_init: now.into(),
-            params,
-        });
-
-        get_message_bus()
-            .borrow_mut()
-            .register_response_handler(command.request_id(), handler)?;
-
-        self.send_data_cmd(DataCommand::Request(command));
-
-        Ok(request_id)
-    }
-
     /// Helper method for requesting bars.
     ///
     /// # Errors
@@ -4303,6 +4499,48 @@ impl DataActorCore {
         let request_id = UUID4::new();
         let command = RequestCommand::Bars(RequestBars {
             bar_type,
+            start,
+            end,
+            limit,
+            client_id,
+            request_id,
+            ts_init: now.into(),
+            params,
+        });
+
+        get_message_bus()
+            .borrow_mut()
+            .register_response_handler(command.request_id(), handler)?;
+
+        self.send_data_cmd(DataCommand::Request(command));
+
+        Ok(request_id)
+    }
+
+    /// Helper method for requesting funding rates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input parameters are invalid.
+    #[expect(clippy::too_many_arguments)]
+    pub fn request_funding_rates(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        handler: ShareableMessageHandler,
+    ) -> anyhow::Result<UUID4> {
+        self.check_registered();
+
+        let now = self.clock_ref().utc_now();
+        check_timestamps(now, start, end)?;
+
+        let request_id = UUID4::new();
+        let command = RequestCommand::FundingRates(RequestFundingRates {
+            instrument_id,
             start,
             end,
             limit,
@@ -4359,9 +4597,9 @@ impl DataActorCore {
     }
 
     #[cfg(test)]
-    pub fn has_deltas_handler(&self, topic: &str) -> bool {
+    pub fn has_deltas_handler(&self, pattern: &str) -> bool {
         self.deltas_handlers
-            .contains_key(&MStr::<Topic>::from(topic))
+            .contains_key(&MStr::<Pattern>::from(pattern))
     }
 }
 
@@ -4401,4 +4639,8 @@ where
     T: Debug,
 {
     log::debug!("{RECV} {msg:?}");
+}
+
+fn log_received_bulk(kind: &str, correlation_id: &UUID4, records: usize) {
+    log::debug!("{RECV} {kind} correlation_id={correlation_id} records={records}");
 }

@@ -20,8 +20,8 @@ use ustr::Ustr;
 
 use super::enums::{OKXOptionType, OKXTriggerType};
 use crate::common::{
-    enums::{OKXContractType, OKXInstrumentStatus, OKXInstrumentType},
-    parse::deserialize_optional_string_to_u64,
+    enums::{OKXContractType, OKXInstrumentCategory, OKXInstrumentStatus, OKXInstrumentType},
+    parse::{deserialize_empty_ustr_as_none, deserialize_optional_string_to_u64},
 };
 
 /// Attached TP/SL child order metadata returned by OKX on parent orders.
@@ -52,6 +52,15 @@ pub struct OKXAttachedAlgoOrd {
     /// Take-profit trigger price type.
     #[serde(default)]
     pub tp_trigger_px_type: Option<OKXTriggerType>,
+    /// Callback ratio for attached trailing stop orders.
+    #[serde(default)]
+    pub callback_ratio: String,
+    /// Callback spread for attached trailing stop orders.
+    #[serde(default)]
+    pub callback_spread: String,
+    /// Activation price for attached trailing stop orders.
+    #[serde(default)]
+    pub active_px: String,
 }
 
 /// Represents an instrument on the OKX exchange.
@@ -70,6 +79,13 @@ pub struct OKXInstrument {
     pub uly: Ustr,
     /// Instrument family, e.g. "BTC-USD". Only applicable to FUTURES/SWAP/OPTION.
     pub inst_family: Ustr,
+    /// Event contract series ID. Only applicable to EVENTS.
+    #[serde(default, deserialize_with = "deserialize_empty_ustr_as_none")]
+    pub series_id: Option<Ustr>,
+    /// Instrument category (the OKX `instCategory` field; the deprecated, distinct
+    /// `category` field is intentionally ignored).
+    #[serde(default)]
+    pub inst_category: Option<OKXInstrumentCategory>,
     /// Base currency, e.g. "BTC" in BTC-USDT. Applicable to SPOT/MARGIN.
     pub base_ccy: Ustr,
     /// Quote currency, e.g. "USDT" in BTC-USDT.

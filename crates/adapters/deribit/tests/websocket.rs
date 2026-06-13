@@ -19,7 +19,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -38,18 +38,24 @@ use futures_util::{StreamExt, pin_mut};
 use nautilus_common::testing::wait_until_async;
 use nautilus_core::{AtomicSet, UnixNanos};
 use nautilus_deribit::{
-    common::enums::DeribitEnvironment,
+    common::{consts::DERIBIT_VENUE, enums::DeribitEnvironment},
+    data_types::DeribitVolatilityIndex,
     websocket::{
-        auth::DERIBIT_DATA_SESSION_NAME, client::DeribitWebSocketClient,
-        enums::DeribitUpdateInterval, messages::NautilusWsMessage,
+        auth::DERIBIT_DATA_SESSION_NAME,
+        client::DeribitWebSocketClient,
+        enums::DeribitUpdateInterval,
+        handler::{DeribitWsFeedHandler, HandlerCommand},
+        messages::{DeribitOrderParams, NautilusWsMessage},
     },
 };
 use nautilus_model::{
-    identifiers::{InstrumentId, Symbol, Venue},
+    data::Data,
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId},
     instruments::{CryptoPerpetual, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
-use nautilus_network::websocket::TransportBackend;
+use nautilus_network::websocket::{AuthTracker, SubscriptionState, TransportBackend};
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 // ------------------------------------------------------------------------------------------------
@@ -69,7 +75,7 @@ fn load_json(filename: &str) -> Value {
 /// Creates a mock BTC-PERPETUAL instrument for testing.
 fn create_btc_perpetual() -> InstrumentAny {
     InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-        InstrumentId::new(Symbol::from("BTC-PERPETUAL"), Venue::from("DERIBIT")),
+        InstrumentId::new(Symbol::from("BTC-PERPETUAL"), *DERIBIT_VENUE),
         Symbol::from("BTC-PERPETUAL"),
         Currency::BTC(),
         Currency::USD(),
@@ -162,6 +168,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
     let ticker_payload = load_json("ws_ticker.json");
     let quote_payload = load_json("ws_quote.json");
     let chart_payload = load_json("ws_chart.json");
+    let volatility_index_payload = load_json("ws_volatility_index.json");
 
     // Create a second chart payload with a later timestamp for emit-on-next pattern
     let mut chart_payload_next = chart_payload.clone();
@@ -271,6 +278,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                                         break;
                                     }
                                     Some(&chart_payload_next)
+                                } else if channel.starts_with("deribit_volatility_index.") {
+                                    Some(&volatility_index_payload)
                                 } else {
                                     None
                                 };
@@ -566,7 +575,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                 }
             }
             // Inner if consumes `data`, cannot hoist into a match guard
-            #[expect(clippy::collapsible_match)]
+            #[allow(clippy::collapsible_match)]
             Message::Ping(data) => {
                 if socket.send(Message::Pong(data)).await.is_err() {
                     break;
@@ -677,6 +686,69 @@ async fn test_wait_until_active_timeout() {
 
     let result = client.wait_until_active(0.1).await;
     assert!(result.is_err(), "expected timeout error");
+}
+
+#[tokio::test]
+async fn test_order_command_send_failure_does_not_emit_rejection() {
+    let signal = Arc::new(AtomicBool::new(false));
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut handler = DeribitWsFeedHandler::new(
+        signal.clone(),
+        cmd_rx,
+        raw_rx,
+        out_tx,
+        AuthTracker::new(),
+        SubscriptionState::new('.'),
+        Arc::new(AtomicSet::new()),
+        Arc::new(AtomicSet::new()),
+        Arc::new(AtomicSet::new()),
+        Some(AccountId::from("DERIBIT-001")),
+        true,
+        Arc::new(Mutex::new(Vec::new())),
+    );
+
+    let handle = tokio::spawn(async move { handler.next().await });
+    cmd_tx
+        .send(HandlerCommand::Buy {
+            params: DeribitOrderParams {
+                instrument_name: "BTC-PERPETUAL".to_string(),
+                amount: Decimal::new(1, 0),
+                order_type: "limit".to_string(),
+                label: Some("ws-send-fail-test-001".to_string()),
+                price: Some(Decimal::new(50_000, 0)),
+                time_in_force: Some("good_til_cancelled".to_string()),
+                post_only: Some(true),
+                reject_post_only: Some(true),
+                reduce_only: None,
+                trigger_price: None,
+                trigger: None,
+                max_show: None,
+                valid_until: None,
+            },
+            client_order_id: ClientOrderId::new("ws-send-fail-test-001"),
+            trader_id: TraderId::from("TESTER-001"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+        })
+        .unwrap();
+
+    let message = tokio::time::timeout(Duration::from_millis(300), out_rx.recv()).await;
+    if let Ok(Some(message)) = message {
+        assert!(
+            !matches!(
+                message,
+                NautilusWsMessage::OrderRejected(_)
+                    | NautilusWsMessage::OrderCancelRejected(_)
+                    | NautilusWsMessage::OrderModifyRejected(_)
+            ),
+            "send failure emitted rejection: {message:?}"
+        );
+    }
+
+    signal.store(true, Ordering::Relaxed);
+    assert!(handle.await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1004,6 +1076,84 @@ async fn test_quote_subscription_flow() {
     match message {
         NautilusWsMessage::Data(data) => {
             assert!(!data.is_empty(), "expected quote payload");
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    client.close().await.expect("close failed");
+}
+
+#[tokio::test]
+async fn test_volatility_index_subscription_flow() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws/api/v2");
+
+    let instruments = load_test_instruments();
+
+    let mut client = create_test_client(&ws_url);
+    client.cache_instruments(&instruments);
+    client.connect().await.expect("connect failed");
+    client
+        .wait_until_active(5.0)
+        .await
+        .expect("client inactive");
+
+    client
+        .subscribe_volatility_index("btc_usd")
+        .await
+        .expect("subscribe failed");
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .subscription_events()
+                    .await
+                    .iter()
+                    .any(|(ch, ok)| ch.starts_with("deribit_volatility_index.") && *ok)
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let stream = client.stream().unwrap();
+    pin_mut!(stream);
+    let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("no message received")
+        .expect("stream ended unexpectedly");
+
+    match message {
+        NautilusWsMessage::Data(data) => {
+            let custom = data
+                .iter()
+                .find_map(|item| {
+                    if let Data::Custom(custom) = item {
+                        Some(custom)
+                    } else {
+                        None
+                    }
+                })
+                .expect("expected custom data payload");
+            let dvol = custom
+                .data
+                .as_any()
+                .downcast_ref::<DeribitVolatilityIndex>()
+                .expect("expected DeribitVolatilityIndex");
+            assert_eq!(dvol.index_name, "btc_usd");
+            assert_eq!(dvol.volatility, 129.36);
+            assert_eq!(
+                custom
+                    .data_type
+                    .metadata()
+                    .as_ref()
+                    .and_then(|m| m.get("index_name"))
+                    .and_then(|v| v.as_str()),
+                Some("btc_usd"),
+            );
         }
         other => panic!("unexpected message: {other:?}"),
     }

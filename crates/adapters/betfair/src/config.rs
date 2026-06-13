@@ -22,6 +22,8 @@ use nautilus_model::{
     identifiers::{AccountId, TraderId},
     types::{Currency, Money},
 };
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     common::{
@@ -37,8 +39,11 @@ fn parse_currency(code: &str) -> anyhow::Result<Currency> {
         .map_err(|_| anyhow::anyhow!("Invalid account currency code: {code}"))
 }
 
-fn make_min_notional(value: Option<f64>, currency: Currency) -> Option<Money> {
-    value.map(|amount| Money::new(amount, currency))
+fn make_min_notional(value: Option<Decimal>, currency: Currency) -> anyhow::Result<Option<Money>> {
+    value
+        .map(|amount| Money::from_decimal(amount, currency))
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn validate_market_start_time(label: &str, value: &Option<String>) -> anyhow::Result<()> {
@@ -96,14 +101,15 @@ fn build_stream_config(
 }
 
 /// Configuration for the Betfair live data client.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.betfair", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.betfair")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.betfair")
 )]
 pub struct BetfairDataConfig {
     /// Account currency code.
@@ -121,7 +127,7 @@ pub struct BetfairDataConfig {
     #[builder(default = 5)]
     pub request_rate_per_second: u32,
     /// Optional default minimum notional in `account_currency`.
-    pub default_min_notional: Option<f64>,
+    pub default_min_notional: Option<Decimal>,
     /// Optional event type ID filter.
     pub event_type_ids: Option<Vec<String>>,
     /// Optional event type name filter.
@@ -210,7 +216,7 @@ impl BetfairDataConfig {
     /// Returns an error if the account currency code is invalid.
     pub fn min_notional(&self) -> anyhow::Result<Option<Money>> {
         let currency = self.currency()?;
-        Ok(make_min_notional(self.default_min_notional, currency))
+        make_min_notional(self.default_min_notional, currency)
     }
 
     /// Returns the navigation filter for instrument loading.
@@ -261,14 +267,15 @@ impl BetfairDataConfig {
 }
 
 /// Configuration for the Betfair live execution client.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.betfair", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.betfair")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.betfair")
 )]
 pub struct BetfairExecConfig {
     /// Trader ID for the client core.
@@ -333,6 +340,11 @@ pub struct BetfairExecConfig {
     /// When true, attach the latest market version to placeOrders and replaceOrders requests.
     #[builder(default)]
     pub use_market_version: bool,
+    /// Lookback window in minutes for the post-reconnect mass-status reconciliation
+    /// that recovers fills which terminated during the disconnect gap. Should
+    /// comfortably exceed the longest expected reconnect duration.
+    #[builder(default = 10)]
+    pub stream_gap_recovery_lookback_mins: u64,
 }
 
 impl Default for BetfairExecConfig {
@@ -623,11 +635,62 @@ mod tests {
     #[rstest]
     fn test_data_config_min_notional() {
         let config = BetfairDataConfig {
-            default_min_notional: Some(2.0),
+            default_min_notional: Some(Decimal::new(2, 0)),
             ..Default::default()
         };
 
         let min_notional = config.min_notional().unwrap();
-        assert_eq!(min_notional, Some(Money::new(2.0, Currency::GBP())));
+        assert_eq!(
+            min_notional,
+            Some(Money::from_decimal(Decimal::new(2, 0), Currency::GBP()).unwrap())
+        );
+    }
+
+    #[rstest]
+    fn test_data_config_toml_minimal() {
+        let config: BetfairDataConfig = toml::from_str(
+            r#"
+account_currency = "USD"
+request_rate_per_second = 10
+stream_heartbeat_ms = 2500
+stream_idle_timeout_ms = 30000
+stream_reconnect_delay_initial_ms = 500
+stream_reconnect_delay_max_ms = 5000
+stream_use_tls = false
+subscription_delay_secs = 1
+subscribe_race_data = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.account_currency, "USD");
+        assert_eq!(config.request_rate_per_second, 10);
+        assert_eq!(config.stream_heartbeat_ms, 2_500);
+        assert!(!config.stream_use_tls);
+        assert!(config.subscribe_race_data);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_empty_uses_defaults() {
+        let config: BetfairExecConfig = toml::from_str("").unwrap();
+        let expected = BetfairExecConfig::default();
+
+        assert_eq!(config.trader_id, expected.trader_id);
+        assert_eq!(config.account_id, expected.account_id);
+        assert_eq!(config.account_currency, expected.account_currency);
+        assert_eq!(
+            config.request_rate_per_second,
+            expected.request_rate_per_second,
+        );
+        assert_eq!(
+            config.order_request_rate_per_second,
+            expected.order_request_rate_per_second,
+        );
+        assert_eq!(config.stream_heartbeat_ms, expected.stream_heartbeat_ms);
+        assert_eq!(config.stream_use_tls, expected.stream_use_tls);
+        assert_eq!(
+            config.calculate_account_state,
+            expected.calculate_account_state,
+        );
     }
 }

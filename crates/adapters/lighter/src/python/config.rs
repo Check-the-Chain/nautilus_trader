@@ -15,30 +15,45 @@
 
 //! Python bindings for Lighter configuration.
 
-use std::collections::HashMap;
+use nautilus_model::identifiers::{AccountId, TraderId};
+use pyo3::pymethods;
 
-use pyo3::prelude::*;
-
-use crate::config::{LighterDataClientConfig, LighterEnvironment, LighterExecClientConfig};
+use crate::{
+    common::enums::LighterEnvironment,
+    config::{LighterDataClientConfig, LighterExecClientConfig},
+};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl LighterDataClientConfig {
-    /// Configuration for the Lighter data client.
+    /// Configuration for the Lighter live data client.
     #[new]
     #[pyo3(signature = (
-        environment = None,
         base_url_http = None,
         base_url_ws = None,
         proxy_url = None,
+        environment = None,
+        account_index = None,
+        api_key_index = None,
+        private_key = None,
         http_timeout_secs = None,
+        ws_timeout_secs = None,
+        update_instruments_interval_mins = None,
+        rest_quota_per_min = None,
     ))]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
-        environment: Option<LighterEnvironment>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
         proxy_url: Option<String>,
+        environment: Option<LighterEnvironment>,
+        account_index: Option<u64>,
+        api_key_index: Option<u8>,
+        private_key: Option<String>,
         http_timeout_secs: Option<u64>,
+        ws_timeout_secs: Option<u64>,
+        update_instruments_interval_mins: Option<u64>,
+        rest_quota_per_min: Option<u32>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -46,8 +61,21 @@ impl LighterDataClientConfig {
             base_url_ws,
             proxy_url,
             environment: environment.unwrap_or(defaults.environment),
+            account_index,
+            api_key_index,
+            private_key,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
+            ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
+            update_instruments_interval_mins: update_instruments_interval_mins
+                .unwrap_or(defaults.update_instruments_interval_mins),
+            rest_quota_per_min,
+            transport_backend: defaults.transport_backend,
         }
+    }
+
+    #[getter]
+    fn proxy_url(&self) -> Option<String> {
+        self.proxy_url.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -58,65 +86,71 @@ impl LighterDataClientConfig {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl LighterExecClientConfig {
-    /// Configuration for the Lighter execution client.
+    /// Configuration for the Lighter live execution client.
     #[new]
     #[pyo3(signature = (
+        trader_id,
+        account_id,
         account_index = None,
-        private_key = None,
         api_key_index = None,
-        maker_private_key = None,
-        maker_api_key_index = None,
-        api_private_keys = None,
-        signer_lib_path = None,
-        environment = None,
+        private_key = None,
         base_url_http = None,
         base_url_ws = None,
         proxy_url = None,
+        environment = None,
         http_timeout_secs = None,
         ws_timeout_secs = None,
-        nonce_mode = None,
-        default_auth_token_ttl_secs = None,
-        cancel_all_gtt_secs = None,
+        active_markets = None,
+        market_order_slippage_bps = None,
+        rest_quota_per_min = None,
+        sendtx_quota_per_min = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
-        account_index: Option<i64>,
-        private_key: Option<String>,
+        trader_id: TraderId,
+        account_id: AccountId,
+        account_index: Option<u64>,
         api_key_index: Option<u8>,
-        maker_private_key: Option<String>,
-        maker_api_key_index: Option<u8>,
-        api_private_keys: Option<HashMap<u8, String>>,
-        signer_lib_path: Option<String>,
-        environment: Option<LighterEnvironment>,
+        private_key: Option<String>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
         proxy_url: Option<String>,
+        environment: Option<LighterEnvironment>,
         http_timeout_secs: Option<u64>,
         ws_timeout_secs: Option<u64>,
-        nonce_mode: Option<String>,
-        default_auth_token_ttl_secs: Option<u64>,
-        cancel_all_gtt_secs: Option<u64>,
+        active_markets: Option<Vec<i16>>,
+        market_order_slippage_bps: Option<u32>,
+        rest_quota_per_min: Option<u32>,
+        sendtx_quota_per_min: Option<u32>,
     ) -> Self {
-        let defaults = Self::default();
+        let defaults = Self::builder()
+            .trader_id(trader_id)
+            .account_id(account_id)
+            .build();
         Self {
+            trader_id,
+            account_id,
             account_index,
-            private_key,
             api_key_index,
-            maker_private_key,
-            maker_api_key_index,
-            api_private_keys,
-            signer_lib_path,
+            private_key,
             base_url_http,
             base_url_ws,
             proxy_url,
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
-            nonce_mode: nonce_mode.unwrap_or(defaults.nonce_mode),
-            default_auth_token_ttl_secs: default_auth_token_ttl_secs
-                .unwrap_or(defaults.default_auth_token_ttl_secs),
-            cancel_all_gtt_secs: cancel_all_gtt_secs.unwrap_or(defaults.cancel_all_gtt_secs),
+            active_markets: active_markets.unwrap_or(defaults.active_markets),
+            market_order_slippage_bps: market_order_slippage_bps
+                .unwrap_or(defaults.market_order_slippage_bps),
+            rest_quota_per_min,
+            sendtx_quota_per_min,
+            transport_backend: defaults.transport_backend,
         }
+    }
+
+    #[getter]
+    fn proxy_url(&self) -> Option<String> {
+        self.proxy_url.clone()
     }
 
     fn __repr__(&self) -> String {

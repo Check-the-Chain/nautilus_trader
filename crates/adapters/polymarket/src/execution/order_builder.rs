@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
+    identifiers::VenueOrderId,
     orders::{Order, OrderAny},
 };
 use rust_decimal::Decimal;
@@ -43,7 +44,7 @@ use crate::{
         enums::{PolymarketOrderSide, PolymarketOrderType, SignatureType},
     },
     http::models::PolymarketOrder,
-    signing::eip712::OrderSigner,
+    signing::eip712::{OrderSigner, order_hash},
 };
 
 /// Zero `bytes32` used for the `metadata` field (reserved for future use).
@@ -147,6 +148,18 @@ impl PolymarketOrderBuilder {
         self.build_and_sign(token_id, side, maker_amount, taker_amount, "0", neg_risk)
     }
 
+    /// Computes the Polymarket order ID for a signed CLOB V2 order.
+    pub fn expected_order_id(
+        &self,
+        order: &PolymarketOrder,
+        neg_risk: bool,
+    ) -> anyhow::Result<VenueOrderId> {
+        let hash = order_hash(order, neg_risk)
+            .map_err(|e| anyhow::anyhow!("Failed to derive order hash: {e}"))?;
+        let order_id = format!("{hash:#x}");
+        Ok(VenueOrderId::from(order_id.as_str()))
+    }
+
     /// Validates a limit order before building, returning a denial reason if invalid.
     pub fn validate_limit_order(order: &OrderAny) -> Result<(), String> {
         if order.is_reduce_only() {
@@ -225,6 +238,13 @@ impl PolymarketOrderBuilder {
             }
         }
 
+        if PolymarketOrderType::from_market_time_in_force(order.time_in_force()).is_err() {
+            return Err(format!(
+                "Unsupported time in force for Polymarket market order: {:?}; use IOC or FOK",
+                order.time_in_force()
+            ));
+        }
+
         Ok(())
     }
 
@@ -243,7 +263,7 @@ impl PolymarketOrderBuilder {
         let mut poly_order = PolymarketOrder {
             salt,
             maker: self.maker_address.clone(),
-            signer: self.signer_address.clone(),
+            signer: self.order_signer_address(),
             token_id: Ustr::from(token_id),
             maker_amount,
             taker_amount,
@@ -263,6 +283,13 @@ impl PolymarketOrderBuilder {
         poly_order.signature = signature;
 
         Ok(poly_order)
+    }
+
+    fn order_signer_address(&self) -> String {
+        match self.signature_type {
+            SignatureType::Poly1271 => self.maker_address.clone(),
+            _ => self.signer_address.clone(),
+        }
     }
 }
 
@@ -358,7 +385,10 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::common::enums::PolymarketOrderSide;
+    use crate::{
+        common::{credential::EvmPrivateKey, enums::PolymarketOrderSide},
+        signing::eip712::OrderSigner,
+    };
 
     fn make_limit(
         reduce_only: bool,
@@ -525,7 +555,6 @@ mod tests {
     }
 
     fn make_test_builder() -> PolymarketOrderBuilder {
-        use crate::{common::credential::EvmPrivateKey, signing::eip712::OrderSigner};
         let pk = EvmPrivateKey::new(
             "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
         )
@@ -589,6 +618,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(order.builder, POLYMARKET_NAUTILUS_BUILDER_CODE);
+    }
+
+    #[rstest]
+    fn test_poly_1271_order_uses_deposit_wallet_as_signer() {
+        let pk = EvmPrivateKey::new(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let signer = OrderSigner::new(&pk).unwrap();
+        let signer_address = format!("{:#x}", signer.address());
+        let deposit_wallet = "0x1111111111111111111111111111111111111111".to_string();
+        let builder = PolymarketOrderBuilder::new(
+            signer,
+            signer_address,
+            deposit_wallet.clone(),
+            SignatureType::Poly1271,
+        );
+
+        let order = builder
+            .build_limit_order(
+                "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+                PolymarketOrderSide::Buy,
+                dec!(0.50),
+                dec!(10),
+                "0",
+                false,
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(order.maker, deposit_wallet);
+        assert_eq!(order.signer, deposit_wallet);
+        assert_eq!(order.signature_type, SignatureType::Poly1271);
+        assert_eq!(order.signature.len(), 636);
     }
 
     #[rstest]

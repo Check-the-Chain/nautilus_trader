@@ -18,7 +18,7 @@
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use nautilus_common::{
-    cache::Cache,
+    cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
@@ -30,7 +30,7 @@ use nautilus_model::{
 };
 
 use crate::{
-    common::consts::BITMEX_VENUE,
+    common::consts::{BITMEX, BITMEX_VENUE},
     config::{BitmexDataClientConfig, BitmexExecClientConfig},
     data::BitmexDataClient,
     execution::BitmexExecutionClient,
@@ -53,7 +53,7 @@ impl ClientConfig for BitmexDataClientConfig {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bitmex")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
 )]
 pub struct BitmexExecFactoryConfig {
     /// The trader ID for the execution client.
@@ -93,7 +93,7 @@ impl ClientConfig for BitmexExecFactoryConfig {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bitmex")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
 )]
 pub struct BitmexDataClientFactory;
 
@@ -116,7 +116,7 @@ impl DataClientFactory for BitmexDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let bitmex_config = config
@@ -135,7 +135,7 @@ impl DataClientFactory for BitmexDataClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "BITMEX"
+        BITMEX
     }
 
     fn config_type(&self) -> &'static str {
@@ -151,7 +151,7 @@ impl DataClientFactory for BitmexDataClientFactory {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bitmex")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
 )]
 pub struct BitmexExecutionClientFactory;
 
@@ -174,7 +174,7 @@ impl ExecutionClientFactory for BitmexExecutionClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        cache: Rc<RefCell<Cache>>,
+        cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let factory_config = config
             .as_any()
@@ -205,7 +205,7 @@ impl ExecutionClientFactory for BitmexExecutionClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "BITMEX"
+        BITMEX
     }
 
     fn config_type(&self) -> &'static str {

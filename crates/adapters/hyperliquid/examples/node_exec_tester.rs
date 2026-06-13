@@ -25,14 +25,13 @@ use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
 use nautilus_hyperliquid::{
     HyperliquidDataClientConfig, HyperliquidDataClientFactory, HyperliquidExecClientConfig,
     HyperliquidExecFactoryConfig, HyperliquidExecutionClientFactory,
-    common::enums::HyperliquidEnvironment,
+    common::{consts::HYPERLIQUID_CLIENT_ID, enums::HyperliquidEnvironment},
 };
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
-use nautilus_network::websocket::TransportBackend;
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
 use nautilus_trading::strategy::StrategyConfig;
 
@@ -40,17 +39,16 @@ use nautilus_trading::strategy::StrategyConfig;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
-    let environment = Environment::Live;
+    let nt_environment = Environment::Live;
     let hl_environment = HyperliquidEnvironment::Mainnet;
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("HYPERLIQUID-001");
     let node_name = "HYPERLIQUID-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("HYPERLIQUID");
+    let client_id = *HYPERLIQUID_CLIENT_ID;
     let instrument_id = InstrumentId::from("ETH-USD-PERP.HYPERLIQUID");
 
     let data_config = HyperliquidDataClientConfig {
         environment: hl_environment,
-        transport_backend: TransportBackend::Sockudo,
         ..Default::default()
     };
 
@@ -59,7 +57,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         account_id,
         config: HyperliquidExecClientConfig {
             environment: hl_environment,
-            transport_backend: TransportBackend::Sockudo,
             ..Default::default()
         },
     };
@@ -71,10 +68,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout_level: LevelFilter::Info,
         ..Default::default()
     };
+    let exec_engine_config = LiveExecEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
-    let mut node = LiveNode::builder(trader_id, environment)?
+    let mut node = LiveNode::builder(trader_id, nt_environment)?
         .with_name(node_name)
         .with_logging(log_config)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)
@@ -87,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .base(StrategyConfig {
             strategy_id: Some(StrategyId::from("EXEC_TESTER-001")),
             external_order_claims: Some(vec![instrument_id]),
-            // Hyperliquid supports hyphens in client order IDs (they're hashed to cloid)
+            // Hyperliquid supports hyphens in client order IDs.
             use_hyphens_in_client_order_ids: true,
             ..Default::default()
         })

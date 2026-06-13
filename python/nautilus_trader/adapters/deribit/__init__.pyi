@@ -10,6 +10,7 @@ __all__ = [
     "DeribitCurrency",
     "DeribitDataClientConfig",
     "DeribitDataClientFactory",
+    "DeribitEnvironment",
     "DeribitExecClientConfig",
     "DeribitExecutionClientFactory",
     "DeribitHttpClient",
@@ -26,18 +27,19 @@ class DeribitDataClientConfig:
     def __init__(
         self,
         product_types: typing.Sequence[DeribitProductType] | None = None,
-        use_testnet: bool | None = None,
+        environment: DeribitEnvironment | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
         base_url_http: str | None = None,
         base_url_ws: str | None = None,
+        proxy_url: str | None = None,
         http_timeout_secs: int | None = None,
         max_retries: int | None = None,
         retry_delay_initial_ms: int | None = None,
         retry_delay_max_ms: int | None = None,
         heartbeat_interval_secs: int | None = None,
         update_instruments_interval_mins: int | None = None,
-        proxy_url: str | None = None,
+        auto_load_missing_instruments: bool | None = None,
     ) -> None: ...
 
 @typing.final
@@ -52,16 +54,16 @@ class DeribitExecClientConfig:
         trader_id: model.TraderId,
         account_id: model.AccountId,
         product_types: typing.Sequence[DeribitProductType] | None = None,
-        use_testnet: bool | None = None,
+        environment: DeribitEnvironment | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
         base_url_http: str | None = None,
         base_url_ws: str | None = None,
+        proxy_url: str | None = None,
         http_timeout_secs: int | None = None,
         max_retries: int | None = None,
         retry_delay_initial_ms: int | None = None,
         retry_delay_max_ms: int | None = None,
-        proxy_url: str | None = None,
     ) -> None: ...
 
 @typing.final
@@ -76,11 +78,11 @@ class DeribitHttpClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         base_url: str | None = None,
-        is_testnet: bool = False,
-        timeout_secs: int | None = None,
-        max_retries: int | None = None,
-        retry_delay_ms: int | None = None,
-        retry_delay_max_ms: int | None = None,
+        environment: DeribitEnvironment = ...,
+        timeout_secs: int = 10,
+        max_retries: int = 3,
+        retry_delay_ms: int = 1000,
+        retry_delay_max_ms: int = 10000,
         proxy_url: str | None = None,
     ) -> None: ...
     @property
@@ -89,47 +91,48 @@ class DeribitHttpClient:
     def cache_instruments(self, instruments: typing.Sequence[typing.Any]) -> None: ...
     def cache_instrument(self, instrument: typing.Any) -> None: ...
     def request_instruments(
-        self, currency: DeribitCurrency, product_type: DeribitProductType | None = ...
+        self, currency: DeribitCurrency, product_type: DeribitProductType | None = None
     ) -> typing.Any: ...
+    def request_option_expirations(self, currency: DeribitCurrency) -> typing.Any: ...
     def request_instrument(self, instrument_id: model.InstrumentId) -> typing.Any: ...
     def request_account_state(self, account_id: model.AccountId) -> typing.Any: ...
     def request_trades(
         self,
         instrument_id: model.InstrumentId,
-        start: datetime.datetime | None = ...,
-        end: datetime.datetime | None = ...,
-        limit: int | None = ...,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        limit: int | None = None,
     ) -> typing.Any: ...
     def request_bars(
         self,
         bar_type: model.BarType,
-        start: datetime.datetime | None = ...,
-        end: datetime.datetime | None = ...,
-        limit: int | None = ...,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        limit: int | None = None,
     ) -> typing.Any: ...
     def request_book_snapshot(
-        self, instrument_id: model.InstrumentId, depth: int | None = ...
+        self, instrument_id: model.InstrumentId, depth: int | None = None
     ) -> typing.Any: ...
     def request_order_status_reports(
         self,
         account_id: model.AccountId,
-        instrument_id: model.InstrumentId | None,
-        start: int | None,
-        end: int | None,
-        open_only: bool,
+        instrument_id: model.InstrumentId | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        open_only: bool = True,
     ) -> typing.Any: ...
     def request_fill_reports(
         self,
         account_id: model.AccountId,
-        instrument_id: model.InstrumentId | None = ...,
-        start: int | None = ...,
-        end: int | None = ...,
+        instrument_id: model.InstrumentId | None = None,
+        start: int | None = None,
+        end: int | None = None,
     ) -> typing.Any: ...
     def request_position_status_reports(
-        self, account_id: model.AccountId, instrument_id: model.InstrumentId | None = ...
+        self, account_id: model.AccountId, instrument_id: model.InstrumentId | None = None
     ) -> typing.Any: ...
     def request_forward_prices(
-        self, currency: str, instrument_id: model.InstrumentId | None = ...
+        self, currency: str, instrument_id: model.InstrumentId | None = None
     ) -> typing.Any: ...
 
 @typing.final
@@ -139,18 +142,19 @@ class DeribitWebSocketClient:
         url: str | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
-        heartbeat_interval: int | None = None,
-        is_testnet: bool = False,
+        heartbeat_interval: int = 30,
+        environment: DeribitEnvironment = ...,
         proxy_url: str | None = None,
     ) -> None: ...
     @staticmethod
     def new_public(
-        is_testnet: bool,
-        proxy_url: str | None = None,
+        environment: DeribitEnvironment, proxy_url: str | None = None
     ) -> DeribitWebSocketClient: ...
     @staticmethod
     def with_credentials(
-        is_testnet: bool,
+        environment: DeribitEnvironment,
+        api_key: str | None = None,
+        api_secret: str | None = None,
         account_id: model.AccountId | None = None,
         proxy_url: str | None = None,
     ) -> DeribitWebSocketClient: ...
@@ -172,51 +176,63 @@ class DeribitWebSocketClient:
     ) -> typing.Any: ...
     def wait_until_active(self, timeout_secs: float) -> typing.Any: ...
     def close(self) -> typing.Any: ...
-    def authenticate(self, session_name: str | None = ...) -> typing.Any: ...
+    def authenticate(self, session_name: str | None = None) -> typing.Any: ...
     def authenticate_session(self, session_name: str) -> typing.Any: ...
     def subscribe_trades(
-        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = ...
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
     ) -> typing.Any: ...
     def unsubscribe_trades(
-        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = ...
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
     ) -> typing.Any: ...
     def subscribe_book(
         self,
         instrument_id: model.InstrumentId,
-        interval: DeribitUpdateInterval | None = ...,
-        depth: int | None = ...,
+        interval: DeribitUpdateInterval | None = None,
+        depth: int | None = None,
     ) -> typing.Any: ...
     def unsubscribe_book(
         self,
         instrument_id: model.InstrumentId,
-        interval: DeribitUpdateInterval | None = ...,
-        depth: int | None = ...,
+        interval: DeribitUpdateInterval | None = None,
+        depth: int | None = None,
     ) -> typing.Any: ...
     def subscribe_book_grouped(
         self,
         instrument_id: model.InstrumentId,
         group: str,
         depth: int,
-        interval: DeribitUpdateInterval | None = ...,
+        interval: DeribitUpdateInterval | None = None,
     ) -> typing.Any: ...
     def unsubscribe_book_grouped(
         self,
         instrument_id: model.InstrumentId,
         group: str,
         depth: int,
-        interval: DeribitUpdateInterval | None = ...,
+        interval: DeribitUpdateInterval | None = None,
     ) -> typing.Any: ...
     def subscribe_ticker(
-        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = ...
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
     ) -> typing.Any: ...
     def unsubscribe_ticker(
-        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = ...
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
+    ) -> typing.Any: ...
+    def subscribe_mark_prices(
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
+    ) -> typing.Any: ...
+    def unsubscribe_mark_prices(
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
+    ) -> typing.Any: ...
+    def subscribe_index_prices(
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
+    ) -> typing.Any: ...
+    def unsubscribe_index_prices(
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
     ) -> typing.Any: ...
     def subscribe_option_greeks(
-        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = ...
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
     ) -> typing.Any: ...
     def unsubscribe_option_greeks(
-        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = ...
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
     ) -> typing.Any: ...
     def subscribe_quotes(self, instrument_id: model.InstrumentId) -> typing.Any: ...
     def unsubscribe_quotes(self, instrument_id: model.InstrumentId) -> typing.Any: ...
@@ -229,13 +245,15 @@ class DeribitWebSocketClient:
     def subscribe(self, channels: typing.Sequence[str]) -> typing.Any: ...
     def unsubscribe(self, channels: typing.Sequence[str]) -> typing.Any: ...
     def subscribe_perpetual_interest_rates(
-        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = ...
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
     ) -> typing.Any: ...
     def unsubscribe_perpetual_interest_rates(
-        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = ...
+        self, instrument_id: model.InstrumentId, interval: DeribitUpdateInterval | None = None
     ) -> typing.Any: ...
     def subscribe_instrument_status(self, instrument_id: model.InstrumentId) -> typing.Any: ...
     def unsubscribe_instrument_status(self, instrument_id: model.InstrumentId) -> typing.Any: ...
+    def subscribe_volatility_index(self, index_name: str) -> typing.Any: ...
+    def unsubscribe_volatility_index(self, index_name: str) -> typing.Any: ...
     def subscribe_chart(self, instrument_id: model.InstrumentId, resolution: str) -> typing.Any: ...
     def unsubscribe_chart(
         self, instrument_id: model.InstrumentId, resolution: str
@@ -251,12 +269,12 @@ class DeribitWebSocketClient:
         trader_id: model.TraderId,
         strategy_id: model.StrategyId,
         instrument_id: model.InstrumentId,
-        price: model.Price | None,
-        time_in_force: model.TimeInForce | None,
-        post_only: bool,
-        reduce_only: bool,
-        trigger_price: model.Price | None = ...,
-        trigger: str | None = ...,
+        price: model.Price | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        post_only: bool = False,
+        reduce_only: bool = False,
+        trigger_price: model.Price | None = None,
+        trigger_type: model.TriggerType | None = None,
     ) -> typing.Any: ...
     def modify_order(
         self,
@@ -277,7 +295,7 @@ class DeribitWebSocketClient:
         instrument_id: model.InstrumentId,
     ) -> typing.Any: ...
     def cancel_all_orders(
-        self, instrument_id: model.InstrumentId, order_type: str | None = ...
+        self, instrument_id: model.InstrumentId, order_type: str | None = None
     ) -> typing.Any: ...
     def query_order(
         self,
@@ -309,6 +327,22 @@ class DeribitCurrency(enum.Enum):
     def from_str(cls, data: typing.Any) -> DeribitCurrency: ...
 
 @typing.final
+class DeribitEnvironment(enum.Enum):
+    MAINNET = ...
+    TESTNET = ...
+
+    def __init__(self, value: typing.Any) -> None: ...
+    def __hash__(self) -> int: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+    @classmethod
+    def variants(cls) -> list[str]: ...
+    @classmethod
+    def from_str(cls, data: typing.Any) -> DeribitEnvironment: ...
+
+@typing.final
 class DeribitProductType(enum.Enum):
     FUTURE = ...
     OPTION = ...
@@ -330,8 +364,8 @@ class DeribitProductType(enum.Enum):
 @typing.final
 class DeribitUpdateInterval(enum.Enum):
     RAW = ...
-    M_S100 = ...
-    AG_G2 = ...
+    MS100 = ...
+    AGG2 = ...
 
     def __init__(self, value: typing.Any) -> None: ...
     def __hash__(self) -> int: ...
@@ -366,5 +400,5 @@ class DeribitWsChannel(enum.Enum):
     UserChanges = ...
     UserAccessLog = ...
 
-def get_deribit_http_base_url(is_testnet: bool) -> str: ...
-def get_deribit_ws_url(is_testnet: bool) -> str: ...
+def get_deribit_http_base_url(environment: DeribitEnvironment) -> str: ...
+def get_deribit_ws_url(environment: DeribitEnvironment) -> str: ...

@@ -36,7 +36,10 @@ use axum::{
     routing::get,
 };
 use futures_util::StreamExt;
-use nautilus_coinbase::{CoinbaseDataClient, CoinbaseDataClientConfig};
+use nautilus_coinbase::{
+    CoinbaseDataClient, CoinbaseDataClientConfig,
+    common::consts::{COINBASE_CLIENT_ID, COINBASE_VENUE},
+};
 use nautilus_common::{
     clients::DataClient,
     live::runner::set_data_event_sender,
@@ -45,8 +48,8 @@ use nautilus_common::{
         data::{
             RequestBars, RequestBookSnapshot, RequestInstrument, RequestInstruments, RequestTrades,
             SubscribeBars, SubscribeBookDeltas, SubscribeFundingRates, SubscribeIndexPrices,
-            SubscribeQuotes, SubscribeTrades, UnsubscribeFundingRates, UnsubscribeIndexPrices,
-            UnsubscribeInstrument,
+            SubscribeInstrumentStatus, SubscribeQuotes, SubscribeTrades, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeInstrument,
         },
     },
     testing::wait_until_async,
@@ -55,7 +58,7 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{BarType, Data},
     enums::BookType,
-    identifiers::{ClientId, InstrumentId, Venue},
+    identifiers::InstrumentId,
 };
 use rstest::rstest;
 use serde::Deserialize;
@@ -239,6 +242,28 @@ async fn handle_ws_socket(mut socket: WebSocket) {
                                 "ticker" => load_json_str("ws_ticker.json"),
                                 "level2" => load_json_str("ws_l2_data_snapshot.json"),
                                 "candles" => load_json_str("ws_candles.json"),
+                                "status" => json!({
+                                    "channel": "status",
+                                    "client_id": "",
+                                    "timestamp": "2026-04-07T00:28:32.643779Z",
+                                    "sequence_num": 0,
+                                    "events": [{
+                                        "type": "snapshot",
+                                        "products": [{
+                                            "product_type": "SPOT",
+                                            "id": "BTC-USD",
+                                            "base_currency": "BTC",
+                                            "quote_currency": "USD",
+                                            "base_increment": "0.00000001",
+                                            "quote_increment": "0.01",
+                                            "display_name": "BTC/USD",
+                                            "status": "online",
+                                            "status_message": "",
+                                            "min_market_funds": "1"
+                                        }]
+                                    }]
+                                })
+                                .to_string(),
                                 _ => json!({"channel": channel}).to_string(),
                             };
 
@@ -252,7 +277,7 @@ async fn handle_ws_socket(mut socket: WebSocket) {
                 }
             }
             // Inner if consumes `data`, cannot hoist into a match guard
-            #[expect(clippy::collapsible_match)]
+            #[allow(clippy::collapsible_match)]
             Message::Ping(data) => {
                 if socket.send(Message::Pong(data)).await.is_err() {
                     break;
@@ -342,7 +367,7 @@ async fn test_data_client_connect_disconnect() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     assert!(!client.is_connected());
 
     client.connect().await.unwrap();
@@ -361,7 +386,7 @@ async fn test_data_client_connect_is_idempotent() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
 
     client.connect().await.unwrap();
     assert!(client.is_connected());
@@ -381,7 +406,7 @@ async fn test_data_client_emits_instruments_on_connect() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     let mut instrument_count = 0;
@@ -409,7 +434,7 @@ async fn test_data_client_reset_clears_state() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
 
     client.reset().unwrap();
     assert!(!client.is_connected());
@@ -430,7 +455,7 @@ async fn test_data_client_subscribe_trades() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
@@ -438,7 +463,7 @@ async fn test_data_client_subscribe_trades() {
     let instrument_id = InstrumentId::from("BTC-USD.COINBASE");
     let cmd = SubscribeTrades::new(
         instrument_id,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -474,7 +499,7 @@ async fn test_data_client_subscribe_quotes() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
@@ -482,7 +507,7 @@ async fn test_data_client_subscribe_quotes() {
     let instrument_id = InstrumentId::from("BTC-USD.COINBASE");
     let cmd = SubscribeQuotes::new(
         instrument_id,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -513,7 +538,7 @@ async fn test_data_client_subscribe_book_deltas() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
@@ -522,7 +547,7 @@ async fn test_data_client_subscribe_book_deltas() {
     let cmd = SubscribeBookDeltas::new(
         instrument_id,
         BookType::L2_MBP,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -555,7 +580,7 @@ async fn test_data_client_request_instruments() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -565,8 +590,8 @@ async fn test_data_client_request_instruments() {
     let request = RequestInstruments::new(
         None,
         None,
-        Some(ClientId::new("COINBASE")),
-        Some(Venue::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
+        Some(*COINBASE_VENUE),
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -595,7 +620,7 @@ async fn test_data_client_request_instrument() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -607,7 +632,7 @@ async fn test_data_client_request_instrument() {
         instrument_id,
         None,
         None,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -636,7 +661,7 @@ async fn test_data_client_request_book_snapshot() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -647,7 +672,7 @@ async fn test_data_client_request_book_snapshot() {
     let request = RequestBookSnapshot::new(
         instrument_id,
         None,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -681,7 +706,7 @@ async fn test_data_client_request_book_snapshot_with_depth() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -692,7 +717,7 @@ async fn test_data_client_request_book_snapshot_with_depth() {
     let request = RequestBookSnapshot::new(
         instrument_id,
         Some(NonZeroUsize::new(2).unwrap()),
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -729,7 +754,7 @@ async fn test_data_client_request_bars() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -742,7 +767,7 @@ async fn test_data_client_request_bars() {
         None,
         None,
         None,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -781,7 +806,7 @@ async fn test_data_client_request_trades() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -794,7 +819,7 @@ async fn test_data_client_request_trades() {
         None,
         None,
         None,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -833,14 +858,14 @@ async fn test_data_client_unsubscribe_instrument_is_noop() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
 
     let cmd = UnsubscribeInstrument::new(
         InstrumentId::from("BTC-USD.COINBASE"),
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -869,7 +894,7 @@ async fn test_data_client_subscribe_bars() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
@@ -877,7 +902,7 @@ async fn test_data_client_subscribe_bars() {
     let bar_type = BarType::from("BTC-USD.COINBASE-5-MINUTE-LAST-EXTERNAL");
     let cmd = SubscribeBars::new(
         bar_type,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -918,14 +943,14 @@ async fn test_data_client_request_book_snapshot_does_not_retry_on_failure() {
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     let instrument_id = InstrumentId::from("BTC-USD.COINBASE");
     let request = RequestBookSnapshot::new(
         instrument_id,
         None,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -948,7 +973,7 @@ async fn test_data_client_request_book_snapshot_does_not_retry_on_failure() {
 fn subscribe_index_cmd(instrument_id: InstrumentId) -> SubscribeIndexPrices {
     SubscribeIndexPrices::new(
         instrument_id,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -960,7 +985,7 @@ fn subscribe_index_cmd(instrument_id: InstrumentId) -> SubscribeIndexPrices {
 fn subscribe_funding_cmd(instrument_id: InstrumentId) -> SubscribeFundingRates {
     SubscribeFundingRates::new(
         instrument_id,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -972,7 +997,7 @@ fn subscribe_funding_cmd(instrument_id: InstrumentId) -> SubscribeFundingRates {
 fn unsubscribe_index_cmd(instrument_id: InstrumentId) -> UnsubscribeIndexPrices {
     UnsubscribeIndexPrices::new(
         instrument_id,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -984,7 +1009,7 @@ fn unsubscribe_index_cmd(instrument_id: InstrumentId) -> UnsubscribeIndexPrices 
 fn unsubscribe_funding_cmd(instrument_id: InstrumentId) -> UnsubscribeFundingRates {
     UnsubscribeFundingRates::new(
         instrument_id,
-        Some(ClientId::new("COINBASE")),
+        Some(*COINBASE_CLIENT_ID),
         None,
         UUID4::new(),
         UnixNanos::default(),
@@ -1018,7 +1043,7 @@ async fn test_data_client_subscribe_index_and_funding_emits_both_kinds() {
     set_data_event_sender(tx);
 
     let config = create_deriv_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
@@ -1107,12 +1132,15 @@ async fn test_data_client_reconnect_resumes_derivatives_polls() {
     use nautilus_model::data::Data;
 
     let state = TestServerState::default();
+    let product_stall_enabled = state.product_stall_enabled.clone();
+    let product_release = state.product_release.clone();
+    let product_hits = state.product_hits.clone();
     let addr = start_mock_server(state).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     set_data_event_sender(tx);
 
     let config = create_deriv_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
@@ -1143,9 +1171,26 @@ async fn test_data_client_reconnect_resumes_derivatives_polls() {
 
     while rx.try_recv().is_ok() {}
 
+    let reconnect_baseline_hits = product_hits.load(Ordering::SeqCst);
+    product_stall_enabled.store(true, Ordering::SeqCst);
+
     client.connect().await.unwrap();
 
+    wait_until_async(
+        || {
+            let done = product_hits.load(Ordering::SeqCst) > reconnect_baseline_hits;
+            async move { done }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // The resumed REST request is parked in the mock handler, so no resumed
+    // index update can be queued before this drain.
     while rx.try_recv().is_ok() {}
+
+    product_release.add_permits(1);
+    product_stall_enabled.store(false, Ordering::SeqCst);
 
     let mut resumed = false;
     wait_until_async(
@@ -1180,7 +1225,7 @@ async fn test_data_client_stop_halts_derivatives_poll() {
     set_data_event_sender(tx);
 
     let config = create_deriv_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     let instrument_id = InstrumentId::from("BIP-20DEC30-CDE.COINBASE");
@@ -1226,7 +1271,7 @@ async fn test_data_client_unsubscribe_during_inflight_poll_masks_dropped_kind() 
     set_data_event_sender(tx);
 
     let config = create_deriv_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
@@ -1335,7 +1380,7 @@ async fn test_data_client_unsubscribe_last_kind_during_inflight_poll_emits_nothi
     set_data_event_sender(tx);
 
     let config = create_deriv_data_client_config(addr);
-    let mut client = CoinbaseDataClient::new(ClientId::new("COINBASE"), config).unwrap();
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
     client.connect().await.unwrap();
 
     while rx.try_recv().is_ok() {}
@@ -1400,5 +1445,73 @@ async fn test_data_client_unsubscribe_last_kind_during_inflight_poll_emits_nothi
     );
 
     product_stall_enabled.store(false, Ordering::SeqCst);
+    client.disconnect().await.unwrap();
+}
+
+// Coinbase rewrites aliased products to their canonical id on the wire, so a
+// caller that subscribed to `BTC-USDC.COINBASE` must still receive status
+// events even though the venue's `status` channel reports `BTC-USD`. This
+// test exercises the alias resolution wired into `subscribe_instrument_status`
+// + `register_subscription_alias` end-to-end; a regression that drops either
+// would either time out or surface the canonical-id event.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_subscribe_instrument_status_rekeys_aliased_product() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = CoinbaseDataClient::new(*COINBASE_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    // Drain the instrument-emit events from connect bootstrap.
+    while rx.try_recv().is_ok() {}
+
+    let alias_id = InstrumentId::from("BTC-USDC.COINBASE");
+    let cmd = SubscribeInstrumentStatus::new(
+        alias_id,
+        Some(*COINBASE_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.subscribe_instrument_status(cmd).unwrap();
+
+    let received = Arc::new(std::sync::Mutex::new(None));
+    let received_clone = Arc::clone(&received);
+
+    wait_until_async(
+        move || {
+            let received = Arc::clone(&received_clone);
+            let found = loop {
+                match rx.try_recv() {
+                    Ok(DataEvent::InstrumentStatus(status)) => {
+                        *received.lock().unwrap() = Some(status);
+                        break true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break false,
+                }
+            };
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let status = received
+        .lock()
+        .unwrap()
+        .take()
+        .expect("InstrumentStatus must be emitted for the alias side");
+    assert_eq!(
+        status.instrument_id, alias_id,
+        "venue reports canonical BTC-USD; event must be re-keyed to the subscribed alias",
+    );
+
     client.disconnect().await.unwrap();
 }

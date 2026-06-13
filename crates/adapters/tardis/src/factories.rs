@@ -18,7 +18,7 @@
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use nautilus_common::{
-    cache::Cache,
+    cache::CacheView,
     clients::DataClient,
     clock::Clock,
     factories::{ClientConfig, DataClientFactory},
@@ -41,7 +41,7 @@ impl ClientConfig for TardisDataClientConfig {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.tardis")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.tardis")
 )]
 pub struct TardisDataClientFactory;
 
@@ -64,7 +64,7 @@ impl DataClientFactory for TardisDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let tardis_config = config

@@ -20,7 +20,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -34,13 +34,14 @@ use nautilus_common::{
             BarsResponse, BookResponse, ForwardPricesResponse, InstrumentResponse,
             InstrumentsResponse, RequestBars, RequestBookSnapshot, RequestForwardPrices,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
-            SubscribeInstrument, SubscribeInstrumentStatus, SubscribeInstruments,
-            SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
-            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
-            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
-            UnsubscribeInstrumentStatus, UnsubscribeInstruments, UnsubscribeMarkPrices,
-            UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCustomData, SubscribeFundingRates,
+            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentStatus,
+            SubscribeInstruments, SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes,
+            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
+            UnsubscribeBookDepth10, UnsubscribeCustomData, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstrumentStatus,
+            UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeOptionGreeks,
+            UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -67,6 +68,7 @@ use crate::{
         parse::{bar_spec_to_resolution, parse_instrument_kind_currency},
     },
     config::DeribitDataClientConfig,
+    data_types::register_deribit_custom_data,
     http::{
         client::DeribitHttpClient,
         models::{DeribitCurrency, DeribitProductType},
@@ -89,9 +91,10 @@ pub struct DeribitDataClient {
     tasks: Vec<JoinHandle<()>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
     mark_price_subs: Arc<AtomicSet<InstrumentId>>,
     index_price_subs: Arc<AtomicSet<InstrumentId>>,
+    option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
+    combo_leg_trade_subs: Arc<AtomicMap<InstrumentId, AHashMap<InstrumentId, usize>>>,
     clock: &'static AtomicTime,
 }
 
@@ -149,9 +152,10 @@ impl DeribitDataClient {
             tasks: Vec::new(),
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
-            option_greeks_subs: Arc::new(AtomicSet::new()),
             mark_price_subs: Arc::new(AtomicSet::new()),
             index_price_subs: Arc::new(AtomicSet::new()),
+            option_greeks_subs: Arc::new(AtomicSet::new()),
+            combo_leg_trade_subs: Arc::new(AtomicMap::new()),
             clock,
         })
     }
@@ -248,7 +252,7 @@ impl DeribitDataClient {
                 }
             }
             NautilusWsMessage::Error(e) => {
-                log::error!("WebSocket error: {e:?}");
+                log::warn!("WebSocket error: {e:?}");
             }
             NautilusWsMessage::Raw(value) => {
                 log::debug!("Unhandled raw message: {value}");
@@ -260,13 +264,7 @@ impl DeribitDataClient {
                 log::debug!("WebSocket authenticated: expires_in={}s", auth.expires_in);
             }
             NautilusWsMessage::FundingRates(funding_rates) => {
-                log::info!(
-                    "Received {} funding rate update(s) from WebSocket",
-                    funding_rates.len()
-                );
-
                 for funding_rate in funding_rates {
-                    log::debug!("Sending funding rate: {funding_rate:?}");
                     if let Err(e) = sender.send(DataEvent::FundingRate(funding_rate)) {
                         log::error!("Failed to send funding rate: {e}");
                     }
@@ -341,6 +339,147 @@ impl DeribitDataClient {
             log::error!("Failed to send data: {e}");
         }
     }
+
+    // Returns whether a subscribe should lazy-load the instrument before sending,
+    // erroring up front when the instrument is missing and the flag is disabled
+    // (so the WebSocket handler does not silently drop later frames).
+    fn prepare_subscribe(&self, instrument_id: InstrumentId) -> anyhow::Result<bool> {
+        if self.instruments.contains_key(&instrument_id) {
+            return Ok(false);
+        }
+
+        if !self.config.auto_load_missing_instruments {
+            anyhow::bail!(
+                "Instrument {instrument_id} not found and `auto_load_missing_instruments` is disabled"
+            );
+        }
+        Ok(true)
+    }
+
+    // Fetches an instrument over HTTP and seeds the local, HTTP, and WebSocket caches.
+    async fn lazy_load_instrument(
+        http_client: &DeribitHttpClient,
+        ws: &DeribitWebSocketClient,
+        instruments: &AtomicMap<InstrumentId, InstrumentAny>,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<()> {
+        let instrument = http_client
+            .request_instrument(instrument_id)
+            .await
+            .with_context(|| format!("failed to lazy-load instrument {instrument_id}"))?;
+        instruments.insert(instrument.id(), instrument.clone());
+        http_client.cache_instruments(std::slice::from_ref(&instrument));
+        ws.cache_instruments(std::slice::from_ref(&instrument));
+        Ok(())
+    }
+
+    fn subscribe_combo_legs(params: &Option<Params>) -> bool {
+        params
+            .as_ref()
+            .and_then(|params| params.get_bool("subscribe_combo_legs"))
+            .unwrap_or(false)
+    }
+
+    fn combo_leg_trade_ids(
+        instruments: &AtomicMap<InstrumentId, InstrumentAny>,
+        instrument_id: InstrumentId,
+    ) -> Vec<InstrumentId> {
+        let Some(instrument) = instruments.get_cloned(&instrument_id) else {
+            log::warn!("Cannot expand Deribit combo legs for missing instrument {instrument_id}");
+            return Vec::new();
+        };
+
+        let info = match instrument {
+            InstrumentAny::CryptoOptionSpread(spread) => spread.info,
+            InstrumentAny::CryptoFuturesSpread(spread) => spread.info,
+            _ => return Vec::new(),
+        };
+        let Some(info) = info else {
+            return Vec::new();
+        };
+        let Some(legs) = info
+            .get("deribit_combo_legs")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Vec::new();
+        };
+
+        let mut leg_ids = Vec::new();
+        let mut seen = AHashSet::new();
+
+        for leg in legs {
+            let Some(leg_id_str) = leg.get("instrument_id").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+
+            match InstrumentId::from_as_ref(leg_id_str) {
+                Ok(leg_id) if leg_id != instrument_id && seen.insert(leg_id) => {
+                    leg_ids.push(leg_id);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!(
+                        "Skipping invalid Deribit combo leg instrument ID {leg_id_str}: {e}"
+                    );
+                }
+            }
+        }
+
+        leg_ids
+    }
+
+    fn track_combo_leg_trade_subs(
+        subscriptions: &AtomicMap<InstrumentId, AHashMap<InstrumentId, usize>>,
+        instrument_id: InstrumentId,
+        leg_ids: &[InstrumentId],
+    ) {
+        if leg_ids.is_empty() {
+            return;
+        }
+
+        subscriptions.rcu(|subscriptions| {
+            let counts = subscriptions.entry(instrument_id).or_default();
+
+            for leg_id in leg_ids {
+                counts
+                    .entry(*leg_id)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
+        });
+    }
+
+    fn combo_leg_trade_unsubs(
+        subscriptions: &AtomicMap<InstrumentId, AHashMap<InstrumentId, usize>>,
+        instrument_id: InstrumentId,
+    ) -> Vec<InstrumentId> {
+        let mut leg_ids = Vec::new();
+
+        subscriptions.rcu(|subscriptions| {
+            let remove_instrument = if let Some(counts) = subscriptions.get_mut(&instrument_id) {
+                leg_ids = counts.keys().copied().collect();
+                counts.retain(|_, count| {
+                    if *count > 1 {
+                        *count -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                counts.is_empty()
+            } else {
+                leg_ids = Vec::new();
+                false
+            };
+
+            if remove_instrument {
+                subscriptions.remove(&instrument_id);
+            }
+        });
+
+        leg_ids
+    }
 }
 
 #[async_trait(?Send)]
@@ -382,6 +521,7 @@ impl DataClient for DeribitDataClient {
         self.cancellation_token = CancellationToken::new();
 
         self.instruments.store(AHashMap::new());
+        self.combo_leg_trade_subs.store(AHashMap::new());
         Ok(())
     }
 
@@ -402,6 +542,8 @@ impl DataClient for DeribitDataClient {
         if self.is_connected() {
             return Ok(());
         }
+
+        register_deribit_custom_data();
 
         // Fetch instruments for each configured product type
         let product_types = if self.config.product_types.is_empty() {
@@ -448,14 +590,14 @@ impl DataClient for DeribitDataClient {
         }
 
         // Cache instruments and set subscription filters in WebSocket client before connecting
-        let option_greeks_subs = self.option_greeks_subs.clone();
         let mark_price_subs = self.mark_price_subs.clone();
         let index_price_subs = self.index_price_subs.clone();
+        let option_greeks_subs = self.option_greeks_subs.clone();
         let ws = self.ws_client_mut()?;
         ws.cache_instruments(&all_instruments);
-        ws.set_option_greeks_subs(option_greeks_subs);
         ws.set_mark_price_subs(mark_price_subs);
         ws.set_index_price_subs(index_price_subs);
+        ws.set_option_greeks_subs(option_greeks_subs);
 
         // Connect WebSocket and wait until active
         ws.connect().await.context("failed to connect WebSocket")?;
@@ -580,12 +722,16 @@ impl DataClient for DeribitDataClient {
             anyhow::bail!("Deribit only supports L2_MBP order book deltas");
         }
 
+        let instrument_id = cmd.instrument_id;
+        let needs_load = self.prepare_subscribe(instrument_id)?;
+
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
-        let instrument_id = cmd.instrument_id;
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
         let interval = self.get_interval(&cmd.params);
 
         let depth = cmd
@@ -620,6 +766,14 @@ impl DataClient for DeribitDataClient {
         );
 
         get_runtime().spawn(async move {
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (book deltas): {e}");
+                return;
+            }
+
             let result = if interval == Some(DeribitUpdateInterval::Raw) {
                 ws.subscribe_book(instrument_id, interval).await
             } else {
@@ -640,12 +794,16 @@ impl DataClient for DeribitDataClient {
             anyhow::bail!("Deribit only supports L2_MBP order book depth");
         }
 
+        let instrument_id = cmd.instrument_id;
+        let needs_load = self.prepare_subscribe(instrument_id)?;
+
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
-        let instrument_id = cmd.instrument_id;
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
         let interval = self.get_interval(&cmd.params);
         let group = cmd
             .params
@@ -663,6 +821,14 @@ impl DataClient for DeribitDataClient {
         );
 
         get_runtime().spawn(async move {
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (book depth10): {e}");
+                return;
+            }
+
             if let Err(e) = ws
                 .subscribe_book_grouped(instrument_id, &group, 10, interval)
                 .await
@@ -675,16 +841,28 @@ impl DataClient for DeribitDataClient {
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let needs_load = self.prepare_subscribe(instrument_id)?;
+
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
-        let instrument_id = cmd.instrument_id;
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
 
         log::debug!("Subscribing to quotes for {instrument_id}");
 
         get_runtime().spawn(async move {
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (quotes): {e}");
+                return;
+            }
+
             if let Err(e) = ws.subscribe_quotes(instrument_id).await {
                 log::error!("Failed to subscribe to quotes for {instrument_id}: {e}");
             }
@@ -694,12 +872,19 @@ impl DataClient for DeribitDataClient {
     }
 
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let needs_load = self.prepare_subscribe(instrument_id)?;
+        let subscribe_combo_legs = Self::subscribe_combo_legs(&cmd.params);
+
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
-        let instrument_id = cmd.instrument_id;
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
+        let combo_leg_trade_subs = Arc::clone(&self.combo_leg_trade_subs);
+        let auto_load_missing_instruments = self.config.auto_load_missing_instruments;
         let interval = self.get_interval(&cmd.params);
 
         log::debug!(
@@ -709,21 +894,80 @@ impl DataClient for DeribitDataClient {
         );
 
         get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_trades(instrument_id, interval).await {
-                log::error!("Failed to subscribe to trades for {instrument_id}: {e}");
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (trades): {e}");
+                return;
             }
+
+            let mut subscription_ids = vec![instrument_id];
+
+            if subscribe_combo_legs {
+                let leg_ids = Self::combo_leg_trade_ids(&instruments, instrument_id);
+                if leg_ids.is_empty() {
+                    log::warn!(
+                        "No Deribit combo legs found for trade subscription opt-in on {instrument_id}"
+                    );
+                }
+
+                for leg_id in leg_ids {
+                    if !instruments.contains_key(&leg_id) {
+                        if !auto_load_missing_instruments {
+                            log::error!(
+                                "Instrument {leg_id} not found and `auto_load_missing_instruments` is disabled"
+                            );
+                            continue;
+                        }
+
+                        if let Err(e) =
+                            Self::lazy_load_instrument(&http_client, &ws, &instruments, leg_id)
+                                .await
+                        {
+                            log::error!("Lazy-load failed for {leg_id} (combo leg trades): {e}");
+                            continue;
+                        }
+                    }
+
+                    subscription_ids.push(leg_id);
+                }
+            }
+
+            let mut opened_leg_ids = Vec::new();
+
+            for subscription_id in subscription_ids {
+                if let Err(e) = ws.subscribe_trades(subscription_id, interval).await {
+                    log::error!("Failed to subscribe to trades for {subscription_id}: {e}");
+                    continue;
+                }
+
+                if subscription_id != instrument_id {
+                    opened_leg_ids.push(subscription_id);
+                }
+            }
+
+            Self::track_combo_leg_trade_subs(
+                &combo_leg_trade_subs,
+                instrument_id,
+                &opened_leg_ids,
+            );
         });
 
         Ok(())
     }
 
     fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let needs_load = self.prepare_subscribe(instrument_id)?;
+
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
-        let instrument_id = cmd.instrument_id;
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
         let interval = self.get_interval(&cmd.params);
 
         // Track subscription so handler gates MarkPriceUpdate emission
@@ -736,6 +980,14 @@ impl DataClient for DeribitDataClient {
         );
 
         get_runtime().spawn(async move {
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (mark prices): {e}");
+                return;
+            }
+
             if let Err(e) = ws.subscribe_ticker(instrument_id, interval).await {
                 log::error!("Failed to subscribe to mark prices for {instrument_id}: {e}");
             }
@@ -745,12 +997,16 @@ impl DataClient for DeribitDataClient {
     }
 
     fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let needs_load = self.prepare_subscribe(instrument_id)?;
+
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
-        let instrument_id = cmd.instrument_id;
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
         let interval = self.get_interval(&cmd.params);
 
         // Track subscription so handler gates IndexPriceUpdate emission
@@ -763,6 +1019,14 @@ impl DataClient for DeribitDataClient {
         );
 
         get_runtime().spawn(async move {
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (index prices): {e}");
+                return;
+            }
+
             if let Err(e) = ws.subscribe_ticker(instrument_id, interval).await {
                 log::error!("Failed to subscribe to index prices for {instrument_id}: {e}");
             }
@@ -772,15 +1036,27 @@ impl DataClient for DeribitDataClient {
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
+        let instrument_id = cmd.bar_type.instrument_id();
+        let needs_load = self.prepare_subscribe(instrument_id)?;
+
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
-        let instrument_id = cmd.bar_type.instrument_id();
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
         let resolution = bar_spec_to_resolution(&cmd.bar_type);
 
         get_runtime().spawn(async move {
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (bars): {e}");
+                return;
+            }
+
             if let Err(e) = ws.subscribe_chart(instrument_id, &resolution).await {
                 log::error!("Failed to subscribe to bars for {instrument_id}: {e}");
             }
@@ -791,26 +1067,15 @@ impl DataClient for DeribitDataClient {
 
     fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
-
-        // Validate instrument is a perpetual - funding rates only apply to perpetual contracts
-        let is_perpetual = self
-            .instruments
-            .load()
-            .get(&instrument_id)
-            .is_some_and(|inst| matches!(inst, InstrumentAny::CryptoPerpetual(_)));
-
-        if !is_perpetual {
-            log::warn!(
-                "Funding rates subscription rejected for {instrument_id}: only available for perpetual instruments"
-            );
-            return Ok(());
-        }
+        let needs_load = self.prepare_subscribe(instrument_id)?;
 
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
         let interval = self.get_interval(&cmd.params);
 
         log::debug!(
@@ -820,6 +1085,26 @@ impl DataClient for DeribitDataClient {
         );
 
         get_runtime().spawn(async move {
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (funding rates): {e}");
+                return;
+            }
+
+            // Funding rates only apply to perpetual contracts; check after any lazy-load
+            let is_perpetual = instruments
+                .load()
+                .get(&instrument_id)
+                .is_some_and(|inst| matches!(inst, InstrumentAny::CryptoPerpetual(_)));
+            if !is_perpetual {
+                log::warn!(
+                    "Funding rates subscription rejected for {instrument_id}: only available for perpetual instruments"
+                );
+                return;
+            }
+
             if let Err(e) = ws
                 .subscribe_perpetual_interests_rates_updates(instrument_id, interval)
                 .await
@@ -856,12 +1141,16 @@ impl DataClient for DeribitDataClient {
     }
 
     fn subscribe_option_greeks(&mut self, cmd: SubscribeOptionGreeks) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let needs_load = self.prepare_subscribe(instrument_id)?;
+
         let ws = self
             .ws_client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
-        let instrument_id = cmd.instrument_id;
+        let http_client = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
         let interval = self.get_interval(&cmd.params);
 
         // Track subscription so handler gates OptionGreeks emission
@@ -874,8 +1163,56 @@ impl DataClient for DeribitDataClient {
         );
 
         get_runtime().spawn(async move {
+            if needs_load
+                && let Err(e) =
+                    Self::lazy_load_instrument(&http_client, &ws, &instruments, instrument_id).await
+            {
+                log::error!("Lazy-load failed for {instrument_id} (option greeks): {e}");
+                return;
+            }
+
             if let Err(e) = ws.subscribe_ticker(instrument_id, interval).await {
                 log::error!("Failed to subscribe to option greeks for {instrument_id}: {e}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
+        let data_type = cmd.data_type.type_name();
+        if data_type != "DeribitVolatilityIndex" {
+            log::warn!("Unsupported custom data subscription: {data_type}");
+            return Ok(());
+        }
+
+        let Some(index_name) = cmd
+            .data_type
+            .metadata()
+            .as_ref()
+            .and_then(|m| m.get("index_name"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+        else {
+            log::warn!(
+                "Rejected Deribit volatility index subscription: missing required metadata `index_name`"
+            );
+            return Ok(());
+        };
+
+        log::info!("Subscribing to Deribit volatility index: {index_name}");
+
+        let ws = self
+            .ws_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
+            .clone();
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.subscribe_volatility_index(&index_name).await {
+                log::error!("Failed to subscribe to volatility index {index_name}: {e}");
             }
         });
 
@@ -1079,16 +1416,24 @@ impl DataClient for DeribitDataClient {
             .clone();
         let instrument_id = cmd.instrument_id;
         let interval = self.get_interval(&cmd.params);
+        let mut subscription_ids = vec![instrument_id];
+        subscription_ids.extend(Self::combo_leg_trade_unsubs(
+            &self.combo_leg_trade_subs,
+            instrument_id,
+        ));
 
         log::debug!(
-            "Unsubscribing from trades for {} (interval: {})",
+            "Unsubscribing from trades for {} instruments from {} (interval: {})",
+            subscription_ids.len(),
             instrument_id,
             interval.map_or("100ms (default)".to_string(), |i| i.to_string())
         );
 
         get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_trades(instrument_id, interval).await {
-                log::error!("Failed to unsubscribe from trades for {instrument_id}: {e}");
+            for subscription_id in subscription_ids {
+                if let Err(e) = ws.unsubscribe_trades(subscription_id, interval).await {
+                    log::error!("Failed to unsubscribe from trades for {subscription_id}: {e}");
+                }
             }
         });
 
@@ -1236,6 +1581,46 @@ impl DataClient for DeribitDataClient {
         Ok(())
     }
 
+    fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
+        let data_type = cmd.data_type.type_name();
+        if data_type != "DeribitVolatilityIndex" {
+            log::warn!("Unsupported custom data unsubscription: {data_type}");
+            return Ok(());
+        }
+
+        let Some(index_name) = cmd
+            .data_type
+            .metadata()
+            .as_ref()
+            .and_then(|m| m.get("index_name"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+        else {
+            log::warn!(
+                "Rejected Deribit volatility index unsubscription: missing required metadata `index_name`"
+            );
+            return Ok(());
+        };
+
+        log::info!("Unsubscribing from Deribit volatility index: {index_name}");
+
+        let ws = self
+            .ws_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
+            .clone();
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.unsubscribe_volatility_index(&index_name).await {
+                log::error!("Failed to unsubscribe from volatility index {index_name}: {e}");
+            }
+        });
+
+        Ok(())
+    }
+
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
         if request.start.is_some() {
             log::warn!(
@@ -1347,29 +1732,7 @@ impl DataClient for DeribitDataClient {
             );
         }
 
-        // First, check if instrument exists in cache
-        if let Some(instrument) = self.instruments.get_cloned(&request.instrument_id) {
-            let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
-                request.request_id,
-                request.client_id.unwrap_or(self.client_id),
-                instrument.id(),
-                instrument,
-                datetime_to_unix_nanos(request.start),
-                datetime_to_unix_nanos(request.end),
-                self.clock.get_time_ns(),
-                request.params,
-            )));
-
-            if let Err(e) = self.data_sender.send(DataEvent::Response(response)) {
-                log::error!("Failed to send instrument response: {e}");
-            }
-            return Ok(());
-        }
-
-        log::debug!(
-            "Instrument {} not in cache, fetching from API",
-            request.instrument_id
-        );
+        log::debug!("Fetching instrument {} from API", request.instrument_id);
 
         let http_client = self.http_client.clone();
         let ws_client = self.ws_client.clone();

@@ -13,5 +13,19 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! WebSocket client surface for Lighter streaming endpoints.
+
+pub(crate) mod account_state;
 pub mod client;
-pub(crate) mod handler;
+pub(crate) mod dispatch;
+pub mod error;
+pub mod handler;
+pub mod messages;
+pub mod parse;
+
+pub use client::LighterWebSocketClient;
+pub use error::LighterWsError;
+pub use messages::{
+    LighterMarketSelection, LighterWsChannel, LighterWsChannelKind, LighterWsRequest,
+    NautilusWsMessage, SendTxRejectionSource,
+};

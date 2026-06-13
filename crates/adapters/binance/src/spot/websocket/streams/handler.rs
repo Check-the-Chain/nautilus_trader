@@ -38,8 +38,8 @@ use ustr::Ustr;
 pub use super::parse::{MarketDataMessage, decode_market_data};
 use super::{
     messages::{
-        BinanceSpotWsMessage, BinanceSpotWsStreamsCommand, BinanceWsErrorMsg,
-        BinanceWsErrorResponse, BinanceWsResponse, BinanceWsSubscription,
+        BinanceSpotServerShutdownMsg, BinanceSpotWsMessage, BinanceSpotWsStreamsCommand,
+        BinanceWsErrorMsg, BinanceWsErrorResponse, BinanceWsResponse, BinanceWsSubscription,
     },
     parse::decode_market_data as decode_sbe,
 };
@@ -180,11 +180,6 @@ impl BinanceSpotWsFeedHandler {
     }
 
     fn handle_text_frame(&mut self, text: &str) -> Vec<BinanceSpotWsMessage> {
-        if let Ok(response) = serde_json::from_str::<BinanceWsResponse>(text) {
-            self.handle_subscription_response(&response);
-            return vec![];
-        }
-
         if let Ok(error) = serde_json::from_str::<BinanceWsErrorResponse>(text) {
             if let Some(id) = error.id
                 && let Some(streams) = self.pending_requests.remove(&id)
@@ -204,12 +199,12 @@ impl BinanceSpotWsFeedHandler {
             })];
         }
 
-        if let Ok(value) = serde_json::from_str(text) {
-            vec![BinanceSpotWsMessage::RawJson(value)]
-        } else {
-            log::warn!("Failed to parse JSON message: {text}");
-            vec![]
+        if let Ok(response) = serde_json::from_str::<BinanceWsResponse>(text) {
+            self.handle_subscription_response(&response);
+            return vec![];
         }
+
+        classify_unsolicited_json(text)
     }
 
     fn handle_subscription_response(&mut self, response: &BinanceWsResponse) {
@@ -284,5 +279,101 @@ impl BinanceSpotWsFeedHandler {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send message: {e}"))?;
         Ok(())
+    }
+}
+
+/// Classifies a JSON text frame that did not match a subscription response or
+/// known error envelope. Recognises the `serverShutdown` event; otherwise
+/// emits `RawJson` for parseable payloads or an empty vector for garbage.
+fn classify_unsolicited_json(text: &str) -> Vec<BinanceSpotWsMessage> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        log::warn!("Failed to parse JSON message: {text}");
+        return vec![];
+    };
+
+    if value.get("e").and_then(|v| v.as_str()) == Some("serverShutdown")
+        && let Ok(msg) = serde_json::from_value::<BinanceSpotServerShutdownMsg>(value.clone())
+    {
+        log::warn!(
+            "Binance server shutdown notice received (event_time={}); disconnect expected ~10 minutes from event",
+            msg.event_time,
+        );
+        return vec![BinanceSpotWsMessage::ServerShutdown(msg)];
+    }
+
+    vec![BinanceSpotWsMessage::RawJson(value)]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    };
+
+    use nautilus_network::websocket::SubscriptionState;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_classify_unsolicited_json_server_shutdown_emits_variant() {
+        let text = r#"{"e":"serverShutdown","E":1700000000000}"#;
+        let out = classify_unsolicited_json(text);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            BinanceSpotWsMessage::ServerShutdown(msg) => {
+                assert_eq!(msg.event_type, "serverShutdown");
+                assert_eq!(msg.event_time, 1_700_000_000_000);
+            }
+            other => panic!("expected ServerShutdown variant, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_classify_unsolicited_json_unrelated_emits_raw_json() {
+        let text = r#"{"e":"trade","p":"50000"}"#;
+        let out = classify_unsolicited_json(text);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], BinanceSpotWsMessage::RawJson(_)));
+    }
+
+    #[rstest]
+    fn test_classify_unsolicited_json_invalid_returns_empty() {
+        let out = classify_unsolicited_json("not json");
+        assert!(out.is_empty());
+    }
+
+    #[rstest]
+    fn test_handle_text_frame_error_with_id_emits_error_and_clears_pending_request() {
+        let signal = Arc::new(AtomicBool::new(false));
+        let request_id_counter = Arc::new(AtomicU64::new(2));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriptions = SubscriptionState::new('@');
+
+        let mut handler = BinanceSpotWsFeedHandler::new(
+            signal,
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            subscriptions,
+            request_id_counter,
+        );
+        handler
+            .pending_requests
+            .insert(1, vec!["btcusdt@trade".to_string()]);
+
+        let out = handler.handle_text_frame(r#"{"code":2,"msg":"Invalid request","id":1}"#);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            BinanceSpotWsMessage::Error(err) => {
+                assert_eq!(err.code, 2);
+                assert_eq!(err.msg, "Invalid request");
+            }
+            other => panic!("expected Error variant, was {other:?}"),
+        }
+        assert!(handler.pending_requests.is_empty());
     }
 }

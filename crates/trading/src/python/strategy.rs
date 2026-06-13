@@ -29,11 +29,11 @@ use nautilus_common::{
     actor::{
         Actor, DataActor,
         data_actor::DataActorCore,
-        registry::{get_actor_registry, try_get_actor_unchecked},
+        registry::{try_get_actor_unchecked, with_actor_registry},
     },
     cache::Cache,
     clock::Clock,
-    component::{Component, get_component_registry},
+    component::{Component, with_component_registry},
     enums::ComponentState,
     python::{cache::PyCache, clock::PyClock, logging::PyLogger},
     signal::Signal,
@@ -59,12 +59,11 @@ use nautilus_model::{
         OrderUpdated, PositionChanged, PositionClosed, PositionOpened,
     },
     identifiers::{
-        AccountId, ActorId, ClientId, InstrumentId, OptionSeriesId, PositionId, StrategyId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, OptionSeriesId, PositionId, StrategyId,
         TraderId, Venue,
     },
     instruments::InstrumentAny,
     orderbook::OrderBook,
-    orders::OrderAny,
     position::Position,
     python::{
         data::option_chain::PyStrikeRange, instruments::instrument_any_to_pyobject,
@@ -72,7 +71,7 @@ use nautilus_model::{
     },
     types::{Price, Quantity},
 };
-use nautilus_portfolio::portfolio::Portfolio;
+use nautilus_portfolio::{portfolio::Portfolio, python::PyPortfolio};
 use pyo3::{prelude::*, types::PyDict};
 use ustr::Ustr;
 
@@ -102,7 +101,11 @@ impl StrategyConfig {
         log_rejected_due_post_only_as_warning=true,
         **_kwargs
     ))]
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        clippy::too_many_arguments,
+        reason = "constructor mirrors the existing Python keyword API"
+    )]
     fn py_new(
         strategy_id: Option<StrategyId>,
         order_id_tag: Option<String>,
@@ -247,7 +250,7 @@ impl ImportableStrategyConfig {
     }
 }
 
-/// Inner state of PyStrategy, shared between Python wrapper and Rust registries.
+/// Inner state of `PyStrategy`, shared between Python wrapper and Rust registries.
 pub struct PyStrategyInner {
     core: StrategyCore,
     py_self: Option<Py<PyAny>>,
@@ -266,7 +269,10 @@ impl Debug for PyStrategyInner {
     }
 }
 
-#[expect(clippy::needless_pass_by_ref_mut)]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "dispatch methods share receiver shape with mutable DataActor hooks"
+)]
 impl PyStrategyInner {
     fn dispatch_on_start(&self) -> PyResult<()> {
         if let Some(ref py_self) = self.py_self {
@@ -459,10 +465,10 @@ impl PyStrategyInner {
         Ok(())
     }
 
-    fn dispatch_on_order_updated(&self, event: OrderUpdated) -> PyResult<()> {
+    fn dispatch_on_order_updated(&self, event: &OrderUpdated) -> PyResult<()> {
         if let Some(ref py_self) = self.py_self {
             Python::attach(|py| {
-                py_self.call_method1(py, "on_order_updated", (event.into_py_any_unwrap(py),))
+                py_self.call_method1(py, "on_order_updated", ((*event).into_py_any_unwrap(py),))
             })?;
         }
         Ok(())
@@ -477,10 +483,10 @@ impl PyStrategyInner {
         Ok(())
     }
 
-    fn dispatch_on_order_filled(&self, event: OrderFilled) -> PyResult<()> {
+    fn dispatch_on_order_filled(&self, event: &OrderFilled) -> PyResult<()> {
         if let Some(ref py_self) = self.py_self {
             Python::attach(|py| {
-                py_self.call_method1(py, "on_order_filled", (event.into_py_any_unwrap(py),))
+                py_self.call_method1(py, "on_order_filled", ((*event).into_py_any_unwrap(py),))
             })?;
         }
         Ok(())
@@ -561,10 +567,14 @@ impl PyStrategyInner {
         Ok(())
     }
 
-    fn dispatch_on_book_deltas(&mut self, deltas: OrderBookDeltas) -> PyResult<()> {
+    fn dispatch_on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> PyResult<()> {
         if let Some(ref py_self) = self.py_self {
             Python::attach(|py| {
-                py_self.call_method1(py, "on_book_deltas", (deltas.into_py_any_unwrap(py),))
+                py_self.call_method1(
+                    py,
+                    "on_book_deltas",
+                    (deltas.clone().into_py_any_unwrap(py),),
+                )
             })?;
         }
         Ok(())
@@ -637,10 +647,14 @@ impl PyStrategyInner {
         Ok(())
     }
 
-    fn dispatch_on_option_chain(&mut self, slice: OptionChainSlice) -> PyResult<()> {
+    fn dispatch_on_option_chain(&mut self, slice: &OptionChainSlice) -> PyResult<()> {
         if let Some(ref py_self) = self.py_self {
             Python::attach(|py| {
-                py_self.call_method1(py, "on_option_chain", (slice.into_py_any_unwrap(py),))
+                py_self.call_method1(
+                    py,
+                    "on_option_chain",
+                    (slice.clone().into_py_any_unwrap(py),),
+                )
             })?;
         }
         Ok(())
@@ -764,6 +778,10 @@ impl Strategy for PyStrategyInner {
         &mut self.core
     }
 
+    fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
+        self.core.config.external_order_claims.clone()
+    }
+
     fn on_order_initialized(&mut self, event: OrderInitialized) {
         let _ = self.dispatch_on_order_initialized(event);
     }
@@ -817,7 +835,7 @@ impl Strategy for PyStrategyInner {
     }
 
     fn on_order_updated(&mut self, event: OrderUpdated) {
-        let _ = self.dispatch_on_order_updated(event);
+        let _ = self.dispatch_on_order_updated(&event);
     }
 
     fn on_position_opened(&mut self, event: PositionOpened) {
@@ -915,7 +933,7 @@ impl DataActor for PyStrategyInner {
     }
 
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        self.dispatch_on_book_deltas(deltas.clone())
+        self.dispatch_on_book_deltas(deltas)
             .map_err(|e| anyhow::anyhow!("Python on_book_deltas failed: {e}"))
     }
 
@@ -955,7 +973,7 @@ impl DataActor for PyStrategyInner {
     }
 
     fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
-        self.dispatch_on_option_chain(slice.clone())
+        self.dispatch_on_option_chain(slice)
             .map_err(|e| anyhow::anyhow!("Python on_option_chain failed: {e}"))
     }
 
@@ -1008,7 +1026,7 @@ impl DataActor for PyStrategyInner {
     }
 
     fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
-        self.dispatch_on_order_filled(*event)
+        self.dispatch_on_order_filled(event)
             .map_err(|e| anyhow::anyhow!("Python on_order_filled failed: {e}"))
     }
 
@@ -1058,7 +1076,8 @@ impl PyStrategy {
 }
 
 impl PyStrategy {
-    /// Creates a new PyStrategy instance.
+    /// Creates a new `PyStrategy` instance.
+    #[must_use]
     pub fn new(config: Option<StrategyConfig>) -> Self {
         let config = config.unwrap_or_default();
         let core = StrategyCore::new(config);
@@ -1082,37 +1101,53 @@ impl PyStrategy {
         self.inner_mut().py_self = Some(py_obj);
     }
 
-    /// Updates the strategy_id (actor_id) in both the core config and the actor_id field.
-    ///
-    /// Must only be called before registration. See `PyDataActor::set_actor_id`.
-    pub fn set_strategy_id(&mut self, strategy_id: StrategyId) {
-        let actor_id = ActorId::from(strategy_id.inner().as_str());
-        let inner = self.inner_mut();
-        inner.core.config.strategy_id = Some(strategy_id);
-        inner.core.actor.config.actor_id = Some(actor_id);
-        inner.core.actor.actor_id = actor_id;
+    /// Updates configured external order claim instrument IDs before registration.
+    pub fn set_external_order_claims(&mut self, external_order_claims: Option<Vec<InstrumentId>>) {
+        self.inner_mut().core.config.external_order_claims = external_order_claims;
     }
 
-    /// Updates the log_events setting in the core config.
+    /// Returns the configured external order claim instrument IDs.
+    #[must_use]
+    pub fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
+        self.inner().external_order_claims()
+    }
+
+    /// Updates the runtime strategy ID.
+    ///
+    /// Must only be called before registration. See `PyDataActor::set_actor_id`.
+    pub fn set_strategy_id(&mut self, strategy_id: StrategyId) -> anyhow::Result<()> {
+        let inner = self.inner_mut();
+        inner.core.change_id(strategy_id);
+        Ok(())
+    }
+
+    /// Updates the runtime order ID tag.
+    pub fn set_order_id_tag(&mut self, order_id_tag: &str) -> anyhow::Result<()> {
+        let inner = self.inner_mut();
+        inner.core.change_order_id_tag(order_id_tag);
+        Ok(())
+    }
+
+    /// Updates the runtime `log_events` setting.
     pub fn set_log_events(&mut self, log_events: bool) {
         let inner = self.inner_mut();
-        inner.core.config.log_events = log_events;
         inner.core.actor.config.log_events = log_events;
     }
 
-    /// Updates the log_commands setting in the core config.
+    /// Updates the runtime `log_commands` setting.
     pub fn set_log_commands(&mut self, log_commands: bool) {
         let inner = self.inner_mut();
-        inner.core.config.log_commands = log_commands;
         inner.core.actor.config.log_commands = log_commands;
     }
 
     /// Returns the strategy ID.
+    #[must_use]
     pub fn strategy_id(&self) -> StrategyId {
         StrategyId::from(self.inner().core.actor.actor_id.inner().as_str())
     }
 
     /// Returns a value indicating whether the strategy has been registered with a trader.
+    #[must_use]
     pub fn is_registered(&self) -> bool {
         self.inner().core.actor.is_registered()
     }
@@ -1159,15 +1194,20 @@ impl PyStrategy {
         let inner_ref: Rc<UnsafeCell<PyStrategyInner>> = self.inner.clone();
 
         let component_trait_ref: Rc<UnsafeCell<dyn Component>> = inner_ref.clone();
-        get_component_registry().insert(component_id, component_trait_ref);
+        with_component_registry(|registry| registry.insert(component_id, component_trait_ref));
 
         let actor_trait_ref: Rc<UnsafeCell<dyn Actor>> = inner_ref;
-        get_actor_registry().insert(actor_id, actor_trait_ref);
+        with_actor_registry(|registry| registry.insert(actor_id, actor_trait_ref));
     }
 }
 
 #[pyo3::pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[expect(
+    clippy::large_types_passed_by_value,
+    clippy::unused_self,
+    reason = "default PyO3 callbacks must remain instance methods and accept Python-owned event values"
+)]
 impl PyStrategy {
     /// Creates a new [`PyStrategy`] instance.
     ///
@@ -1229,6 +1269,19 @@ impl PyStrategy {
         } else {
             Err(to_pyruntime_err(
                 "Strategy must be registered with a trader before accessing cache",
+            ))
+        }
+    }
+
+    #[getter]
+    #[pyo3(name = "portfolio")]
+    fn py_portfolio(&self) -> PyResult<PyPortfolio> {
+        let inner = self.inner();
+        if inner.core.actor.is_registered() {
+            Ok(PyPortfolio::from_rc(inner.core.portfolio().clone()))
+        } else {
+            Err(to_pyruntime_err(
+                "Strategy must be registered with a trader before accessing portfolio",
             ))
         }
     }
@@ -1322,99 +1375,83 @@ impl PyStrategy {
         let order = pyobject_to_order_any(py, order)?;
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
         let inner = self.inner_mut();
-        match params_map {
-            Some(p) => Strategy::submit_order_with_params(inner, order, position_id, client_id, p),
-            None => Strategy::submit_order(inner, order, position_id, client_id),
-        }
-        .map_err(to_pyruntime_err)
+
+        Strategy::submit_order(inner, order, position_id, client_id, params_map)
+            .map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "modify_order")]
-    #[pyo3(signature = (order, quantity=None, price=None, trigger_price=None, client_id=None, params=None))]
-    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (client_order_id, quantity=None, price=None, trigger_price=None, client_id=None, params=None))]
     fn py_modify_order(
         &mut self,
-        py: Python<'_>,
-        order: Py<PyAny>,
+        client_order_id: ClientOrderId,
         quantity: Option<Quantity>,
         price: Option<Price>,
         trigger_price: Option<Price>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
-        let order = pyobject_to_order_any(py, order)?;
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
         let inner = self.inner_mut();
 
-        match params_map {
-            Some(p) => Strategy::modify_order_with_params(
-                inner,
-                order,
-                quantity,
-                price,
-                trigger_price,
-                client_id,
-                p,
-            ),
-            None => Strategy::modify_order(inner, order, quantity, price, trigger_price, client_id),
-        }
+        Strategy::modify_order(
+            inner,
+            client_order_id,
+            quantity,
+            price,
+            trigger_price,
+            client_id,
+            params_map,
+        )
         .map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "cancel_order")]
-    #[pyo3(signature = (order, client_id=None, params=None))]
+    #[pyo3(signature = (client_order_id, client_id=None, params=None))]
     fn py_cancel_order(
         &mut self,
-        py: Python<'_>,
-        order: Py<PyAny>,
+        client_order_id: ClientOrderId,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
-        let order = pyobject_to_order_any(py, order)?;
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
         let inner = self.inner_mut();
-        match params_map {
-            Some(p) => Strategy::cancel_order_with_params(inner, order, client_id, p),
-            None => Strategy::cancel_order(inner, order, client_id),
-        }
-        .map_err(to_pyruntime_err)
+
+        Strategy::cancel_order(inner, client_order_id, client_id, params_map)
+            .map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "cancel_orders")]
-    #[pyo3(signature = (orders, client_id=None, params=None))]
+    #[pyo3(signature = (client_order_ids, client_id=None, params=None))]
     fn py_cancel_orders(
         &mut self,
-        py: Python<'_>,
-        orders: Vec<Py<PyAny>>,
+        client_order_ids: Vec<ClientOrderId>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        let orders: Vec<OrderAny> = orders
-            .into_iter()
-            .map(|o| pyobject_to_order_any(py, o))
-            .collect::<PyResult<Vec<_>>>()?;
-        Strategy::cancel_orders(self.inner_mut(), orders, client_id, params_map)
+
+        Strategy::cancel_orders(self.inner_mut(), client_order_ids, client_id, params_map)
             .map_err(to_pyruntime_err)
     }
 
@@ -1429,22 +1466,17 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        let inner = self.inner_mut();
-
-        match params_map {
-            Some(p) => Strategy::cancel_all_orders_with_params(
-                inner,
-                instrument_id,
-                order_side,
-                client_id,
-                p,
-            ),
-            None => Strategy::cancel_all_orders(inner, instrument_id, order_side, client_id),
-        }
+        Strategy::cancel_all_orders(
+            self.inner_mut(),
+            instrument_id,
+            order_side,
+            client_id,
+            params_map,
+        )
         .map_err(to_pyruntime_err)
     }
 
@@ -1509,7 +1541,7 @@ impl PyStrategy {
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         let params_map = match params {
-            Some(dict) => from_pydict(py, dict)?,
+            Some(dict) => from_pydict(py, &dict)?,
             None => None,
         };
         Strategy::query_account(self.inner_mut(), account_id, client_id, params_map)
@@ -1527,7 +1559,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let order = pyobject_to_order_any(py, order)?;
         let params_map = match params {
-            Some(dict) => from_pydict(py, dict)?,
+            Some(dict) => from_pydict(py, &dict)?,
             None => None,
         };
         Strategy::query_order(self.inner_mut(), &order, client_id, params_map)
@@ -1747,7 +1779,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1765,7 +1797,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1783,7 +1815,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1804,7 +1836,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1834,7 +1866,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1864,7 +1896,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1882,7 +1914,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1900,7 +1932,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1918,7 +1950,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1936,7 +1968,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1954,7 +1986,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1972,7 +2004,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -1990,7 +2022,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2013,7 +2045,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2038,7 +2070,7 @@ impl PyStrategy {
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         let params_map = match params {
-            Some(dict) => from_pydict(py, dict)?,
+            Some(dict) => from_pydict(py, &dict)?,
             None => None,
         };
         DataActor::subscribe_option_chain(
@@ -2074,7 +2106,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2092,7 +2124,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2110,7 +2142,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2128,7 +2160,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2147,7 +2179,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2174,7 +2206,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2192,7 +2224,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2210,7 +2242,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2228,7 +2260,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2246,7 +2278,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2264,7 +2296,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2287,7 +2319,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2310,7 +2342,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2333,7 +2365,7 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2381,7 +2413,7 @@ impl PyStrategy {
     ) -> PyResult<String> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2414,7 +2446,7 @@ impl PyStrategy {
     ) -> PyResult<String> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2445,7 +2477,7 @@ impl PyStrategy {
     ) -> PyResult<String> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2475,7 +2507,7 @@ impl PyStrategy {
     ) -> PyResult<String> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2505,7 +2537,7 @@ impl PyStrategy {
     ) -> PyResult<String> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2539,7 +2571,7 @@ impl PyStrategy {
     ) -> PyResult<String> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2573,7 +2605,7 @@ impl PyStrategy {
     ) -> PyResult<String> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2607,7 +2639,7 @@ impl PyStrategy {
     ) -> PyResult<String> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
-                Some(dict) => from_pydict(py, dict),
+                Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
@@ -2631,7 +2663,7 @@ impl PyStrategy {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, str::FromStr};
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc, str::FromStr};
 
     use nautilus_common::{
         actor::DataActor,
@@ -2674,7 +2706,7 @@ mod tests {
     use ustr::Ustr;
 
     use super::PyStrategy;
-    use crate::strategy::Strategy;
+    use crate::strategy::{Strategy, StrategyConfig};
 
     const TRACKING_STRATEGY_CODE: &std::ffi::CStr = c_str!(
         r#"
@@ -2937,8 +2969,8 @@ class TrackingStrategy:
                 UnixNanos::from(1_711_036_800_000_000_000),
             ),
             atm_strike: None,
-            calls: Default::default(),
-            puts: Default::default(),
+            calls: BTreeMap::default(),
+            puts: BTreeMap::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
         }
@@ -3043,6 +3075,20 @@ class TrackingStrategy:
             .unwrap();
 
         (py_strategy, rust_strategy)
+    }
+
+    #[rstest::rstest]
+    fn test_external_order_claims_returns_configured_instruments() {
+        let claims = vec![
+            InstrumentId::from("AUDUSD.SIM"),
+            InstrumentId::from("BTCUSDT.BINANCE"),
+        ];
+        let strategy = PyStrategy::new(Some(StrategyConfig {
+            external_order_claims: Some(claims.clone()),
+            ..Default::default()
+        }));
+
+        assert_eq!(strategy.external_order_claims(), Some(claims));
     }
 
     fn assert_python_dispatch<F>(py: Python<'_>, method_name: &str, invoke: F)

@@ -63,7 +63,8 @@ pub struct FuturesInstrument {
     pub isin: Option<String>,
     pub contract_value_trade_precision: i32,
     pub post_only: bool,
-    pub fee_schedule_uid: String,
+    #[serde(default)]
+    pub fee_schedule_uid: Option<String>,
     pub mtf: bool,
     pub base: String,
     pub quote: String,
@@ -923,6 +924,41 @@ mod tests {
             response.order_events[2].event_type,
             KrakenFuturesOrderEventType::Cancel
         );
+    }
+
+    #[rstest]
+    fn test_parse_futures_order_events_tolerates_unknown_enum_values() {
+        // Regression for Kraken Futures change log 2026-05-18: an `"unknown"`
+        // value anywhere in the batch must not fail the surrounding response.
+        let data = load_test_data("http_futures_order_events_unknown.json");
+        let response: FuturesOrderEventsResponse =
+            serde_json::from_str(&data).expect("Failed to parse futures order events with unknown");
+
+        assert_eq!(response.order_events.len(), 1);
+        assert_eq!(
+            response.order_events[0].order.order_type,
+            KrakenFuturesOrderType::Unknown
+        );
+    }
+
+    #[rstest]
+    fn test_parse_futures_order_trigger_data_tolerates_unknown_enum_values() {
+        // Trigger payload uses non-optional enums, so an `"unknown"` on
+        // triggerSide / triggerSignal must not fail the sendStatus batch.
+        let data = load_test_data("http_send_order_futures_unknown_trigger.json");
+        let response: FuturesSendOrderResponse =
+            serde_json::from_str(&data).expect("Failed to parse send-order response with unknown");
+
+        let send_status = response.send_status.expect("sendStatus missing");
+        let order_events = send_status.order_events.expect("orderEvents missing");
+        let trigger = order_events[0]
+            .order_trigger
+            .as_ref()
+            .expect("orderTrigger missing");
+
+        assert_eq!(trigger.order_type, KrakenFuturesOrderType::Unknown);
+        assert_eq!(trigger.trigger_side, KrakenTriggerSide::Unknown);
+        assert_eq!(trigger.trigger_signal, KrakenTriggerSignal::Unknown);
     }
 
     #[rstest]

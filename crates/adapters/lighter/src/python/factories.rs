@@ -13,18 +13,19 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+//! Python bindings for Lighter factory types.
+
 use pyo3::prelude::*;
 
 use crate::{
-    config::LighterExecClientConfig,
-    factories::{
-        LighterDataClientFactory, LighterExecFactoryConfig, LighterExecutionClientFactory,
-    },
+    common::consts::LIGHTER,
+    factories::{LighterDataClientFactory, LighterExecutionClientFactory},
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl LighterDataClientFactory {
+    /// Factory for creating Lighter data clients.
     #[new]
     fn py_new() -> Self {
         Self
@@ -32,12 +33,14 @@ impl LighterDataClientFactory {
 
     #[pyo3(name = "name")]
     fn py_name(&self) -> &'static str {
-        "LIGHTER"
+        LIGHTER
     }
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl LighterExecutionClientFactory {
+    /// Factory for creating Lighter execution clients.
     #[new]
     fn py_new() -> Self {
         Self
@@ -45,22 +48,6 @@ impl LighterExecutionClientFactory {
 
     #[pyo3(name = "name")]
     fn py_name(&self) -> &'static str {
-        "LIGHTER"
-    }
-}
-
-#[pymethods]
-impl LighterExecFactoryConfig {
-    #[new]
-    fn py_new(trader_id: TraderId, account_id: AccountId, config: LighterExecClientConfig) -> Self {
-        Self {
-            trader_id,
-            account_id,
-            config,
-        }
-    }
-
-    fn __repr__(&self) -> String {
-        format!("{self:?}")
+        LIGHTER
     }
 }

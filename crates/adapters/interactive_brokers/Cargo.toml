@@ -22,8 +22,9 @@ name = "nautilus_interactive_brokers"
 crate-type = ["rlib"]
 
 [features]
-default = []
-examples = ["nautilus-live/node"]
+default = ["execution"]
+execution = ["dep:nautilus-execution", "dep:nautilus-network"]
+examples = ["nautilus-live/node", "nautilus-trading/examples"]
 extension-module = [
   "gateway",
   "nautilus-common/extension-module",
@@ -36,16 +37,25 @@ extension-module = [
   "python",
 ]
 python = [
+  "execution",
+  "dep:nautilus-system",
   "nautilus-common/python",
   "nautilus-core/python",
   "nautilus-execution/python",
   "nautilus-live/python",
   "nautilus-model/python",
   "nautilus-network/python",
+  "nautilus-system/python",
   "pyo3",
   "pyo3-async-runtimes",
 ]
 gateway = ["bollard"]
+
+[package.metadata.cargo-machete]
+ignored = [
+  "nautilus-execution", # Activated by the `execution` feature for downstream feature chaining
+  "nautilus-network", # Activated by the `execution` feature for downstream feature chaining
+]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -54,22 +64,21 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
-nautilus-execution = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
-nautilus-network = { workspace = true }
+
+nautilus-execution = { workspace = true, optional = true }
+nautilus-network = { workspace = true, optional = true }
+nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
-async-stream = { workspace = true }
 async-trait = { workspace = true }
-bollard = { workspace = true, optional = true }
 bon = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 ibapi = { workspace = true }
-indexmap = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
@@ -81,19 +90,34 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 ustr = { workspace = true }
 
+bollard = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-testkit = { workspace = true }
+nautilus-trading = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }
-tracing-test = { workspace = true }
 
-# Run with `cargo run -p nautilus-interactive-brokers --example interactive-brokers-data-latency-smoke --features examples`
+# Run live smoke with `cargo run --example ib-data-tester --package nautilus-interactive-brokers --features examples`.
+# Run embedded config unit tests with `cargo test --example ib-data-tester --package nautilus-interactive-brokers --features examples`.
 [[example]]
-name = "interactive-brokers-data-latency-smoke"
-path = "examples/data_latency_smoke.rs"
+name = "ib-data-tester"
+path = "examples/node_data_tester.rs"
 required-features = ["examples"]
 doc = false
+
+# Run live smoke with `cargo run --example ib-exec-tester --package nautilus-interactive-brokers --features examples`.
+# Run embedded config unit tests with `cargo test --example ib-exec-tester --package nautilus-interactive-brokers --features examples`.
+[[example]]
+name = "ib-exec-tester"
+path = "examples/node_exec_tester.rs"
+required-features = ["examples"]
+doc = false
+
+[[test]]
+name = "python"
+path = "tests/python.rs"
+required-features = ["python"]

@@ -14,30 +14,38 @@
 // -------------------------------------------------------------------------------------------------
 
 use anyhow::Context;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     enums::{
-        CurrencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified,
-        TimeInForce, TriggerType,
+        AssetClass, CurrencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
+        PositionSideSpecified, TimeInForce, TriggerType,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
-    instruments::{CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
+    instruments::{BinaryOption, CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use ustr::Ustr;
 
-use super::models::{AssetPosition, HyperliquidFill, PerpMeta, SpotBalance, SpotMeta};
+use super::models::{
+    AssetPosition, HyperliquidFill, OutcomeMarket, OutcomeMeta, OutcomeQuestion, PerpMeta,
+    SpotBalance, SpotMeta,
+};
 use crate::{
     common::{
         consts::HYPERLIQUID_VENUE,
         enums::{
             HyperliquidFillDirection, HyperliquidOrderStatus as HyperliquidOrderStatusEnum,
-            HyperliquidSide, HyperliquidTpSl,
+            HyperliquidSide, HyperliquidTimeInForce,
         },
-        parse::make_fill_trade_id,
+        parse::{
+            format_outcome_nautilus_symbol, is_conditional_order_data, make_fill_trade_id,
+            parse_trigger_order_type,
+        },
+        types::HyperliquidAssetId,
     },
     websocket::messages::{WsBasicOrderData, WsOrderData},
 };
@@ -49,6 +57,38 @@ pub enum HyperliquidMarketType {
     Perp,
     /// Spot trading pair.
     Spot,
+    /// HIP-4 binary outcome side token.
+    Outcome,
+}
+
+/// Outcome-specific metadata carried on [`HyperliquidInstrumentDef`] for HIP-4
+/// binary outcome side tokens.
+///
+/// The venue's `outcomeMeta` payload is partial today (no precision or
+/// expiry fields), so unknown values are left as defaults until real venue
+/// payloads are available.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidOutcomeMetadata {
+    /// HIP-4 outcome index (`outcome` field from `outcomeMeta`).
+    pub outcome_index: u32,
+    /// Side digit (`0` or `1`).
+    pub outcome_side: u8,
+    /// Outcome market name (for example, "BTC daily").
+    pub market_name: Ustr,
+    /// Side specification name. Set from the venue's `sideSpecs` entry when
+    /// present, otherwise falls back to the canonical HIP-4 labels (`"Yes"`
+    /// for side `0`, `"No"` for side `1`).
+    pub side_name: Option<Ustr>,
+    /// Venue-supplied description.
+    pub description: Option<Ustr>,
+    /// Activation timestamp; `0` when the venue payload does not expose it.
+    pub activation_ns: UnixNanos,
+    /// Expiration timestamp; `0` when the venue payload does not expose it.
+    pub expiration_ns: UnixNanos,
+    /// Structured metadata surfaced as `BinaryOption.info`; see the Hyperliquid
+    /// integration guide for the field layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<Params>,
 }
 
 /// Normalized instrument definition produced by this parser.
@@ -62,16 +102,21 @@ pub struct HyperliquidInstrumentDef {
     /// Raw symbol used in Hyperliquid WebSocket subscriptions/messages.
     /// For perps: base currency (e.g., "BTC").
     /// For spot: `@{pair_index}` format (e.g., "@107" for HYPE-USDC).
+    /// For outcomes: `#<encoding>` spot-coin form (e.g., "#10").
     pub raw_symbol: Ustr,
     /// Base currency/asset (e.g., "BTC", "PURR").
     pub base: Ustr,
     /// Quote currency (e.g., "USD" for perps, "USDC" for spot).
     pub quote: Ustr,
-    /// Market type (perpetual or spot).
+    /// Settlement currency for perps. `None` for spot and outcome instruments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<Ustr>,
+    /// Market type (perpetual, spot, or outcome).
     pub market_type: HyperliquidMarketType,
     /// Asset index used for order submission.
     /// For perps: index in meta.universe (0, 1, 2, ...).
     /// For spot: 10000 + index in spotMeta.universe.
+    /// For outcomes: `100_000_000 + 10 * outcome + side`.
     pub asset_index: u32,
     /// Number of decimal places for price precision.
     pub price_decimals: u32,
@@ -89,6 +134,10 @@ pub struct HyperliquidInstrumentDef {
     pub is_hip3: bool,
     /// Whether the instrument is active/tradeable.
     pub active: bool,
+    /// Outcome-specific metadata when [`market_type`](Self::market_type) is
+    /// [`HyperliquidMarketType::Outcome`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<HyperliquidOutcomeMetadata>,
     /// Raw upstream data for debugging.
     pub raw_data: String,
 }
@@ -129,6 +178,18 @@ pub fn parse_perp_instruments(
     meta: &PerpMeta,
     asset_index_base: u32,
 ) -> Result<Vec<HyperliquidInstrumentDef>, String> {
+    Ok(parse_perp_instruments_with_settlement(
+        meta,
+        asset_index_base,
+        DEFAULT_PERP_SETTLEMENT_CURRENCY,
+    ))
+}
+
+pub(crate) fn parse_perp_instruments_with_settlement(
+    meta: &PerpMeta,
+    asset_index_base: u32,
+    settlement_currency: &str,
+) -> Vec<HyperliquidInstrumentDef> {
     const PERP_MAX_DECIMALS: i32 = 6;
 
     let mut defs = Vec::new();
@@ -149,6 +210,7 @@ pub fn parse_perp_instruments(
             raw_symbol,
             base: asset.name.clone().into(),
             quote: "USD".into(),
+            settlement: Some(settlement_currency.into()),
             market_type: HyperliquidMarketType::Perp,
             asset_index: asset_index_base + index as u32,
             price_decimals,
@@ -159,13 +221,43 @@ pub fn parse_perp_instruments(
             only_isolated: asset.only_isolated.unwrap_or(false),
             is_hip3: asset_index_base > 0,
             active: !is_delisted,
+            outcome: None,
             raw_data: serde_json::to_string(asset).unwrap_or_default(),
         };
 
         defs.push(def);
     }
 
-    Ok(defs)
+    defs
+}
+
+const DEFAULT_PERP_COLLATERAL_TOKEN: u32 = 0;
+const DEFAULT_PERP_SETTLEMENT_CURRENCY: &str = "USDC";
+
+pub(crate) fn resolve_perp_settlement_currency(
+    meta: &PerpMeta,
+    spot_meta: Option<&SpotMeta>,
+) -> Result<Ustr, String> {
+    let Some(collateral_token) = meta.collateral_token else {
+        return Ok(DEFAULT_PERP_SETTLEMENT_CURRENCY.into());
+    };
+
+    if collateral_token == DEFAULT_PERP_COLLATERAL_TOKEN {
+        return Ok(DEFAULT_PERP_SETTLEMENT_CURRENCY.into());
+    }
+
+    let spot_meta = spot_meta.ok_or_else(|| {
+        format!("Spot metadata required to resolve perp collateral token {collateral_token}")
+    })?;
+    let token = spot_meta
+        .tokens
+        .iter()
+        .find(|token| token.index == collateral_token)
+        .ok_or_else(|| {
+            format!("Perp collateral token index {collateral_token} not found in spot metadata")
+        })?;
+
+    Ok(token.name.as_str().into())
 }
 
 /// Parse spot instrument definitions from Hyperliquid `spotMeta` response.
@@ -222,6 +314,7 @@ pub fn parse_spot_instruments(meta: &SpotMeta) -> Result<Vec<HyperliquidInstrume
             raw_symbol,
             base: base_token.name.clone().into(),
             quote: quote_token.name.clone().into(),
+            settlement: None,
             market_type: HyperliquidMarketType::Spot,
             asset_index: SPOT_INDEX_OFFSET + pair.index,
             price_decimals,
@@ -232,6 +325,7 @@ pub fn parse_spot_instruments(meta: &SpotMeta) -> Result<Vec<HyperliquidInstrume
             only_isolated: false,
             is_hip3: false,
             active: pair.is_canonical, // Use canonical status to indicate if pair is actively tradeable
+            outcome: None,
             raw_data: serde_json::to_string(pair).unwrap_or_default(),
         };
 
@@ -251,6 +345,201 @@ pub fn parse_spot_instruments(meta: &SpotMeta) -> Result<Vec<HyperliquidInstrume
     Ok(defs)
 }
 
+// Default precision for HIP-4 outcome side tokens until the venue exposes
+// per-market values via `outcomeMeta`. Outcomes settle in `[0, 1]` so 4
+// decimals of price granularity (tick `0.0001`) and 2 decimals of size
+// granularity (lot `0.01`) are conservative starting values; refine when
+// real venue payloads land.
+pub const OUTCOME_PRICE_DECIMALS: u32 = 4;
+pub const OUTCOME_SIZE_DECIMALS: u32 = 2;
+
+/// Parse outcome instrument definitions from Hyperliquid `outcomeMeta` response.
+///
+/// Each [`OutcomeMarket`] yields two definitions, one per side (`0` and `1`),
+/// modeled as binary outcome side tokens. The Nautilus internal symbol uses
+/// the form `{outcome_index}-{YES|NO}-OUTCOME` (symmetric with `-PERP` /
+/// `-SPOT`), and the wire `raw_symbol` uses the spot-coin form
+/// (`#<encoding>`) which is what `l2Book`, `trades`, and `bbo` subscriptions
+/// accept.
+///
+/// Expiry is read from the market's own description when it carries
+/// `class:priceBinary`; for outcomes that point at a parent question (`other`
+/// or `index:N`), the expiry is inherited from that question's description.
+///
+/// `side_name` is taken from the venue's `sideSpecs` entry when present,
+/// otherwise it falls back to the canonical HIP-4 labels (`"Yes"` / `"No"`).
+pub fn parse_outcome_instruments(
+    meta: &OutcomeMeta,
+) -> Result<Vec<HyperliquidInstrumentDef>, String> {
+    let mut defs = Vec::with_capacity(meta.outcomes.len() * 2);
+
+    for market in &meta.outcomes {
+        for side in 0u8..=1u8 {
+            defs.push(build_outcome_def(market, side, meta)?);
+        }
+    }
+
+    Ok(defs)
+}
+
+fn build_outcome_def(
+    market: &OutcomeMarket,
+    side: u8,
+    meta: &OutcomeMeta,
+) -> Result<HyperliquidInstrumentDef, String> {
+    let outcome_index = market.outcome;
+    let asset_id = HyperliquidAssetId::outcome(outcome_index, side);
+    let encoding = asset_id.outcome_encoding().ok_or_else(|| {
+        format!("Invalid outcome encoding for outcome={outcome_index} side={side}")
+    })?;
+
+    let token = format!("+{encoding}");
+    let coin = format!("#{encoding}");
+    let symbol = format_outcome_nautilus_symbol(outcome_index, side);
+
+    let side_name = market
+        .side_specs
+        .get(usize::from(side))
+        .map(|spec| Ustr::from(spec.name.as_str()))
+        .or_else(|| Some(Ustr::from(default_side_label(side))));
+
+    let description = if market.description.is_empty() {
+        None
+    } else {
+        Some(Ustr::from(market.description.as_str()))
+    };
+
+    let parent_question = meta.parent_question(outcome_index);
+    let expiration_ns = resolve_outcome_expiration_ns(market, meta);
+
+    let info = build_outcome_info(
+        market,
+        side,
+        encoding,
+        asset_id.to_raw(),
+        side_name.as_ref().map(Ustr::as_str),
+        parent_question,
+    );
+
+    let outcome_metadata = HyperliquidOutcomeMetadata {
+        outcome_index,
+        outcome_side: side,
+        market_name: Ustr::from(market.name.as_str()),
+        side_name,
+        description,
+        activation_ns: UnixNanos::default(),
+        expiration_ns,
+        info: Some(info),
+    };
+
+    Ok(HyperliquidInstrumentDef {
+        symbol: Ustr::from(symbol.as_str()),
+        raw_symbol: Ustr::from(coin.as_str()),
+        base: Ustr::from(token.as_str()),
+        quote: "USDH".into(),
+        settlement: None,
+        market_type: HyperliquidMarketType::Outcome,
+        asset_index: asset_id.to_raw(),
+        price_decimals: OUTCOME_PRICE_DECIMALS,
+        size_decimals: OUTCOME_SIZE_DECIMALS,
+        tick_size: pow10_neg(OUTCOME_PRICE_DECIMALS),
+        lot_size: pow10_neg(OUTCOME_SIZE_DECIMALS),
+        max_leverage: None,
+        only_isolated: false,
+        is_hip3: false,
+        active: true,
+        outcome: Some(outcome_metadata),
+        raw_data: serde_json::to_string(market).unwrap_or_default(),
+    })
+}
+
+// Side `0` is Yes, `1` is No; matches the HIP-4 encoding convention.
+fn default_side_label(side: u8) -> &'static str {
+    if side == 0 { "Yes" } else { "No" }
+}
+
+// Splits a `key:value|key:value|...` description into snake_case keyed entries
+// keyed on the venue's camelCase keys lowered to snake_case. Empty descriptions
+// produce an empty iterator.
+fn parse_description_fields(description: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    description
+        .split('|')
+        .filter_map(|piece| piece.split_once(':'))
+        .map(|(key, value)| (camel_to_snake(key.trim()), value.trim().to_string()))
+}
+
+fn camel_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn build_outcome_info(
+    market: &OutcomeMarket,
+    side: u8,
+    encoding: u32,
+    asset_id_raw: u32,
+    side_name: Option<&str>,
+    parent_question: Option<&OutcomeQuestion>,
+) -> Params {
+    let mut info = Params::new();
+
+    info.insert("outcome_index".into(), json!(market.outcome));
+    info.insert("outcome_side".into(), json!(side));
+    if let Some(name) = side_name {
+        info.insert("side_name".into(), Value::String(name.to_string()));
+    }
+    info.insert("encoding".into(), json!(encoding));
+    info.insert("asset_id".into(), json!(asset_id_raw));
+    info.insert("market_name".into(), Value::String(market.name.clone()));
+
+    // Direct binary outcomes (`class:priceBinary|...`) carry the full metadata
+    // on the market description. Named-outcome descriptions are sentinels
+    // (`index:N` / `other`) that just point at the parent question.
+    for (key, value) in parse_description_fields(&market.description) {
+        match key.as_str() {
+            "index" => {
+                if let Ok(named) = value.parse::<u32>() {
+                    info.insert("named_index".into(), json!(named));
+                }
+            }
+            "other" => {
+                info.insert("is_fallback".into(), json!(true));
+            }
+            _ => {
+                info.insert(key, Value::String(value));
+            }
+        }
+    }
+
+    // The market description for named outcomes is literally the keyless
+    // sentinel `other`; capture it explicitly so consumers don't need to
+    // inspect the raw description.
+    if market.description.trim() == "other" {
+        info.insert("is_fallback".into(), json!(true));
+    }
+
+    if let Some(question) = parent_question {
+        info.insert("question".into(), json!(question.question));
+        info.insert("question_name".into(), Value::String(question.name.clone()));
+        for (key, value) in parse_description_fields(&question.description) {
+            let prefixed = format!("question_{key}");
+            info.insert(prefixed, Value::String(value));
+        }
+    }
+
+    info
+}
+
 fn pow10_neg(decimals: u32) -> Decimal {
     if decimals == 0 {
         return Decimal::ONE;
@@ -258,6 +547,133 @@ fn pow10_neg(decimals: u32) -> Decimal {
 
     // Build 1 / 10^decimals using integer arithmetic
     Decimal::from_i128_with_scale(1, decimals)
+}
+
+// Direct binary outcomes carry `expiry:` in their own description. Named
+// outcomes (`index:N`) and the `other` fallback inherit expiry from the
+// parent question. Returns zero when no expiry can be located.
+fn resolve_outcome_expiration_ns(market: &OutcomeMarket, meta: &OutcomeMeta) -> UnixNanos {
+    if let Some(ns) = parse_expiry_from_description(&market.description) {
+        return ns;
+    }
+
+    meta.parent_question(market.outcome)
+        .and_then(|q| parse_expiry_from_description(&q.description))
+        .unwrap_or_default()
+}
+
+fn parse_expiry_from_description(description: &str) -> Option<UnixNanos> {
+    description
+        .split('|')
+        .filter_map(|piece| piece.split_once(':'))
+        .find_map(|(key, value)| (key == "expiry").then_some(value))
+        .and_then(parse_outcome_expiry_ns)
+}
+
+// Parses a Hyperliquid outcome expiry stamp `YYYYMMDD-HHMM` (UTC) to UnixNanos.
+fn parse_outcome_expiry_ns(s: &str) -> Option<UnixNanos> {
+    let (date_part, time_part) = s.split_once('-')?;
+    if date_part.len() != 8 || time_part.len() != 4 {
+        return None;
+    }
+
+    let year: i32 = date_part[0..4].parse().ok()?;
+    let month: u32 = date_part[4..6].parse().ok()?;
+    let day: u32 = date_part[6..8].parse().ok()?;
+    let hour: u32 = time_part[0..2].parse().ok()?;
+    let minute: u32 = time_part[2..4].parse().ok()?;
+
+    let datetime = chrono::NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_opt(hour, minute, 0)?
+        .and_utc();
+    let nanos = datetime.timestamp_nanos_opt()?;
+    u64::try_from(nanos).ok().map(UnixNanos::from)
+}
+
+/// Settlement state for a single HIP-4 outcome side token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutcomeSettlement {
+    /// Outcome index from `outcomeMeta`.
+    pub outcome_index: u32,
+    /// Side token (`0` or `1`).
+    pub outcome_side: u8,
+    /// Final settlement value: `1` for the winning side, `0` for losing sides.
+    pub final_value: u8,
+}
+
+/// Derives per-side settlement values from an `outcomeMeta` snapshot.
+///
+/// Returns one [`OutcomeSettlement`] for every side of every outcome whose
+/// resolution can be inferred from the snapshot:
+///
+/// - For each question with non-empty `settled_named_outcomes`, every named
+///   outcome and the fallback are emitted: the winning named outcomes get
+///   `Yes -> 1, No -> 0`, every other named outcome and the fallback get
+///   `Yes -> 0, No -> 1`.
+/// - Standalone outcomes (not referenced by any question) are skipped because
+///   the venue does not expose their resolution in `outcomeMeta`. They will
+///   need a separate signal (status flag, fill, or position-state event).
+///
+/// Outcomes referenced by a question that has not yet settled are also
+/// skipped. This lets a caller poll `outcomeMeta` and emit settlement events
+/// when entries first appear in the result.
+#[must_use]
+pub fn derive_outcome_settlements(meta: &OutcomeMeta) -> Vec<OutcomeSettlement> {
+    let mut settlements = Vec::new();
+
+    for question in &meta.questions {
+        if question.settled_named_outcomes.is_empty() {
+            continue;
+        }
+
+        let losing_sides_won = |outcome_index: u32| -> [OutcomeSettlement; 2] {
+            // Named outcome did not win; Yes side -> 0, No side -> 1.
+            [
+                OutcomeSettlement {
+                    outcome_index,
+                    outcome_side: 0,
+                    final_value: 0,
+                },
+                OutcomeSettlement {
+                    outcome_index,
+                    outcome_side: 1,
+                    final_value: 1,
+                },
+            ]
+        };
+
+        let winning_sides = |outcome_index: u32| -> [OutcomeSettlement; 2] {
+            // Named outcome won; Yes side -> 1, No side -> 0.
+            [
+                OutcomeSettlement {
+                    outcome_index,
+                    outcome_side: 0,
+                    final_value: 1,
+                },
+                OutcomeSettlement {
+                    outcome_index,
+                    outcome_side: 1,
+                    final_value: 0,
+                },
+            ]
+        };
+
+        for outcome_index in &question.named_outcomes {
+            if question.settled_named_outcomes.contains(outcome_index) {
+                settlements.extend(winning_sides(*outcome_index));
+            } else {
+                settlements.extend(losing_sides_won(*outcome_index));
+            }
+        }
+
+        // The fallback is the "no named outcome resolved" branch; it loses
+        // whenever any named outcome won.
+        if let Some(fallback) = question.fallback_outcome {
+            settlements.extend(losing_sides_won(fallback));
+        }
+    }
+
+    settlements
 }
 
 pub fn get_currency(code: &str) -> Currency {
@@ -269,6 +685,80 @@ pub fn get_currency(code: &str) -> Currency {
         currency
     })
 }
+
+/// Returns the HIP-4 outcome settlement currency, registering it on first call.
+///
+/// Outcome markets settle in USDH (token index 360 on the `USDH/USDC` spot pair
+/// `@230`), not USDC. The registration is explicit so the precision is
+/// deterministic rather than dependent on whichever caller first triggers
+/// `get_currency`'s auto-register path.
+pub fn get_usdh_currency() -> Currency {
+    Currency::try_from_str("USDH").unwrap_or_else(|| {
+        let currency = Currency::new("USDH", 8, 0, "Hyperliquid USD", CurrencyType::Crypto);
+        if let Err(e) = Currency::register(currency, false) {
+            log::error!("Failed to register USDH currency: {e}");
+        }
+        currency
+    })
+}
+
+/// Resolves the commission currency for a fill given the venue's `feeToken` field.
+///
+/// HIP-4 outcome fills echo the side token (e.g. `+50`) as `feeToken` even when
+/// the fee is zero. The side token is not a Nautilus currency and emitting it as
+/// the commission currency would leak into `OrderFilled` events and persistence;
+/// for outcome side tokens the instrument's quote currency is always used, even
+/// when another adapter path (such as spot-balance parsing) has registered the
+/// side token in the global registry. Non-zero side-token fees error: the venue
+/// does not denominate fees in side tokens. Other unknown tokens fall back to
+/// the instrument's quote currency only when the fee is zero.
+///
+/// # Errors
+///
+/// Returns an error when an outcome side token carries a non-zero fee, or when
+/// `fee_token` cannot be resolved and `fee_amount` is non-zero.
+pub fn resolve_fee_currency(
+    fee_token: &str,
+    fee_amount: Decimal,
+    instrument: &dyn Instrument,
+) -> anyhow::Result<Currency> {
+    if is_outcome_side_token(fee_token) {
+        if !fee_amount.is_zero() {
+            anyhow::bail!(
+                "Outcome side token '{fee_token}' carried a non-zero fee {fee_amount}; \
+                 venue does not denominate fees in side tokens",
+            );
+        }
+        return Ok(instrument.quote_currency());
+    }
+
+    if let Some(currency) = Currency::try_from_str(fee_token) {
+        return Ok(currency);
+    }
+
+    if fee_amount.is_zero() {
+        let fallback = instrument.quote_currency();
+        log::debug!(
+            "Unregistered fee token '{fee_token}' on zero-fee fill for {}; using {fallback} as fallback",
+            instrument.id(),
+        );
+        return Ok(fallback);
+    }
+
+    anyhow::bail!("Unknown fee token '{fee_token}' with non-zero fee {fee_amount}")
+}
+
+fn is_outcome_side_token(symbol: &str) -> bool {
+    let Some(rest) = symbol.strip_prefix('+') else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+// Hyperliquid documents a venue-wide minimum order notional: $10 for perps,
+// and 10 quote_token for spot.
+// https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses
+const HYPERLIQUID_MIN_ORDER_NOTIONAL: Decimal = Decimal::TEN;
 
 /// Converts a single Hyperliquid instrument definition into a Nautilus `InstrumentAny`.
 ///
@@ -287,39 +777,54 @@ pub fn create_instrument_from_def(
     // - Spot PURR: slash format (e.g., "PURR/USDC")
     // - Spot others: @{index} format (e.g., "@107")
     let raw_symbol = Symbol::new(def.raw_symbol);
-    let base_currency = get_currency(&def.base);
-    let quote_currency = get_currency(&def.quote);
     let price_increment = Price::from(def.tick_size.to_string());
     let size_increment = Quantity::from(def.lot_size.to_string());
 
     match def.market_type {
-        HyperliquidMarketType::Spot => Some(InstrumentAny::CurrencyPair(CurrencyPair::new(
-            instrument_id,
-            raw_symbol,
-            base_currency,
-            quote_currency,
-            def.price_decimals as u8,
-            def.size_decimals as u8,
-            price_increment,
-            size_increment,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ts_init, // Identical to ts_init for now
-            ts_init,
-        ))),
+        HyperliquidMarketType::Spot => {
+            let base_currency = get_currency(&def.base);
+            let quote_currency = get_currency(&def.quote);
+            let min_notional = Some(min_order_notional(quote_currency)?);
+
+            Some(InstrumentAny::CurrencyPair(CurrencyPair::new(
+                instrument_id,
+                raw_symbol,
+                base_currency,
+                quote_currency,
+                def.price_decimals as u8,
+                def.size_decimals as u8,
+                price_increment,
+                size_increment,
+                None,
+                None,
+                None,
+                None,
+                None,
+                min_notional,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ts_init, // Identical to ts_init for now
+                ts_init,
+            )))
+        }
         HyperliquidMarketType::Perp => {
-            let settlement_currency = get_currency("USDC");
+            let base_currency = get_currency(&def.base);
+            let quote_currency = get_currency(&def.quote);
+            let settlement_code = def
+                .settlement
+                .as_ref()
+                .map_or(DEFAULT_PERP_SETTLEMENT_CURRENCY, Ustr::as_str);
+            let settlement_currency = if settlement_code == "USDH" {
+                get_usdh_currency()
+            } else {
+                get_currency(settlement_code)
+            };
+            let min_notional = Some(min_order_notional(quote_currency)?);
 
             Some(InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
                 instrument_id,
@@ -337,7 +842,7 @@ pub fn create_instrument_from_def(
                 None,
                 None,
                 None,
-                None,
+                min_notional,
                 None,
                 None,
                 None,
@@ -349,7 +854,43 @@ pub fn create_instrument_from_def(
                 ts_init,
             )))
         }
+        HyperliquidMarketType::Outcome => {
+            let outcome = def.outcome.as_ref()?;
+            let currency = get_usdh_currency();
+
+            Some(InstrumentAny::BinaryOption(BinaryOption::new(
+                instrument_id,
+                raw_symbol,
+                AssetClass::Alternative,
+                currency,
+                outcome.activation_ns,
+                outcome.expiration_ns,
+                def.price_decimals as u8,
+                def.size_decimals as u8,
+                price_increment,
+                size_increment,
+                outcome.side_name,
+                outcome.description,
+                None, // max_quantity
+                None, // min_quantity
+                None, // max_notional
+                None, // min_notional
+                None, // max_price
+                None, // min_price
+                None, // margin_init
+                None, // margin_maint
+                None, // maker_fee
+                None, // taker_fee
+                outcome.info.clone(),
+                ts_init,
+                ts_init,
+            )))
+        }
     }
+}
+
+fn min_order_notional(currency: Currency) -> Option<Money> {
+    Money::from_decimal(HYPERLIQUID_MIN_ORDER_NOTIONAL, currency).ok()
 }
 
 /// Convert a collection of Hyperliquid instrument definitions into Nautilus instruments,
@@ -418,27 +959,22 @@ pub fn parse_order_status_report_from_basic(
     let venue_order_id = VenueOrderId::new(order.oid.to_string());
     let order_side = OrderSide::from(order.side);
 
-    // Determine order type based on trigger parameters
-    let order_type = if order.trigger_px.is_some() {
-        if order.is_market == Some(true) {
-            // Check if it's stop-loss or take-profit based on tpsl field
-            match order.tpsl.as_ref() {
-                Some(HyperliquidTpSl::Tp) => OrderType::MarketIfTouched,
-                Some(HyperliquidTpSl::Sl) => OrderType::StopMarket,
-                _ => OrderType::StopMarket,
-            }
-        } else {
-            match order.tpsl.as_ref() {
-                Some(HyperliquidTpSl::Tp) => OrderType::LimitIfTouched,
-                Some(HyperliquidTpSl::Sl) => OrderType::StopLimit,
-                _ => OrderType::StopLimit,
-            }
+    let is_conditional =
+        is_conditional_order_data(order.trigger_px.as_deref(), order.tpsl.as_ref());
+    let order_type = if is_conditional {
+        match (order.is_market, order.tpsl.as_ref()) {
+            (Some(is_market), Some(tpsl)) => parse_trigger_order_type(is_market, tpsl),
+            (None, Some(tpsl)) => parse_trigger_order_type(false, tpsl),
+            _ => OrderType::Limit,
         }
     } else {
         OrderType::Limit
     };
 
-    let time_in_force = TimeInForce::Gtc;
+    let time_in_force = match order.tif {
+        Some(HyperliquidTimeInForce::Ioc) => TimeInForce::Ioc,
+        _ => TimeInForce::Gtc,
+    };
     let order_status = OrderStatus::from(*status);
 
     let price_precision = instrument.price_precision();
@@ -485,6 +1021,14 @@ pub fn parse_order_status_report_from_basic(
         report = report.with_client_order_id(ClientOrderId::new(cloid.as_str()));
     }
 
+    if matches!(order.tif, Some(HyperliquidTimeInForce::Alo)) {
+        report = report.with_post_only(true);
+    }
+
+    if let Some(reduce_only) = order.reduce_only {
+        report = report.with_reduce_only(reduce_only);
+    }
+
     // Only set price for non-filled orders. For filled orders, the limit price is not
     // the execution price, and setting it would cause bogus inferred fills to be created
     // during reconciliation. Real fills arrive via the userEvents WebSocket channel.
@@ -501,8 +1045,7 @@ pub fn parse_order_status_report_from_basic(
         report = report.with_price(price);
     }
 
-    // Add trigger price if present
-    if let Some(trigger_px) = &order.trigger_px {
+    if is_conditional && let Some(trigger_px) = &order.trigger_px {
         let trig_px: Decimal = trigger_px
             .parse()
             .map_err(|e| anyhow::anyhow!("Failed to parse trigger_px: {e}"))?;
@@ -571,10 +1114,7 @@ pub fn parse_fill_report(
         .parse()
         .map_err(|e| anyhow::anyhow!("Failed to parse fee: {e}"))?;
 
-    let fee_currency: Currency = fill
-        .fee_token
-        .parse()
-        .map_err(|e| anyhow::anyhow!("Unknown fee token '{}': {e}", fill.fee_token))?;
+    let fee_currency = resolve_fee_currency(fill.fee_token.as_str(), fee_amount, instrument)?;
     let commission = Money::from_decimal(fee_amount, fee_currency)
         .map_err(|e| anyhow::anyhow!("Failed to create commission from fee: {e}"))?;
 
@@ -698,7 +1238,10 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::{
-        super::models::{HyperliquidL2Book, PerpAsset, SpotPair, SpotToken},
+        super::models::{
+            HyperliquidL2Book, OutcomeMarket, OutcomeMeta, OutcomeQuestion, OutcomeSideSpec,
+            PerpAsset, SpotPair, SpotToken,
+        },
         *,
     };
 
@@ -735,6 +1278,7 @@ mod tests {
                 },
             ],
             margin_tables: vec![],
+            collateral_token: None,
         };
 
         let defs = parse_perp_instruments(&meta, 0).unwrap();
@@ -746,6 +1290,7 @@ mod tests {
         assert_eq!(btc.symbol, "BTC-USD-PERP");
         assert_eq!(btc.base, "BTC");
         assert_eq!(btc.quote, "USD");
+        assert_eq!(btc.settlement.as_ref().unwrap().as_str(), "USDC");
         assert_eq!(btc.market_type, HyperliquidMarketType::Perp);
         assert_eq!(btc.price_decimals, 1); // 6 - 5 = 1
         assert_eq!(btc.size_decimals, 5);
@@ -777,6 +1322,7 @@ mod tests {
         assert_eq!(btc.symbol, "BTC-USD-PERP");
         assert_eq!(btc.base, "BTC");
         assert_eq!(btc.quote, "USD");
+        assert_eq!(btc.settlement.as_ref().unwrap().as_str(), "USDC");
         assert_eq!(btc.market_type, HyperliquidMarketType::Perp);
         assert_eq!(btc.size_decimals, 5);
         assert_eq!(btc.max_leverage, Some(40));
@@ -795,6 +1341,141 @@ mod tests {
         assert_eq!(atom.base, "ATOM");
         assert_eq!(atom.size_decimals, 2);
         assert_eq!(atom.max_leverage, Some(5));
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_perp_sets_min_notional() {
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                let min_notional = perp.min_notional.unwrap();
+                assert_eq!(min_notional.currency, Currency::USD());
+                assert_eq!(min_notional.as_decimal(), dec!(10));
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDC");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_parse_perp_instruments_with_non_usdc_collateral() {
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+        let spot_meta: SpotMeta = load_test_data("http_spot_meta_non_usdc_collateral.json");
+
+        assert_eq!(all_metas[1].collateral_token, Some(360));
+        assert_eq!(all_metas[2].collateral_token, Some(235));
+
+        let settlement_currency =
+            resolve_perp_settlement_currency(&all_metas[1], Some(&spot_meta)).unwrap();
+        let defs = parse_perp_instruments_with_settlement(
+            &all_metas[1],
+            110_000,
+            settlement_currency.as_str(),
+        );
+
+        assert_eq!(settlement_currency.as_str(), "USDH");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].symbol.as_str(), "km:US500-USD-PERP");
+        assert_eq!(defs[0].quote.as_str(), "USD");
+        assert_eq!(defs[0].settlement.as_ref().unwrap().as_str(), "USDH");
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDH");
+                assert_eq!(perp.settlement_currency.name.as_str(), "Hyperliquid USD");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+
+        let settlement_currency =
+            resolve_perp_settlement_currency(&all_metas[2], Some(&spot_meta)).unwrap();
+        let defs = parse_perp_instruments_with_settlement(
+            &all_metas[2],
+            140_000,
+            settlement_currency.as_str(),
+        );
+
+        assert_eq!(settlement_currency.as_str(), "USDE");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].symbol.as_str(), "hyna:BTC-USD-PERP");
+        assert_eq!(defs[0].quote.as_str(), "USD");
+        assert_eq!(defs[0].settlement.as_ref().unwrap().as_str(), "USDE");
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDE");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_perp_defaults_missing_settlement_to_usdc() {
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let mut defs = parse_perp_instruments(&meta, 0).unwrap();
+        defs[0].settlement = None;
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDC");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_resolve_perp_settlement_currency_defaults_to_usdc() {
+        let legacy_meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+
+        let legacy_settlement = resolve_perp_settlement_currency(&legacy_meta, None).unwrap();
+        let token_zero_settlement = resolve_perp_settlement_currency(&all_metas[0], None).unwrap();
+
+        assert_eq!(legacy_settlement.as_str(), "USDC");
+        assert_eq!(token_zero_settlement.as_str(), "USDC");
+    }
+
+    #[rstest]
+    fn test_resolve_perp_settlement_currency_requires_spot_meta_for_non_usdc() {
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+
+        let err = resolve_perp_settlement_currency(&all_metas[1], None).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Spot metadata required to resolve perp collateral token 360",
+        );
+    }
+
+    #[rstest]
+    fn test_resolve_perp_settlement_currency_errors_on_missing_token_index() {
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+        let spot_meta = SpotMeta {
+            tokens: Vec::new(),
+            universe: Vec::new(),
+        };
+
+        let err = resolve_perp_settlement_currency(&all_metas[1], Some(&spot_meta)).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Perp collateral token index 360 not found in spot metadata",
+        );
     }
 
     #[rstest]
@@ -895,6 +1576,17 @@ mod tests {
         assert_eq!(alias.symbol, "PURR-USDC-SPOT");
         assert_eq!(alias.base, "PURR");
         assert!(!alias.active); // Non-canonical pairs are marked as inactive
+
+        let instrument = create_instrument_from_def(purr_usdc, UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::CurrencyPair(pair) => {
+                let min_notional = pair.min_notional.unwrap();
+                assert_eq!(min_notional.currency, Currency::USDC());
+                assert_eq!(min_notional.as_decimal(), dec!(10));
+            }
+            other => panic!("Expected CurrencyPair, was {other:?}"),
+        }
     }
 
     #[rstest]
@@ -965,6 +1657,7 @@ mod tests {
                 ..Default::default()
             }],
             margin_tables: vec![],
+            collateral_token: None,
         };
 
         let defs = parse_perp_instruments(&meta, 0).unwrap();
@@ -997,6 +1690,7 @@ mod tests {
                 },
             ],
             margin_tables: vec![],
+            collateral_token: None,
         };
 
         let defs = parse_perp_instruments(&meta, 110_000).unwrap();
@@ -1086,6 +1780,7 @@ mod tests {
                 margin_mode: None,
             }],
             margin_tables: vec![],
+            collateral_token: None,
         };
 
         let defs = parse_perp_instruments(&meta, 110_000).unwrap();
@@ -1093,5 +1788,564 @@ mod tests {
         assert_eq!(defs[0].symbol, "dex:STREAMABCDxxxx-USD-PERP");
         assert_eq!(defs[0].raw_symbol.as_str(), "dex:STREAMABCD****");
         assert_eq!(defs[0].base.as_str(), "dex:STREAMABCD****");
+    }
+
+    #[rstest]
+    fn test_parse_outcome_instruments_emits_both_sides() {
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 1,
+                name: "BTC daily".to_string(),
+                description: "BTC settles above strike at 06:00 UTC".to_string(),
+                side_specs: vec![
+                    OutcomeSideSpec {
+                        name: "Yes".to_string(),
+                    },
+                    OutcomeSideSpec {
+                        name: "No".to_string(),
+                    },
+                ],
+            }],
+            questions: vec![],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        assert_eq!(defs.len(), 2);
+
+        let yes = &defs[0];
+        assert_eq!(yes.symbol.as_str(), "1-YES-OUTCOME");
+        assert_eq!(yes.raw_symbol.as_str(), "#10");
+        assert_eq!(yes.market_type, HyperliquidMarketType::Outcome);
+        assert_eq!(yes.asset_index, 100_000_010);
+        assert_eq!(yes.price_decimals, OUTCOME_PRICE_DECIMALS);
+        assert_eq!(yes.size_decimals, OUTCOME_SIZE_DECIMALS);
+        assert_eq!(yes.tick_size, dec!(0.0001));
+        assert_eq!(yes.lot_size, dec!(0.01));
+        assert_eq!(yes.quote.as_str(), "USDH");
+        assert!(yes.active);
+
+        let yes_meta = yes.outcome.as_ref().unwrap();
+        assert_eq!(yes_meta.outcome_index, 1);
+        assert_eq!(yes_meta.outcome_side, 0);
+        assert_eq!(yes_meta.market_name.as_str(), "BTC daily");
+        assert_eq!(yes_meta.side_name.unwrap().as_str(), "Yes");
+        assert_eq!(
+            yes_meta.description.unwrap().as_str(),
+            "BTC settles above strike at 06:00 UTC"
+        );
+
+        let no = &defs[1];
+        assert_eq!(no.symbol.as_str(), "1-NO-OUTCOME");
+        assert_eq!(no.raw_symbol.as_str(), "#11");
+        assert_eq!(no.asset_index, 100_000_011);
+        let no_meta = no.outcome.as_ref().unwrap();
+        assert_eq!(no_meta.outcome_side, 1);
+        assert_eq!(no_meta.side_name.unwrap().as_str(), "No");
+    }
+
+    #[rstest]
+    fn test_parse_outcome_instruments_handles_missing_side_specs() {
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 5,
+                name: "Recurring".to_string(),
+                description: String::new(),
+                side_specs: vec![],
+            }],
+            questions: vec![],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        assert_eq!(defs.len(), 2);
+
+        // Even when the venue omits `sideSpecs`, the parser falls back to the
+        // canonical HIP-4 labels ("Yes" / "No") so downstream `BinaryOption`
+        // instruments always carry a meaningful side label.
+        assert_eq!(
+            defs[0]
+                .outcome
+                .as_ref()
+                .unwrap()
+                .side_name
+                .unwrap()
+                .as_str(),
+            "Yes"
+        );
+        assert_eq!(
+            defs[1]
+                .outcome
+                .as_ref()
+                .unwrap()
+                .side_name
+                .unwrap()
+                .as_str(),
+            "No"
+        );
+
+        for def in &defs {
+            assert!(def.outcome.as_ref().unwrap().description.is_none());
+        }
+
+        assert_eq!(defs[0].asset_index, 100_000_050);
+        assert_eq!(defs[1].asset_index, 100_000_051);
+    }
+
+    #[rstest]
+    fn test_get_usdh_currency_registers_with_explicit_precision() {
+        let currency = get_usdh_currency();
+        assert_eq!(currency.code.as_str(), "USDH");
+        assert_eq!(currency.precision, 8);
+        assert_eq!(currency.currency_type, CurrencyType::Crypto);
+
+        // Repeated calls return the same registered currency
+        let again = get_usdh_currency();
+        assert_eq!(again, currency);
+        assert!(Currency::try_from_str("USDH").is_some());
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_outcome_emits_binary_option() {
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 2,
+                name: "Recurring BTC".to_string(),
+                description: "Daily settlement".to_string(),
+                side_specs: vec![
+                    OutcomeSideSpec {
+                        name: "Yes".to_string(),
+                    },
+                    OutcomeSideSpec {
+                        name: "No".to_string(),
+                    },
+                ],
+            }],
+            questions: vec![],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::BinaryOption(bo) => {
+                assert_eq!(bo.id.symbol.as_str(), "2-YES-OUTCOME");
+                assert_eq!(bo.raw_symbol.as_str(), "#20");
+                assert_eq!(bo.asset_class, AssetClass::Alternative);
+                assert_eq!(bo.currency.code.as_str(), "USDH");
+                assert_eq!(bo.price_precision, OUTCOME_PRICE_DECIMALS as u8);
+                assert_eq!(bo.size_precision, OUTCOME_SIZE_DECIMALS as u8);
+                assert_eq!(bo.outcome.unwrap().as_str(), "Yes");
+                assert_eq!(bo.description.unwrap().as_str(), "Daily settlement");
+
+                let info = bo.info.expect("info should be populated for outcomes");
+                assert_eq!(info.get_u64("outcome_index"), Some(2));
+                assert_eq!(info.get_u64("outcome_side"), Some(0));
+                assert_eq!(info.get_u64("encoding"), Some(20));
+                assert_eq!(info.get_u64("asset_id"), Some(100_000_020));
+                assert_eq!(info.get_str("side_name"), Some("Yes"));
+                assert_eq!(info.get_str("market_name"), Some("Recurring BTC"));
+            }
+            other => panic!("Expected BinaryOption, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_outcome_info_carries_parsed_description() {
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 5,
+                name: "Recurring BTC".to_string(),
+                description:
+                    "class:priceBinary|underlying:BTC|expiry:20260508-0600|targetPrice:81041|period:1d"
+                        .to_string(),
+                side_specs: vec![
+                    OutcomeSideSpec {
+                        name: "Yes".to_string(),
+                    },
+                    OutcomeSideSpec {
+                        name: "No".to_string(),
+                    },
+                ],
+            }],
+            questions: vec![],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        let yes = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        match yes {
+            InstrumentAny::BinaryOption(bo) => {
+                let info = bo.info.expect("info should be populated for outcomes");
+                assert_eq!(info.get_str("class"), Some("priceBinary"));
+                assert_eq!(info.get_str("underlying"), Some("BTC"));
+                assert_eq!(info.get_str("expiry"), Some("20260508-0600"));
+                assert_eq!(info.get_str("target_price"), Some("81041"));
+                assert_eq!(info.get_str("period"), Some("1d"));
+                assert!(info.get("question").is_none());
+            }
+            other => panic!("Expected BinaryOption, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_outcome_info_merges_parent_question() {
+        let meta = OutcomeMeta {
+            outcomes: vec![
+                OutcomeMarket {
+                    outcome: 6,
+                    name: "Recurring Fallback".to_string(),
+                    description: "other".to_string(),
+                    side_specs: vec![],
+                },
+                OutcomeMarket {
+                    outcome: 7,
+                    name: "Recurring Named Outcome".to_string(),
+                    description: "index:0".to_string(),
+                    side_specs: vec![],
+                },
+            ],
+            questions: vec![OutcomeQuestion {
+                question: 0,
+                name: "Recurring".to_string(),
+                description:
+                    "class:priceBucket|underlying:BTC|expiry:20260508-0600|priceThresholds:79303,82540|period:1d"
+                        .to_string(),
+                fallback_outcome: Some(6),
+                named_outcomes: vec![7, 8, 9],
+                settled_named_outcomes: vec![],
+            }],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+
+        // Named outcome 7, Yes side (defs[2]).
+        let named = create_instrument_from_def(&defs[2], UnixNanos::default()).unwrap();
+        match named {
+            InstrumentAny::BinaryOption(bo) => {
+                assert_eq!(bo.id.symbol.as_str(), "7-YES-OUTCOME");
+                let info = bo.info.expect("info should be populated for outcomes");
+                assert_eq!(info.get_u64("named_index"), Some(0));
+                assert_eq!(info.get_u64("question"), Some(0));
+                assert_eq!(info.get_str("question_name"), Some("Recurring"));
+                assert_eq!(info.get_str("question_class"), Some("priceBucket"));
+                assert_eq!(info.get_str("question_underlying"), Some("BTC"));
+                assert_eq!(
+                    info.get_str("question_price_thresholds"),
+                    Some("79303,82540"),
+                );
+                assert_eq!(info.get_str("question_expiry"), Some("20260508-0600"));
+            }
+            other => panic!("Expected BinaryOption, was {other:?}"),
+        }
+
+        // Fallback outcome 6, Yes side (defs[0]).
+        let fallback = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+        match fallback {
+            InstrumentAny::BinaryOption(bo) => {
+                assert_eq!(bo.id.symbol.as_str(), "6-YES-OUTCOME");
+                let info = bo.info.expect("info should be populated for outcomes");
+                assert_eq!(info.get_bool("is_fallback"), Some(true));
+                assert_eq!(info.get_u64("question"), Some(0));
+                assert_eq!(info.get_str("question_class"), Some("priceBucket"));
+            }
+            other => panic!("Expected BinaryOption, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_outcome_round_trip() {
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 42,
+                name: "BTC daily".to_string(),
+                description: "BTC settles above strike at 06:00 UTC".to_string(),
+                side_specs: vec![
+                    OutcomeSideSpec {
+                        name: "Yes".to_string(),
+                    },
+                    OutcomeSideSpec {
+                        name: "No".to_string(),
+                    },
+                ],
+            }],
+            questions: vec![],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        let yes = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+        assert_eq!(yes.id().symbol.as_str(), "42-YES-OUTCOME");
+
+        let fill = HyperliquidFill {
+            coin: Ustr::from("#420"),
+            px: "0.5500".to_string(),
+            sz: "1000.00".to_string(),
+            side: HyperliquidSide::Buy,
+            time: 1_704_470_400_000,
+            start_position: "0.00".to_string(),
+            dir: HyperliquidFillDirection::OpenLong,
+            closed_pnl: "0.0".to_string(),
+            hash: "0xfeed".to_string(),
+            oid: 99_001,
+            crossed: true,
+            fee: "0.0".to_string(),
+            fee_token: Ustr::from("+420"),
+        };
+
+        let account_id = AccountId::from("HYPERLIQUID-001");
+        let report = parse_fill_report(&fill, &yes, account_id, UnixNanos::default()).unwrap();
+
+        // Zero-fee outcome fills resolve commission to the instrument's quote
+        // currency (USDH) rather than the side token, so downstream OrderFilled
+        // events and persistence carry a registered currency.
+        assert_eq!(report.commission.currency.code.as_str(), "USDH");
+        assert!(report.commission.as_decimal().is_zero());
+        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(report.last_qty.as_decimal(), dec!(1000));
+        assert_eq!(report.last_px.as_decimal(), dec!(0.55));
+    }
+
+    #[rstest]
+    fn test_resolve_fee_currency_outcome_token_returns_quote_even_when_registered() {
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 88,
+                name: "Edge".to_string(),
+                description: String::new(),
+                side_specs: vec![],
+            }],
+            questions: vec![],
+        };
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        let yes = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        // Simulate another adapter path (e.g. spot balance parsing) having already
+        // registered the side token in the global currency registry.
+        let _ = get_currency("+880");
+        assert!(Currency::try_from_str("+880").is_some());
+
+        let currency = resolve_fee_currency("+880", Decimal::ZERO, &yes)
+            .expect("zero-fee outcome side token must resolve to quote currency");
+        assert_eq!(currency.code.as_str(), "USDH");
+
+        let err = resolve_fee_currency("+880", dec!(0.01), &yes).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Outcome side token '+880'"));
+        assert!(err_msg.contains("non-zero fee"));
+    }
+
+    #[rstest]
+    #[case("+50", true)]
+    #[case("+0", true)]
+    #[case("+880", true)]
+    #[case("", false)]
+    #[case("+", false)]
+    #[case("+abc", false)]
+    #[case("+50a", false)]
+    #[case("#50", false)]
+    #[case("USDC", false)]
+    #[case("-50", false)]
+    fn test_is_outcome_side_token(#[case] input: &str, #[case] expected: bool) {
+        assert_eq!(is_outcome_side_token(input), expected);
+    }
+
+    #[rstest]
+    fn test_resolve_fee_currency_falls_back_to_quote_when_unregistered_and_zero_fee() {
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 77,
+                name: "Edge".to_string(),
+                description: String::new(),
+                side_specs: vec![],
+            }],
+            questions: vec![],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        let no = create_instrument_from_def(&defs[1], UnixNanos::default()).unwrap();
+
+        // Use a token that the venue would not normally emit; the helper must still
+        // return the instrument's quote currency on a zero-fee fill.
+        let currency = resolve_fee_currency("+UNREGISTERED-TOKEN", Decimal::ZERO, &no)
+            .expect("zero-fee fallback should succeed");
+        assert_eq!(currency.code.as_str(), "USDH");
+
+        let err = resolve_fee_currency("+UNREGISTERED-TOKEN", dec!(0.01), &no).unwrap_err();
+        assert!(err.to_string().contains("non-zero fee"));
+    }
+
+    #[rstest]
+    fn test_parse_outcome_expiry_ns_round_trip() {
+        // 2026-05-08 06:00:00 UTC == 1778652000 seconds since epoch
+        let ns = parse_outcome_expiry_ns("20260508-0600").unwrap();
+        assert_eq!(ns.as_u64(), 1_778_220_000_000_000_000);
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("20260508")]
+    #[case("20260508-")]
+    #[case("20260508-0600 ")]
+    #[case("2026-05-08-06-00")]
+    #[case("20261308-0600")]
+    fn test_parse_outcome_expiry_ns_rejects_bad_input(#[case] input: &str) {
+        assert!(parse_outcome_expiry_ns(input).is_none());
+    }
+
+    #[rstest]
+    fn test_parse_outcome_instruments_pulls_expiry_from_price_binary() {
+        let meta = OutcomeMeta {
+            outcomes: vec![OutcomeMarket {
+                outcome: 5,
+                name: "Recurring".to_string(),
+                description:
+                    "class:priceBinary|underlying:BTC|expiry:20260508-0600|targetPrice:81041|period:1d"
+                        .to_string(),
+                side_specs: vec![
+                    OutcomeSideSpec {
+                        name: "Yes".to_string(),
+                    },
+                    OutcomeSideSpec {
+                        name: "No".to_string(),
+                    },
+                ],
+            }],
+            questions: vec![],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        let yes_meta = defs[0].outcome.as_ref().unwrap();
+        assert_eq!(yes_meta.expiration_ns.as_u64(), 1_778_220_000_000_000_000);
+    }
+
+    #[rstest]
+    fn test_parse_outcome_instruments_inherits_expiry_from_parent_question() {
+        // outcome=7 has `index:0` description and is referenced by question 0's
+        // `named_outcomes`. outcome=6 has `other` description and is the
+        // `fallback_outcome`. Both should pick up the question's expiry.
+        let meta = OutcomeMeta {
+            outcomes: vec![
+                OutcomeMarket {
+                    outcome: 6,
+                    name: "Recurring Fallback".to_string(),
+                    description: "other".to_string(),
+                    side_specs: vec![],
+                },
+                OutcomeMarket {
+                    outcome: 7,
+                    name: "Recurring Named Outcome".to_string(),
+                    description: "index:0".to_string(),
+                    side_specs: vec![],
+                },
+            ],
+            questions: vec![OutcomeQuestion {
+                question: 0,
+                name: "Recurring".to_string(),
+                description:
+                    "class:priceBucket|underlying:BTC|expiry:20260508-0600|priceThresholds:79303,82540|period:1d"
+                        .to_string(),
+                fallback_outcome: Some(6),
+                named_outcomes: vec![7, 8, 9],
+                settled_named_outcomes: vec![],
+            }],
+        };
+
+        let defs = parse_outcome_instruments(&meta).unwrap();
+        let expected_ns: u64 = 1_778_220_000_000_000_000;
+
+        for def in &defs {
+            let outcome = def.outcome.as_ref().unwrap();
+            assert_eq!(
+                outcome.expiration_ns.as_u64(),
+                expected_ns,
+                "outcome {} side {} should inherit expiry",
+                outcome.outcome_index,
+                outcome.outcome_side,
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_derive_outcome_settlements_returns_empty_when_no_questions() {
+        let meta = OutcomeMeta {
+            outcomes: vec![],
+            questions: vec![],
+        };
+        assert!(derive_outcome_settlements(&meta).is_empty());
+    }
+
+    #[rstest]
+    fn test_derive_outcome_settlements_returns_empty_when_no_questions_settled() {
+        let meta = OutcomeMeta {
+            outcomes: vec![],
+            questions: vec![OutcomeQuestion {
+                question: 0,
+                name: "Recurring".to_string(),
+                description: "class:priceBucket|expiry:20260508-0600".to_string(),
+                fallback_outcome: Some(6),
+                named_outcomes: vec![7, 8, 9],
+                settled_named_outcomes: vec![],
+            }],
+        };
+
+        assert!(derive_outcome_settlements(&meta).is_empty());
+    }
+
+    #[rstest]
+    fn test_derive_outcome_settlements_marks_winners_losers_and_fallback() {
+        let meta = OutcomeMeta {
+            outcomes: vec![],
+            questions: vec![OutcomeQuestion {
+                question: 0,
+                name: "Recurring".to_string(),
+                description: "class:priceBucket|expiry:20260508-0600".to_string(),
+                fallback_outcome: Some(6),
+                named_outcomes: vec![7, 8, 9],
+                settled_named_outcomes: vec![8],
+            }],
+        };
+
+        let settlements = derive_outcome_settlements(&meta);
+        let lookup: ahash::AHashMap<(u32, u8), u8> = settlements
+            .into_iter()
+            .map(|s| ((s.outcome_index, s.outcome_side), s.final_value))
+            .collect();
+
+        // Winning named outcome 8: Yes -> 1, No -> 0
+        assert_eq!(lookup[&(8, 0)], 1);
+        assert_eq!(lookup[&(8, 1)], 0);
+
+        // Losing named outcomes 7, 9 and fallback 6: Yes -> 0, No -> 1
+        for losing in [7, 9, 6] {
+            assert_eq!(lookup[&(losing, 0)], 0, "outcome {losing} Yes side");
+            assert_eq!(lookup[&(losing, 1)], 1, "outcome {losing} No side");
+        }
+
+        assert_eq!(lookup.len(), 8);
+    }
+
+    #[rstest]
+    fn test_parse_outcome_meta_question_settlement_round_trip() {
+        let json = r#"{
+            "outcomes": [{"outcome": 5, "name": "Recurring", "description": "class:priceBinary|expiry:20260508-0600", "sideSpecs": []}],
+            "questions": [{
+                "question": 0,
+                "name": "Recurring",
+                "description": "class:priceBucket|expiry:20260508-0600",
+                "fallbackOutcome": 6,
+                "namedOutcomes": [7, 8, 9],
+                "settledNamedOutcomes": [8]
+            }]
+        }"#;
+
+        let meta: OutcomeMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.questions.len(), 1);
+        let q = &meta.questions[0];
+        assert_eq!(q.fallback_outcome, Some(6));
+        assert_eq!(q.named_outcomes, vec![7, 8, 9]);
+        assert_eq!(q.settled_named_outcomes, vec![8]);
+
+        assert!(meta.parent_question(7).is_some());
+        assert!(meta.parent_question(6).is_some());
+        assert!(meta.parent_question(99).is_none());
     }
 }

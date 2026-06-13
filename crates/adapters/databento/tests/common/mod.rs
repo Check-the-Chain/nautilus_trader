@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-pub mod mock_server;
+pub(crate) mod mock_server;
 
 use std::{ffi::c_char, sync::Arc};
 
@@ -31,24 +31,24 @@ use nautilus_databento::{
 };
 use nautilus_model::identifiers::Venue;
 
-pub const TEST_KEY: &str = "32-character-with-lots-of-filler";
-pub const TEST_DATASET: &str = "GLBX.MDP3";
-pub const PUBLISHER_ID: u16 = 1;
+pub(crate) const TEST_KEY: &str = "32-character-with-lots-of-filler";
+pub(crate) const TEST_DATASET: &str = "GLBX.MDP3";
+pub(crate) const PUBLISHER_ID: u16 = 1;
 
-pub fn publisher_venue_map() -> IndexMap<u16, Venue> {
+pub(crate) fn publisher_venue_map() -> IndexMap<u16, Venue> {
     let mut map = IndexMap::new();
     map.insert(PUBLISHER_ID, Venue::from("GLBX"));
     map
 }
 
 #[derive(Default)]
-pub struct TestHandlerConfig {
+pub(crate) struct TestHandlerConfig {
     pub use_exchange_as_venue: bool,
     pub bars_timestamp_on_close: bool,
     pub reconnect_timeout_mins: Option<u64>,
 }
 
-pub fn create_test_handler(
+pub(crate) fn create_test_handler(
     addr: &str,
     dataset: &str,
 ) -> (
@@ -59,7 +59,7 @@ pub fn create_test_handler(
     create_test_handler_with_config(addr, dataset, &TestHandlerConfig::default())
 }
 
-pub fn create_test_handler_with_config(
+pub(crate) fn create_test_handler_with_config(
     addr: &str,
     dataset: &str,
     config: &TestHandlerConfig,
@@ -98,7 +98,21 @@ fn str_to_cchar_array<const N: usize>(s: &str) -> [c_char; N] {
     arr
 }
 
-pub fn symbol_mapping_msg(instrument_id: u32, raw_symbol: &str) -> SymbolMappingMsg {
+pub(crate) fn symbol_mapping_msg(instrument_id: u32, raw_symbol: &str) -> SymbolMappingMsg {
+    symbol_mapping_msg_with_stype(
+        instrument_id,
+        dbn::SType::InstrumentId,
+        &instrument_id.to_string(),
+        raw_symbol,
+    )
+}
+
+pub(crate) fn symbol_mapping_msg_with_stype(
+    instrument_id: u32,
+    stype_in: dbn::SType,
+    stype_in_symbol: &str,
+    raw_symbol: &str,
+) -> SymbolMappingMsg {
     SymbolMappingMsg {
         hd: RecordHeader::new::<SymbolMappingMsg>(
             rtype::SYMBOL_MAPPING,
@@ -106,8 +120,8 @@ pub fn symbol_mapping_msg(instrument_id: u32, raw_symbol: &str) -> SymbolMapping
             instrument_id,
             1_000_000_000,
         ),
-        stype_in: dbn::SType::InstrumentId as u8,
-        stype_in_symbol: str_to_cchar_array::<SYMBOL_CSTR_LEN>(&instrument_id.to_string()),
+        stype_in: stype_in as u8,
+        stype_in_symbol: str_to_cchar_array::<SYMBOL_CSTR_LEN>(stype_in_symbol),
         stype_out: dbn::SType::RawSymbol as u8,
         stype_out_symbol: str_to_cchar_array::<SYMBOL_CSTR_LEN>(raw_symbol),
         start_ts: 1_000_000_000,
@@ -115,7 +129,7 @@ pub fn symbol_mapping_msg(instrument_id: u32, raw_symbol: &str) -> SymbolMapping
     }
 }
 
-pub fn trade_msg(instrument_id: u32, price: i64, size: u32) -> TradeMsg {
+pub(crate) fn trade_msg(instrument_id: u32, price: i64, size: u32) -> TradeMsg {
     TradeMsg {
         hd: RecordHeader::new::<TradeMsg>(rtype::MBP_0, PUBLISHER_ID, instrument_id, 1_000_000_000),
         price,
@@ -130,7 +144,7 @@ pub fn trade_msg(instrument_id: u32, price: i64, size: u32) -> TradeMsg {
     }
 }
 
-pub fn mbp1_msg(instrument_id: u32, bid_px: i64, ask_px: i64, action: u8) -> Mbp1Msg {
+pub(crate) fn mbp1_msg(instrument_id: u32, bid_px: i64, ask_px: i64, action: u8) -> Mbp1Msg {
     Mbp1Msg {
         hd: RecordHeader::new::<Mbp1Msg>(rtype::MBP_1, PUBLISHER_ID, instrument_id, 1_000_000_000),
         price: bid_px,
@@ -153,7 +167,7 @@ pub fn mbp1_msg(instrument_id: u32, bid_px: i64, ask_px: i64, action: u8) -> Mbp
     }
 }
 
-pub fn mbp10_msg(instrument_id: u32) -> Mbp10Msg {
+pub(crate) fn mbp10_msg(instrument_id: u32) -> Mbp10Msg {
     let levels = std::array::from_fn::<BidAskPair, 10, _>(|i| {
         let offset = (i as i64) * 1_000_000_000;
         BidAskPair {
@@ -186,11 +200,11 @@ pub fn mbp10_msg(instrument_id: u32) -> Mbp10Msg {
     }
 }
 
-pub fn mbo_msg(instrument_id: u32, action: u8, side: u8, flags: u8, price: i64) -> MboMsg {
+pub(crate) fn mbo_msg(instrument_id: u32, action: u8, side: u8, flags: u8, price: i64) -> MboMsg {
     mbo_msg_with_ts(instrument_id, action, side, flags, price, 1_000_000_000)
 }
 
-pub fn mbo_msg_with_ts(
+pub(crate) fn mbo_msg_with_ts(
     instrument_id: u32,
     action: u8,
     side: u8,
@@ -213,7 +227,7 @@ pub fn mbo_msg_with_ts(
     }
 }
 
-pub fn ohlcv_msg(instrument_id: u32) -> OhlcvMsg {
+pub(crate) fn ohlcv_msg(instrument_id: u32) -> OhlcvMsg {
     OhlcvMsg {
         hd: RecordHeader::new::<OhlcvMsg>(
             rtype::OHLCV_1S,
@@ -229,7 +243,7 @@ pub fn ohlcv_msg(instrument_id: u32) -> OhlcvMsg {
     }
 }
 
-pub fn status_msg(instrument_id: u32) -> StatusMsg {
+pub(crate) fn status_msg(instrument_id: u32) -> StatusMsg {
     StatusMsg {
         hd: RecordHeader::new::<StatusMsg>(
             rtype::STATUS,
@@ -252,7 +266,7 @@ pub fn status_msg(instrument_id: u32) -> StatusMsg {
     clippy::field_reassign_with_default,
     reason = "conditional fields (options) prevent struct init syntax"
 )]
-pub fn instrument_def_msg(instrument_id: u32, instrument_class: u8) -> InstrumentDefMsg {
+pub(crate) fn instrument_def_msg(instrument_id: u32, instrument_class: u8) -> InstrumentDefMsg {
     let mut msg = InstrumentDefMsg::default();
     msg.hd = RecordHeader::new::<InstrumentDefMsg>(
         rtype::INSTRUMENT_DEF,
@@ -291,7 +305,7 @@ pub fn instrument_def_msg(instrument_id: u32, instrument_class: u8) -> Instrumen
     msg
 }
 
-pub fn imbalance_msg(instrument_id: u32) -> ImbalanceMsg {
+pub(crate) fn imbalance_msg(instrument_id: u32) -> ImbalanceMsg {
     ImbalanceMsg {
         hd: RecordHeader::new::<ImbalanceMsg>(
             rtype::IMBALANCE,
@@ -310,7 +324,7 @@ pub fn imbalance_msg(instrument_id: u32) -> ImbalanceMsg {
     }
 }
 
-pub fn statistics_msg(instrument_id: u32) -> StatMsg {
+pub(crate) fn statistics_msg(instrument_id: u32) -> StatMsg {
     StatMsg {
         hd: RecordHeader::new::<StatMsg>(
             rtype::STATISTICS,
@@ -327,7 +341,7 @@ pub fn statistics_msg(instrument_id: u32) -> StatMsg {
     }
 }
 
-pub fn error_msg(message: &str) -> ErrorMsg {
+pub(crate) fn error_msg(message: &str) -> ErrorMsg {
     let mut err = [0 as c_char; 302];
 
     for (i, byte) in message.bytes().enumerate() {
@@ -344,7 +358,7 @@ pub fn error_msg(message: &str) -> ErrorMsg {
     }
 }
 
-pub fn system_msg(message: &str, code: u8) -> SystemMsg {
+pub(crate) fn system_msg(message: &str, code: u8) -> SystemMsg {
     let mut msg_bytes = [0 as c_char; 303];
 
     for (i, byte) in message.bytes().enumerate() {

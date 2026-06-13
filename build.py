@@ -49,12 +49,17 @@ DRY_RUN = bool(os.getenv("DRY_RUN", ""))
 
 # Precision mode configuration
 # https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode
-HIGH_PRECISION = os.getenv("HIGH_PRECISION", "true").lower() == "true"
+_HIGH_PRECISION = os.getenv("HIGH_PRECISION")
+if _HIGH_PRECISION is None or _HIGH_PRECISION.strip() == "":
+    HIGH_PRECISION = True
+else:
+    HIGH_PRECISION = _HIGH_PRECISION.strip().lower() in ("true", "1")
 if IS_WINDOWS and HIGH_PRECISION:
     print(
         "Warning: high-precision mode not supported on Windows (128-bit integers unavailable)\nForcing standard-precision (64-bit) mode",
     )
     HIGH_PRECISION = False
+os.environ["HIGH_PRECISION"] = "true" if HIGH_PRECISION else "false"
 
 if PROFILE_MODE:
     # For subsequent debugging, the C source needs to be in the same tree as
@@ -122,6 +127,8 @@ CARGO_BUILD_TARGET = os.environ.get("CARGO_BUILD_TARGET", "")
 # Determine the profile directory name
 if BUILD_MODE == "release":
     profile_dir = "release"
+elif BUILD_MODE == "ci-pr":
+    profile_dir = "ci-pr-wheel"
 elif BUILD_MODE == "debug-pyo3":
     profile_dir = "debug-pyo3"
 else:
@@ -187,6 +194,8 @@ def _build_rust_libs() -> None:
             if IS_LINUX:
                 existing_rustflags = os.environ.get("RUSTFLAGS", "")
                 os.environ["RUSTFLAGS"] = f"{existing_rustflags} -C link-arg=-s"
+        elif BUILD_MODE == "ci-pr":
+            build_options = ["--profile", "ci-pr-wheel"]
         elif BUILD_MODE == "debug-pyo3":
             build_options = ["--profile", "debug-pyo3"]
         else:
@@ -542,6 +551,36 @@ def show_rustanalyzer_settings() -> None:
     print(json.dumps(settings, indent=2))
 
 
+def _ensure_local_editable_pth() -> None:
+    # Make the v1 source tree (with its built `.so` files) importable from any cwd
+    # after `make build`, without requiring a follow-up `uv sync`. This closes the
+    # gap where a bare `make build` leaves the venv unable to resolve `nautilus_trader`
+    # from a tempdir (e.g. the docs tutorial subprocess tests).
+    if not COPY_TO_SOURCE:
+        return
+    if sys.prefix == sys.base_prefix:
+        return  # Not running inside a venv (e.g. PEP 517 build host)
+
+    site_packages = Path(sysconfig.get_paths()["purelib"])
+    try:
+        site_packages.relative_to(Path(sys.prefix))
+    except ValueError:
+        return  # `purelib` is outside the active venv prefix
+
+    if not site_packages.is_dir():
+        return
+
+    repo_root = Path(__file__).resolve().parent
+    pth_file = site_packages / "nautilus-trader-local.pth"
+    contents = f"{repo_root}\n"
+
+    if pth_file.is_file() and pth_file.read_text() == contents:
+        return
+
+    pth_file.write_text(contents)
+    print(f"Wrote local editable .pth: {pth_file}")
+
+
 def build() -> None:
     """
     Construct the extensions and distribution.
@@ -573,6 +612,8 @@ def build() -> None:
     if (BUILD_MODE == "release" or FORCE_STRIP) and (IS_LINUX or IS_MACOS):
         # Strip symbols for release builds or when forced
         _strip_unneeded_symbols()
+
+    _ensure_local_editable_pth()
 
 
 def print_env_var_if_exists(key: str) -> None:

@@ -15,12 +15,18 @@
 
 use std::{sync::LazyLock, time::Duration};
 
-use nautilus_model::identifiers::Venue;
+use nautilus_model::identifiers::{ClientId, Venue};
 use ustr::Ustr;
 
+/// Venue identifier string.
 pub const COINBASE: &str = "COINBASE";
 
+/// Static venue instance.
 pub static COINBASE_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(COINBASE)));
+
+/// Static client ID instance.
+pub static COINBASE_CLIENT_ID: LazyLock<ClientId> =
+    LazyLock::new(|| ClientId::new(Ustr::from(COINBASE)));
 
 pub const REST_URL: &str = "https://api.coinbase.com";
 pub const REST_API_PATH: &str = "/api/v3/brokerage";
@@ -55,6 +61,18 @@ pub const ACCOUNTS_PAGE_LIMIT: &str = "250";
 /// `order_status` filter value for Coinbase's `/orders/historical/batch`
 /// endpoint; selects orders the venue considers `OPEN`.
 pub const ORDER_STATUS_OPEN: &str = "OPEN";
+
+// Query parameter keys shared across multiple paginated REST endpoints,
+// where the fills endpoint substitutes `*_SEQUENCE_TIMESTAMP` for `*_DATE`.
+pub const QUERY_KEY_LIMIT: &str = "limit";
+pub const QUERY_KEY_CURSOR: &str = "cursor";
+pub const QUERY_KEY_PRODUCT_IDS: &str = "product_ids";
+pub const QUERY_KEY_ORDER_IDS: &str = "order_ids";
+pub const QUERY_KEY_ORDER_STATUS: &str = "order_status";
+pub const QUERY_KEY_START_DATE: &str = "start_date";
+pub const QUERY_KEY_END_DATE: &str = "end_date";
+pub const QUERY_KEY_START_SEQUENCE_TIMESTAMP: &str = "start_sequence_timestamp";
+pub const QUERY_KEY_END_SEQUENCE_TIMESTAMP: &str = "end_sequence_timestamp";
 
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 

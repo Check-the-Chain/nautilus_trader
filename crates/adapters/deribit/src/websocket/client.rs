@@ -85,7 +85,7 @@ const AUTHENTICATION_TIMEOUT_SECS: u64 = 30;
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.deribit")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deribit")
 )]
 pub struct DeribitWebSocketClient {
     url: String,
@@ -268,22 +268,26 @@ impl DeribitWebSocketClient {
 
     /// Creates an authenticated client with credentials.
     ///
-    /// Uses environment variables to load credentials:
+    /// Resolves each credential from the provided argument first, falling back
+    /// to the environment variable for the given `environment`:
     /// - Testnet: `DERIBIT_TESTNET_API_KEY` and `DERIBIT_TESTNET_API_SECRET`
     /// - Mainnet: `DERIBIT_API_KEY` and `DERIBIT_API_SECRET`
     ///
     /// # Errors
     ///
-    /// Returns an error if credentials are not found in environment variables.
+    /// Returns an error if neither the argument nor the environment variable
+    /// provides a credential.
     pub fn with_credentials(
         environment: DeribitEnvironment,
+        api_key: Option<String>,
+        api_secret: Option<String>,
         proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
         let (key_env, secret_env) = credential_env_vars(environment);
 
-        let api_key = get_or_env_var_opt(None, key_env)
+        let api_key = get_or_env_var_opt(api_key, key_env)
             .ok_or_else(|| anyhow::anyhow!("Missing environment variable: {key_env}"))?;
-        let api_secret = get_or_env_var_opt(None, secret_env)
+        let api_secret = get_or_env_var_opt(api_secret, secret_env)
             .ok_or_else(|| anyhow::anyhow!("Missing environment variable: {secret_env}"))?;
 
         Self::new(
@@ -1254,6 +1258,28 @@ impl DeribitWebSocketClient {
         currency: &str,
     ) -> DeribitWsResult<()> {
         let channel = DeribitWsChannel::format_instrument_state_channel(kind, currency);
+        self.send_unsubscribe(vec![channel]).await
+    }
+
+    /// Subscribes to volatility index updates for the given index name.
+    ///
+    /// Channel format: `deribit_volatility_index.{index_name}`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if subscription fails.
+    pub async fn subscribe_volatility_index(&self, index_name: &str) -> DeribitWsResult<()> {
+        let channel = DeribitWsChannel::VolatilityIndex.format_channel(index_name, None);
+        self.send_subscribe(vec![channel]).await
+    }
+
+    /// Unsubscribes from volatility index updates for the given index name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unsubscription fails.
+    pub async fn unsubscribe_volatility_index(&self, index_name: &str) -> DeribitWsResult<()> {
+        let channel = DeribitWsChannel::VolatilityIndex.format_channel(index_name, None);
         self.send_unsubscribe(vec![channel]).await
     }
 

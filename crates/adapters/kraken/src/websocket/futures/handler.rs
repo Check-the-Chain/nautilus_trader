@@ -38,6 +38,7 @@ use super::messages::{
     KrakenFuturesOpenOrdersDelta, KrakenFuturesTickerData, KrakenFuturesTradeData,
     KrakenFuturesWsMessage, classify_futures_message,
 };
+use crate::common::consts::KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION;
 
 /// Commands sent from the outer client to the inner message handler.
 #[derive(Debug)]
@@ -109,8 +110,14 @@ impl FuturesFeedHandler {
                             return None;
                         }
                         FuturesHandlerCommand::Subscribe { payload }
-                        | FuturesHandlerCommand::Unsubscribe { payload }
-                        | FuturesHandlerCommand::RequestChallenge { payload } => {
+                        | FuturesHandlerCommand::Unsubscribe { payload } => {
+                            if let Some(ref client) = self.inner
+                                && let Err(e) = client.send_text(payload, Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice())).await
+                            {
+                                log::error!("Failed to send text: {e}");
+                            }
+                        }
+                        FuturesHandlerCommand::RequestChallenge { payload } => {
                             if let Some(ref client) = self.inner
                                 && let Err(e) = client.send_text(payload, None).await
                             {
@@ -250,7 +257,7 @@ impl FuturesFeedHandler {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown error");
-                log::error!("Kraken Futures WebSocket error: {message}");
+                log::warn!("Kraken Futures WebSocket error: {message}");
             }
             KrakenFuturesMessageType::Alert => {
                 let message = value

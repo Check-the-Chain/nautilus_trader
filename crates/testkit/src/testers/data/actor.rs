@@ -54,6 +54,10 @@ pub struct DataTester {
 nautilus_actor!(DataTester);
 
 impl DataActor for DataTester {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup subscribes to each configured data scenario explicitly"
+    )]
     fn on_start(&mut self) -> anyhow::Result<()> {
         let instrument_ids = self.config.instrument_ids.clone();
         let client_id = self.config.client_id;
@@ -159,10 +163,21 @@ impl DataActor for DataTester {
                 self.subscribe_option_greeks(instrument_id, client_id, subscribe_params.clone());
             }
 
-            // TODO: Implement historical data requests
-            // if self.config.request_quotes {
-            //     self.request_quote_ticks(...);
-            // }
+            // Request historical quotes (default to last 1 hour)
+            if self.config.request_quotes {
+                let start = self.clock().utc_now() - ChronoDuration::hours(1);
+
+                if let Err(e) = self.request_quotes(
+                    instrument_id,
+                    Some(start),
+                    None,
+                    None,
+                    client_id,
+                    request_params.clone(),
+                ) {
+                    log::error!("Failed to request quotes for {instrument_id}: {e}");
+                }
+            }
 
             // Request order book snapshot if configured
             if self.config.request_book_snapshot {
@@ -462,6 +477,29 @@ impl DataActor for DataTester {
                 log_info!(
                     "  ... and {} more trades",
                     trades.len() - 5,
+                    color = LogColor::Cyan
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn on_historical_quotes(&mut self, quotes: &[QuoteTick]) -> anyhow::Result<()> {
+        if self.config.log_data {
+            log_info!(
+                "Received {} historical quotes",
+                quotes.len(),
+                color = LogColor::Cyan
+            );
+
+            for quote in quotes.iter().take(5) {
+                log_info!("  {quote:?}", color = LogColor::Cyan);
+            }
+
+            if quotes.len() > 5 {
+                log_info!(
+                    "  ... and {} more quotes",
+                    quotes.len() - 5,
                     color = LogColor::Cyan
                 );
             }

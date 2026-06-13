@@ -13,45 +13,63 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! NautilusTrader adapter primitives for the Lighter exchange.
+//! [NautilusTrader](https://nautilustrader.io) adapter for the [Lighter](https://lighter.xyz) DEX.
+//!
+//! The `nautilus-lighter` crate provides integration with the Lighter API for trading
+//! perpetual futures and spot markets on a zk-rollup decentralized exchange.
+//!
+//! # NautilusTrader
+//!
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
+//!
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
+//!
+//! # Feature Flags
+//!
+//! This crate provides feature flags to control source code inclusion during compilation,
+//! depending on the intended use case, i.e. whether to provide Python bindings
+//! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
+//! or as part of a Rust only build.
+//!
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `extension-module`: Builds as a Python extension module.
+//!
+//! Python bindings for the Lighter adapter are intentionally scoped to configuration,
+//! enums, factory wiring, and integrator revocation. Data and execution
+//! clients are consumed directly through the Rust trait surface.
+//!
+//! [High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
+//!
+//! # Integrator attribution
+//!
+//! Submitted create and modify order transactions carry the NautilusTrader integrator account index
+//! in Lighter's `L2TxAttributes`. This helps us gauge real usage of the integration and prioritize
+//! ongoing maintenance. Maker and taker integrator fees are set to zero, so attribution adds no
+//! trading cost.
+//!
+//! Lighter requires an `ApproveIntegrator` approval before these attributes can be attached to
+//! orders. During startup, the execution client submits the required zero-fee approval for the
+//! configured L2 account. See the
+//! [Lighter integration guide](https://nautilustrader.io/docs/nightly/integrations/lighter.html#integrator-attribution)
+//! for approval and revocation details.
 
 #![warn(rustc::all)]
+#![deny(unsafe_code)]
 #![deny(nonstandard_style)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::too_many_arguments)]
+#![deny(missing_debug_implementations)]
+#![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-pub mod client;
 pub mod common;
 pub mod config;
-pub mod constants;
-pub mod custom;
 pub mod data;
-pub mod error;
 pub mod execution;
 pub mod factories;
-pub mod ffi;
 pub mod http;
-pub mod models;
-pub mod nonce;
-pub mod normalize;
-#[cfg(feature = "python")]
-pub mod python;
-pub mod rest;
-pub mod types;
+pub mod signing;
 pub mod websocket;
 
-pub use crate::{
-    config::{
-        Config, LIGHTER_MAINNET_HOST, LIGHTER_TESTNET_HOST, LighterDataClientConfig,
-        LighterExecClientConfig, lighter_http_base_url, lighter_ws_base_url,
-    },
-    custom::{LighterAccountPosition, LighterAccountPositions},
-    data::LighterDataClient,
-    execution::LighterExecutionClient,
-    factories::{
-        LighterDataClientFactory, LighterExecFactoryConfig, LighterExecutionClientFactory,
-    },
-    http::client::LighterHttpClient,
-    websocket::client::LighterWebSocketClient,
-};
+#[cfg(feature = "python")]
+pub mod python;

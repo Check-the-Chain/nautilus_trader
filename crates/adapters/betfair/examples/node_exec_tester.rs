@@ -29,17 +29,17 @@
 use std::sync::Arc;
 
 use nautilus_betfair::{
-    common::enums::RunnerStatus,
+    common::{consts::BETFAIR_CLIENT_ID, enums::RunnerStatus},
     config::{BetfairDataConfig, BetfairExecConfig},
     factories::{BetfairDataClientFactory, BetfairExecutionClientFactory},
     http::client::BetfairHttpClient,
     provider::{BetfairInstrumentProvider, NavigationFilter},
 };
 use nautilus_common::{enums::Environment, providers::InstrumentProvider};
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
     enums::TimeInForce,
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     instruments::{Instrument, InstrumentAny},
     types::{Currency, Quantity},
 };
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("BETFAIR-001");
     let node_name = "BETFAIR-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("BETFAIR");
+    let client_id = *BETFAIR_CLIENT_ID;
 
     let data_config = BetfairDataConfig {
         account_currency: account_currency.clone(),
@@ -90,9 +90,15 @@ async fn main() -> anyhow::Result<()> {
 
     let data_factory = BetfairDataClientFactory::new();
     let exec_factory = BetfairExecutionClientFactory::new();
+    let exec_engine_config = LiveExecEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)

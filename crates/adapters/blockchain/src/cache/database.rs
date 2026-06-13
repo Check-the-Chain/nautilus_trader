@@ -32,13 +32,16 @@ use nautilus_model::{
     identifiers::InstrumentId,
 };
 use rust_decimal::Decimal;
-use sqlx::{PgPool, Row, postgres::PgConnectOptions};
+use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgConnectOptions};
 
 use crate::{
     cache::{
         consistency::CachedBlocksConsistencyStatus,
         copy::PostgresCopyHandler,
-        rows::{BlockTimestampRow, PoolRow, TokenRow, transform_row_to_dex_pool_data},
+        rows::{
+            BlockTimestampRow, PoolRow, TokenRow, parse_cached_block_timestamp,
+            transform_row_to_dex_pool_data,
+        },
         types::{U128Pg, U256Pg},
     },
     events::initialize::InitializeEvent,
@@ -58,14 +61,24 @@ impl BlockchainCacheDatabase {
     ///
     /// Panics if unable to connect to PostgreSQL with the provided options.
     pub async fn init(pg_options: PgConnectOptions) -> Self {
+        Self::connect(pg_options)
+            .await
+            .expect("Error connecting to Postgres")
+    }
+
+    /// Establishes a connection to PostgreSQL and returns a new database instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a connection cannot be established with the provided options.
+    pub async fn connect(pg_options: PgConnectOptions) -> anyhow::Result<Self> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(32) // Increased from default 10
             .min_connections(5) // Keep some connections warm
             .acquire_timeout(std::time::Duration::from_secs(3))
             .connect_with(pg_options)
-            .await
-            .expect("Error connecting to Postgres");
-        Self { pool }
+            .await?;
+        Ok(Self { pool })
     }
 
     /// Seeds the database with a blockchain chain record.
@@ -299,6 +312,50 @@ impl BlockchainCacheDatabase {
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to batch insert into block table: {e}"))
+    }
+
+    /// Inserts block timestamps observed while streaming pool events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub async fn add_pool_event_blocks_batch(
+        &self,
+        chain_id: u32,
+        blocks: &[Block],
+    ) -> anyhow::Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let mut numbers: Vec<i64> = Vec::with_capacity(blocks.len());
+        let mut timestamps: Vec<String> = Vec::with_capacity(blocks.len());
+
+        for block in blocks {
+            numbers.push(block.number as i64);
+            timestamps.push(block.timestamp.to_string());
+        }
+
+        sqlx::query(
+            "
+            INSERT INTO pool_event_block (
+                chain_id, number, timestamp
+            )
+            SELECT
+                $1, *
+            FROM UNNEST(
+                $2::int8[], $3::text[]
+            )
+            ON CONFLICT (chain_id, number) DO NOTHING
+           ",
+        )
+        .bind(chain_id as i32)
+        .bind(&numbers[..])
+        .bind(&timestamps[..])
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_event_block table: {e}"))
     }
 
     /// Inserts blocks using PostgreSQL COPY BINARY for maximum performance.
@@ -1211,7 +1268,7 @@ impl BlockchainCacheDatabase {
         let query = format!(
             "SELECT MAX(block) FROM {table_name} WHERE chain_id = $1 AND pool_identifier = $2"
         );
-        let result = sqlx::query_as::<_, (Option<i64>,)>(query.as_str())
+        let result = sqlx::query_as::<_, (Option<i64>,)>(AssertSqlSafe(query))
             .bind(chain_id as i32)
             .bind(pool_identifier.as_ref())
             .fetch_optional(&self.pool)
@@ -1677,6 +1734,27 @@ impl BlockchainCacheDatabase {
         chain_id: u32,
         pool_identifier: &PoolIdentifier,
     ) -> anyhow::Result<Option<PoolSnapshot>> {
+        self.load_latest_pool_snapshot(chain_id, pool_identifier, None, true)
+            .await
+    }
+
+    /// Loads the latest pool snapshot from the database, optionally bounded by block.
+    ///
+    /// When `max_block` is `Some`, only snapshots at or before that block are considered, so a
+    /// backtest can restore pool state as of a replay start. When `require_valid` is `true`, only
+    /// snapshots validated against on-chain state are considered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub async fn load_latest_pool_snapshot(
+        &self,
+        chain_id: u32,
+        pool_identifier: &PoolIdentifier,
+        max_block: Option<u64>,
+        require_valid: bool,
+    ) -> anyhow::Result<Option<PoolSnapshot>> {
+        let allow_invalid = !require_valid;
         let result = sqlx::query(
             "
             SELECT
@@ -1688,15 +1766,23 @@ impl BlockchainCacheDatabase {
                 total_amount0_collected::TEXT, total_amount1_collected::TEXT,
                 total_swaps, total_mints, total_burns, total_fee_collects, total_flashes,
                 liquidity_utilization_rate,
-                (SELECT dex_name FROM pool WHERE chain_id = $1 AND address = $2) as dex_name
+                (SELECT dex_name FROM pool WHERE chain_id = $1 AND address = $2) as dex_name,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_snapshot.chain_id AND block.number = pool_snapshot.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_snapshot.chain_id AND pool_event_block.number = pool_snapshot.block)
+                ) as block_timestamp
             FROM pool_snapshot
-            WHERE chain_id = $1 AND pool_identifier = $2 AND is_valid = TRUE
+            WHERE chain_id = $1 AND pool_identifier = $2
+                AND ($3::BIGINT IS NULL OR block <= $3)
+                AND ($4 OR is_valid = TRUE)
             ORDER BY block DESC, transaction_index DESC, log_index DESC
             LIMIT 1
             ",
         )
         .bind(chain_id as i32)
         .bind(pool_identifier.as_ref())
+        .bind(max_block.map(|b| b as i64))
+        .bind(allow_invalid)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to load latest valid pool snapshot: {e}"))?;
@@ -1707,6 +1793,8 @@ impl BlockchainCacheDatabase {
             let transaction_index: i32 = row.get("transaction_index");
             let log_index: i32 = row.get("log_index");
             let transaction_hash: String = row.get("transaction_hash");
+            let block_timestamp = row.get::<String, _>("block_timestamp");
+            let timestamp = parse_cached_block_timestamp(&block_timestamp)?;
 
             let block_position = BlockPosition::new(
                 block as u64,
@@ -1782,6 +1870,8 @@ impl BlockchainCacheDatabase {
                 ticks,
                 analytics,
                 block_position,
+                timestamp, // ts_event
+                timestamp, // ts_init (same block timestamp)
             )))
         } else {
             Ok(None)
@@ -1950,7 +2040,8 @@ impl BlockchainCacheDatabase {
     /// Streams pool events from all event tables (swap, liquidity, collect) for a specific pool.
     ///
     /// Creates a unified stream of pool events from multiple tables, ordering them chronologically
-    /// by block number, transaction index, and log index. Optionally resumes from a specific block position.
+    /// by block number, transaction index, and log index. Optionally resumes from a specific
+    /// block position and stops at a maximum block.
     ///
     /// # Returns
     ///
@@ -1966,8 +2057,8 @@ impl BlockchainCacheDatabase {
         instrument_id: InstrumentId,
         pool_identifier: PoolIdentifier,
         from_position: Option<BlockPosition>,
+        to_block: Option<u64>,
     ) -> Pin<Box<dyn Stream<Item = Result<DexPoolData, anyhow::Error>> + Send + 'a>> {
-        // Query without position filter (streams all events)
         const QUERY_ALL: &str = "
             (SELECT
                 'swap' as event_type,
@@ -1977,6 +2068,10 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_swap_event.chain_id AND block.number = pool_swap_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_swap_event.chain_id AND pool_event_block.number = pool_swap_event.block)
+                ) as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -1996,7 +2091,8 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_paid0,
                 NULL::TEXT as flash_paid1
             FROM pool_swap_event
-            WHERE chain_id = $1 AND pool_identifier = $2)
+            WHERE chain_id = $1 AND pool_identifier = $2
+            AND ($3::BIGINT IS NULL OR block <= $3))
             UNION ALL
             (SELECT
                 'liquidity' as event_type,
@@ -2006,6 +2102,10 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_liquidity_event.chain_id AND block.number = pool_liquidity_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_liquidity_event.chain_id AND pool_event_block.number = pool_liquidity_event.block)
+                ) as block_timestamp,
                 sender,
                 NULL::TEXT as recipient,
                 owner,
@@ -2025,7 +2125,8 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_paid0,
                 NULL::TEXT as flash_paid1
             FROM pool_liquidity_event
-            WHERE chain_id = $1 AND pool_identifier = $2)
+            WHERE chain_id = $1 AND pool_identifier = $2
+            AND ($3::BIGINT IS NULL OR block <= $3))
             UNION ALL
             (SELECT
                 'collect' as event_type,
@@ -2035,6 +2136,10 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_collect_event.chain_id AND block.number = pool_collect_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_collect_event.chain_id AND pool_event_block.number = pool_collect_event.block)
+                ) as block_timestamp,
                 NULL::TEXT as sender,
                 NULL::TEXT as recipient,
                 owner,
@@ -2054,7 +2159,8 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_paid0,
                 NULL::TEXT as flash_paid1
             FROM pool_collect_event
-            WHERE chain_id = $1 AND pool_identifier = $2)
+            WHERE chain_id = $1 AND pool_identifier = $2
+            AND ($3::BIGINT IS NULL OR block <= $3))
             UNION ALL
             (SELECT
                 'flash' as event_type,
@@ -2064,6 +2170,10 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_flash_event.chain_id AND block.number = pool_flash_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_flash_event.chain_id AND pool_event_block.number = pool_flash_event.block)
+                ) as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -2083,10 +2193,10 @@ impl BlockchainCacheDatabase {
                 paid0::TEXT as flash_paid0,
                 paid1::TEXT as flash_paid1
             FROM pool_flash_event
-            WHERE chain_id = $1 AND pool_identifier = $2)
+            WHERE chain_id = $1 AND pool_identifier = $2
+            AND ($3::BIGINT IS NULL OR block <= $3))
             ORDER BY block, transaction_index, log_index";
 
-        // Query with position filter (resumes from specific block position)
         const QUERY_FROM_POSITION: &str = "
             (SELECT
                 'swap' as event_type,
@@ -2096,6 +2206,10 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_swap_event.chain_id AND block.number = pool_swap_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_swap_event.chain_id AND pool_event_block.number = pool_swap_event.block)
+                ) as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -2116,7 +2230,8 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_paid1
             FROM pool_swap_event
             WHERE chain_id = $1 AND pool_identifier = $2
-            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5)))
+            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
+            AND ($6::BIGINT IS NULL OR block <= $6))
             UNION ALL
             (SELECT
                 'liquidity' as event_type,
@@ -2126,6 +2241,10 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_liquidity_event.chain_id AND block.number = pool_liquidity_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_liquidity_event.chain_id AND pool_event_block.number = pool_liquidity_event.block)
+                ) as block_timestamp,
                 sender,
                 NULL::TEXT as recipient,
                 owner,
@@ -2146,7 +2265,8 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_paid1
             FROM pool_liquidity_event
             WHERE chain_id = $1 AND pool_identifier = $2
-            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5)))
+            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
+            AND ($6::BIGINT IS NULL OR block <= $6))
             UNION ALL
             (SELECT
                 'collect' as event_type,
@@ -2156,6 +2276,10 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_collect_event.chain_id AND block.number = pool_collect_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_collect_event.chain_id AND pool_event_block.number = pool_collect_event.block)
+                ) as block_timestamp,
                 NULL::TEXT as sender,
                 NULL::TEXT as recipient,
                 owner,
@@ -2176,7 +2300,8 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_paid1
             FROM pool_collect_event
             WHERE chain_id = $1 AND pool_identifier = $2
-            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5)))
+            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
+            AND ($6::BIGINT IS NULL OR block <= $6))
             UNION ALL
             (SELECT
                 'flash' as event_type,
@@ -2186,6 +2311,10 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_flash_event.chain_id AND block.number = pool_flash_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_flash_event.chain_id AND pool_event_block.number = pool_flash_event.block)
+                ) as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -2206,7 +2335,8 @@ impl BlockchainCacheDatabase {
                 paid1::TEXT as flash_paid1
             FROM pool_flash_event
             WHERE chain_id = $1 AND pool_identifier = $2
-            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5)))
+            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
+            AND ($6::BIGINT IS NULL OR block <= $6))
             ORDER BY block, transaction_index, log_index";
 
         // Build query with appropriate bindings
@@ -2217,11 +2347,13 @@ impl BlockchainCacheDatabase {
                 .bind(pos.number as i64)
                 .bind(pos.transaction_index as i32)
                 .bind(pos.log_index as i32)
+                .bind(to_block.map(|block| block as i64))
                 .fetch(&self.pool)
         } else {
             sqlx::query(QUERY_ALL)
                 .bind(chain.chain_id as i32)
                 .bind(pool_identifier.to_string())
+                .bind(to_block.map(|block| block as i64))
                 .fetch(&self.pool)
         };
 
@@ -2235,5 +2367,28 @@ impl BlockchainCacheDatabase {
         });
 
         Box::pin(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::postgres::PgConnectOptions;
+
+    use super::BlockchainCacheDatabase;
+
+    #[tokio::test]
+    async fn connect_returns_err_for_unreachable_database() {
+        // `connect` backs the Python `load_pool_snapshot` binding, so a connection
+        // failure must surface as `Err` rather than panicking across the API boundary.
+        let options = PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(1)
+            .username("nautilus")
+            .password("pass")
+            .database("nautilus");
+
+        let result = BlockchainCacheDatabase::connect(options).await;
+
+        assert!(result.is_err());
     }
 }

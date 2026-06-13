@@ -34,7 +34,10 @@ use rust_decimal::Decimal;
 use time::{PrimitiveDateTime, macros::format_description};
 
 use crate::{
-    common::parse::is_spread_instrument_id,
+    common::{
+        enums::{IbAction, IbOrderStatus, IbOrderType, IbTimeInForce},
+        parse::is_spread_instrument_id,
+    },
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
 
@@ -45,19 +48,27 @@ pub(crate) fn should_use_avg_fill_price(avg_fill_price: f64, instrument_id: &Ins
         && (avg_fill_price > 0.0 || is_spread_instrument_id(instrument_id))
 }
 
+pub(crate) fn ib_venue_order_id(order_id: i32, perm_id: i64) -> VenueOrderId {
+    if order_id != 0 {
+        VenueOrderId::new(order_id.to_string())
+    } else {
+        VenueOrderId::new(format!("PERM-{perm_id}"))
+    }
+}
+
+pub(crate) fn normalized_order_ref(order_ref: &str) -> Option<&str> {
+    if order_ref.is_empty() {
+        return None;
+    }
+
+    Some(
+        order_ref
+            .rsplit_once(':')
+            .map_or(order_ref, |(base, _)| base),
+    )
+}
+
 /// Parse an IB execution to a Nautilus FillReport.
-///
-/// # Arguments
-///
-/// * `execution` - The IB execution
-/// * `contract` - The IB contract
-/// * `commission` - Commission amount
-/// * `commission_currency` - Commission currency
-/// * `instrument_id` - The instrument ID
-/// * `account_id` - The account ID
-/// * `instrument_provider` - Instrument provider for price conversion
-/// * `ts_init` - Initial timestamp
-/// * `avg_px` - Optional average fill price (from order status tracking)
 ///
 /// # Errors
 ///
@@ -86,11 +97,7 @@ pub fn parse_execution_to_fill_report(
     let execution_price = execution.price * price_magnifier;
 
     // Determine order side
-    let order_side = match execution.side.as_str() {
-        "BUY" | "BOT" => OrderSide::Buy,
-        "SELL" | "SLD" => OrderSide::Sell,
-        _ => anyhow::bail!("Unknown order side: {}", execution.side),
-    };
+    let order_side = IbAction::from_str(execution.side.as_str())?.order_side();
 
     // Get instrument for precision
     let instrument = instrument_provider
@@ -101,8 +108,9 @@ pub fn parse_execution_to_fill_report(
     let last_qty = Quantity::new(execution.shares, instrument.size_precision());
     let last_px = Price::new(execution_price, instrument.price_precision());
 
-    // Create commission
-    let commission_money = Money::new(commission, Currency::from_str(commission_currency)?);
+    // Create commission — clamp IB's -1 pending sentinel to 0.0 to avoid invalid Money values
+    let commission_clamped = if commission < 0.0 { 0.0 } else { commission };
+    let commission_money = Money::new(commission_clamped, Currency::from_str(commission_currency)?);
 
     // Parse execution time
     let ts_event = parse_execution_time(&execution.time)?;
@@ -110,15 +118,9 @@ pub fn parse_execution_to_fill_report(
     // Create trade ID
     let trade_id = TradeId::new(&execution.execution_id);
 
-    // Create venue order ID
-    let venue_order_id = VenueOrderId::new(execution.order_id.to_string());
+    let venue_order_id = ib_venue_order_id(execution.order_id, execution.perm_id);
 
-    // Parse client order ID from order reference
-    let client_order_id = if !execution.order_reference.is_empty() {
-        Some(ClientOrderId::new(&execution.order_reference))
-    } else {
-        None
-    };
+    let client_order_id = normalized_order_ref(&execution.order_reference).map(ClientOrderId::new);
 
     let mut report = FillReport::new(
         account_id,
@@ -143,15 +145,6 @@ pub fn parse_execution_to_fill_report(
 
 /// Parse an IB order status to a Nautilus OrderStatusReport.
 ///
-/// # Arguments
-///
-/// * `order_status` - The IB order status
-/// * `order` - The IB order (if available)
-/// * `instrument_id` - The instrument ID
-/// * `account_id` - The account ID
-/// * `instrument_provider` - Instrument provider for price conversion
-/// * `ts_init` - Initial timestamp
-///
 /// # Errors
 ///
 /// Returns an error if parsing fails.
@@ -166,18 +159,12 @@ pub fn parse_order_status_to_report(
     // Get price magnifier from instrument provider
     let price_magnifier = instrument_provider.get_price_magnifier(&instrument_id) as f64;
 
-    // Convert Nautilus order status
-    let nautilus_status = match order_status.status.as_str() {
-        "ApiPending" | "PendingSubmit" | "PreSubmitted" => NautilusOrderStatus::Submitted,
-        "Submitted" => NautilusOrderStatus::Accepted,
-        "PendingCancel" => NautilusOrderStatus::PendingCancel,
-        "ApiCancelled" | "Cancelled" => NautilusOrderStatus::Canceled,
-        "Filled" => NautilusOrderStatus::Filled,
-        "Inactive" => NautilusOrderStatus::Rejected,
+    let mut nautilus_status = match IbOrderStatus::from_str(order_status.status.as_str()) {
+        Ok(status) => status.nautilus_status(),
         _ => {
             tracing::warn!(
                 "Unknown order status: {}, defaulting to SUBMITTED",
-                order_status.status
+                order_status.status.as_str()
             );
             NautilusOrderStatus::Submitted
         }
@@ -185,12 +172,7 @@ pub fn parse_order_status_to_report(
 
     // Get order side
     let order_side = if let Some(order) = order {
-        match order.action {
-            ibapi::orders::Action::Buy => OrderSide::Buy,
-            ibapi::orders::Action::Sell => OrderSide::Sell,
-            ibapi::orders::Action::SellShort => OrderSide::Sell,
-            ibapi::orders::Action::SellLong => OrderSide::Sell,
-        }
+        IbAction::from(order.action).order_side()
     } else {
         // Default to Buy if order not available
         OrderSide::Buy
@@ -217,26 +199,26 @@ pub fn parse_order_status_to_report(
     let filled_qty = Quantity::new(order_status.filled, size_precision);
 
     // Get average price
-    let include_avg_px = should_use_avg_fill_price(order_status.average_fill_price, &instrument_id);
+    let average_fill_price = order_status.average_fill_price.unwrap_or(0.0);
+    let include_avg_px = should_use_avg_fill_price(average_fill_price, &instrument_id);
     let avg_px_value = if include_avg_px {
-        order_status.average_fill_price * price_magnifier
+        average_fill_price * price_magnifier
     } else {
         0.0
     };
 
-    // Extract venue order ID from order_status
-    let venue_order_id = VenueOrderId::new(order_status.order_id.to_string());
+    if order_status.filled > 0.0
+        && (order_status.remaining > 0.0
+            || order.is_some_and(|order| order.total_quantity > order_status.filled))
+    {
+        nautilus_status = NautilusOrderStatus::PartiallyFilled;
+    }
 
-    // Extract client order ID from order reference if available
-    let client_order_id = if let Some(order) = order {
-        if order.order_ref.is_empty() {
-            None
-        } else {
-            Some(ClientOrderId::new(&order.order_ref))
-        }
-    } else {
-        None
-    };
+    let venue_order_id = ib_venue_order_id(order_status.order_id, order_status.perm_id);
+
+    let client_order_id = order
+        .and_then(|order| normalized_order_ref(&order.order_ref))
+        .map(ClientOrderId::new);
 
     // Map order type from IB order if available
     let order_type = order
@@ -245,20 +227,11 @@ pub fn parse_order_status_to_report(
 
     // Map time in force from IB order if available
     let time_in_force = if let Some(order) = order {
-        let tif_str = order.tif.to_string();
-        match tif_str.as_str() {
-            "DAY" => TimeInForce::Day,
-            "GTC" => TimeInForce::Gtc,
-            "IOC" => TimeInForce::Ioc,
-            "FOK" => TimeInForce::Fok,
-            _ => {
-                // Try to parse GTD date
-                if tif_str.starts_with("GTD") || !order.good_till_date.is_empty() {
-                    TimeInForce::Gtd
-                } else {
-                    TimeInForce::Day // Default fallback
-                }
-            }
+        let ib_time_in_force = IbTimeInForce::from(order.tif.clone());
+        if ib_time_in_force == IbTimeInForce::GoodTilDate || !order.good_till_date.is_empty() {
+            TimeInForce::Gtd
+        } else {
+            ib_time_in_force.nautilus_time_in_force()
         }
     } else {
         TimeInForce::Day // Default when order not available
@@ -317,18 +290,7 @@ pub fn parse_order_status_to_report(
 }
 
 fn map_ib_order_type(order_type: &str) -> OrderType {
-    match order_type {
-        "MKT" | "MOC" => OrderType::Market,
-        "LMT" | "LOC" => OrderType::Limit,
-        "STP" => OrderType::StopMarket,
-        "STP LMT" => OrderType::StopLimit,
-        "TRAIL" => OrderType::TrailingStopMarket,
-        "TRAIL LIMIT" => OrderType::TrailingStopLimit,
-        "MIT" => OrderType::MarketIfTouched,
-        "LIT" => OrderType::LimitIfTouched,
-        "MTL" => OrderType::MarketToLimit,
-        _ => OrderType::Market,
-    }
+    IbOrderType::from_str(order_type).map_or(OrderType::Market, IbOrderType::nautilus_order_type)
 }
 
 fn parse_ib_order_pricing_fields(
@@ -408,10 +370,6 @@ fn decimal_from_f64(value: f64) -> anyhow::Result<Decimal> {
 /// - "20230223 00:43:36" (assumed UTC)
 /// - "20250225-15:15:00" (assumed UTC)
 ///
-/// # Arguments
-///
-/// * `time_str` - The execution time string from IB
-///
 /// # Errors
 ///
 /// Returns an error if the execution timestamp is malformed or uses a non-UTC timezone.
@@ -465,7 +423,7 @@ pub fn parse_execution_time(time_str: &str) -> anyhow::Result<UnixNanos> {
 mod tests {
     use ibapi::{
         contracts::Contract,
-        orders::{Action, Liquidity, Order},
+        orders::{Action, ExecutionSide, Liquidity, Order, OrderStatusKind},
     };
     use nautilus_model::{
         enums::TrailingOffsetType,
@@ -546,16 +504,16 @@ mod tests {
 
         let order_status = OrderStatus {
             order_id: 12345,
-            status: String::from("Submitted"),
+            status: OrderStatusKind::Submitted,
             filled: 0.0,
             remaining: 100.0,
-            average_fill_price: 0.0,
+            average_fill_price: Some(0.0),
             perm_id: 0,
             parent_id: 0,
-            last_fill_price: 0.0,
+            last_fill_price: Some(0.0),
             client_id: 0,
             why_held: String::new(),
-            market_cap_price: 0.0,
+            market_cap_price: Some(0.0),
         };
 
         let result = parse_order_status_to_report(
@@ -586,16 +544,16 @@ mod tests {
 
         let order_status = OrderStatus {
             order_id: 12345,
-            status: String::from("Filled"),
+            status: OrderStatusKind::Filled,
             filled: 100.0,
             remaining: 0.0,
-            average_fill_price: 150.25,
+            average_fill_price: Some(150.25),
             perm_id: 0,
             parent_id: 0,
-            last_fill_price: 150.25,
+            last_fill_price: Some(150.25),
             client_id: 0,
             why_held: String::new(),
-            market_cap_price: 0.0,
+            market_cap_price: Some(0.0),
         };
 
         let result = parse_order_status_to_report(
@@ -629,16 +587,16 @@ mod tests {
 
         let order_status = OrderStatus {
             order_id: 12345,
-            status: String::from("Filled"),
+            status: OrderStatusKind::Filled,
             filled: 1.0,
             remaining: 0.0,
-            average_fill_price: -2.25,
+            average_fill_price: Some(-2.25),
             perm_id: 0,
             parent_id: 0,
-            last_fill_price: -2.25,
+            last_fill_price: Some(-2.25),
             client_id: 0,
             why_held: String::new(),
-            market_cap_price: 0.0,
+            market_cap_price: Some(0.0),
         };
 
         let report = parse_order_status_to_report(
@@ -662,16 +620,16 @@ mod tests {
 
         let order_status = OrderStatus {
             order_id: 12345,
-            status: String::from("Inactive"),
+            status: OrderStatusKind::Inactive,
             filled: 0.0,
             remaining: 100.0,
-            average_fill_price: 0.0,
+            average_fill_price: Some(0.0),
             perm_id: 0,
             parent_id: 0,
-            last_fill_price: 0.0,
+            last_fill_price: Some(0.0),
             client_id: 0,
             why_held: String::new(),
-            market_cap_price: 0.0,
+            market_cap_price: Some(0.0),
         };
 
         let report = parse_order_status_to_report(
@@ -685,6 +643,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.order_status, NautilusOrderStatus::Rejected);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_to_report_partial_fill_and_perm_fallback() {
+        let instrument_provider = create_test_instrument_provider();
+        let instrument_id = create_test_instrument_id();
+        let account_id = AccountId::from("IB-001");
+
+        let order_status = OrderStatus {
+            order_id: 0,
+            status: OrderStatusKind::Submitted,
+            filled: 3.0,
+            remaining: 7.0,
+            average_fill_price: Some(150.25),
+            perm_id: 123_456,
+            parent_id: 0,
+            last_fill_price: Some(150.25),
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: Some(0.0),
+        };
+        let order = Order {
+            action: Action::Buy,
+            total_quantity: 10.0,
+            order_type: "LMT".to_string(),
+            limit_price: Some(150.25),
+            order_ref: "O-20260527-001:123".to_string(),
+            ..Default::default()
+        };
+
+        let report = parse_order_status_to_report(
+            &order_status,
+            Some(&order),
+            instrument_id,
+            account_id,
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_status, NautilusOrderStatus::PartiallyFilled);
+        assert_eq!(report.venue_order_id.to_string(), "PERM-123456");
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::from("O-20260527-001"))
+        );
+    }
+
+    #[rstest]
+    fn test_ib_venue_order_id_prefers_order_id_and_falls_back_to_perm_id() {
+        assert_eq!(ib_venue_order_id(123, 456).to_string(), "123");
+        assert_eq!(ib_venue_order_id(0, 456).to_string(), "PERM-456");
+    }
+
+    #[rstest]
+    fn test_normalized_order_ref_strips_ib_suffix() {
+        assert_eq!(normalized_order_ref("O-001:123"), Some("O-001"));
+        assert_eq!(normalized_order_ref("O-001"), Some("O-001"));
+        assert_eq!(normalized_order_ref(""), None);
     }
 
     #[rstest]
@@ -798,16 +815,16 @@ mod tests {
 
         let order_status = OrderStatus {
             order_id: 12345,
-            status: String::from("Submitted"),
+            status: OrderStatusKind::Submitted,
             filled: 0.0,
             remaining: 5.0,
-            average_fill_price: 0.0,
+            average_fill_price: Some(0.0),
             perm_id: 0,
             parent_id: 0,
-            last_fill_price: 0.0,
+            last_fill_price: Some(0.0),
             client_id: 0,
             why_held: String::new(),
-            market_cap_price: 0.0,
+            market_cap_price: Some(0.0),
         };
 
         let order = Order {
@@ -848,16 +865,16 @@ mod tests {
 
         let order_status = OrderStatus {
             order_id: 12345,
-            status: String::from("Submitted"),
+            status: OrderStatusKind::Submitted,
             filled: 0.0,
             remaining: 5.0,
-            average_fill_price: 0.0,
+            average_fill_price: Some(0.0),
             perm_id: 0,
             parent_id: 0,
-            last_fill_price: 0.0,
+            last_fill_price: Some(0.0),
             client_id: 0,
             why_held: String::new(),
-            market_cap_price: 0.0,
+            market_cap_price: Some(0.0),
         };
 
         let order = Order {
@@ -903,7 +920,7 @@ mod tests {
             time: String::from("20230223 00:43:36 Universal"),
             account_number: String::new(),
             exchange: String::new(),
-            side: String::from("BOT"),
+            side: ExecutionSide::Bought,
             shares: 100.0,
             price: 150.25,
             perm_id: 0,
@@ -962,7 +979,7 @@ mod tests {
             time: String::from("20230223 00:43:36 Universal"),
             account_number: String::new(),
             exchange: String::new(),
-            side: String::from("SLD"),
+            side: ExecutionSide::Sold,
             shares: 50.0,
             price: 151.0,
             perm_id: 0,

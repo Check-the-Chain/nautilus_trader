@@ -46,12 +46,15 @@
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod account;
 pub mod common;
 pub mod config;
 pub mod data;
+pub mod data_types;
 pub mod execution;
 pub mod factories;
 pub mod http;
+pub mod outcome_settlement;
 pub mod signing;
 pub mod websocket;
 

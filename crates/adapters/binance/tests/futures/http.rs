@@ -16,6 +16,7 @@
 //! Integration tests for the Binance Futures HTTP client using a mock server.
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         Arc,
@@ -26,7 +27,7 @@ use std::{
 
 use axum::{
     Router,
-    extract::State,
+    extract::{RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -36,7 +37,10 @@ use nautilus_binance::{
         BinanceEnvironment, BinanceFuturesOrderType, BinanceProductType, BinanceSide,
         BinanceTimeInForce,
     },
-    futures::http::{client::BinanceRawFuturesHttpClient, query::BinanceNewOrderParamsBuilder},
+    futures::http::{
+        client::BinanceRawFuturesHttpClient,
+        query::{BinanceNewOrderParamsBuilder, BinanceOpenInterestHistParams},
+    },
 };
 use rstest::rstest;
 use serde_json::json;
@@ -300,12 +304,43 @@ async fn handle_all_orders(headers: HeaderMap, State(state): State<TestServerSta
     json_response(&json!([]))
 }
 
+async fn handle_open_interest_hist(raw_query: RawQuery) -> Response {
+    let query = raw_query.0.unwrap_or_default();
+    let params: HashMap<String, String> = serde_urlencoded::from_str(&query).unwrap_or_default();
+
+    if params
+        .get("symbol")
+        .is_some_and(|symbol| symbol == "BTCUSDT")
+        && params.get("period").is_some_and(|period| period == "5m")
+    {
+        return json_response(&json!([
+            {
+                "symbol": "BTCUSDT",
+                "sumOpenInterest": "100.0",
+                "sumOpenInterestValue": "1000.0",
+                "timestamp": 1700000000000_i64
+            }
+        ]));
+    }
+
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "application/json")],
+        json!({"code": -1102, "msg": "Unexpected params"}).to_string(),
+    )
+        .into_response()
+}
+
 fn create_router(state: TestServerState) -> Router {
     Router::new()
         .route("/fapi/v1/ping", get(handle_ping))
         .route("/fapi/v1/time", get(handle_time))
         .route("/fapi/v1/exchangeInfo", get(handle_exchange_info))
         .route("/fapi/v1/depth", get(handle_depth))
+        .route(
+            "/futures/data/openInterestHist",
+            get(handle_open_interest_hist),
+        )
         .route("/fapi/v2/account", get(handle_account))
         .route("/fapi/v2/balance", get(handle_balance))
         .route("/fapi/v2/positionRisk", get(handle_position_risk))
@@ -351,7 +386,7 @@ fn create_raw_client(
     let base_url = format!("http://{addr}");
     BinanceRawFuturesHttpClient::new(
         BinanceProductType::UsdM,
-        BinanceEnvironment::Mainnet,
+        BinanceEnvironment::Live,
         api_key,
         api_secret,
         Some(base_url),
@@ -360,6 +395,22 @@ fn create_raw_client(
         None,
     )
     .unwrap()
+}
+
+#[rstest]
+fn test_raw_client_accepts_demo_environment() {
+    let result = BinanceRawFuturesHttpClient::new(
+        BinanceProductType::UsdM,
+        BinanceEnvironment::Demo,
+        None,
+        None,
+        Some("http://127.0.0.1:1".to_string()),
+        None,
+        Some(60),
+        None,
+    );
+
+    assert!(result.is_ok());
 }
 
 #[rstest]
@@ -413,6 +464,35 @@ async fn test_depth() {
 
 #[rstest]
 #[tokio::test]
+async fn test_open_interest_hist_public_path() {
+    let addr = start_test_server(TestServerState::default()).await.unwrap();
+    let client = create_raw_client(&addr, None, None);
+    let params = BinanceOpenInterestHistParams {
+        symbol: Some("BTCUSDT".to_string()),
+        pair: None,
+        contract_type: None,
+        period: "5m".to_string(),
+        start_time: None,
+        end_time: None,
+        limit: Some(1),
+    };
+
+    let result: serde_json::Value = client
+        .get(
+            "/futures/data/openInterestHist",
+            Some(&params),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result[0]["symbol"], "BTCUSDT");
+    assert_eq!(result[0]["sumOpenInterest"], "100.0");
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_account_requires_credentials() {
     let addr = start_test_server(TestServerState::default()).await.unwrap();
     let client = create_raw_client(&addr, None, None);
@@ -420,7 +500,7 @@ async fn test_account_requires_credentials() {
     let result: Result<serde_json::Value, _> = client
         .get("/fapi/v2/account", None::<&()>, true, false)
         .await;
-    assert!(result.is_err());
+    result.unwrap_err();
 }
 
 #[rstest]
@@ -631,5 +711,5 @@ async fn test_rate_limit_triggers() {
     let result: Result<serde_json::Value, _> = client
         .get("/fapi/v2/account", None::<&()>, true, false)
         .await;
-    assert!(result.is_err());
+    result.unwrap_err();
 }

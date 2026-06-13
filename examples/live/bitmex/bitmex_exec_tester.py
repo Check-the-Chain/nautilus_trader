@@ -63,6 +63,7 @@ config_node = TradingNodeConfig(
     exec_engine=LiveExecEngineConfig(
         reconciliation=True,
         reconciliation_instrument_ids=[instrument_id],  # Only reconcile this instrument
+        filter_unclaimed_external_orders=True,
         open_check_interval_secs=5.0,
         open_check_open_only=False,
         # position_check_interval_secs=60.0,
@@ -74,16 +75,14 @@ config_node = TradingNodeConfig(
     ),
     data_clients={
         BITMEX: BitmexDataClientConfig(
-            environment=BitmexEnvironment.TESTNET,
+            environment=BitmexEnvironment.TESTNET if testnet else BitmexEnvironment.MAINNET,
             instrument_provider=InstrumentProviderConfig(load_all=True),
-            testnet=testnet,
         ),
     },
     exec_clients={
         BITMEX: BitmexExecClientConfig(
-            environment=BitmexEnvironment.TESTNET,
+            environment=BitmexEnvironment.TESTNET if testnet else BitmexEnvironment.MAINNET,
             instrument_provider=InstrumentProviderConfig(load_all=True),
-            testnet=testnet,
             submitter_pool_size=1,
             canceller_pool_size=3,
         ),

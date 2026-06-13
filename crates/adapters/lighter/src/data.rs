@@ -13,14 +13,19 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::sync::{
-    Arc, Mutex as StdMutex,
-    atomic::{AtomicBool, Ordering},
+//! Live data client for the Lighter adapter.
+
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use ahash::AHashMap;
 use anyhow::Context;
-use async_trait::async_trait;
+use dashmap::{DashMap, DashSet, mapref::entry::Entry};
 use nautilus_common::{
     clients::DataClient,
     live::{runner::get_data_event_sender, runtime::get_runtime},
@@ -28,198 +33,795 @@ use nautilus_common::{
         DataEvent,
         data::{
             BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
-            InstrumentsResponse, QuotesResponse, RequestBars, RequestBookSnapshot,
+            InstrumentsResponse, RequestBars, RequestBookDepth, RequestBookSnapshot,
             RequestFundingRates, RequestInstrument, RequestInstruments, RequestQuotes,
-            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeCustomData,
-            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument, SubscribeInstruments,
-            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeCustomData, UnsubscribeFundingRates,
-            UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10,
+            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeInstrumentStatus, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
+            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
+            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
+            UnsubscribeInstrumentStatus, UnsubscribeMarkPrices, UnsubscribeQuotes,
+            UnsubscribeTrades,
         },
     },
 };
-#[cfg(feature = "latency-probe")]
-use nautilus_core::latency;
-use nautilus_core::{UnixNanos, datetime::datetime_to_unix_nanos, time::get_atomic_clock_realtime};
-use nautilus_model::{
-    data::{Data, OrderBookDeltas_API},
-    enums::BookType,
-    identifiers::{ClientId, Venue},
-    orderbook::OrderBook,
+use nautilus_core::{
+    AtomicMap, UnixNanos,
+    datetime::datetime_to_unix_nanos,
+    time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_network::websocket::SubscriptionState;
+use nautilus_model::{
+    data::{Data, InstrumentStatus, OrderBookDeltas_API, TradeTick},
+    enums::{BookType, MarketStatusAction},
+    identifiers::{ClientId, InstrumentId, Venue},
+    instruments::{Instrument, InstrumentAny},
+};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        LighterInstrumentRegistry, LighterMarketStatUpdate, bar_granularity, candles_to_bars,
-        channel_market_id, funding_rate_updates_from_history, load_instrument_registry,
-        market_stats_to_updates, order_book_delta_updates, order_book_snapshot_deltas,
-        populate_order_book, quote_tick_from_ticker, trade_tick_from_trade, venue,
+        consts::LIGHTER_VENUE,
+        credential::Credential,
+        enums::{LighterCandleResolution, LighterMarketStatus},
+        rate_limit::resolve_quota,
+        symbol::MarketRegistry,
     },
-    config::{Config, LighterDataClientConfig},
-    custom::{
-        LIGHTER_ACCOUNT_POSITIONS_TYPE, LighterAccountPositions, account_index_from_channel,
-        account_index_from_data_type, account_index_from_params, account_positions_channel,
+    config::LighterDataClientConfig,
+    http::{
+        client::{LighterHttpClient, LighterRawHttpClient},
+        parse::parse_l2_order_book_snapshot,
+        query::LighterOrderBookOrdersQuery,
     },
-    http::client::LighterHttpClient,
-    models::ws::{
-        WsAccountAllPositionsUpdate, WsMarketStatsUpdate, WsMessage, WsOrderBookMessage,
-        WsTickerUpdate, WsTradeUpdate,
+    websocket::{
+        client::LighterWebSocketClient,
+        error::LighterWsError,
+        messages::{LighterMarketSelection, LighterWsChannel, NautilusWsMessage},
     },
-    normalize::timestamp::{epoch_to_unix_nanos, message_event_time, ticker_event_time},
-    websocket::client::LighterWebSocketClient,
 };
+
+/// Maximum `limit` accepted by `GET /api/v1/orderBookOrders` (venue-imposed).
+const LIGHTER_BOOK_ORDERS_MAX_LIMIT: u16 = 250;
+const DEFAULT_BOOK_SNAPSHOT_LIMIT: u16 = LIGHTER_BOOK_ORDERS_MAX_LIMIT;
+const DEFAULT_TRADES_LIMIT: u16 = 100;
+
+/// Which slice of the Lighter `market_stats` payload a caller has subscribed to.
+///
+/// The venue streams mark price, index price, and funding rate through the same
+/// `market_stats` channel, so a single subscription can fan out to up to three
+/// Nautilus subscriptions. [`MarketStatsFlags`] tracks which ones are active.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MarketStatsKind {
+    MarkPrice,
+    IndexPrice,
+    FundingRate,
+}
+
+/// Per-instrument fan-out state for the shared `market_stats` subscription.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct MarketStatsFlags {
+    mark_price: bool,
+    index_price: bool,
+    funding_rate: bool,
+}
+
+impl MarketStatsFlags {
+    fn is_empty(self) -> bool {
+        !self.mark_price && !self.index_price && !self.funding_rate
+    }
+
+    fn contains(self, kind: MarketStatsKind) -> bool {
+        match kind {
+            MarketStatsKind::MarkPrice => self.mark_price,
+            MarketStatsKind::IndexPrice => self.index_price,
+            MarketStatsKind::FundingRate => self.funding_rate,
+        }
+    }
+
+    fn insert(&mut self, kind: MarketStatsKind) {
+        match kind {
+            MarketStatsKind::MarkPrice => self.mark_price = true,
+            MarketStatsKind::IndexPrice => self.index_price = true,
+            MarketStatsKind::FundingRate => self.funding_rate = true,
+        }
+    }
+
+    fn remove(&mut self, kind: MarketStatsKind) {
+        match kind {
+            MarketStatsKind::MarkPrice => self.mark_price = false,
+            MarketStatsKind::IndexPrice => self.index_price = false,
+            MarketStatsKind::FundingRate => self.funding_rate = false,
+        }
+    }
+}
+
+impl From<MarketStatsKind> for MarketStatsFlags {
+    fn from(kind: MarketStatsKind) -> Self {
+        let mut flags = Self::default();
+        flags.insert(kind);
+        flags
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MarketStatsSubscription {
+    channel: LighterWsChannel,
+    flags: MarketStatsFlags,
+}
 
 #[derive(Debug)]
 pub struct LighterDataClient {
+    clock: &'static AtomicTime,
     client_id: ClientId,
+    config: LighterDataClientConfig,
+    credential: Option<Credential>,
     http_client: LighterHttpClient,
     ws_client: LighterWebSocketClient,
+    registry: Arc<MarketRegistry>,
     is_connected: AtomicBool,
+    cancellation_token: CancellationToken,
+    tasks: Vec<JoinHandle<()>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    registry: Arc<tokio::sync::RwLock<LighterInstrumentRegistry>>,
-    subscription_state: SubscriptionState,
-    clock: &'static nautilus_core::time::AtomicTime,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    instrument_statuses: Arc<DashMap<InstrumentId, LighterMarketStatus>>,
+    instrument_status_subscriptions: Arc<DashSet<InstrumentId>>,
+    market_stats_subscriptions: Arc<DashMap<InstrumentId, MarketStatsSubscription>>,
 }
 
 impl LighterDataClient {
-    pub fn new(client_id: ClientId, config: &LighterDataClientConfig) -> anyhow::Result<Self> {
-        let mut runtime_config = Config::for_environment(config.environment)
-            .with_http_base_url(config.http_url())
-            .with_ws_base_url(config.ws_url());
+    /// Creates a new [`LighterDataClient`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client fails to initialize.
+    pub fn new(client_id: ClientId, config: LighterDataClientConfig) -> anyhow::Result<Self> {
+        let clock = get_atomic_clock_realtime();
+        let data_sender = get_data_event_sender();
 
-        if let Some(proxy) = &config.proxy_url {
-            runtime_config = runtime_config.with_proxy(proxy.clone());
-        }
-        runtime_config = runtime_config.with_timeout_secs(config.http_timeout_secs);
+        let credential = if config.has_credentials() {
+            // Mirror `has_credentials()`: a blank or whitespace-only `private_key`
+            // config value falls back to the env var rather than overriding it.
+            let private_key = config
+                .private_key
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            Credential::resolve(
+                private_key,
+                config.account_index,
+                config.api_key_index,
+                config.environment,
+            )
+            .context("failed to resolve Lighter data credentials")?
+        } else {
+            None
+        };
 
-        let http_client = LighterHttpClient::new_public(runtime_config)?;
-        let ws_client = LighterWebSocketClient::new(config.ws_url(), None)
-            .with_proxy_url(config.proxy_url.clone());
+        let registry = Arc::new(MarketRegistry::new());
+
+        let raw_http = LighterRawHttpClient::new_with_quotas(
+            config.environment,
+            config.base_url_http.clone(),
+            config.http_timeout_secs,
+            config.proxy_url.clone(),
+            resolve_quota(config.rest_quota_per_min),
+            None,
+        )
+        .context("failed to construct Lighter raw HTTP client")?;
+        let http_client =
+            LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry));
+
+        let ws_client = LighterWebSocketClient::new(
+            Some(config.ws_url()),
+            config.environment,
+            Arc::clone(&registry),
+            config.transport_backend,
+            config.proxy_url.clone(),
+        );
 
         Ok(Self {
+            clock,
             client_id,
+            config,
+            credential,
             http_client,
             ws_client,
+            registry,
             is_connected: AtomicBool::new(false),
-            data_sender: get_data_event_sender(),
-            registry: Arc::new(tokio::sync::RwLock::new(
-                LighterInstrumentRegistry::default(),
-            )),
-            subscription_state: SubscriptionState::new('/'),
-            clock: get_atomic_clock_realtime(),
+            cancellation_token: CancellationToken::new(),
+            tasks: Vec::new(),
+            data_sender,
+            instruments: Arc::new(AtomicMap::new()),
+            instrument_statuses: Arc::new(DashMap::new()),
+            instrument_status_subscriptions: Arc::new(DashSet::new()),
+            market_stats_subscriptions: Arc::new(DashMap::new()),
         })
     }
 
-    fn subscribe_topic(&self, topic: String) {
-        if !self.subscription_state.add_reference(&topic) {
-            return;
-        }
-        self.subscription_state.mark_subscribe(&topic);
-        let ws = self.ws_client.clone();
-        get_runtime().spawn(async move {
-            if let Err(error) = ws.subscribe(topic.clone(), None).await {
-                log::error!("Failed to subscribe to Lighter websocket topic {topic}: {error}");
-            }
-        });
+    fn venue(&self) -> Venue {
+        *LIGHTER_VENUE
     }
 
-    fn unsubscribe_topic(&self, topic: String) {
-        if !self.subscription_state.remove_reference(&topic) {
-            return;
-        }
-        self.subscription_state.mark_unsubscribe(&topic);
-        let ws = self.ws_client.clone();
-        get_runtime().spawn(async move {
-            if let Err(error) = ws.unsubscribe(topic.clone()).await {
-                log::error!("Failed to unsubscribe from Lighter websocket topic {topic}: {error}");
-            }
-        });
+    /// Returns `true` when the data client holds resolved Lighter credentials.
+    #[must_use]
+    pub fn has_credentials(&self) -> bool {
+        self.credential.is_some()
     }
 
-    async fn bootstrap_instruments(
-        &self,
-    ) -> anyhow::Result<Vec<nautilus_model::instruments::InstrumentAny>> {
-        let registry = load_instrument_registry(&self.http_client)
+    async fn bootstrap_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
+        let instruments_with_status = self
+            .http_client
+            .request_instruments_with_status()
             .await
-            .context("failed to load Lighter instruments")?;
-        let instruments = registry.instruments();
-        *self.registry.write().await = registry;
+            .context("failed to fetch instruments during bootstrap")?;
+        let instruments: Vec<InstrumentAny> = instruments_with_status
+            .iter()
+            .map(|(instrument, _)| instrument.clone())
+            .collect();
+
+        let mut ws_cache: Vec<(i16, InstrumentAny)> = Vec::with_capacity(instruments.len());
+        self.instruments.rcu(|m| {
+            for instrument in &instruments {
+                m.insert(instrument.id(), instrument.clone());
+            }
+        });
+
+        for instrument in &instruments {
+            if let Some(market_index) = self.registry.market_index(&instrument.id()) {
+                ws_cache.push((market_index, instrument.clone()));
+            } else {
+                log::warn!(
+                    "No market_index registered for instrument {} during bootstrap",
+                    instrument.id(),
+                );
+            }
+        }
+
+        self.instrument_statuses.clear();
+        for (instrument, status) in &instruments_with_status {
+            cache_lighter_instrument_status(&self.instrument_statuses, instrument.id(), *status);
+        }
+
+        self.ws_client.cache_instruments(ws_cache);
+
+        log::debug!(
+            "Bootstrapped {} Lighter instruments ({} registry entries)",
+            self.instruments.len(),
+            self.registry.len(),
+        );
         Ok(instruments)
     }
 
-    async fn connect_ws(&self) -> anyhow::Result<()> {
-        let sender = self.data_sender.clone();
-        let registry_snapshot = self.registry.read().await.clone();
-        let clock = self.clock;
-        let book_offsets = Arc::new(StdMutex::new(AHashMap::new()));
+    async fn spawn_ws(&mut self) -> anyhow::Result<()> {
+        // Connect on a clone so the resulting `out_rx` (and inner handler
+        // task handle) live on the consumer; transfer the handle back to
+        // `self.ws_client` so disconnect() can await it.
+        let mut ws_client = self.ws_client.clone();
+        ws_client
+            .connect()
+            .await
+            .context("failed to connect to Lighter WebSocket")?;
 
-        self.ws_client
-            .connect_with_event_handler({
-                let book_offsets = Arc::clone(&book_offsets);
-                move |event| {
-                    let mut book_offsets = book_offsets.lock().expect("book offsets lock poisoned");
+        if let Some(handle) = ws_client.take_task_handle() {
+            self.ws_client.set_task_handle(handle);
+        }
 
-                    if let Err(error) = handle_ws_message(
-                        &event.text,
-                        &sender,
-                        &registry_snapshot,
-                        &mut book_offsets,
-                        clock,
-                        #[cfg(feature = "latency-probe")]
-                        event.received_ns,
-                    ) {
-                        log::warn!("Failed to handle Lighter websocket message: {error}");
+        let cancellation_token = self.cancellation_token.clone();
+        let data_sender = self.data_sender.clone();
+        let market_stats_subscriptions = Arc::clone(&self.market_stats_subscriptions);
+
+        let task = get_runtime().spawn(async move {
+            log::debug!("Lighter WebSocket consumption loop started");
+
+            loop {
+                tokio::select! {
+                    () = cancellation_token.cancelled() => {
+                        log::debug!("Lighter WebSocket consumption loop cancelled");
+                        break;
+                    }
+                    msg_opt = ws_client.next_event() => {
+                        match msg_opt {
+                            Some(NautilusWsMessage::Trades(trades)) => {
+                                for trade in trades {
+                                    if let Err(e) = data_sender
+                                        .send(DataEvent::Data(Data::Trade(trade)))
+                                    {
+                                        log::error!("Failed to send trade tick: {e}");
+                                    }
+                                }
+                            }
+                            Some(NautilusWsMessage::Quote(quote)) => {
+                                if let Err(e) = data_sender
+                                    .send(DataEvent::Data(Data::Quote(quote)))
+                                {
+                                    log::error!("Failed to send quote tick: {e}");
+                                }
+                            }
+                            Some(NautilusWsMessage::Deltas(deltas)) => {
+                                let data = Data::Deltas(OrderBookDeltas_API::new(deltas));
+                                if let Err(e) = data_sender.send(DataEvent::Data(data)) {
+                                    log::error!("Failed to send order book deltas: {e}");
+                                }
+                            }
+                            Some(NautilusWsMessage::Depth10(depth)) => {
+                                if let Err(e) =
+                                    data_sender.send(DataEvent::Data(Data::Depth10(depth)))
+                                {
+                                    log::error!("Failed to send order book depth10: {e}");
+                                }
+                            }
+                            Some(NautilusWsMessage::Bar(bar)) => {
+                                if let Err(e) = data_sender.send(DataEvent::Data(Data::Bar(bar))) {
+                                    log::error!("Failed to send bar: {e}");
+                                }
+                            }
+                            Some(message @ (NautilusWsMessage::MarkPrice(_)
+                                | NautilusWsMessage::IndexPrice(_)
+                                | NautilusWsMessage::FundingRate(_))) =>
+                            {
+                                emit_market_stats_ws_message(
+                                    &data_sender,
+                                    &market_stats_subscriptions,
+                                    &message,
+                                );
+                            }
+                            Some(NautilusWsMessage::Raw(value)) => {
+                                log::debug!("Unhandled Lighter raw frame: {value}");
+                            }
+                            // The data client does not consume execution-side
+                            // reports; the execution client subscribes to its
+                            // own clone of the WebSocket and routes them.
+                            Some(
+                                NautilusWsMessage::ExecutionReports(_)
+                                | NautilusWsMessage::PositionSnapshot(_)
+                                | NautilusWsMessage::AccountState(_)
+                                | NautilusWsMessage::SendTxAck { .. }
+                                | NautilusWsMessage::SendTxRejected { .. }
+                                | NautilusWsMessage::AccountStreamFirstFrame(_),
+                            ) => {}
+                            Some(NautilusWsMessage::Reconnected) => {
+                                log::debug!("Lighter WebSocket reconnected");
+                            }
+                            None => {
+                                log::debug!("Lighter WebSocket next_event returned None");
+                                tokio::select! {
+                                    () = cancellation_token.cancelled() => {
+                                        log::debug!(
+                                            "Lighter WebSocket consumption loop cancelled"
+                                        );
+                                        break;
+                                    }
+                                    () = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
+                                }
+                            }
+                        }
                     }
                 }
-            })
-            .await
-            .context("failed to connect Lighter websocket")
+            }
+
+            log::debug!("Lighter WebSocket consumption loop finished");
+        });
+
+        self.tasks.push(task);
+        log::debug!("Lighter WebSocket consumption task spawned");
+
+        Ok(())
     }
 
-    fn send_response(&self, response: DataResponse) {
-        if let Err(error) = self.data_sender.send(DataEvent::Response(response)) {
-            log::warn!("Failed to send Lighter data response: {error}");
+    fn spawn_instrument_refresh(&mut self) {
+        let minutes = self.config.update_instruments_interval_mins;
+        if minutes == 0 {
+            log::debug!("Lighter instrument refresh disabled (interval=0)");
+            return;
+        }
+
+        let interval = Duration::from_secs(minutes.saturating_mul(60));
+        let cancellation = self.cancellation_token.clone();
+        let http_client = self.http_client.clone();
+        let instruments_cache = Arc::clone(&self.instruments);
+        let statuses = Arc::clone(&self.instrument_statuses);
+        let status_subscriptions = Arc::clone(&self.instrument_status_subscriptions);
+        let registry = Arc::clone(&self.registry);
+        let ws_client = self.ws_client.clone();
+        let data_sender = self.data_sender.clone();
+        let client_id = self.client_id;
+        let clock = self.clock;
+
+        let handle = get_runtime().spawn(async move {
+            loop {
+                let sleep = tokio::time::sleep(interval);
+                tokio::pin!(sleep);
+                tokio::select! {
+                    () = cancellation.cancelled() => {
+                        log::debug!("Lighter instrument refresh task cancelled");
+                        break;
+                    }
+                    () = &mut sleep => {
+                        match http_client.request_instruments_with_status().await {
+                            Ok(items) => {
+                                instruments_cache.rcu(|m| {
+                                    for (instrument, _) in &items {
+                                        m.insert(instrument.id(), instrument.clone());
+                                    }
+                                });
+
+                                let ws_cache: Vec<(i16, InstrumentAny)> = items
+                                    .iter()
+                                    .filter_map(|(instrument, _)| {
+                                        registry
+                                            .market_index(&instrument.id())
+                                            .map(|idx| (idx, instrument.clone()))
+                                    })
+                                    .collect();
+
+                                if !ws_cache.is_empty() {
+                                    ws_client.cache_instruments(ws_cache);
+                                }
+
+                                statuses.clear();
+                                let ts_init = clock.get_time_ns();
+
+                                for (instrument, status) in &items {
+                                    cache_lighter_instrument_status(
+                                        &statuses,
+                                        instrument.id(),
+                                        *status,
+                                    );
+                                    emit_lighter_instrument_status_if_subscribed(
+                                        &data_sender,
+                                        &status_subscriptions,
+                                        instrument.id(),
+                                        *status,
+                                        ts_init,
+                                        ts_init,
+                                    );
+
+                                    if let Err(e) = data_sender
+                                        .send(DataEvent::Instrument(instrument.clone()))
+                                    {
+                                        log::warn!(
+                                            "Failed to send refreshed Lighter instrument: {e}"
+                                        );
+                                    }
+                                }
+
+                                log::debug!(
+                                    "Lighter instruments refreshed: client_id={client_id}, count={}",
+                                    items.len(),
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to refresh Lighter instruments: client_id={client_id}, error={e:?}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        self.tasks.push(handle);
+    }
+
+    fn clear_market_stats_subscriptions(&self) {
+        self.market_stats_subscriptions.clear();
+    }
+
+    fn clear_instrument_status_subscriptions(&self) {
+        self.instrument_status_subscriptions.clear();
+    }
+
+    fn emit_cached_instrument_status(&self, instrument_id: InstrumentId) -> bool {
+        let Some(status) = self
+            .instrument_statuses
+            .get(&instrument_id)
+            .map(|status| *status)
+        else {
+            return false;
+        };
+
+        let ts_init = self.clock.get_time_ns();
+        emit_lighter_instrument_status(&self.data_sender, instrument_id, status, ts_init, ts_init);
+        true
+    }
+
+    fn activate_market_stats_subscription(
+        &self,
+        instrument_id: InstrumentId,
+        channel: LighterWsChannel,
+        kind: MarketStatsKind,
+        label: &'static str,
+    ) {
+        let subscribe_channel = match self.market_stats_subscriptions.entry(instrument_id) {
+            Entry::Occupied(mut entry) => {
+                let subscription = entry.get_mut();
+                let should_subscribe = subscription.flags.is_empty();
+                subscription.flags.insert(kind);
+                should_subscribe.then(|| subscription.channel.clone())
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(MarketStatsSubscription {
+                    channel: channel.clone(),
+                    flags: kind.into(),
+                });
+                Some(channel)
+            }
+        };
+
+        if let Some(channel) = subscribe_channel {
+            let ws = self.ws_client.clone();
+            get_runtime().spawn(async move {
+                if let Err(e) = subscribe_market_stats_channel(ws, channel).await {
+                    log::error!("Failed to subscribe to Lighter {label}: {e:?}");
+                }
+            });
+        }
+    }
+
+    fn deactivate_market_stats_subscription(
+        &self,
+        instrument_id: InstrumentId,
+        kind: MarketStatsKind,
+        label: &'static str,
+    ) {
+        let unsubscribe_channel = if let Some(mut subscription) =
+            self.market_stats_subscriptions.get_mut(&instrument_id)
+        {
+            subscription.flags.remove(kind);
+            subscription
+                .flags
+                .is_empty()
+                .then(|| subscription.channel.clone())
+        } else {
+            None
+        };
+
+        if let Some(channel) = unsubscribe_channel {
+            self.market_stats_subscriptions.remove(&instrument_id);
+
+            let ws = self.ws_client.clone();
+            get_runtime().spawn(async move {
+                if let Err(e) = unsubscribe_market_stats_channel(ws, channel).await {
+                    log::error!("Failed to unsubscribe from Lighter {label}: {e:?}");
+                }
+            });
+        }
+    }
+
+    fn perp_market_stats_channel(
+        &self,
+        instrument_id: InstrumentId,
+        label: &str,
+    ) -> anyhow::Result<LighterWsChannel> {
+        let instrument = self
+            .instruments
+            .get_cloned(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+
+        anyhow::ensure!(
+            matches!(instrument, InstrumentAny::CryptoPerpetual(_)),
+            "Lighter {label} subscriptions require a perpetual instrument: {instrument_id}",
+        );
+
+        let market_index = self.registry.market_index(&instrument_id).ok_or_else(|| {
+            anyhow::anyhow!("No Lighter market_index registered for {instrument_id}")
+        })?;
+
+        Ok(LighterWsChannel::MarketStats(
+            LighterMarketSelection::Market(market_index),
+        ))
+    }
+
+    fn index_market_stats_channel(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<LighterWsChannel> {
+        let instrument = self
+            .instruments
+            .get_cloned(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+        let market_index = self.registry.market_index(&instrument_id).ok_or_else(|| {
+            anyhow::anyhow!("No Lighter market_index registered for {instrument_id}")
+        })?;
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(_) => Ok(LighterWsChannel::MarketStats(
+                LighterMarketSelection::Market(market_index),
+            )),
+            InstrumentAny::CurrencyPair(_) => Ok(LighterWsChannel::SpotMarketStats(
+                LighterMarketSelection::Market(market_index),
+            )),
+            _ => anyhow::bail!(
+                "Lighter index price subscriptions require a perpetual or spot instrument: {instrument_id}",
+            ),
         }
     }
 }
 
-#[async_trait(?Send)]
+fn cache_lighter_instrument_status(
+    statuses: &DashMap<InstrumentId, LighterMarketStatus>,
+    instrument_id: InstrumentId,
+    status: LighterMarketStatus,
+) {
+    statuses.insert(instrument_id, status);
+}
+
+fn emit_lighter_instrument_status_if_subscribed(
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    subscriptions: &DashSet<InstrumentId>,
+    instrument_id: InstrumentId,
+    status: LighterMarketStatus,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) {
+    if subscriptions.contains(&instrument_id) {
+        emit_lighter_instrument_status(sender, instrument_id, status, ts_event, ts_init);
+    }
+}
+
+fn emit_lighter_instrument_status(
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instrument_id: InstrumentId,
+    status: LighterMarketStatus,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) {
+    let action = lighter_market_status_action(status);
+    let is_trading = Some(matches!(action, MarketStatusAction::Trading));
+    let status = InstrumentStatus::new(
+        instrument_id,
+        action,
+        ts_event,
+        ts_init,
+        None,
+        None,
+        is_trading,
+        None,
+        None,
+    );
+
+    if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
+        log::error!("Failed to send Lighter instrument status: {e}");
+    }
+}
+
+fn lighter_market_status_action(status: LighterMarketStatus) -> MarketStatusAction {
+    match status {
+        LighterMarketStatus::Active => MarketStatusAction::Trading,
+        LighterMarketStatus::Inactive => MarketStatusAction::NotAvailableForTrading,
+    }
+}
+
+async fn subscribe_market_stats_channel(
+    ws: LighterWebSocketClient,
+    channel: LighterWsChannel,
+) -> Result<(), LighterWsError> {
+    match channel {
+        LighterWsChannel::MarketStats(selection) => ws.subscribe_market_stats(selection).await,
+        LighterWsChannel::SpotMarketStats(selection) => {
+            ws.subscribe_spot_market_stats(selection).await
+        }
+        _ => unreachable!("market-stats subscription called with non-market-stats channel"),
+    }
+}
+
+async fn unsubscribe_market_stats_channel(
+    ws: LighterWebSocketClient,
+    channel: LighterWsChannel,
+) -> Result<(), LighterWsError> {
+    match channel {
+        LighterWsChannel::MarketStats(selection) => ws.unsubscribe_market_stats(selection).await,
+        LighterWsChannel::SpotMarketStats(selection) => {
+            ws.unsubscribe_spot_market_stats(selection).await
+        }
+        _ => unreachable!("market-stats unsubscription called with non-market-stats channel"),
+    }
+}
+
+fn emit_market_stats_ws_message(
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    subscriptions: &DashMap<InstrumentId, MarketStatsSubscription>,
+    message: &NautilusWsMessage,
+) -> bool {
+    match message {
+        NautilusWsMessage::MarkPrice(mark_price) => {
+            if !market_stats_is_subscribed(
+                subscriptions,
+                &mark_price.instrument_id,
+                MarketStatsKind::MarkPrice,
+            ) {
+                return false;
+            }
+
+            if let Err(e) = sender.send(DataEvent::Data(Data::MarkPriceUpdate(*mark_price))) {
+                log::error!("Failed to send mark price: {e}");
+            }
+            true
+        }
+        NautilusWsMessage::IndexPrice(index_price) => {
+            if !market_stats_is_subscribed(
+                subscriptions,
+                &index_price.instrument_id,
+                MarketStatsKind::IndexPrice,
+            ) {
+                return false;
+            }
+
+            if let Err(e) = sender.send(DataEvent::Data(Data::IndexPriceUpdate(*index_price))) {
+                log::error!("Failed to send index price: {e}");
+            }
+            true
+        }
+        NautilusWsMessage::FundingRate(funding_rate) => {
+            if !market_stats_is_subscribed(
+                subscriptions,
+                &funding_rate.instrument_id,
+                MarketStatsKind::FundingRate,
+            ) {
+                return false;
+            }
+
+            if let Err(e) = sender.send(DataEvent::FundingRate(*funding_rate)) {
+                log::error!("Failed to send funding rate: {e}");
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn market_stats_is_subscribed(
+    subscriptions: &DashMap<InstrumentId, MarketStatsSubscription>,
+    instrument_id: &InstrumentId,
+    kind: MarketStatsKind,
+) -> bool {
+    subscriptions
+        .get(instrument_id)
+        .is_some_and(|subscription| subscription.flags.contains(kind))
+}
+
+#[async_trait::async_trait(?Send)]
 impl DataClient for LighterDataClient {
     fn client_id(&self) -> ClientId {
         self.client_id
     }
 
     fn venue(&self) -> Option<Venue> {
-        Some(venue())
+        Some(self.venue())
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        log::info!(
+            "Starting Lighter data client: client_id={}, environment={:?}, has_credentials={}",
+            self.client_id,
+            self.config.environment,
+            self.has_credentials(),
+        );
         Ok(())
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        self.is_connected.store(false, Ordering::Release);
-        let ws_client = self.ws_client.clone();
-        get_runtime().spawn(async move {
-            if let Err(error) = ws_client.close().await {
-                log::warn!("Failed to close Lighter websocket on stop: {error}");
-            }
-        });
+        log::info!("Stopping Lighter data client {}", self.client_id);
+        self.cancellation_token.cancel();
+        self.clear_instrument_status_subscriptions();
+        self.clear_market_stats_subscriptions();
+        self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        self.is_connected.store(false, Ordering::Release);
-        self.subscription_state.clear();
-        self.registry
-            .try_write()
-            .expect("instrument registry lock poisoned")
-            .clear();
+        log::debug!("Resetting Lighter data client {}", self.client_id);
+        self.clear_instrument_status_subscriptions();
+        self.clear_market_stats_subscriptions();
+        self.is_connected.store(false, Ordering::Relaxed);
+        self.cancellation_token = CancellationToken::new();
+        self.tasks.clear();
         Ok(())
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
+        log::debug!("Disposing Lighter data client {}", self.client_id);
         self.stop()
     }
 
@@ -236,192 +838,582 @@ impl DataClient for LighterDataClient {
             return Ok(());
         }
 
-        let instruments = self.bootstrap_instruments().await?;
+        // `stop()` and `disconnect()` cancel `cancellation_token` to tear down
+        // the consumer task. Without rotating it here, a subsequent connect()
+        // would clone an already-cancelled token into the new consumer, which
+        // would exit immediately while we still mark the client connected.
+        if self.cancellation_token.is_cancelled() {
+            self.cancellation_token = CancellationToken::new();
+        }
+
+        let instruments = self
+            .bootstrap_instruments()
+            .await
+            .context("failed to bootstrap Lighter instruments")?;
+
         for instrument in instruments {
-            if let Err(error) = self.data_sender.send(DataEvent::Instrument(instrument)) {
-                log::warn!("Failed to publish Lighter instrument: {error}");
+            if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
+                log::warn!("Failed to send instrument: {e}");
             }
         }
 
-        self.connect_ws().await?;
-        self.is_connected.store(true, Ordering::Release);
+        self.spawn_ws()
+            .await
+            .context("failed to spawn Lighter WebSocket consumer")?;
+        self.spawn_instrument_refresh();
+
+        self.is_connected.store(true, Ordering::Relaxed);
+        log::info!("Connected: client_id={}", self.client_id);
+
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.is_disconnected() {
+        if !self.is_connected() {
             return Ok(());
         }
 
-        self.ws_client.close().await?;
-        self.reset()?;
-        self.is_connected.store(false, Ordering::Release);
+        self.cancellation_token.cancel();
+        self.clear_instrument_status_subscriptions();
+        self.clear_market_stats_subscriptions();
+
+        for task in self.tasks.drain(..) {
+            if let Err(e) = task.await {
+                log::error!("Error waiting for Lighter task to complete: {e}");
+            }
+        }
+
+        if let Err(e) = self.ws_client.disconnect().await {
+            log::warn!("Error disconnecting Lighter WebSocket client: {e}");
+        }
+
+        self.instruments.store(AHashMap::new());
+        self.instrument_statuses.clear();
+        self.registry.clear();
+
+        self.is_connected.store(false, Ordering::Relaxed);
+        log::info!("Disconnected: client_id={}", self.client_id);
+
         Ok(())
     }
 
-    fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
-        let instruments = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .instruments();
-        self.send_response(DataResponse::Instruments(InstrumentsResponse::new(
-            request.request_id,
-            request.client_id.unwrap_or(self.client_id),
-            venue(),
-            instruments,
-            datetime_to_unix_nanos(request.start),
-            datetime_to_unix_nanos(request.end),
-            self.clock.get_time_ns(),
-            request.params,
-        )));
+    fn subscribe_instrument(&mut self, cmd: SubscribeInstrument) -> anyhow::Result<()> {
+        let instruments = self.instruments.load();
+        if let Some(instrument) = instruments.get(&cmd.instrument_id) {
+            if let Err(e) = self
+                .data_sender
+                .send(DataEvent::Instrument(instrument.clone()))
+            {
+                log::error!("Failed to send instrument {}: {e}", cmd.instrument_id);
+            }
+        } else {
+            log::warn!("Instrument {} not found in cache", cmd.instrument_id);
+        }
         Ok(())
     }
 
-    fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
-        let registry = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned");
-        let instrument = registry
-            .meta_for_instrument_id(&request.instrument_id)
-            .map(|meta| meta.instrument.clone())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {}", request.instrument_id))?;
-
-        self.send_response(DataResponse::Instrument(Box::new(InstrumentResponse::new(
-            request.request_id,
-            request.client_id.unwrap_or(self.client_id),
-            request.instrument_id,
-            instrument,
-            datetime_to_unix_nanos(request.start),
-            datetime_to_unix_nanos(request.end),
-            self.clock.get_time_ns(),
-            request.params,
-        ))));
+    fn unsubscribe_instrument(&mut self, cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        log::debug!(
+            "Unsubscribing from instrument: {} (cache replay only)",
+            cmd.instrument_id,
+        );
         Ok(())
     }
 
-    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
-        let http_client = self.http_client.clone();
-        let sender = self.data_sender.clone();
+    fn subscribe_instrument_status(
+        &mut self,
+        subscription: SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        let instrument_id = subscription.instrument_id;
+        log::debug!("Subscribing to instrument status: {instrument_id}");
+
+        self.instrument_status_subscriptions.insert(instrument_id);
+        if self.emit_cached_instrument_status(instrument_id) {
+            return Ok(());
+        }
+
+        let http = self.http_client.clone();
+        let ws = self.ws_client.clone();
         let registry = Arc::clone(&self.registry);
-        let client_id = request.client_id.unwrap_or(self.client_id);
+        let sender = self.data_sender.clone();
+        let instruments_cache = Arc::clone(&self.instruments);
+        let statuses = Arc::clone(&self.instrument_statuses);
+        let subscriptions = Arc::clone(&self.instrument_status_subscriptions);
         let clock = self.clock;
 
         get_runtime().spawn(async move {
-            let registry = registry.read().await;
-            let Some(meta) = registry
-                .meta_for_instrument_id(&request.instrument_id)
-                .cloned()
-            else {
-                return;
-            };
-            let depth = request.depth.map_or(100, |value| value.get() as u32);
-            match http_client
-                .rest()
-                .get_order_book_orders(meta.market_id, depth)
-                .await
-            {
-                Ok(snapshot) => {
-                    let ts_event = clock.get_time_ns();
-                    let mut book = OrderBook::new(request.instrument_id, BookType::L2_MBP);
-                    populate_order_book(
-                        &mut book,
-                        &meta.instrument,
-                        &snapshot
-                            .bids
-                            .iter()
-                            .map(|order| crate::models::order_book::PriceLevel {
-                                price: order.price.clone(),
-                                size: order.remaining_base_amount.clone(),
-                            })
-                            .collect::<Vec<_>>(),
-                        &snapshot
-                            .asks
-                            .iter()
-                            .map(|order| crate::models::order_book::PriceLevel {
-                                price: order.price.clone(),
-                                size: order.remaining_base_amount.clone(),
-                            })
-                            .collect::<Vec<_>>(),
-                        snapshot.total_bids.unwrap_or_default() as u64,
-                        ts_event,
-                    );
+            match http.request_instrument_with_status(instrument_id).await {
+                Ok((instrument, status)) => {
+                    instruments_cache.rcu(|map| {
+                        map.insert(instrument.id(), instrument.clone());
+                    });
 
-                    let response = DataResponse::Book(BookResponse::new(
-                        request.request_id,
-                        client_id,
-                        request.instrument_id,
-                        book,
-                        None,
-                        None,
-                        ts_event,
-                        request.params,
-                    ));
-                    let _ = sender.send(DataEvent::Response(response));
+                    if let Some(market_index) = registry.market_index(&instrument.id()) {
+                        ws.cache_instrument(market_index, instrument.clone());
+                    }
+
+                    cache_lighter_instrument_status(&statuses, instrument.id(), status);
+                    let ts_init = clock.get_time_ns();
+                    emit_lighter_instrument_status_if_subscribed(
+                        &sender,
+                        &subscriptions,
+                        instrument.id(),
+                        status,
+                        ts_init,
+                        ts_init,
+                    );
                 }
-                Err(error) => log::warn!("Failed to request Lighter order book snapshot: {error}"),
+                Err(e) => {
+                    log::error!(
+                        "Failed to fetch Lighter instrument status for {instrument_id}: {e:?}"
+                    );
+                }
             }
         });
 
         Ok(())
     }
 
-    fn request_quotes(&self, request: RequestQuotes) -> anyhow::Result<()> {
-        self.send_response(DataResponse::Quotes(QuotesResponse::new(
-            request.request_id,
-            request.client_id.unwrap_or(self.client_id),
-            request.instrument_id,
-            Vec::new(),
-            datetime_to_unix_nanos(request.start),
-            datetime_to_unix_nanos(request.end),
-            self.clock.get_time_ns(),
-            request.params,
-        )));
+    fn subscribe_book_deltas(&mut self, subscription: SubscribeBookDeltas) -> anyhow::Result<()> {
+        log::debug!("Subscribing to book deltas: {}", subscription.instrument_id);
+
+        validate_book_deltas_subscription(subscription.book_type)?;
+
+        let ws = self.ws_client.clone();
+        let instrument_id = subscription.instrument_id;
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.subscribe_book(instrument_id).await {
+                log::error!("Failed to subscribe to Lighter book deltas: {e:?}");
+            }
+        });
+
         Ok(())
     }
 
-    fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
-        let http_client = self.http_client.clone();
-        let sender = self.data_sender.clone();
+    fn subscribe_book_depth10(&mut self, subscription: SubscribeBookDepth10) -> anyhow::Result<()> {
+        log::debug!(
+            "Subscribing to book depth10: {}",
+            subscription.instrument_id
+        );
+
+        validate_book_depth10_subscription(subscription.book_type)?;
+
+        let ws = self.ws_client.clone();
+        let instrument_id = subscription.instrument_id;
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.subscribe_book_depth10(instrument_id).await {
+                log::error!("Failed to subscribe to Lighter book depth10: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn subscribe_quotes(&mut self, subscription: SubscribeQuotes) -> anyhow::Result<()> {
+        log::debug!("Subscribing to quotes: {}", subscription.instrument_id);
+
+        let ws = self.ws_client.clone();
+        let instrument_id = subscription.instrument_id;
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.subscribe_quotes(instrument_id).await {
+                log::error!("Failed to subscribe to Lighter quotes: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn subscribe_trades(&mut self, subscription: SubscribeTrades) -> anyhow::Result<()> {
+        log::debug!("Subscribing to trades: {}", subscription.instrument_id);
+
+        let ws = self.ws_client.clone();
+        let instrument_id = subscription.instrument_id;
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.subscribe_trades(instrument_id).await {
+                log::error!("Failed to subscribe to Lighter trades: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn subscribe_mark_prices(&mut self, subscription: SubscribeMarkPrices) -> anyhow::Result<()> {
+        let instrument_id = subscription.instrument_id;
+        log::debug!("Subscribing to mark prices: {instrument_id}");
+
+        let channel = self.perp_market_stats_channel(instrument_id, "mark price")?;
+        self.activate_market_stats_subscription(
+            instrument_id,
+            channel,
+            MarketStatsKind::MarkPrice,
+            "mark price",
+        );
+
+        Ok(())
+    }
+
+    fn subscribe_index_prices(&mut self, subscription: SubscribeIndexPrices) -> anyhow::Result<()> {
+        let instrument_id = subscription.instrument_id;
+        log::debug!("Subscribing to index prices: {instrument_id}");
+
+        let channel = self.index_market_stats_channel(instrument_id)?;
+        self.activate_market_stats_subscription(
+            instrument_id,
+            channel,
+            MarketStatsKind::IndexPrice,
+            "index price",
+        );
+
+        Ok(())
+    }
+
+    fn subscribe_funding_rates(
+        &mut self,
+        subscription: SubscribeFundingRates,
+    ) -> anyhow::Result<()> {
+        let instrument_id = subscription.instrument_id;
+        log::debug!("Subscribing to funding rates: {instrument_id}");
+
+        let channel = self.perp_market_stats_channel(instrument_id, "funding rate")?;
+        self.activate_market_stats_subscription(
+            instrument_id,
+            channel,
+            MarketStatsKind::FundingRate,
+            "funding rate",
+        );
+
+        Ok(())
+    }
+
+    fn subscribe_bars(&mut self, subscription: SubscribeBars) -> anyhow::Result<()> {
+        let bar_type = subscription.bar_type;
+        log::debug!("Subscribing to bars: {bar_type}");
+
+        let resolution = LighterCandleResolution::try_from(&bar_type)?;
+        anyhow::ensure!(
+            resolution.is_ws_streamable(),
+            "Lighter does not offer {bar_type} on the candle WebSocket stream",
+        );
+
+        let instrument_id = bar_type.instrument_id();
+        anyhow::ensure!(
+            self.instruments.contains_key(&instrument_id),
+            "Instrument {instrument_id} not found in cache",
+        );
+
+        let ws = self.ws_client.clone();
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.subscribe_candles(instrument_id, resolution).await {
+                log::error!("Failed to subscribe to Lighter candles for {bar_type}: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn unsubscribe_book_deltas(
+        &mut self,
+        unsubscription: &UnsubscribeBookDeltas,
+    ) -> anyhow::Result<()> {
+        log::debug!(
+            "Unsubscribing from book deltas: {}",
+            unsubscription.instrument_id
+        );
+
+        let ws = self.ws_client.clone();
+        let instrument_id = unsubscription.instrument_id;
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.unsubscribe_book(instrument_id).await {
+                log::error!("Failed to unsubscribe from Lighter book deltas: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn unsubscribe_book_depth10(
+        &mut self,
+        unsubscription: &UnsubscribeBookDepth10,
+    ) -> anyhow::Result<()> {
+        log::debug!(
+            "Unsubscribing from book depth10: {}",
+            unsubscription.instrument_id
+        );
+
+        let ws = self.ws_client.clone();
+        let instrument_id = unsubscription.instrument_id;
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.unsubscribe_book_depth10(instrument_id).await {
+                log::error!("Failed to unsubscribe from Lighter book depth10: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn unsubscribe_quotes(&mut self, unsubscription: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        log::debug!(
+            "Unsubscribing from quotes: {}",
+            unsubscription.instrument_id
+        );
+
+        let ws = self.ws_client.clone();
+        let instrument_id = unsubscription.instrument_id;
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.unsubscribe_quotes(instrument_id).await {
+                log::error!("Failed to unsubscribe from Lighter quotes: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn unsubscribe_trades(&mut self, unsubscription: &UnsubscribeTrades) -> anyhow::Result<()> {
+        log::debug!(
+            "Unsubscribing from trades: {}",
+            unsubscription.instrument_id
+        );
+
+        let ws = self.ws_client.clone();
+        let instrument_id = unsubscription.instrument_id;
+
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.unsubscribe_trades(instrument_id).await {
+                log::error!("Failed to unsubscribe from Lighter trades: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn unsubscribe_instrument_status(
+        &mut self,
+        unsubscription: &UnsubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        let instrument_id = unsubscription.instrument_id;
+        log::debug!("Unsubscribing from instrument status: {instrument_id}");
+
+        self.instrument_status_subscriptions.remove(&instrument_id);
+
+        Ok(())
+    }
+
+    fn unsubscribe_mark_prices(
+        &mut self,
+        unsubscription: &UnsubscribeMarkPrices,
+    ) -> anyhow::Result<()> {
+        let instrument_id = unsubscription.instrument_id;
+        log::debug!("Unsubscribing from mark prices: {instrument_id}");
+
+        self.deactivate_market_stats_subscription(
+            instrument_id,
+            MarketStatsKind::MarkPrice,
+            "mark price",
+        );
+
+        Ok(())
+    }
+
+    fn unsubscribe_index_prices(
+        &mut self,
+        unsubscription: &UnsubscribeIndexPrices,
+    ) -> anyhow::Result<()> {
+        let instrument_id = unsubscription.instrument_id;
+        log::debug!("Unsubscribing from index prices: {instrument_id}");
+
+        self.deactivate_market_stats_subscription(
+            instrument_id,
+            MarketStatsKind::IndexPrice,
+            "index price",
+        );
+
+        Ok(())
+    }
+
+    fn unsubscribe_funding_rates(
+        &mut self,
+        unsubscription: &UnsubscribeFundingRates,
+    ) -> anyhow::Result<()> {
+        let instrument_id = unsubscription.instrument_id;
+        log::debug!("Unsubscribing from funding rates: {instrument_id}");
+
+        self.deactivate_market_stats_subscription(
+            instrument_id,
+            MarketStatsKind::FundingRate,
+            "funding rate",
+        );
+
+        Ok(())
+    }
+
+    fn unsubscribe_bars(&mut self, unsubscription: &UnsubscribeBars) -> anyhow::Result<()> {
+        let bar_type = unsubscription.bar_type;
+        log::debug!("Unsubscribing from bars: {bar_type}");
+
+        let resolution = match LighterCandleResolution::try_from(&bar_type) {
+            Ok(resolution) => resolution,
+            Err(e) => {
+                log::warn!("Skipping Lighter candle unsubscribe for {bar_type}: {e}");
+                return Ok(());
+            }
+        };
+
+        let instrument_id = bar_type.instrument_id();
+        let ws = self.ws_client.clone();
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.unsubscribe_candles(instrument_id, resolution).await {
+                log::error!("Failed to unsubscribe from Lighter candles for {bar_type}: {e:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
+        log::debug!("Requesting Lighter instruments");
+
+        let http = self.http_client.clone();
+        let ws = self.ws_client.clone();
         let registry = Arc::clone(&self.registry);
+        let sender = self.data_sender.clone();
+        let instruments_cache = Arc::clone(&self.instruments);
+        let status_cache = Arc::clone(&self.instrument_statuses);
+        let status_subscriptions = Arc::clone(&self.instrument_status_subscriptions);
+        let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
+        let venue = self.venue();
+        let start_nanos = datetime_to_unix_nanos(request.start);
+        let end_nanos = datetime_to_unix_nanos(request.end);
+        let params = request.params;
         let clock = self.clock;
 
         get_runtime().spawn(async move {
-            let registry = registry.read().await;
-            let Some(meta) = registry
-                .meta_for_instrument_id(&request.instrument_id)
-                .cloned()
-            else {
-                return;
-            };
-            let limit = request.limit.map_or(200, |value| value.get() as u32);
-            match http_client
-                .rest()
-                .get_recent_trades(meta.market_id, limit)
-                .await
-            {
-                Ok(response) => {
-                    let ts_init = clock.get_time_ns();
-                    let trades = response
-                        .trades
+            match http.request_instruments_with_status().await {
+                Ok(instruments_with_status) => {
+                    let instruments: Vec<InstrumentAny> = instruments_with_status
                         .iter()
-                        .map(|trade| trade_tick_from_trade(&meta.instrument, trade, ts_init))
+                        .map(|(instrument, _)| instrument.clone())
                         .collect();
-                    let response = DataResponse::Trades(TradesResponse::new(
-                        request.request_id,
+
+                    instruments_cache.rcu(|map| {
+                        for instrument in &instruments {
+                            map.insert(instrument.id(), instrument.clone());
+                        }
+                    });
+
+                    let ws_cache: Vec<(i16, InstrumentAny)> = instruments
+                        .iter()
+                        .filter_map(|i| registry.market_index(&i.id()).map(|idx| (idx, i.clone())))
+                        .collect();
+
+                    if !ws_cache.is_empty() {
+                        ws.cache_instruments(ws_cache);
+                    }
+
+                    status_cache.clear();
+                    let ts_init = clock.get_time_ns();
+
+                    for (instrument, status) in &instruments_with_status {
+                        cache_lighter_instrument_status(&status_cache, instrument.id(), *status);
+                        emit_lighter_instrument_status_if_subscribed(
+                            &sender,
+                            &status_subscriptions,
+                            instrument.id(),
+                            *status,
+                            ts_init,
+                            ts_init,
+                        );
+                    }
+
+                    let response = DataResponse::Instruments(InstrumentsResponse::new(
+                        request_id,
                         client_id,
-                        request.instrument_id,
-                        trades,
-                        datetime_to_unix_nanos(request.start),
-                        datetime_to_unix_nanos(request.end),
-                        ts_init,
-                        request.params,
+                        venue,
+                        instruments,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
                     ));
-                    let _ = sender.send(DataEvent::Response(response));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send instruments response: {e}");
+                    }
                 }
-                Err(error) => log::warn!("Failed to request Lighter trades: {error}"),
+                Err(e) => {
+                    log::error!("Failed to fetch Lighter instruments: {e:?}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
+        log::debug!("Requesting Lighter instrument: {}", request.instrument_id);
+
+        let http = self.http_client.clone();
+        let ws = self.ws_client.clone();
+        let registry = Arc::clone(&self.registry);
+        let sender = self.data_sender.clone();
+        let instruments_cache = Arc::clone(&self.instruments);
+        let status_cache = Arc::clone(&self.instrument_statuses);
+        let status_subscriptions = Arc::clone(&self.instrument_status_subscriptions);
+        let instrument_id = request.instrument_id;
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let start_nanos = datetime_to_unix_nanos(request.start);
+        let end_nanos = datetime_to_unix_nanos(request.end);
+        let params = request.params;
+        let clock = self.clock;
+
+        get_runtime().spawn(async move {
+            match http.request_instrument_with_status(instrument_id).await {
+                Ok((instrument, status)) => {
+                    instruments_cache.rcu(|map| {
+                        map.insert(instrument.id(), instrument.clone());
+                    });
+
+                    if let Some(market_index) = registry.market_index(&instrument.id()) {
+                        ws.cache_instrument(market_index, instrument.clone());
+                    }
+
+                    cache_lighter_instrument_status(&status_cache, instrument.id(), status);
+                    let ts_init = clock.get_time_ns();
+                    emit_lighter_instrument_status_if_subscribed(
+                        &sender,
+                        &status_subscriptions,
+                        instrument.id(),
+                        status,
+                        ts_init,
+                        ts_init,
+                    );
+
+                    let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
+                        request_id,
+                        client_id,
+                        instrument.id(),
+                        instrument,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    )));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send instrument response: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to fetch Lighter instrument {instrument_id}: {e:?}");
+                }
             }
         });
 
@@ -429,47 +1421,111 @@ impl DataClient for LighterDataClient {
     }
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
-        let http_client = self.http_client.clone();
+        let bar_type = request.bar_type;
+        log::debug!("Requesting Lighter bars for {bar_type}");
+
+        LighterCandleResolution::try_from(&bar_type)?;
+
+        let instrument_id = bar_type.instrument_id();
+        let instrument = self
+            .instruments
+            .get_cloned(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+
+        let http = self.http_client.clone();
         let sender = self.data_sender.clone();
-        let registry = Arc::clone(&self.registry);
+        let start = request.start;
+        let end = request.end;
+        let limit = request.limit.map(|n| n.get() as u32);
+        let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+
+        get_runtime().spawn(async move {
+            match http
+                .request_bars(&instrument, bar_type, start, end, limit)
+                .await
+            {
+                Ok(bars) => {
+                    let response = DataResponse::Bars(BarsResponse::new(
+                        request_id,
+                        client_id,
+                        bar_type,
+                        bars,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send bars response: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Lighter bars request failed for {instrument_id}: {e:?}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_quotes(&self, request: RequestQuotes) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Lighter does not support historical quote requests for {}; \
+             subscribe to quotes via WebSocket for live BBO ticks",
+            request.instrument_id,
+        )
+    }
+
+    fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let instrument_id = request.instrument_id;
+        log::debug!("Requesting Lighter trades for {instrument_id}");
+
+        let instrument = self
+            .instruments
+            .get_cloned(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let limit = request.limit.map_or(DEFAULT_TRADES_LIMIT, |n| {
+            u16::try_from(n.get()).unwrap_or(u16::MAX)
+        });
+        let start_nanos = datetime_to_unix_nanos(request.start);
+        let end_nanos = datetime_to_unix_nanos(request.end);
+        let params = request.params;
         let clock = self.clock;
 
         get_runtime().spawn(async move {
-            let registry = registry.read().await;
-            let Some(meta) = registry
-                .meta_for_instrument_id(&request.bar_type.instrument_id())
-                .cloned()
-            else {
-                return;
-            };
-            let Ok(granularity) = bar_granularity(request.bar_type) else {
-                return;
-            };
-            match http_client
-                .rest()
-                .get_candles(meta.market_id, &granularity, None)
-                .await
-            {
-                Ok(response) => {
-                    match candles_to_bars(&meta.instrument, request.bar_type, &response.candles) {
-                        Ok(bars) => {
-                            let response = DataResponse::Bars(BarsResponse::new(
-                                request.request_id,
-                                client_id,
-                                request.bar_type,
-                                bars,
-                                datetime_to_unix_nanos(request.start),
-                                datetime_to_unix_nanos(request.end),
-                                clock.get_time_ns(),
-                                request.params,
-                            ));
-                            let _ = sender.send(DataEvent::Response(response));
-                        }
-                        Err(error) => log::warn!("Failed to parse Lighter bars: {error}"),
+            match http.request_recent_trades(&instrument, limit).await {
+                Ok(mut trades) => {
+                    retain_trade_ticks_in_range(&mut trades, start_nanos, end_nanos);
+
+                    let response = DataResponse::Trades(TradesResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        trades,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send trades response: {e}");
                     }
                 }
-                Err(error) => log::warn!("Failed to request Lighter bars: {error}"),
+                Err(e) => {
+                    log::error!("Lighter trades request failed for {instrument_id}: {e}");
+                }
             }
         });
 
@@ -477,604 +1533,1384 @@ impl DataClient for LighterDataClient {
     }
 
     fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
-        let http_client = self.http_client.clone();
+        let instrument_id = request.instrument_id;
+        log::debug!("Requesting Lighter funding rates for {instrument_id}");
+
+        let instrument = self
+            .instruments
+            .get_cloned(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+
+        anyhow::ensure!(
+            matches!(instrument, InstrumentAny::CryptoPerpetual(_)),
+            "Lighter funding-rate requests require a perpetual instrument: {instrument_id}",
+        );
+
+        let http = self.http_client.clone();
         let sender = self.data_sender.clone();
-        let registry = Arc::clone(&self.registry);
+        let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let start = datetime_to_unix_nanos(request.start);
-        let end = datetime_to_unix_nanos(request.end);
-        let limit = request.limit.map(|value| value.get());
+        let start = request.start;
+        let end = request.end;
+        let limit = request.limit.map(|n| n.get());
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+        let params = request.params;
         let clock = self.clock;
 
         get_runtime().spawn(async move {
-            let registry = registry.read().await;
-            let Some(meta) = registry
-                .meta_for_instrument_id(&request.instrument_id)
-                .cloned()
-            else {
-                return;
-            };
-            if !meta.market_type.is_perp() {
-                return;
-            }
-            match http_client
-                .rest()
-                .get_funding_rates(meta.market_id, None)
+            match http
+                .request_funding_rates(&instrument, start, end, limit)
                 .await
             {
-                Ok(response) => {
-                    let ts_init = clock.get_time_ns();
-                    let updates = funding_rate_updates_from_history(
-                        &meta.instrument,
-                        &response.funding_rates,
-                        meta.market_id,
-                        start,
-                        end,
-                        limit,
-                        ts_init,
-                    );
+                Ok(funding_rates) => {
                     let response = DataResponse::FundingRates(FundingRatesResponse::new(
-                        request.request_id,
+                        request_id,
                         client_id,
-                        request.instrument_id,
-                        updates,
-                        start,
-                        end,
-                        ts_init,
-                        request.params,
+                        instrument_id,
+                        funding_rates,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
                     ));
-                    let _ = sender.send(DataEvent::Response(response));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send funding rates response: {e}");
+                    }
                 }
-                Err(error) => log::warn!("Failed to request Lighter funding rates: {error}"),
+                Err(e) => {
+                    log::error!("Lighter funding rates request failed for {instrument_id}: {e:?}");
+                }
             }
         });
 
         Ok(())
     }
 
-    fn subscribe_instrument(&mut self, subscription: SubscribeInstrument) -> anyhow::Result<()> {
-        if let Some(meta) = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .cloned()
-        {
-            let _ = self
-                .data_sender
-                .send(DataEvent::Instrument(meta.instrument));
-        }
+    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let instrument_id = request.instrument_id;
+        log::debug!("Requesting Lighter book snapshot for {instrument_id}");
+
+        let instrument = self
+            .instruments
+            .get_cloned(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+
+        let market_index = self.registry.market_index(&instrument_id).ok_or_else(|| {
+            anyhow::anyhow!("No Lighter market_index registered for {instrument_id}")
+        })?;
+
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let limit = clamp_book_snapshot_limit(request.depth);
+        let params = request.params;
+        let clock = self.clock;
+        let price_precision = instrument.price_precision();
+        let size_precision = instrument.size_precision();
+
+        let query = LighterOrderBookOrdersQuery {
+            market_id: market_index,
+            limit,
+        };
+
+        get_runtime().spawn(async move {
+            match http.inner.get_order_book_orders(&query).await {
+                Ok(snapshot) => {
+                    let ts_init = clock.get_time_ns();
+                    let book = parse_l2_order_book_snapshot(
+                        &snapshot,
+                        instrument_id,
+                        price_precision,
+                        size_precision,
+                    );
+
+                    let response = DataResponse::Book(BookResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        book,
+                        None,
+                        None,
+                        ts_init,
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send book snapshot response: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Lighter book snapshot request failed for {instrument_id}: {e:?}");
+                }
+            }
+        });
+
         Ok(())
     }
 
-    fn subscribe_instruments(&mut self, _subscription: SubscribeInstruments) -> anyhow::Result<()> {
-        for instrument in self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .instruments()
-        {
-            let _ = self.data_sender.send(DataEvent::Instrument(instrument));
-        }
-        Ok(())
-    }
-
-    fn subscribe(&mut self, subscription: SubscribeCustomData) -> anyhow::Result<()> {
-        if subscription.data_type.type_name() != LIGHTER_ACCOUNT_POSITIONS_TYPE {
-            anyhow::bail!(
-                "unsupported Lighter custom data type: {}",
-                subscription.data_type.type_name()
-            );
-        }
-        let account_index = account_index_from_data_type(&subscription.data_type)
-            .or_else(|| account_index_from_params(subscription.params.as_ref()))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Lighter account position subscriptions require account_index metadata"
-                )
-            })?;
-        log::info!("Subscribing to Lighter account positions for account {account_index}");
-        self.subscribe_topic(account_positions_channel(account_index));
-        Ok(())
-    }
-
-    fn unsubscribe(&mut self, subscription: &UnsubscribeCustomData) -> anyhow::Result<()> {
-        if subscription.data_type.type_name() != LIGHTER_ACCOUNT_POSITIONS_TYPE {
-            return Ok(());
-        }
-        if let Some(account_index) = account_index_from_data_type(&subscription.data_type)
-            .or_else(|| account_index_from_params(subscription.params.as_ref()))
-        {
-            log::info!("Unsubscribing from Lighter account positions for account {account_index}");
-            self.unsubscribe_topic(account_positions_channel(account_index));
-        }
-        Ok(())
-    }
-
-    fn subscribe_book_deltas(&mut self, subscription: SubscribeBookDeltas) -> anyhow::Result<()> {
-        if subscription.book_type != BookType::L2_MBP {
-            anyhow::bail!("Lighter only supports L2_MBP order book data");
-        }
-        if let Some(meta) = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .cloned()
-        {
-            self.subscribe_topic(format!("order_book/{}", meta.market_id));
-        }
-        Ok(())
-    }
-
-    fn unsubscribe_book_deltas(
-        &mut self,
-        subscription: &UnsubscribeBookDeltas,
-    ) -> anyhow::Result<()> {
-        if let Some(meta) = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .cloned()
-        {
-            self.unsubscribe_topic(format!("order_book/{}", meta.market_id));
-        }
-        Ok(())
-    }
-
-    fn subscribe_quotes(&mut self, subscription: SubscribeQuotes) -> anyhow::Result<()> {
-        if let Some(meta) = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .cloned()
-        {
-            self.subscribe_topic(format!("ticker/{}", meta.market_id));
-        }
-        Ok(())
-    }
-
-    fn unsubscribe_quotes(&mut self, subscription: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        if let Some(meta) = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .cloned()
-        {
-            self.unsubscribe_topic(format!("ticker/{}", meta.market_id));
-        }
-        Ok(())
-    }
-
-    fn subscribe_trades(&mut self, subscription: SubscribeTrades) -> anyhow::Result<()> {
-        if let Some(meta) = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .cloned()
-        {
-            self.subscribe_topic(format!("trade/{}", meta.market_id));
-        }
-        Ok(())
-    }
-
-    fn unsubscribe_trades(&mut self, subscription: &UnsubscribeTrades) -> anyhow::Result<()> {
-        if let Some(meta) = self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .cloned()
-        {
-            self.unsubscribe_topic(format!("trade/{}", meta.market_id));
-        }
-        Ok(())
-    }
-
-    fn subscribe_mark_prices(&mut self, subscription: SubscribeMarkPrices) -> anyhow::Result<()> {
-        if self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .is_some_and(|meta| meta.market_type.is_perp())
-        {
-            self.subscribe_topic("market_stats/all".to_string());
-        }
-        Ok(())
-    }
-
-    fn unsubscribe_mark_prices(
-        &mut self,
-        subscription: &UnsubscribeMarkPrices,
-    ) -> anyhow::Result<()> {
-        if self
-            .registry
-            .try_read()
-            .expect("instrument registry lock poisoned")
-            .meta_for_instrument_id(&subscription.instrument_id)
-            .is_some_and(|meta| meta.market_type.is_perp())
-        {
-            self.unsubscribe_topic("market_stats/all".to_string());
-        }
-        Ok(())
-    }
-
-    fn subscribe_index_prices(&mut self, subscription: SubscribeIndexPrices) -> anyhow::Result<()> {
-        self.subscribe_mark_prices(SubscribeMarkPrices::new(
-            subscription.instrument_id,
-            subscription.client_id,
-            subscription.venue,
-            subscription.command_id,
-            subscription.ts_init,
-            subscription.correlation_id,
-            subscription.params,
-        ))
-    }
-
-    fn unsubscribe_index_prices(
-        &mut self,
-        subscription: &UnsubscribeIndexPrices,
-    ) -> anyhow::Result<()> {
-        self.unsubscribe_mark_prices(&UnsubscribeMarkPrices::new(
-            subscription.instrument_id,
-            subscription.client_id,
-            subscription.venue,
-            subscription.command_id,
-            subscription.ts_init,
-            subscription.correlation_id,
-            subscription.params.clone(),
-        ))
-    }
-
-    fn subscribe_funding_rates(
-        &mut self,
-        subscription: SubscribeFundingRates,
-    ) -> anyhow::Result<()> {
-        self.subscribe_mark_prices(SubscribeMarkPrices::new(
-            subscription.instrument_id,
-            subscription.client_id,
-            subscription.venue,
-            subscription.command_id,
-            subscription.ts_init,
-            subscription.correlation_id,
-            subscription.params,
-        ))
-    }
-
-    fn unsubscribe_funding_rates(
-        &mut self,
-        subscription: &UnsubscribeFundingRates,
-    ) -> anyhow::Result<()> {
-        self.unsubscribe_mark_prices(&UnsubscribeMarkPrices::new(
-            subscription.instrument_id,
-            subscription.client_id,
-            subscription.venue,
-            subscription.command_id,
-            subscription.ts_init,
-            subscription.correlation_id,
-            subscription.params.clone(),
-        ))
-    }
-
-    fn subscribe_bars(&mut self, _subscription: SubscribeBars) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    fn unsubscribe_bars(&mut self, _subscription: &UnsubscribeBars) -> anyhow::Result<()> {
-        Ok(())
+    fn request_book_depth(&self, request: RequestBookDepth) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Lighter does not support historical order book depth requests for {}; \
+             use request_book_snapshot for an L2 snapshot or subscribe_book_depth10 for live depth10",
+            request.instrument_id,
+        )
     }
 }
 
-fn handle_ws_message(
-    message: &str,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    registry: &LighterInstrumentRegistry,
-    book_offsets: &mut AHashMap<i64, u64>,
-    clock: &'static nautilus_core::time::AtomicTime,
-    #[cfg(feature = "latency-probe")] raw_received_ns: u64,
-) -> anyhow::Result<()> {
-    #[cfg(feature = "latency-probe")]
-    {
-        latency::record_duration(
-            "lighter.adapter.raw_to_loop",
-            raw_received_ns,
-            latency::timestamp_ns(),
-        );
-    }
+fn retain_trade_ticks_in_range(
+    trades: &mut Vec<TradeTick>,
+    start_nanos: Option<UnixNanos>,
+    end_nanos: Option<UnixNanos>,
+) {
+    trades.retain(|trade| trade_tick_in_range(trade.ts_event, start_nanos, end_nanos));
+    trades.sort_by_key(|trade| trade.ts_event);
+}
 
-    #[cfg(feature = "latency-probe")]
-    let header_parse_start_ns = latency::timestamp_ns();
-    let header: WsMessage = serde_json::from_str(message)?;
-    #[cfg(feature = "latency-probe")]
-    latency::record_duration(
-        "lighter.adapter.header_parse",
-        header_parse_start_ns,
-        latency::timestamp_ns(),
+fn trade_tick_in_range(
+    ts_event: UnixNanos,
+    start_nanos: Option<UnixNanos>,
+    end_nanos: Option<UnixNanos>,
+) -> bool {
+    start_nanos.is_none_or(|start| ts_event >= start) && end_nanos.is_none_or(|end| ts_event <= end)
+}
+
+/// Returns an error if `book_type` is not [`BookType::L2_MBP`].
+///
+/// Lighter publishes only level-aggregated book updates, so any other book
+/// type cannot be served by the WebSocket feed.
+fn validate_book_deltas_subscription(book_type: BookType) -> anyhow::Result<()> {
+    validate_l2_mbp_book_type(book_type, "deltas")
+}
+
+fn validate_book_depth10_subscription(book_type: BookType) -> anyhow::Result<()> {
+    validate_l2_mbp_book_type(book_type, "depth10")
+}
+
+fn validate_l2_mbp_book_type(book_type: BookType, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        book_type == BookType::L2_MBP,
+        "Lighter only supports L2_MBP order book {label}",
     );
-    if matches!(header.msg_type.as_str(), "connected" | "ping" | "pong") {
-        return Ok(());
-    }
-
-    match header.msg_type.as_str() {
-        "subscribed/account_all_positions" | "update/account_all_positions" => {
-            #[cfg(feature = "latency-probe")]
-            let payload_parse_start_ns = latency::timestamp_ns();
-            let payload: WsAccountAllPositionsUpdate = serde_json::from_str(message)?;
-            #[cfg(feature = "latency-probe")]
-            latency::record_duration(
-                "lighter.adapter.account_positions_payload_parse",
-                payload_parse_start_ns,
-                latency::timestamp_ns(),
-            );
-            let Some(account_index) = account_index_from_channel(&payload.channel) else {
-                return Ok(());
-            };
-            let ts_init = adapter_ts_init(
-                clock,
-                #[cfg(feature = "latency-probe")]
-                raw_received_ns,
-            );
-            let custom = LighterAccountPositions::try_from_ws_update(
-                account_index,
-                payload,
-                ts_init,
-                ts_init,
-            )?
-            .into_custom_data();
-            let _ = sender.send(DataEvent::Data(Data::Custom(custom)));
-            return Ok(());
-        }
-        "subscribed/order_book" | "update/order_book" => {
-            #[cfg(feature = "latency-probe")]
-            let payload_parse_start_ns = latency::timestamp_ns();
-            let payload: WsOrderBookMessage = serde_json::from_str(message)?;
-            #[cfg(feature = "latency-probe")]
-            latency::record_duration(
-                "lighter.adapter.book_payload_parse",
-                payload_parse_start_ns,
-                latency::timestamp_ns(),
-            );
-            let Some(market_id) = channel_market_id(&payload.channel) else {
-                return Ok(());
-            };
-            let Some(meta) = registry.meta_for_market_id(market_id) else {
-                return Ok(());
-            };
-            let sequence = payload.offset as u64;
-            let ts_init = adapter_ts_init(
-                clock,
-                #[cfg(feature = "latency-probe")]
-                raw_received_ns,
-            );
-            let ts_event = {
-                let ts_event = epoch_to_unix_nanos(Some(payload.timestamp));
-                if ts_event == UnixNanos::default() {
-                    ts_init
-                } else {
-                    ts_event
-                }
-            };
-
-            if payload.msg_type.starts_with("subscribed/") {
-                #[cfg(feature = "latency-probe")]
-                let normalize_start_ns = latency::timestamp_ns();
-                book_offsets.insert(market_id, sequence);
-                let deltas = order_book_snapshot_deltas(
-                    &meta.instrument,
-                    &payload.order_book.bids,
-                    &payload.order_book.asks,
-                    sequence,
-                    ts_event,
-                    ts_init,
-                );
-                #[cfg(feature = "latency-probe")]
-                latency::record_duration(
-                    "lighter.adapter.book_snapshot_normalize",
-                    normalize_start_ns,
-                    latency::timestamp_ns(),
-                );
-                let _ = sender.send(DataEvent::Data(Data::Deltas(OrderBookDeltas_API::new(
-                    deltas,
-                ))));
-                #[cfg(feature = "latency-probe")]
-                record_after_send("lighter.adapter.book_snapshot_after_send", raw_received_ns);
-                return Ok(());
-            }
-
-            let last_sequence = book_offsets.get(&market_id).copied().unwrap_or_default();
-            if sequence <= last_sequence {
-                return Ok(());
-            }
-
-            #[cfg(feature = "latency-probe")]
-            let normalize_start_ns = latency::timestamp_ns();
-            book_offsets.insert(market_id, sequence);
-            let deltas = order_book_delta_updates(
-                &meta.instrument,
-                &payload.order_book.bids,
-                &payload.order_book.asks,
-                sequence,
-                ts_event,
-                ts_init,
-            );
-            #[cfg(feature = "latency-probe")]
-            latency::record_duration(
-                "lighter.adapter.book_delta_normalize",
-                normalize_start_ns,
-                latency::timestamp_ns(),
-            );
-            let _ = sender.send(DataEvent::Data(Data::Deltas(OrderBookDeltas_API::new(
-                deltas,
-            ))));
-            #[cfg(feature = "latency-probe")]
-            record_after_send("lighter.adapter.book_delta_after_send", raw_received_ns);
-        }
-        "subscribed/ticker" | "update/ticker" => {
-            #[cfg(feature = "latency-probe")]
-            let payload_parse_start_ns = latency::timestamp_ns();
-            let payload: WsTickerUpdate = serde_json::from_str(message)?;
-            #[cfg(feature = "latency-probe")]
-            latency::record_duration(
-                "lighter.adapter.ticker_payload_parse",
-                payload_parse_start_ns,
-                latency::timestamp_ns(),
-            );
-            let Some(market_id) = payload.channel.as_deref().and_then(channel_market_id) else {
-                return Ok(());
-            };
-            let Some(ticker) = payload.ticker else {
-                return Ok(());
-            };
-            let Some(meta) = registry.meta_for_market_id(market_id) else {
-                return Ok(());
-            };
-            let ts_init = adapter_ts_init(
-                clock,
-                #[cfg(feature = "latency-probe")]
-                raw_received_ns,
-            );
-            let ts_event = ticker_event_time(
-                ticker.last_updated_at,
-                payload.last_updated_at,
-                payload.timestamp,
-                ts_init,
-            );
-            #[cfg(feature = "latency-probe")]
-            let normalize_start_ns = latency::timestamp_ns();
-            if let Some(quote) =
-                quote_tick_from_ticker(&meta.instrument, &ticker, ts_event, ts_init)
-            {
-                #[cfg(feature = "latency-probe")]
-                latency::record_duration(
-                    "lighter.adapter.ticker_normalize",
-                    normalize_start_ns,
-                    latency::timestamp_ns(),
-                );
-                let _ = sender.send(DataEvent::Data(Data::Quote(quote)));
-                #[cfg(feature = "latency-probe")]
-                record_after_send("lighter.adapter.ticker_after_send", raw_received_ns);
-            }
-        }
-        "subscribed/trade" | "update/trade" => {
-            #[cfg(feature = "latency-probe")]
-            let payload_parse_start_ns = latency::timestamp_ns();
-            let payload: WsTradeUpdate = serde_json::from_str(message)?;
-            #[cfg(feature = "latency-probe")]
-            latency::record_duration(
-                "lighter.adapter.trade_payload_parse",
-                payload_parse_start_ns,
-                latency::timestamp_ns(),
-            );
-            let Some(market_id) = channel_market_id(&payload.channel) else {
-                return Ok(());
-            };
-            let Some(meta) = registry.meta_for_market_id(market_id) else {
-                return Ok(());
-            };
-            let ts_init = adapter_ts_init(
-                clock,
-                #[cfg(feature = "latency-probe")]
-                raw_received_ns,
-            );
-            #[cfg(feature = "latency-probe")]
-            let normalize_start_ns = latency::timestamp_ns();
-            for trade in payload.trades {
-                let _ = sender.send(DataEvent::Data(Data::Trade(trade_tick_from_trade(
-                    &meta.instrument,
-                    &trade,
-                    ts_init,
-                ))));
-            }
-            #[cfg(feature = "latency-probe")]
-            {
-                latency::record_duration(
-                    "lighter.adapter.trade_normalize_send",
-                    normalize_start_ns,
-                    latency::timestamp_ns(),
-                );
-                record_after_send("lighter.adapter.trade_after_send", raw_received_ns);
-            }
-        }
-        "update/market_stats" | "subscribed/market_stats" => {
-            #[cfg(feature = "latency-probe")]
-            let payload_parse_start_ns = latency::timestamp_ns();
-            let payload: WsMarketStatsUpdate = serde_json::from_str(message)?;
-            #[cfg(feature = "latency-probe")]
-            latency::record_duration(
-                "lighter.adapter.market_stats_payload_parse",
-                payload_parse_start_ns,
-                latency::timestamp_ns(),
-            );
-            let ts_init = adapter_ts_init(
-                clock,
-                #[cfg(feature = "latency-probe")]
-                raw_received_ns,
-            );
-            let ts_event = message_event_time(payload.timestamp, ts_init);
-
-            #[cfg(feature = "latency-probe")]
-            let normalize_start_ns = latency::timestamp_ns();
-            for market in payload.markets {
-                let Some(market_id) = market.market_id else {
-                    continue;
-                };
-                let Some(meta) = registry.meta_for_market_id(market_id) else {
-                    continue;
-                };
-                for update in market_stats_to_updates(&meta.instrument, &market, ts_event, ts_init)
-                {
-                    match update {
-                        LighterMarketStatUpdate::Mark(update) => {
-                            let _ = sender.send(DataEvent::Data(Data::MarkPriceUpdate(update)));
-                        }
-                        LighterMarketStatUpdate::Index(update) => {
-                            let _ = sender.send(DataEvent::Data(Data::IndexPriceUpdate(update)));
-                        }
-                        LighterMarketStatUpdate::Funding(update) => {
-                            let _ = sender.send(DataEvent::FundingRate(update));
-                        }
-                    }
-                }
-            }
-            #[cfg(feature = "latency-probe")]
-            {
-                latency::record_duration(
-                    "lighter.adapter.market_stats_normalize_send",
-                    normalize_start_ns,
-                    latency::timestamp_ns(),
-                );
-                record_after_send("lighter.adapter.market_stats_after_send", raw_received_ns);
-            }
-        }
-        _ => {}
-    }
-
     Ok(())
 }
 
-#[cfg(feature = "latency-probe")]
-fn adapter_ts_init(
-    clock: &'static nautilus_core::time::AtomicTime,
-    raw_received_ns: u64,
-) -> UnixNanos {
-    if latency::enabled() {
-        UnixNanos::from(raw_received_ns)
-    } else {
-        clock.get_time_ns()
+/// Clamps a `RequestBookSnapshot.depth` to a `limit` value the venue accepts.
+///
+/// Lighter's `GET /api/v1/orderBookOrders` rejects `limit` above
+/// [`LIGHTER_BOOK_ORDERS_MAX_LIMIT`] with venue error 20001. `None` defaults
+/// to the cap.
+fn clamp_book_snapshot_limit(depth: Option<std::num::NonZeroUsize>) -> u16 {
+    depth
+        .map_or(DEFAULT_BOOK_SNAPSHOT_LIMIT, |n| {
+            u16::try_from(n.get()).unwrap_or(u16::MAX)
+        })
+        .min(LIGHTER_BOOK_ORDERS_MAX_LIMIT)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroUsize, time::Duration};
+
+    use axum::{
+        Router,
+        extract::Query,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::get,
+    };
+    use chrono::DateTime;
+    use nautilus_common::live::runner::replace_data_event_sender;
+    use nautilus_core::UUID4;
+    use nautilus_model::{
+        data::{
+            BarSpecification, BarType, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate,
+            TradeTick,
+        },
+        enums::{AggregationSource, AggressorSide, BarAggregation, PriceType},
+        identifiers::{InstrumentId, Symbol, TradeId},
+        instruments::{CryptoPerpetual, CurrencyPair},
+        types::{Currency, Price, Quantity},
+    };
+    use rstest::rstest;
+    use rust_decimal::Decimal;
+
+    use super::*;
+    use crate::{
+        common::enums::{LighterFundingResolution, LighterProductType},
+        http::query::{LighterFundingsQuery, LighterRecentTradesQuery},
+    };
+
+    const HTTP_ORDER_BOOK_DETAILS: &str = include_str!("../test_data/http_order_book_details.json");
+    const HTTP_FUNDINGS: &str = include_str!("../test_data/http_fundings.json");
+    const HTTP_RECENT_TRADES: &str = include_str!("../test_data/http_recent_trades.json");
+    const HTTP_RECENT_TRADES_NULL: &str = include_str!("../test_data/http_recent_trades_null.json");
+    const HTTP_RECENT_TRADES_UNORDERED: &str =
+        include_str!("../test_data/http_recent_trades_unordered.json");
+    const PRIVATE_KEY_HEX: &str =
+        "0b8e0f63c24d8baacd9d29ad4e9a4b73c4a8d2bb8b16dc4fa9d7c2e1d3a8b1f0e8d3a4c5b6e7f001";
+
+    #[rstest]
+    #[case::none_defaults_to_cap(None, LIGHTER_BOOK_ORDERS_MAX_LIMIT)]
+    #[case::below_cap_passes_through(Some(10), 10)]
+    #[case::at_cap_passes_through(
+        Some(LIGHTER_BOOK_ORDERS_MAX_LIMIT as usize),
+        LIGHTER_BOOK_ORDERS_MAX_LIMIT
+    )]
+    #[case::above_cap_clamps(Some(500), LIGHTER_BOOK_ORDERS_MAX_LIMIT)]
+    #[case::usize_max_clamps(Some(usize::MAX), LIGHTER_BOOK_ORDERS_MAX_LIMIT)]
+    fn test_clamp_book_snapshot_limit(#[case] depth: Option<usize>, #[case] expected: u16) {
+        let depth = depth.map(|n| NonZeroUsize::new(n).expect("non-zero"));
+        assert_eq!(clamp_book_snapshot_limit(depth), expected);
     }
-}
 
-#[cfg(not(feature = "latency-probe"))]
-fn adapter_ts_init(clock: &'static nautilus_core::time::AtomicTime) -> UnixNanos {
-    clock.get_time_ns()
-}
+    #[rstest]
+    fn test_new_uses_readonly_websocket_url() {
+        let client = create_data_client_for_test();
 
-#[cfg(feature = "latency-probe")]
-fn record_after_send(stage: &'static str, raw_received_ns: u64) {
-    latency::record_duration(stage, raw_received_ns, latency::timestamp_ns());
+        assert_eq!(
+            client.ws_client.url(),
+            "wss://mainnet.zklighter.elliot.ai/stream?readonly=true",
+        );
+    }
+
+    #[rstest]
+    fn test_validate_book_deltas_accepts_l2_mbp() {
+        assert!(validate_book_deltas_subscription(BookType::L2_MBP).is_ok());
+    }
+
+    #[rstest]
+    #[case(BookType::L1_MBP)]
+    #[case(BookType::L3_MBO)]
+    fn test_validate_book_deltas_rejects_other_book_types(#[case] book_type: BookType) {
+        let err = validate_book_deltas_subscription(book_type).unwrap_err();
+        assert!(
+            err.to_string().contains("L2_MBP"),
+            "expected error to cite L2_MBP, was: {err}",
+        );
+    }
+
+    #[rstest]
+    fn test_validate_book_depth10_accepts_l2_mbp() {
+        assert!(validate_book_depth10_subscription(BookType::L2_MBP).is_ok());
+    }
+
+    #[rstest]
+    #[case(BookType::L1_MBP)]
+    #[case(BookType::L3_MBO)]
+    fn test_validate_book_depth10_rejects_other_book_types(#[case] book_type: BookType) {
+        let err = validate_book_depth10_subscription(book_type).unwrap_err();
+        assert!(
+            err.to_string().contains("depth10"),
+            "expected error to cite depth10, was: {err}",
+        );
+    }
+
+    #[rstest]
+    #[case(LighterMarketStatus::Active, MarketStatusAction::Trading)]
+    #[case(
+        LighterMarketStatus::Inactive,
+        MarketStatusAction::NotAvailableForTrading
+    )]
+    fn test_lighter_market_status_action(
+        #[case] status: LighterMarketStatus,
+        #[case] expected: MarketStatusAction,
+    ) {
+        assert_eq!(lighter_market_status_action(status), expected);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_instrument_status_replays_cached_status() {
+        let (mut client, mut receiver) = create_data_client_with_receiver_for_test();
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        cache_lighter_instrument_status(
+            &client.instrument_statuses,
+            instrument_id,
+            LighterMarketStatus::Active,
+        );
+
+        DataClient::subscribe_instrument_status(
+            &mut client,
+            SubscribeInstrumentStatus::new(
+                instrument_id,
+                Some(ClientId::new("LIGHTER")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let event = receiver.recv().await.expect("instrument status event");
+        match event {
+            DataEvent::InstrumentStatus(status) => {
+                assert_eq!(status.instrument_id, instrument_id);
+                assert_eq!(status.action, MarketStatusAction::Trading);
+                assert_eq!(status.is_trading, Some(true));
+            }
+            event => panic!("expected instrument status, was {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_instrument_status_fetches_when_cache_is_empty() {
+        let base_url = spawn_order_book_details_server().await;
+        let config = LighterDataClientConfig {
+            base_url_http: Some(base_url),
+            ..Default::default()
+        };
+        let (mut client, mut receiver) =
+            create_data_client_with_receiver_and_config_for_test(config);
+        let instrument_id = client.registry.insert(0, "ETH", LighterProductType::Perp);
+
+        DataClient::subscribe_instrument_status(
+            &mut client,
+            SubscribeInstrumentStatus::new(
+                instrument_id,
+                Some(ClientId::new("LIGHTER")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("instrument status response")
+            .expect("instrument status event");
+
+        match event {
+            DataEvent::InstrumentStatus(status) => {
+                assert_eq!(status.instrument_id, instrument_id);
+                assert_eq!(status.action, MarketStatusAction::Trading);
+                assert_eq!(status.is_trading, Some(true));
+            }
+            event => panic!("expected instrument status, was {event:?}"),
+        }
+        assert!(client.instruments.get_cloned(&instrument_id).is_some());
+        assert_eq!(
+            client
+                .instrument_statuses
+                .get(&instrument_id)
+                .map(|status| *status),
+            Some(LighterMarketStatus::Active),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_market_stats_subscriptions_share_perp_channel_until_last_unsub() {
+        let mut client = create_data_client_for_test();
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+
+        DataClient::subscribe_mark_prices(
+            &mut client,
+            SubscribeMarkPrices::new(
+                instrument_id,
+                Some(ClientId::new("LIGHTER")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        DataClient::subscribe_index_prices(
+            &mut client,
+            SubscribeIndexPrices::new(
+                instrument_id,
+                Some(ClientId::new("LIGHTER")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        DataClient::subscribe_funding_rates(
+            &mut client,
+            SubscribeFundingRates::new(
+                instrument_id,
+                Some(ClientId::new("LIGHTER")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let subscription = client
+            .market_stats_subscriptions
+            .get(&instrument_id)
+            .expect("market stats subscription");
+        assert_eq!(
+            subscription.flags,
+            MarketStatsFlags {
+                mark_price: true,
+                index_price: true,
+                funding_rate: true,
+            },
+        );
+        assert!(matches!(
+            subscription.channel,
+            LighterWsChannel::MarketStats(LighterMarketSelection::Market(0)),
+        ));
+        drop(subscription);
+
+        DataClient::unsubscribe_mark_prices(
+            &mut client,
+            &UnsubscribeMarkPrices::new(
+                instrument_id,
+                Some(ClientId::new("LIGHTER")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .market_stats_subscriptions
+                .get(&instrument_id)
+                .expect("index and funding still active")
+                .flags,
+            MarketStatsFlags {
+                index_price: true,
+                funding_rate: true,
+                ..Default::default()
+            },
+        );
+
+        DataClient::unsubscribe_index_prices(
+            &mut client,
+            &UnsubscribeIndexPrices::new(
+                instrument_id,
+                Some(ClientId::new("LIGHTER")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .market_stats_subscriptions
+                .get(&instrument_id)
+                .expect("funding still active")
+                .flags,
+            MarketStatsFlags {
+                funding_rate: true,
+                ..Default::default()
+            },
+        );
+
+        DataClient::unsubscribe_funding_rates(
+            &mut client,
+            &UnsubscribeFundingRates::new(
+                instrument_id,
+                Some(ClientId::new("LIGHTER")),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        assert!(
+            !client
+                .market_stats_subscriptions
+                .contains_key(&instrument_id)
+        );
+    }
+
+    #[rstest]
+    fn test_market_stats_ws_forwarding_requires_matching_subscription() {
+        let subscriptions = DashMap::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), *LIGHTER_VENUE);
+        let other_instrument_id = InstrumentId::new(Symbol::new("BTC-PERP"), *LIGHTER_VENUE);
+
+        subscriptions.insert(
+            instrument_id,
+            MarketStatsSubscription {
+                channel: LighterWsChannel::MarketStats(LighterMarketSelection::Market(0)),
+                flags: MarketStatsFlags {
+                    mark_price: true,
+                    index_price: true,
+                    funding_rate: true,
+                },
+            },
+        );
+
+        assert!(emit_market_stats_ws_message(
+            &sender,
+            &subscriptions,
+            &NautilusWsMessage::MarkPrice(MarkPriceUpdate::new(
+                instrument_id,
+                Price::from("2000.00"),
+                UnixNanos::from(10),
+                UnixNanos::from(1),
+            )),
+        ));
+        assert!(emit_market_stats_ws_message(
+            &sender,
+            &subscriptions,
+            &NautilusWsMessage::IndexPrice(IndexPriceUpdate::new(
+                instrument_id,
+                Price::from("1999.50"),
+                UnixNanos::from(11),
+                UnixNanos::from(1),
+            )),
+        ));
+        assert!(emit_market_stats_ws_message(
+            &sender,
+            &subscriptions,
+            &NautilusWsMessage::FundingRate(FundingRateUpdate::new(
+                instrument_id,
+                Decimal::new(12, 6),
+                None,
+                Some(UnixNanos::from(100)),
+                UnixNanos::from(12),
+                UnixNanos::from(1),
+            )),
+        ));
+
+        match receiver.try_recv().unwrap() {
+            DataEvent::Data(Data::MarkPriceUpdate(update)) => {
+                assert_eq!(update.instrument_id, instrument_id);
+                assert_eq!(update.value, Price::from("2000.00"));
+            }
+            event => panic!("expected mark price update, was {event:?}"),
+        }
+
+        match receiver.try_recv().unwrap() {
+            DataEvent::Data(Data::IndexPriceUpdate(update)) => {
+                assert_eq!(update.instrument_id, instrument_id);
+                assert_eq!(update.value, Price::from("1999.50"));
+            }
+            event => panic!("expected index price update, was {event:?}"),
+        }
+
+        match receiver.try_recv().unwrap() {
+            DataEvent::FundingRate(update) => {
+                assert_eq!(update.instrument_id, instrument_id);
+                assert_eq!(update.rate, Decimal::new(12, 6));
+            }
+            event => panic!("expected funding rate update, was {event:?}"),
+        }
+
+        assert!(!emit_market_stats_ws_message(
+            &sender,
+            &subscriptions,
+            &NautilusWsMessage::MarkPrice(MarkPriceUpdate::new(
+                other_instrument_id,
+                Price::from("1.00"),
+                UnixNanos::from(13),
+                UnixNanos::from(1),
+            )),
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_index_market_stats_channel_uses_spot_stream_for_spot_instrument() {
+        let client = create_data_client_for_test();
+        let instrument_id = cache_test_instrument(&client, 2048, "ETH", LighterProductType::Spot);
+
+        let channel = client.index_market_stats_channel(instrument_id).unwrap();
+
+        assert!(matches!(
+            channel,
+            LighterWsChannel::SpotMarketStats(LighterMarketSelection::Market(2048)),
+        ));
+    }
+
+    #[rstest]
+    fn test_mark_price_channel_rejects_spot_instrument() {
+        let client = create_data_client_for_test();
+        let instrument_id = cache_test_instrument(&client, 2048, "ETH", LighterProductType::Spot);
+
+        let err = client
+            .perp_market_stats_channel(instrument_id, "mark price")
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("mark price subscriptions require a perpetual instrument"),
+        );
+    }
+
+    #[rstest]
+    fn test_request_bars_rejects_unsupported_bar_type() {
+        let client = create_data_client_for_test();
+        let request = RequestBars::new(
+            unsupported_three_minute_bar_type(),
+            None,
+            None,
+            None,
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        let err = DataClient::request_bars(&client, request).unwrap_err();
+
+        assert_eq!(err.to_string(), "unsupported Lighter candle minute step: 3");
+    }
+
+    #[rstest]
+    fn test_subscribe_bars_rejects_unsupported_bar_type() {
+        let mut client = create_data_client_for_test();
+        let subscription = SubscribeBars::new(
+            unsupported_three_minute_bar_type(),
+            Some(ClientId::new("LIGHTER")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        let err = DataClient::subscribe_bars(&mut client, subscription).unwrap_err();
+
+        assert_eq!(err.to_string(), "unsupported Lighter candle minute step: 3");
+    }
+
+    #[rstest]
+    fn test_subscribe_bars_accepts_ws_streamable_resolution() {
+        let mut client = create_data_client_for_test();
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        let bar_type = BarType::new(
+            instrument_id,
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+            AggregationSource::External,
+        );
+        let subscription = SubscribeBars::new(
+            bar_type,
+            Some(ClientId::new("LIGHTER")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        DataClient::subscribe_bars(&mut client, subscription).unwrap();
+    }
+
+    #[rstest]
+    fn test_subscribe_bars_rejects_one_week_with_ws_message() {
+        let mut client = create_data_client_for_test();
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        let bar_type = BarType::new(
+            instrument_id,
+            BarSpecification::new(1, BarAggregation::Week, PriceType::Last),
+            AggregationSource::External,
+        );
+        let subscription = SubscribeBars::new(
+            bar_type,
+            Some(ClientId::new("LIGHTER")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        let err = DataClient::subscribe_bars(&mut client, subscription).unwrap_err();
+
+        assert!(
+            err.to_string().contains("does not offer")
+                && err.to_string().contains("candle WebSocket stream"),
+            "expected WS-streamable rejection, was: {err}",
+        );
+    }
+
+    #[rstest]
+    fn test_unsubscribe_bars_returns_ok_for_unsupported_bar_type() {
+        let mut client = create_data_client_for_test();
+        let unsubscription = UnsubscribeBars::new(
+            unsupported_three_minute_bar_type(),
+            Some(ClientId::new("LIGHTER")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        DataClient::unsubscribe_bars(&mut client, &unsubscription).unwrap();
+    }
+
+    #[rstest]
+    fn test_subscribe_book_depth10_rejects_unsupported_book_type() {
+        let mut client = create_data_client_for_test();
+        let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), *LIGHTER_VENUE);
+        let subscription = SubscribeBookDepth10::new(
+            instrument_id,
+            BookType::L1_MBP,
+            Some(ClientId::new("LIGHTER")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        );
+
+        let err = DataClient::subscribe_book_depth10(&mut client, subscription).unwrap_err();
+
+        assert!(err.to_string().contains("L2_MBP"));
+    }
+
+    #[rstest]
+    fn test_request_quotes_rejects_unsupported_rest_quotes() {
+        let client = create_data_client_for_test();
+        let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), *LIGHTER_VENUE);
+        let request = RequestQuotes::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        let err = DataClient::request_quotes(&client, request).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("does not support historical quote requests"),
+        );
+    }
+
+    #[rstest]
+    fn test_request_book_depth_rejects_unsupported_rest_depth() {
+        let client = create_data_client_for_test();
+        let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), *LIGHTER_VENUE);
+        let request = RequestBookDepth::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            NonZeroUsize::new(10),
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        let err = DataClient::request_book_depth(&client, request).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("does not support historical order book depth requests"),
+        );
+    }
+
+    #[rstest]
+    fn test_request_funding_rates_rejects_spot_instrument() {
+        let client = create_data_client_for_test();
+        let instrument_id = cache_test_instrument(&client, 2048, "ETH", LighterProductType::Spot);
+        let request = RequestFundingRates::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        let err = DataClient::request_funding_rates(&client, request).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("funding-rate requests require a perpetual instrument"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_funding_rates_emits_response() {
+        let base_url = spawn_fundings_server().await;
+        let config = LighterDataClientConfig {
+            base_url_http: Some(base_url),
+            ..Default::default()
+        };
+        let (client, mut receiver) = create_data_client_with_receiver_and_config_for_test(config);
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        let start = DateTime::from_timestamp(1_778_702_400, 0).unwrap();
+        let end = DateTime::from_timestamp(1_778_706_000, 0).unwrap();
+        let request = RequestFundingRates::new(
+            instrument_id,
+            Some(start),
+            Some(end),
+            NonZeroUsize::new(2),
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        DataClient::request_funding_rates(&client, request).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("funding rates response")
+            .expect("funding rates event");
+
+        match event {
+            DataEvent::Response(DataResponse::FundingRates(response)) => {
+                assert_eq!(response.instrument_id, instrument_id);
+                assert_eq!(response.data.len(), 2);
+                assert_eq!(response.data[0].rate, Decimal::new(12, 4));
+                assert_eq!(response.data[0].interval, Some(60));
+                assert_eq!(
+                    response.data[0].ts_event,
+                    UnixNanos::from(1_778_702_400_000_000_000)
+                );
+                assert_eq!(response.data[1].rate, Decimal::new(-2, 4));
+                assert_eq!(response.data[1].interval, Some(60));
+            }
+            event => panic!("expected funding rates response, was {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_trades_uses_recent_trades_endpoint() {
+        let base_url = spawn_trades_server().await;
+        let config = LighterDataClientConfig {
+            base_url_http: Some(base_url),
+            ..Default::default()
+        };
+        let (client, mut receiver) = create_data_client_with_receiver_and_config_for_test(config);
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let request = RequestTrades::new(
+            instrument_id,
+            Some(start),
+            None,
+            NonZeroUsize::new(50),
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        DataClient::request_trades(&client, request).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("trades response")
+            .expect("trades event");
+
+        match event {
+            DataEvent::Response(DataResponse::Trades(response)) => {
+                assert_eq!(response.instrument_id, instrument_id);
+                assert_eq!(response.data.len(), 1);
+                let tick = &response.data[0];
+                assert_eq!(tick.instrument_id, instrument_id);
+                assert_eq!(tick.price, Price::from("2361.31"));
+                assert_eq!(tick.size, Quantity::from("0.0005"));
+                assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+                assert_eq!(tick.trade_id.to_string(), "19211490282");
+            }
+            event => panic!("expected trades response, was {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_trades_emits_empty_response_for_null_recent_trades() {
+        let base_url = spawn_trades_server_with_response(HTTP_RECENT_TRADES_NULL).await;
+        let config = LighterDataClientConfig {
+            base_url_http: Some(base_url),
+            ..Default::default()
+        };
+        let (client, mut receiver) = create_data_client_with_receiver_and_config_for_test(config);
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let request = RequestTrades::new(
+            instrument_id,
+            Some(start),
+            None,
+            NonZeroUsize::new(50),
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        DataClient::request_trades(&client, request).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("trades response")
+            .expect("trades event");
+
+        match event {
+            DataEvent::Response(DataResponse::Trades(response)) => {
+                assert_eq!(response.instrument_id, instrument_id);
+                assert!(response.data.is_empty());
+            }
+            event => panic!("expected trades response, was {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_trades_filters_recent_trades_to_requested_range() {
+        let base_url = spawn_trades_server().await;
+        let config = LighterDataClientConfig {
+            base_url_http: Some(base_url),
+            ..Default::default()
+        };
+        let (client, mut receiver) = create_data_client_with_receiver_and_config_for_test(config);
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        let end = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let request = RequestTrades::new(
+            instrument_id,
+            None,
+            Some(end),
+            NonZeroUsize::new(50),
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        DataClient::request_trades(&client, request).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("trades response")
+            .expect("trades event");
+
+        match event {
+            DataEvent::Response(DataResponse::Trades(response)) => {
+                assert_eq!(response.instrument_id, instrument_id);
+                assert!(response.data.is_empty());
+            }
+            event => panic!("expected trades response, was {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_trades_returns_recent_trades_in_timestamp_order() {
+        let base_url = spawn_trades_server_with_response(HTTP_RECENT_TRADES_UNORDERED).await;
+        let config = LighterDataClientConfig {
+            base_url_http: Some(base_url),
+            ..Default::default()
+        };
+        let (client, mut receiver) = create_data_client_with_receiver_and_config_for_test(config);
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        let start = DateTime::from_timestamp_millis(1_777_945_103_092).unwrap();
+        let end = DateTime::from_timestamp_millis(1_777_945_103_094).unwrap();
+        let request = RequestTrades::new(
+            instrument_id,
+            Some(start),
+            Some(end),
+            NonZeroUsize::new(50),
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        DataClient::request_trades(&client, request).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("trades response")
+            .expect("trades event");
+
+        match event {
+            DataEvent::Response(DataResponse::Trades(response)) => {
+                assert_eq!(response.instrument_id, instrument_id);
+                assert_eq!(
+                    response
+                        .data
+                        .iter()
+                        .map(|trade| trade.trade_id.to_string())
+                        .collect::<Vec<_>>(),
+                    vec!["19211490282", "19211490283", "19211490284"],
+                );
+                assert_eq!(
+                    response
+                        .data
+                        .iter()
+                        .map(|trade| trade.ts_event.as_u64())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        1_777_945_103_092_000_000,
+                        1_777_945_103_093_000_000,
+                        1_777_945_103_094_000_000,
+                    ],
+                );
+            }
+            event => panic!("expected trades response, was {event:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_retain_trade_ticks_in_range_sorts_ascending() {
+        let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), *LIGHTER_VENUE);
+        let tick = |ts_event, trade_id| {
+            TradeTick::new(
+                instrument_id,
+                Price::from("1.0"),
+                Quantity::from("1.0"),
+                AggressorSide::Buyer,
+                TradeId::new(trade_id),
+                UnixNanos::from(ts_event),
+                UnixNanos::from(ts_event + 1),
+            )
+        };
+        let mut trades = vec![tick(4, "4"), tick(1, "1"), tick(3, "3"), tick(2, "2")];
+
+        retain_trade_ticks_in_range(
+            &mut trades,
+            Some(UnixNanos::from(2)),
+            Some(UnixNanos::from(4)),
+        );
+
+        assert_eq!(
+            trades
+                .iter()
+                .map(|trade| trade.ts_event.as_u64())
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_instrument_refresh_skipped_when_interval_zero() {
+        let config = LighterDataClientConfig {
+            update_instruments_interval_mins: 0,
+            ..Default::default()
+        };
+        let (mut client, _receiver) = create_data_client_with_receiver_and_config_for_test(config);
+
+        assert!(client.tasks.is_empty());
+        client.spawn_instrument_refresh();
+        assert!(client.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_instrument_refresh_registers_task() {
+        let config = LighterDataClientConfig {
+            update_instruments_interval_mins: 60,
+            ..Default::default()
+        };
+        let (mut client, _receiver) = create_data_client_with_receiver_and_config_for_test(config);
+
+        assert!(client.tasks.is_empty());
+        client.spawn_instrument_refresh();
+        assert_eq!(client.tasks.len(), 1);
+
+        client.cancellation_token.cancel();
+        for task in client.tasks.drain(..) {
+            task.await.unwrap();
+        }
+    }
+
+    // Tests that observe `has_credentials()` semantics under controlled env
+    // state. Pinned to the workspace `serial_tests` group (see
+    // `.config/nextest.toml`) so env-var mutation runs single-threaded.
+    #[allow(unsafe_code)] // env-var mutation in tests; restored via `EnvGuard`.
+    mod serial_tests {
+        use super::*;
+
+        const LIGHTER_ENV_VARS: &[&str] = &[
+            "LIGHTER_API_KEY_INDEX",
+            "LIGHTER_API_SECRET",
+            "LIGHTER_ACCOUNT_INDEX",
+            "LIGHTER_TESTNET_API_KEY_INDEX",
+            "LIGHTER_TESTNET_API_SECRET",
+            "LIGHTER_TESTNET_ACCOUNT_INDEX",
+        ];
+
+        struct EnvGuard {
+            saved: Vec<(&'static str, Option<String>)>,
+        }
+
+        impl EnvGuard {
+            fn clear_lighter() -> Self {
+                let saved = LIGHTER_ENV_VARS
+                    .iter()
+                    .map(|&name| (name, std::env::var(name).ok()))
+                    .collect::<Vec<_>>();
+                for &(name, _) in &saved {
+                    // SAFETY: the `serial_tests` nextest group serializes
+                    // these tests, and no other lighter test reads or writes
+                    // the LIGHTER_* env vars.
+                    unsafe { std::env::remove_var(name) };
+                }
+                Self { saved }
+            }
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (name, original) in &self.saved {
+                    match original {
+                        // SAFETY: see `EnvGuard::clear_lighter`.
+                        Some(value) => unsafe { std::env::set_var(name, value) },
+                        None => unsafe { std::env::remove_var(name) },
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn new_data_client_with_partial_config_skips_credential_resolution() {
+            // With `account_index` missing and the env cleared,
+            // `LighterDataClientConfig::has_credentials()` must short-circuit
+            // to `false` so `Credential::resolve` is never called. Regressing
+            // the `&&` in `has_credentials()` to `||` would route this case
+            // through `credential_from_resolved_values` and fail construction
+            // with "incomplete Lighter credentials".
+            let _guard = EnvGuard::clear_lighter();
+            let config = LighterDataClientConfig {
+                api_key_index: Some(5),
+                private_key: Some(PRIVATE_KEY_HEX.to_string()),
+                account_index: None,
+                ..Default::default()
+            };
+            let (client, _receiver) = create_data_client_with_receiver_and_config_for_test(config);
+
+            assert!(!client.has_credentials());
+        }
+
+        #[tokio::test]
+        async fn new_data_client_with_all_config_fields_resolves_credential() {
+            let _guard = EnvGuard::clear_lighter();
+            let config = LighterDataClientConfig {
+                api_key_index: Some(5),
+                account_index: Some(12_345),
+                private_key: Some(PRIVATE_KEY_HEX.to_string()),
+                ..Default::default()
+            };
+            let (client, _receiver) = create_data_client_with_receiver_and_config_for_test(config);
+
+            assert!(client.has_credentials());
+        }
+
+        #[tokio::test]
+        async fn new_data_client_blank_private_key_falls_back_to_env() {
+            // `has_credentials()` and `Credential::resolve` must agree on
+            // precedence: when the config holds a blank `private_key` and the
+            // env secret is set, resolution must succeed via the env value
+            // rather than failing with "incomplete Lighter credentials".
+            let _guard = EnvGuard::clear_lighter();
+            // SAFETY: see `EnvGuard::clear_lighter`; the guard restores values on drop.
+            unsafe {
+                std::env::set_var("LIGHTER_API_SECRET", PRIVATE_KEY_HEX);
+            }
+            let config = LighterDataClientConfig {
+                api_key_index: Some(5),
+                account_index: Some(12_345),
+                private_key: Some("   ".to_string()),
+                ..Default::default()
+            };
+            let (client, _receiver) = create_data_client_with_receiver_and_config_for_test(config);
+
+            assert!(client.has_credentials());
+        }
+    }
+
+    fn create_data_client_for_test() -> LighterDataClient {
+        create_data_client_with_receiver_for_test().0
+    }
+
+    fn create_data_client_with_receiver_for_test() -> (
+        LighterDataClient,
+        tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    ) {
+        create_data_client_with_receiver_and_config_for_test(LighterDataClientConfig::default())
+    }
+
+    fn create_data_client_with_receiver_and_config_for_test(
+        config: LighterDataClientConfig,
+    ) -> (
+        LighterDataClient,
+        tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+        let client = LighterDataClient::new(ClientId::new("LIGHTER"), config).unwrap();
+        (client, receiver)
+    }
+
+    async fn spawn_order_book_details_server() -> String {
+        let app = Router::new().route("/api/v1/orderBookDetails", get(order_book_details));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    async fn spawn_fundings_server() -> String {
+        let app = Router::new().route("/api/v1/fundings", get(fundings));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    async fn spawn_trades_server() -> String {
+        spawn_trades_server_with_response(HTTP_RECENT_TRADES).await
+    }
+
+    async fn spawn_trades_server_with_response(response_body: &'static str) -> String {
+        let app = Router::new().route(
+            "/api/v1/recentTrades",
+            get(
+                move |Query(query): Query<LighterRecentTradesQuery>| async move {
+                    recent_trades_response(&query, response_body)
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    async fn order_book_details() -> Response {
+        (StatusCode::OK, HTTP_ORDER_BOOK_DETAILS).into_response()
+    }
+
+    async fn fundings(Query(query): Query<LighterFundingsQuery>) -> Response {
+        assert_eq!(query.market_id, 0);
+        assert_eq!(query.resolution, LighterFundingResolution::OneHour);
+        assert_eq!(query.start_timestamp, 1_778_702_400_000);
+        assert_eq!(query.end_timestamp, 1_778_706_000_000);
+        assert_eq!(query.count_back, 2);
+        (StatusCode::OK, HTTP_FUNDINGS).into_response()
+    }
+
+    fn recent_trades_response(
+        query: &LighterRecentTradesQuery,
+        response_body: &'static str,
+    ) -> Response {
+        assert_eq!(query.market_id, 0);
+        assert_eq!(query.limit, 50);
+        (StatusCode::OK, response_body).into_response()
+    }
+
+    fn cache_test_instrument(
+        client: &LighterDataClient,
+        market_index: i16,
+        venue_symbol: &str,
+        product_type: LighterProductType,
+    ) -> InstrumentId {
+        let instrument_id = client
+            .registry
+            .insert(market_index, venue_symbol, product_type);
+        let instrument = match product_type {
+            LighterProductType::Perp => test_perp_instrument(instrument_id, venue_symbol),
+            LighterProductType::Spot => test_spot_instrument(instrument_id, venue_symbol),
+        };
+
+        client.instruments.rcu(|m| {
+            m.insert(instrument_id, instrument.clone());
+        });
+
+        instrument_id
+    }
+
+    fn test_perp_instrument(instrument_id: InstrumentId, venue_symbol: &str) -> InstrumentAny {
+        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
+            instrument_id,
+            Symbol::new(format!("{venue_symbol}-PERP")),
+            Currency::from(venue_symbol),
+            Currency::from("USDC"),
+            Currency::from("USDC"),
+            false,
+            2,
+            4,
+            Price::from("0.01"),
+            Quantity::from("0.0001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ))
+    }
+
+    fn test_spot_instrument(instrument_id: InstrumentId, venue_symbol: &str) -> InstrumentAny {
+        InstrumentAny::CurrencyPair(CurrencyPair::new(
+            instrument_id,
+            Symbol::new(format!("{venue_symbol}-SPOT")),
+            Currency::from(venue_symbol),
+            Currency::from("USDC"),
+            2,
+            4,
+            Price::from("0.01"),
+            Quantity::from("0.0001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ))
+    }
+
+    fn unsupported_three_minute_bar_type() -> BarType {
+        let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), *LIGHTER_VENUE);
+        BarType::new(
+            instrument_id,
+            BarSpecification::new(3, BarAggregation::Minute, PriceType::Last),
+            AggregationSource::External,
+        )
+    }
 }

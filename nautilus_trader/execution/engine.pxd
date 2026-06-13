@@ -157,6 +157,15 @@ cdef class ExecutionEngine(Component):
 
 # -- EVENT HANDLERS -------------------------------------------------------------------------------
 
+    cdef str _check_position_id_against_oms(
+        self,
+        InstrumentId instrument_id,
+        StrategyId strategy_id,
+        PositionId position_id,
+        ExecutionClient client,
+    )
+    cdef OmsType _resolve_oms_type(self, StrategyId strategy_id, ExecutionClient client)
+
     cpdef void _handle_event(self, OrderEvent event)
     cpdef OmsType _determine_oms_type(self, OrderFilled fill)
     cpdef void _determine_position_id(self, OrderFilled fill, OmsType oms_type, Order order=*)
@@ -166,7 +175,10 @@ cdef class ExecutionEngine(Component):
     cpdef bint _apply_event_to_order(self, Order order, OrderEvent event)
     cpdef void _handle_order_fill(self, Order order, OrderFilled fill, OmsType oms_type)
     cdef bint _is_leg_fill(self, OrderFilled fill)
+    cdef void _send_fill_to_portfolio_before_position_update(self, OrderFilled fill)
     cdef void _handle_position_update(self, Instrument instrument, OrderFilled fill, OmsType oms_type)
+    cdef bint _reject_reduce_only_netting_position_open(self, OrderFilled fill, OmsType oms_type)
+    cdef str _reduce_only_open_position_details(self, list positions_open)
     cpdef void _handle_leg_fill_without_order(self, OrderFilled fill)
     cpdef void _open_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type)
     cpdef void _reopen_position(self, Position position, OmsType oms_type)

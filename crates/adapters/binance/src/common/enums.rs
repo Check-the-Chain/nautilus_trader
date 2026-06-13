@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.binance")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.binance")
 )]
 pub enum BinanceProductType {
     /// Spot trading (api.binance.com).
@@ -128,12 +128,12 @@ impl Display for BinanceProductType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.binance")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.binance")
 )]
 pub enum BinanceEnvironment {
-    /// Production/mainnet environment.
+    /// Live exchange environment.
     #[default]
-    Mainnet,
+    Live,
     /// Testnet environment.
     Testnet,
     /// Demo trading environment.
@@ -198,7 +198,7 @@ impl From<BinanceSide> for OrderSide {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.binance")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.binance")
 )]
 pub enum BinancePositionSide {
     /// Single position mode (both).
@@ -229,7 +229,7 @@ pub enum BinancePositionSide {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.binance")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.binance")
 )]
 pub enum BinanceMarginType {
     /// Cross margin.
@@ -783,7 +783,7 @@ pub enum BinanceFilterType {
 impl Display for BinanceEnvironment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Mainnet => write!(f, "Mainnet"),
+            Self::Live => write!(f, "Live"),
             Self::Testnet => write!(f, "Testnet"),
             Self::Demo => write!(f, "Demo"),
         }
@@ -1056,6 +1056,6 @@ mod tests {
     #[case("invalid")]
     #[case("")]
     fn test_price_match_from_param_invalid(#[case] input: &str) {
-        assert!(BinancePriceMatch::from_param(input).is_err());
+        BinancePriceMatch::from_param(input).unwrap_err();
     }
 }

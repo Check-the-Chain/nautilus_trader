@@ -62,7 +62,7 @@ use crate::{
         message::WsMessage,
         parse::{
             parse_derivative_ticker_index_price, parse_derivative_ticker_mark_price,
-            parse_tardis_ws_message, parse_tardis_ws_message_funding_rate,
+            parse_tardis_ws_message_data, parse_tardis_ws_message_funding_rate,
         },
         types::{TardisInstrumentKey, TardisInstrumentMiniInfo},
     },
@@ -150,6 +150,7 @@ impl TardisDataClient {
         url: String,
         instrument_map: AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>>,
         book_snapshot_output: BookSnapshotOutput,
+        extract_bbo_as_quotes: bool,
         is_stream_mode: bool,
     ) {
         let sender = self.data_sender.clone();
@@ -167,6 +168,7 @@ impl TardisDataClient {
                 &sender,
                 &instrument_map,
                 &book_snapshot_output,
+                extract_bbo_as_quotes,
             )
             .await;
 
@@ -217,6 +219,7 @@ impl TardisDataClient {
                             &sender,
                             &instrument_map,
                             &book_snapshot_output,
+                            extract_bbo_as_quotes,
                         )
                         .await;
 
@@ -255,6 +258,7 @@ impl TardisDataClient {
         sender: &UnboundedSender<DataEvent>,
         instrument_map: &AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>>,
         book_snapshot_output: &BookSnapshotOutput,
+        extract_bbo_as_quotes: bool,
     ) -> bool {
         let (mut writer, mut reader) = ws_stream.split();
 
@@ -285,6 +289,7 @@ impl TardisDataClient {
             sender,
             instrument_map,
             book_snapshot_output,
+            extract_bbo_as_quotes,
         )
         .await;
 
@@ -347,6 +352,7 @@ impl TardisDataClient {
         sender: &UnboundedSender<DataEvent>,
         instrument_map: &AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>>,
         book_snapshot_output: &BookSnapshotOutput,
+        extract_bbo_as_quotes: bool,
     ) -> bool {
         let mut ticker_cache = DerivativeTickerCache::default();
 
@@ -381,18 +387,18 @@ impl TardisDataClient {
                                         return false;
                                     }
                                 } else {
-                                    let event = parse_tardis_ws_message(
+                                    let data = parse_tardis_ws_message_data(
                                         ws_msg,
                                         &info,
                                         book_snapshot_output,
-                                    )
-                                    .map(DataEvent::Data);
+                                        extract_bbo_as_quotes,
+                                    );
 
-                                    if let Some(event) = event
-                                        && let Err(e) = sender.send(event)
-                                    {
-                                        log::error!("Failed to send data event: {e}");
-                                        return false;
+                                    for data in data {
+                                        if let Err(e) = sender.send(DataEvent::Data(data)) {
+                                            log::error!("Failed to send data event: {e}");
+                                            return false;
+                                        }
                                     }
                                 }
                             }
@@ -412,7 +418,7 @@ impl TardisDataClient {
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
-                    log::error!("WebSocket error: {e}");
+                    log::warn!("WebSocket error: {e}");
                     return true;
                 }
                 None => {
@@ -514,6 +520,7 @@ impl DataClient for TardisDataClient {
 
         let is_stream_mode = self.is_stream_mode();
         let book_snapshot_output = self.config.book_snapshot_output.clone();
+        let extract_bbo_as_quotes = self.config.extract_bbo_as_quotes;
 
         let http_client = TardisHttpClient::new(
             self.config.api_key.as_deref(),
@@ -564,6 +571,7 @@ impl DataClient for TardisDataClient {
             url,
             instrument_map,
             book_snapshot_output,
+            extract_bbo_as_quotes,
             is_stream_mode,
         );
         self.is_connected.store(true, Ordering::Release);
@@ -596,12 +604,12 @@ impl DataClient for TardisDataClient {
 mod tests {
     use chrono::NaiveDate;
     use nautilus_common::live::runner::set_data_event_sender;
-    use nautilus_model::identifiers::ClientId;
     use rstest::rstest;
 
     use super::*;
     use crate::{
-        common::enums::TardisExchange, config::TardisDataClientConfig,
+        common::{consts::TARDIS_CLIENT_ID, enums::TardisExchange},
+        config::TardisDataClientConfig,
         machine::types::ReplayNormalizedRequestOptions,
     };
 
@@ -636,7 +644,7 @@ mod tests {
             ..Default::default()
         };
 
-        let client = TardisDataClient::new(ClientId::new("TARDIS"), config).unwrap();
+        let client = TardisDataClient::new(*TARDIS_CLIENT_ID, config).unwrap();
         let url = client.build_ws_url("ws://localhost:8001").unwrap();
 
         assert!(
@@ -662,7 +670,7 @@ mod tests {
             ..Default::default()
         };
 
-        let client = TardisDataClient::new(ClientId::new("TARDIS"), config).unwrap();
+        let client = TardisDataClient::new(*TARDIS_CLIENT_ID, config).unwrap();
         let ws_url = client.build_ws_url("ws://localhost:8001").unwrap();
 
         let decoded = urlencoding::decode(ws_url.split("options=").nth(1).unwrap()).unwrap();

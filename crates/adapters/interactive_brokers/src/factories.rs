@@ -18,7 +18,7 @@
 use std::{any::Any, cell::RefCell, rc::Rc, sync::Arc};
 
 use nautilus_common::{
-    cache::Cache,
+    cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
@@ -30,47 +30,20 @@ use nautilus_model::{
 };
 
 use crate::{
-    common::consts::IB_VENUE,
-    config::{
-        InteractiveBrokersDataClientConfig, InteractiveBrokersExecClientConfig,
-        InteractiveBrokersInstrumentProviderConfig,
-    },
+    common::consts::{IB, IB_VENUE},
+    config::{InteractiveBrokersDataClientConfig, InteractiveBrokersExecClientConfig},
     data::InteractiveBrokersDataClient,
     execution::InteractiveBrokersExecutionClient,
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
 
-/// Configuration for creating Interactive Brokers data clients via factory.
-///
-/// The data client requires both connection settings and an instrument provider. Keeping the
-/// provider config with the client config lets Rust `LiveNode` launches mirror the Python adapter
-/// startup path where instruments can be loaded before subscriptions are issued.
-#[derive(Clone, Debug)]
-pub struct InteractiveBrokersDataFactoryConfig {
-    /// The underlying data client configuration.
-    pub config: InteractiveBrokersDataClientConfig,
-    /// Instrument provider configuration used by the data client.
-    pub instrument_provider: InteractiveBrokersInstrumentProviderConfig,
-}
-
-impl ClientConfig for InteractiveBrokersDataFactoryConfig {
+impl ClientConfig for InteractiveBrokersDataClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-/// Configuration for creating Interactive Brokers execution clients via factory.
-#[derive(Clone, Debug)]
-pub struct InteractiveBrokersExecFactoryConfig {
-    /// The trader ID for the execution client.
-    pub trader_id: TraderId,
-    /// The underlying execution client configuration.
-    pub config: InteractiveBrokersExecClientConfig,
-    /// Instrument provider configuration used by the execution client.
-    pub instrument_provider: InteractiveBrokersInstrumentProviderConfig,
-}
-
-impl ClientConfig for InteractiveBrokersExecFactoryConfig {
+impl ClientConfig for InteractiveBrokersExecClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -78,6 +51,13 @@ impl ClientConfig for InteractiveBrokersExecFactoryConfig {
 
 /// Factory for creating Interactive Brokers data clients.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        from_py_object
+    )
+)]
 pub struct InteractiveBrokersDataClientFactory;
 
 impl InteractiveBrokersDataClientFactory {
@@ -99,55 +79,62 @@ impl DataClientFactory for InteractiveBrokersDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
-        let factory_config = config
+        let ib_config = config
             .as_any()
-            .downcast_ref::<InteractiveBrokersDataFactoryConfig>()
+            .downcast_ref::<InteractiveBrokersDataClientConfig>()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid config type for InteractiveBrokersDataClientFactory. Expected InteractiveBrokersDataFactoryConfig, was {config:?}",
+                    "Invalid config type for InteractiveBrokersDataClientFactory. Expected InteractiveBrokersDataClientConfig, was {config:?}",
                 )
             })?
             .clone();
 
         let instrument_provider = Arc::new(InteractiveBrokersInstrumentProvider::new(
-            factory_config.instrument_provider,
+            ib_config.instrument_provider.clone(),
         ));
+        seed_provider_from_cache(&instrument_provider, &cache);
         let client = InteractiveBrokersDataClient::new(
             ClientId::from(name),
-            factory_config.config,
+            ib_config,
             instrument_provider,
         )?;
-
         Ok(Box::new(client))
     }
 
     fn name(&self) -> &'static str {
-        "IB"
+        IB
     }
 
     fn config_type(&self) -> &'static str {
-        "InteractiveBrokersDataFactoryConfig"
+        stringify!(InteractiveBrokersDataClientConfig)
     }
 }
 
 /// Factory for creating Interactive Brokers execution clients.
 #[derive(Debug, Clone)]
-pub struct InteractiveBrokersExecutionClientFactory;
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        from_py_object
+    )
+)]
+pub struct InteractiveBrokersExecutionClientFactory {
+    trader_id: TraderId,
+    account_id: AccountId,
+}
 
 impl InteractiveBrokersExecutionClientFactory {
     /// Creates a new [`InteractiveBrokersExecutionClientFactory`] instance.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for InteractiveBrokersExecutionClientFactory {
-    fn default() -> Self {
-        Self::new()
+    pub const fn new(trader_id: TraderId, account_id: AccountId) -> Self {
+        Self {
+            trader_id,
+            account_id,
+        }
     }
 }
 
@@ -156,58 +143,84 @@ impl ExecutionClientFactory for InteractiveBrokersExecutionClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        cache: Rc<RefCell<Cache>>,
+        cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
-        let factory_config = config
+        let mut ib_config = config
             .as_any()
-            .downcast_ref::<InteractiveBrokersExecFactoryConfig>()
+            .downcast_ref::<InteractiveBrokersExecClientConfig>()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid config type for InteractiveBrokersExecutionClientFactory. Expected InteractiveBrokersExecFactoryConfig, was {config:?}",
+                    "Invalid config type for InteractiveBrokersExecutionClientFactory. Expected InteractiveBrokersExecClientConfig, was {config:?}",
                 )
             })?
             .clone();
-        let mut config = factory_config.config;
-        let account_id = ib_account_id(config.account_id.as_deref())?;
-        config.account_id = Some(account_id.to_string());
+
+        let account_id = if let Some(account_id) = ib_config.account_id.as_deref() {
+            resolve_account_id(name, account_id)?
+        } else {
+            self.account_id
+        };
+        ib_config.account_id = Some(account_id.to_string());
+
+        let instrument_provider = Arc::new(InteractiveBrokersInstrumentProvider::new(
+            ib_config.instrument_provider.clone(),
+        ));
+        seed_provider_from_cache(&instrument_provider, &cache);
 
         let core = ExecutionClientCore::new(
-            factory_config.trader_id,
+            self.trader_id,
             ClientId::from(name),
             *IB_VENUE,
             OmsType::Netting,
             account_id,
             AccountType::Margin,
-            None,
+            None, // base_currency: IB accounts can be multi-currency
             cache,
         );
 
-        let instrument_provider = Arc::new(InteractiveBrokersInstrumentProvider::new(
-            factory_config.instrument_provider,
-        ));
-        let client = InteractiveBrokersExecutionClient::new(core, config, instrument_provider)?;
-
+        let client = InteractiveBrokersExecutionClient::new(core, ib_config, instrument_provider)?;
         Ok(Box::new(client))
     }
 
     fn name(&self) -> &'static str {
-        "IB"
+        IB
     }
 
     fn config_type(&self) -> &'static str {
-        "InteractiveBrokersExecFactoryConfig"
+        stringify!(InteractiveBrokersExecClientConfig)
     }
 }
 
-fn ib_account_id(value: Option<&str>) -> anyhow::Result<AccountId> {
-    let value = value.filter(|value| !value.is_empty()).ok_or_else(|| {
-        anyhow::anyhow!("InteractiveBrokersExecClientConfig.account_id is required")
-    })?;
+fn resolve_account_id(name: &str, account_id: &str) -> anyhow::Result<AccountId> {
+    if account_id.contains('-') {
+        return AccountId::new_checked(account_id)
+            .map_err(|e| anyhow::anyhow!("Invalid Interactive Brokers account_id: {e}"));
+    }
 
-    if value.starts_with("IB-") {
-        Ok(AccountId::from(value))
-    } else {
-        Ok(AccountId::from(format!("IB-{value}")))
+    let issuer = if name.is_empty() { IB } else { name };
+    AccountId::new_checked(format!("{issuer}-{account_id}"))
+        .map_err(|e| anyhow::anyhow!("Invalid Interactive Brokers account_id: {e}"))
+}
+
+fn seed_provider_from_cache(
+    instrument_provider: &InteractiveBrokersInstrumentProvider,
+    cache: &CacheView,
+) {
+    let instruments = {
+        let cache = cache.borrow();
+        cache
+            .instrument_ids(None)
+            .into_iter()
+            .filter_map(|instrument_id| cache.instrument(instrument_id).cloned())
+            .collect::<Vec<_>>()
+    };
+
+    let count = instrument_provider.add_cached_instruments(instruments);
+    if count > 0 {
+        tracing::debug!(
+            "Seeded Interactive Brokers instrument provider with {} cached instruments",
+            count
+        );
     }
 }
 
@@ -218,78 +231,107 @@ mod tests {
     use nautilus_common::{
         cache::Cache,
         clock::TestClock,
-        factories::{DataClientFactory, ExecutionClientFactory},
+        factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
+        live::runner::replace_data_event_sender,
     };
     use rstest::rstest;
 
     use super::*;
 
     #[rstest]
-    fn data_factory_rejects_wrong_config_type() {
+    fn test_interactive_brokers_data_client_factory_creation() {
         let factory = InteractiveBrokersDataClientFactory::new();
-        let wrong_config = InteractiveBrokersExecFactoryConfig {
-            trader_id: TraderId::from("TRADER-001"),
-            config: InteractiveBrokersExecClientConfig {
-                account_id: Some("DU12345".to_string()),
-                ..Default::default()
-            },
-            instrument_provider: InteractiveBrokersInstrumentProviderConfig::default(),
-        };
+        assert_eq!(factory.name(), IB);
+        assert_eq!(factory.config_type(), "InteractiveBrokersDataClientConfig");
+    }
 
+    #[rstest]
+    fn test_interactive_brokers_data_client_factory_default() {
+        let factory = InteractiveBrokersDataClientFactory;
+        assert_eq!(factory.name(), IB);
+    }
+
+    #[rstest]
+    fn test_interactive_brokers_exec_client_factory_creation() {
+        let factory = InteractiveBrokersExecutionClientFactory::new(
+            TraderId::from("TRADER-001"),
+            AccountId::from("IB-U1234567"),
+        );
+        assert_eq!(factory.name(), IB);
+        assert_eq!(factory.config_type(), "InteractiveBrokersExecClientConfig");
+    }
+
+    #[rstest]
+    fn test_interactive_brokers_configs_implement_client_config() {
+        let data_config = InteractiveBrokersDataClientConfig::default();
+        let exec_config = InteractiveBrokersExecClientConfig::default();
+
+        let boxed_data_config: Box<dyn ClientConfig> = Box::new(data_config);
+        let boxed_exec_config: Box<dyn ClientConfig> = Box::new(exec_config);
+
+        assert!(
+            boxed_data_config
+                .as_any()
+                .downcast_ref::<InteractiveBrokersDataClientConfig>()
+                .is_some()
+        );
+        assert!(
+            boxed_exec_config
+                .as_any()
+                .downcast_ref::<InteractiveBrokersExecClientConfig>()
+                .is_some()
+        );
+    }
+
+    #[rstest]
+    fn test_interactive_brokers_data_client_factory_creates_client() {
+        let factory = InteractiveBrokersDataClientFactory::new();
+        let config = InteractiveBrokersDataClientConfig::default();
         let cache = Rc::new(RefCell::new(Cache::default()));
         let clock = Rc::new(RefCell::new(TestClock::new()));
+        let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(data_tx);
 
-        let result = factory.create("IB-TEST", &wrong_config, cache, clock);
+        let result = factory.create("IB-TEST", &config, cache.into(), clock);
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("Invalid config type")
-        );
+        assert!(result.is_ok());
+        let client = result.unwrap();
+        assert_eq!(client.client_id(), ClientId::from("IB-TEST"));
     }
 
     #[rstest]
-    fn execution_factory_requires_config_account_id() {
-        let factory = InteractiveBrokersExecutionClientFactory::new();
-        let config = InteractiveBrokersExecFactoryConfig {
-            trader_id: TraderId::from("TRADER-001"),
-            config: InteractiveBrokersExecClientConfig::default(),
-            instrument_provider: InteractiveBrokersInstrumentProviderConfig::default(),
-        };
-
+    fn test_interactive_brokers_exec_client_factory_creates_client() {
+        let factory = InteractiveBrokersExecutionClientFactory::new(
+            TraderId::from("TRADER-001"),
+            AccountId::from("IB-U1234567"),
+        );
+        let config = InteractiveBrokersExecClientConfig::default();
         let cache = Rc::new(RefCell::new(Cache::default()));
 
-        let result = factory.create("IB-TEST", &config, cache);
+        let result = factory.create("IB-TEST", &config, cache.into());
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("account_id is required")
-        );
+        assert!(result.is_ok());
+        let client = result.unwrap();
+        assert_eq!(client.client_id(), ClientId::from("IB-TEST"));
+        assert_eq!(client.account_id(), AccountId::from("IB-U1234567"));
     }
 
     #[rstest]
-    fn execution_factory_uses_normalized_config_account_id() {
-        let factory = InteractiveBrokersExecutionClientFactory::new();
-        let config = InteractiveBrokersExecFactoryConfig {
-            trader_id: TraderId::from("TRADER-001"),
-            config: InteractiveBrokersExecClientConfig {
-                account_id: Some("DU12345".to_string()),
-                ..Default::default()
-            },
-            instrument_provider: InteractiveBrokersInstrumentProviderConfig::default(),
+    fn test_interactive_brokers_exec_client_factory_uses_config_account_id() {
+        let factory = InteractiveBrokersExecutionClientFactory::new(
+            TraderId::from("TRADER-001"),
+            AccountId::from("IB-U1234567"),
+        );
+        let config = InteractiveBrokersExecClientConfig {
+            account_id: Some(String::from("U7654321")),
+            ..Default::default()
         };
-
         let cache = Rc::new(RefCell::new(Cache::default()));
 
-        let client = factory.create("IB-TEST", &config, cache).unwrap();
+        let result = factory.create("IB-CUSTOM", &config, cache.into());
 
-        assert_eq!(client.account_id(), AccountId::from("IB-DU12345"));
+        assert!(result.is_ok());
+        let client = result.unwrap();
+        assert_eq!(client.account_id(), AccountId::from("IB-CUSTOM-U7654321"));
     }
 }

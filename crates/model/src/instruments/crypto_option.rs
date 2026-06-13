@@ -110,12 +110,13 @@ pub struct CryptoOption {
 impl CryptoOption {
     /// Creates a new [`CryptoOption`] instance with correctness checking.
     ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     /// # Errors
     ///
     /// Returns an error if any input validation fails.
+    ///
+    /// # Notes
+    ///
+    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     #[expect(clippy::too_many_arguments)]
     pub fn new_checked(
         instrument_id: InstrumentId,
@@ -165,6 +166,10 @@ impl CryptoOption {
 
         if let Some(multiplier) = multiplier {
             check_positive_quantity(multiplier, stringify!(multiplier))?;
+        }
+
+        if let Some(lot_size) = lot_size {
+            check_positive_quantity(lot_size, stringify!(lot_size))?;
         }
 
         Ok(Self {
@@ -488,6 +493,42 @@ mod tests {
             Quantity::from("0.1"),
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_new_checked_rejects_non_positive_lot_size() {
+        let result = CryptoOption::new_checked(
+            InstrumentId::from("TEST.DERIBIT"),
+            Symbol::from("TEST"),
+            Currency::BTC(),
+            Currency::USD(),
+            Currency::BTC(),
+            false,
+            OptionKind::Call,
+            Price::from("50000.0"),
+            0.into(),
+            0.into(),
+            1,
+            1,
+            Price::from("0.1"),
+            Quantity::from("0.1"),
+            None,
+            Some(Quantity::from("0")),
             None,
             None,
             None,

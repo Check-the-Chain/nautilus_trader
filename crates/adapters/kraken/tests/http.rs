@@ -21,7 +21,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -33,12 +33,26 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Response,
 };
-use nautilus_common::testing::wait_until_async;
-use nautilus_kraken::{
-    common::enums::{
-        KrakenApiResult, KrakenEnvironment, KrakenOrderSide, KrakenOrderStatus, KrakenOrderType,
-        KrakenSendStatus,
+use nautilus_common::{
+    clients::DataClient,
+    live::runner::replace_data_event_sender,
+    messages::{
+        DataEvent, DataResponse,
+        data::{InstrumentResponse, RequestInstrument},
     },
+    testing::wait_until_async,
+};
+use nautilus_core::{UUID4, UnixNanos};
+use nautilus_kraken::{
+    common::{
+        consts::KRAKEN_CLIENT_ID,
+        enums::{
+            KrakenApiResult, KrakenEnvironment, KrakenOrderSide, KrakenOrderStatus,
+            KrakenOrderType, KrakenProductType, KrakenSendStatus,
+        },
+    },
+    config::KrakenDataClientConfig,
+    data::{KrakenFuturesDataClient, KrakenSpotDataClient},
     http::{
         KrakenFuturesHttpClient, KrakenFuturesRawHttpClient, KrakenSpotAddOrderParamsBuilder,
         KrakenSpotCancelOrderParamsBuilder, KrakenSpotHttpClient, KrakenSpotRawHttpClient,
@@ -47,14 +61,16 @@ use nautilus_kraken::{
 use nautilus_model::{
     data::BarType,
     enums::{
-        MarketStatusAction, OrderSide as ModelOrderSide, OrderType as ModelOrderType, TimeInForce,
+        AccountType, MarketStatusAction, OrderSide as ModelOrderSide, OrderType as ModelOrderType,
+        TimeInForce,
     },
-    identifiers::{ClientOrderId, InstrumentId, Symbol, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
     instruments::{CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
+use rust_decimal_macros::dec;
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -65,6 +81,20 @@ struct TestServerState {
     last_ohlc_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     add_order_calls: Arc<AtomicUsize>,
     add_order_batch_calls: Arc<AtomicUsize>,
+    /// When true, `/0/private/TradeBalance` returns an API error instead of the normal fixture.
+    trade_balance_error: Arc<AtomicBool>,
+    /// When set, `/0/private/TradeBalance` returns this JSON string instead of the fixture file.
+    trade_balance_json: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Captures the last raw body posted to `/0/private/TradeBalance` for assertion.
+    last_trade_balance_body: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// When true, `/0/private/OpenPositions` returns an empty positions map.
+    open_positions_empty: Arc<AtomicBool>,
+    /// When set, `/0/private/OpenPositions` returns this JSON string instead of the fixture file.
+    open_positions_json: Arc<tokio::sync::Mutex<Option<String>>>,
+    spot_asset_pairs_empty: Arc<AtomicBool>,
+    spot_asset_pairs_request_count: Arc<AtomicUsize>,
+    futures_instruments_empty: Arc<AtomicBool>,
+    futures_instruments_request_count: Arc<AtomicUsize>,
 }
 
 impl Default for TestServerState {
@@ -76,6 +106,15 @@ impl Default for TestServerState {
             last_ohlc_query: Arc::new(tokio::sync::Mutex::new(None)),
             add_order_calls: Arc::new(AtomicUsize::new(0)),
             add_order_batch_calls: Arc::new(AtomicUsize::new(0)),
+            trade_balance_error: Arc::new(AtomicBool::new(false)),
+            trade_balance_json: Arc::new(tokio::sync::Mutex::new(None)),
+            last_trade_balance_body: Arc::new(tokio::sync::Mutex::new(None)),
+            open_positions_empty: Arc::new(AtomicBool::new(false)),
+            open_positions_json: Arc::new(tokio::sync::Mutex::new(None)),
+            spot_asset_pairs_empty: Arc::new(AtomicBool::new(false)),
+            spot_asset_pairs_request_count: Arc::new(AtomicUsize::new(0)),
+            futures_instruments_empty: Arc::new(AtomicBool::new(false)),
+            futures_instruments_request_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -168,7 +207,19 @@ async fn mock_system_status() -> Response {
         .unwrap()
 }
 
-async fn mock_asset_pairs(aclass_base: Option<&str>) -> Response {
+async fn mock_asset_pairs(aclass_base: Option<&str>, state: Arc<TestServerState>) -> Response {
+    state
+        .spot_asset_pairs_request_count
+        .fetch_add(1, Ordering::Relaxed);
+
+    if state.spot_asset_pairs_empty.load(Ordering::Relaxed) {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"error":[],"result":{}}"#))
+            .unwrap();
+    }
+
     let filename = match aclass_base {
         Some("tokenized_asset") => "http_asset_pairs_tokenized.json",
         _ => "http_asset_pairs.json",
@@ -259,7 +310,19 @@ async fn mock_rate_limit_error() -> Response {
         .unwrap()
 }
 
-async fn mock_futures_instruments() -> Response {
+async fn mock_futures_instruments(state: Arc<TestServerState>) -> Response {
+    state
+        .futures_instruments_request_count
+        .fetch_add(1, Ordering::Relaxed);
+
+    if state.futures_instruments_empty.load(Ordering::Relaxed) {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"result":"success","instruments":[]}"#))
+            .unwrap();
+    }
+
     let data = load_test_data("http_futures_instruments.json");
     Response::builder()
         .status(StatusCode::OK)
@@ -446,7 +509,7 @@ async fn mock_handler(req: Request, state: Arc<TestServerState>) -> Response {
         // Strip query string for matching (some endpoints embed params in the path)
         let match_path = path.split('?').next().unwrap_or(path);
         return match match_path {
-            "/derivatives/api/v3/instruments" => mock_futures_instruments().await,
+            "/derivatives/api/v3/instruments" => mock_futures_instruments(state.clone()).await,
             "/derivatives/api/v3/tickers" => mock_futures_tickers().await,
             "/derivatives/api/v3/fills" => mock_futures_fills().await,
             "/derivatives/api/v3/openpositions" => mock_futures_open_positions().await,
@@ -491,7 +554,7 @@ async fn mock_handler(req: Request, state: Arc<TestServerState>) -> Response {
             let query =
                 Query::<HashMap<String, String>>::try_from_uri(req.uri()).unwrap_or_default();
             let aclass_base = query.get("aclass_base").map(|s| s.as_str());
-            mock_asset_pairs(aclass_base).await
+            mock_asset_pairs(aclass_base, state.clone()).await
         }
         "/0/public/Ticker" => mock_ticker().await,
         "/0/public/OHLC" => {
@@ -506,6 +569,47 @@ async fn mock_handler(req: Request, state: Arc<TestServerState>) -> Response {
             mock_trades(query, state.clone()).await
         }
         "/0/private/GetWebSocketsToken" => mock_websockets_token(req.headers().clone()).await,
+        "/0/private/Balance" => mock_spot_balance().await,
+        "/0/private/TradeBalance" => {
+            let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+            *state.last_trade_balance_body.lock().await = Some(body_str);
+
+            if state.trade_balance_error.load(Ordering::Relaxed) {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"error":["EAPI:Invalid key"],"result":{}}"#))
+                    .unwrap()
+            } else if let Some(json) = state.trade_balance_json.lock().await.clone() {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap()
+            } else {
+                mock_spot_trade_balance().await
+            }
+        }
+        "/0/private/OpenPositions" => {
+            if state.open_positions_empty.load(Ordering::Relaxed) {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"error":[],"result":{}}"#))
+                    .unwrap()
+            } else if let Some(json) = state.open_positions_json.lock().await.clone() {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap()
+            } else {
+                mock_spot_open_positions().await
+            }
+        }
         "/0/private/OpenOrders" => mock_open_orders(state.clone()).await,
         "/0/private/ClosedOrders" => mock_closed_orders().await,
         "/0/private/TradesHistory" => mock_trades_history().await,
@@ -563,11 +667,236 @@ async fn mock_add_order_batch_spot() -> Response {
         .unwrap()
 }
 
+async fn mock_spot_balance() -> Response {
+    let data = std::fs::read_to_string("test_data/http_spot_balance.json").unwrap_or_else(|_| {
+        r#"{"error":[],"result":{"ZUSD":"10000.00","XXBT":"0.5","ETH":"2.0"}}"#.to_string()
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(data))
+        .unwrap()
+}
+
+async fn mock_spot_trade_balance() -> Response {
+    let data = std::fs::read_to_string("test_data/http_spot_trade_balance.json")
+        .expect("Failed to load http_spot_trade_balance.json");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(data))
+        .unwrap()
+}
+
+async fn mock_spot_open_positions() -> Response {
+    let data = std::fs::read_to_string("test_data/http_spot_open_positions.json")
+        .expect("Failed to load http_spot_open_positions.json");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(data))
+        .unwrap()
+}
+
 fn create_router(state: Arc<TestServerState>) -> Router {
     Router::new().fallback(move |req| {
         let state = state.clone();
         async move { mock_handler(req, state).await }
     })
+}
+
+async fn start_test_server() -> (SocketAddr, Arc<TestServerState>) {
+    let state = Arc::new(TestServerState::default());
+    let app = create_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    (addr, state)
+}
+
+async fn drain_data_events(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    timeout: Duration,
+) -> Vec<DataEvent> {
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        events.push(event);
+    }
+    events
+}
+
+fn instrument_response(events: &[DataEvent]) -> Option<&InstrumentResponse> {
+    events.iter().find_map(|event| match event {
+        DataEvent::Response(DataResponse::Instrument(response)) => Some(response.as_ref()),
+        _ => None,
+    })
+}
+
+fn create_data_config(addr: SocketAddr, product_type: KrakenProductType) -> KrakenDataClientConfig {
+    KrakenDataClientConfig {
+        product_type,
+        environment: KrakenEnvironment::Live,
+        base_url: Some(format!("http://{addr}")),
+        ws_public_url: Some(format!("ws://{addr}/ws-public")),
+        ws_private_url: Some(format!("ws://{addr}/ws-private")),
+        ws_l3_url: Some(format!("ws://{addr}/ws-l3")),
+        timeout_secs: 10,
+        max_requests_per_second: Some(5),
+        ..KrakenDataClientConfig::default()
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_data_client_request_instrument_refetches_when_cached() {
+    let (addr, state) = start_test_server().await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let client = KrakenSpotDataClient::new(
+        *KRAKEN_CLIENT_ID,
+        create_data_config(addr, KrakenProductType::Spot),
+    )
+    .expect("Kraken spot data client");
+    let instrument_id = InstrumentId::from("BTC/USDT.KRAKEN");
+
+    let first_request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(*KRAKEN_CLIENT_ID),
+            first_request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("first request_instrument");
+
+    wait_until_async(
+        || async {
+            state.spot_asset_pairs_request_count.load(Ordering::Relaxed) >= 1 && !rx.is_empty()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let events = drain_data_events(&mut rx, Duration::from_millis(200)).await;
+    let response = instrument_response(&events).expect("instrument response");
+    assert_eq!(response.correlation_id, first_request_id);
+    assert_eq!(response.client_id, *KRAKEN_CLIENT_ID);
+    assert_eq!(response.instrument_id, instrument_id);
+
+    let count_after_first = state.spot_asset_pairs_request_count.load(Ordering::Relaxed);
+    state.spot_asset_pairs_empty.store(true, Ordering::Relaxed);
+
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(*KRAKEN_CLIENT_ID),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("second request_instrument");
+
+    wait_until_async(
+        || async {
+            state.spot_asset_pairs_request_count.load(Ordering::Relaxed) > count_after_first
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let events = drain_data_events(&mut rx, Duration::from_millis(300)).await;
+    assert!(
+        instrument_response(&events).is_none(),
+        "request_instrument must not emit a stale cached response when Kraken Spot returns no instruments; events were: {events:?}",
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_futures_data_client_request_instrument_refetches_when_cached() {
+    let (addr, state) = start_test_server().await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let client = KrakenFuturesDataClient::new(
+        *KRAKEN_CLIENT_ID,
+        create_data_config(addr, KrakenProductType::Futures),
+    )
+    .expect("Kraken futures data client");
+    let instrument_id = InstrumentId::from("PF_ETHUSD.KRAKEN");
+
+    let first_request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(*KRAKEN_CLIENT_ID),
+            first_request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("first request_instrument");
+
+    wait_until_async(
+        || async {
+            state
+                .futures_instruments_request_count
+                .load(Ordering::Relaxed)
+                >= 1
+                && !rx.is_empty()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let events = drain_data_events(&mut rx, Duration::from_millis(200)).await;
+    let response = instrument_response(&events).expect("instrument response");
+    assert_eq!(response.correlation_id, first_request_id);
+    assert_eq!(response.client_id, *KRAKEN_CLIENT_ID);
+    assert_eq!(response.instrument_id, instrument_id);
+
+    state
+        .futures_instruments_empty
+        .store(true, Ordering::Relaxed);
+
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(*KRAKEN_CLIENT_ID),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("second request_instrument");
+
+    wait_until_async(
+        || async {
+            state
+                .futures_instruments_request_count
+                .load(Ordering::Relaxed)
+                >= 2
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let events = drain_data_events(&mut rx, Duration::from_millis(300)).await;
+    assert!(
+        instrument_response(&events).is_none(),
+        "request_instrument must not emit a stale cached response when Kraken Futures returns no instruments; events were: {events:?}",
+    );
 }
 
 #[rstest]
@@ -586,7 +915,7 @@ async fn test_spot_raw_get_server_time() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -621,7 +950,7 @@ async fn test_spot_raw_get_system_status() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -655,7 +984,7 @@ async fn test_spot_raw_get_asset_pairs() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -690,7 +1019,7 @@ async fn test_spot_raw_get_asset_pairs_tokenized() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -728,7 +1057,7 @@ async fn test_spot_domain_request_instruments() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -772,7 +1101,7 @@ async fn test_spot_domain_request_instrument_statuses() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -811,7 +1140,7 @@ async fn test_spot_raw_get_ticker() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -845,7 +1174,7 @@ async fn test_spot_raw_get_book_depth() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -879,7 +1208,7 @@ async fn test_spot_raw_get_trades() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -913,7 +1242,7 @@ async fn test_spot_raw_get_ohlc() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -947,7 +1276,7 @@ async fn test_spot_raw_get_trades_with_since() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -989,7 +1318,7 @@ async fn test_spot_raw_get_ohlc_with_interval() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1029,7 +1358,7 @@ async fn test_spot_raw_get_websockets_token_requires_credentials() {
 
     // Client without credentials
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1067,7 +1396,7 @@ async fn test_spot_raw_get_websockets_token_with_credentials() {
     let client = KrakenSpotRawHttpClient::with_credentials(
         "test_api_key".to_string(),
         "dGVzdF9hcGlfc2VjcmV0X2Jhc2U2NA==".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1102,7 +1431,7 @@ async fn test_spot_domain_request_trades() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1143,7 +1472,7 @@ async fn test_spot_domain_request_bars() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1184,7 +1513,7 @@ async fn test_futures_raw_get_instruments() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1225,7 +1554,7 @@ async fn test_futures_domain_request_instrument_statuses() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1260,7 +1589,7 @@ async fn test_futures_raw_get_tickers() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1302,7 +1631,7 @@ async fn test_futures_raw_get_ohlc_trade() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1347,7 +1676,7 @@ async fn test_futures_raw_get_ohlc_mark() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1389,7 +1718,7 @@ async fn test_futures_raw_get_ohlc_spot() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1431,7 +1760,7 @@ async fn test_futures_raw_get_public_executions() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1479,7 +1808,7 @@ async fn test_spot_raw_get_open_orders() {
     let client = KrakenSpotRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1522,7 +1851,7 @@ async fn test_spot_raw_get_closed_orders() {
     let client = KrakenSpotRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1566,7 +1895,7 @@ async fn test_spot_raw_get_trades_history() {
     let client = KrakenSpotRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1604,7 +1933,7 @@ async fn test_futures_raw_get_open_orders() {
     let client = KrakenFuturesRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1648,7 +1977,7 @@ async fn test_futures_raw_get_order_events() {
     let client = KrakenFuturesRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1697,7 +2026,7 @@ async fn test_futures_raw_get_fills() {
     let client = KrakenFuturesRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1739,7 +2068,7 @@ async fn test_futures_raw_get_open_positions() {
     let client = KrakenFuturesRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1783,7 +2112,7 @@ async fn test_spot_raw_add_order() {
     let client = KrakenSpotRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1829,7 +2158,7 @@ async fn test_spot_raw_cancel_order() {
     let client = KrakenSpotRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1870,7 +2199,7 @@ async fn test_futures_raw_send_order() {
     let client = KrakenFuturesRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1914,7 +2243,7 @@ async fn test_futures_raw_cancel_order() {
     let client = KrakenFuturesRawHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -1960,7 +2289,7 @@ async fn test_spot_raw_rate_limit_error() {
     let client = KrakenSpotRawHttpClient::with_credentials(
         "test_key".to_string(),
         api_secret,
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2008,7 +2337,7 @@ async fn test_spot_raw_api_error_response() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotRawHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2045,7 +2374,7 @@ async fn test_futures_domain_request_trades() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2086,7 +2415,7 @@ async fn test_futures_domain_request_instruments_includes_tokenized_contract() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2131,7 +2460,7 @@ async fn test_futures_domain_request_bars() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2170,7 +2499,7 @@ async fn test_spot_domain_request_book_snapshot() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenSpotHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2215,7 +2544,7 @@ async fn test_futures_domain_request_book_snapshot() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2260,7 +2589,7 @@ async fn test_futures_domain_request_funding_rates() {
     wait_for_server(addr, "/0/public/Time").await;
 
     let client = KrakenFuturesHttpClient::new(
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2295,6 +2624,8 @@ async fn test_futures_domain_request_funding_rates() {
 #[rstest]
 #[tokio::test]
 async fn test_spot_domain_submit_orders_batch_preserves_status_order() {
+    use nautilus_model::enums::AccountType;
+
     let state = Arc::new(TestServerState::default());
     let app = create_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2310,7 +2641,7 @@ async fn test_spot_domain_submit_orders_batch_preserves_status_order() {
     let client = KrakenSpotHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2349,62 +2680,68 @@ async fn test_spot_domain_submit_orders_batch_preserves_status_order() {
     )));
 
     let statuses = client
-        .submit_orders_batch(vec![
-            (
-                InstrumentId::from("ETH/USD.KRAKEN"),
-                ClientOrderId::new("missing-cache"),
-                ModelOrderSide::Buy,
-                ModelOrderType::Limit,
-                Quantity::from("0.01"),
-                TimeInForce::Gtc,
-                None,
-                Some(Price::from("50000")),
-                None,
-                None,
-                None,
-                None,
-                false,
-                false,
-                false,
-                None,
-            ),
-            (
-                instrument_id,
-                ClientOrderId::new("batch-ok-1"),
-                ModelOrderSide::Buy,
-                ModelOrderType::Limit,
-                Quantity::from("0.02"),
-                TimeInForce::Gtc,
-                None,
-                Some(Price::from("50010")),
-                None,
-                None,
-                None,
-                None,
-                false,
-                false,
-                false,
-                None,
-            ),
-            (
-                instrument_id,
-                ClientOrderId::new("batch-ok-2"),
-                ModelOrderSide::Sell,
-                ModelOrderType::Limit,
-                Quantity::from("0.03"),
-                TimeInForce::Gtc,
-                None,
-                Some(Price::from("50020")),
-                None,
-                None,
-                None,
-                None,
-                false,
-                true,
-                false,
-                None,
-            ),
-        ])
+        .submit_orders_batch(
+            vec![
+                (
+                    InstrumentId::from("ETH/USD.KRAKEN"),
+                    ClientOrderId::new("missing-cache"),
+                    ModelOrderSide::Buy,
+                    ModelOrderType::Limit,
+                    Quantity::from("0.01"),
+                    TimeInForce::Gtc,
+                    None,
+                    Some(Price::from("50000")),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                ),
+                (
+                    instrument_id,
+                    ClientOrderId::new("batch-ok-1"),
+                    ModelOrderSide::Buy,
+                    ModelOrderType::Limit,
+                    Quantity::from("0.02"),
+                    TimeInForce::Gtc,
+                    None,
+                    Some(Price::from("50010")),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                ),
+                (
+                    instrument_id,
+                    ClientOrderId::new("batch-ok-2"),
+                    ModelOrderSide::Sell,
+                    ModelOrderType::Limit,
+                    Quantity::from("0.03"),
+                    TimeInForce::Gtc,
+                    None,
+                    Some(Price::from("50020")),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    true,
+                    false,
+                    None,
+                    None,
+                ),
+            ],
+            AccountType::Cash,
+        )
         .await
         .unwrap();
 
@@ -2417,6 +2754,8 @@ async fn test_spot_domain_submit_orders_batch_preserves_status_order() {
 #[rstest]
 #[tokio::test]
 async fn test_spot_domain_submit_orders_batch_singleton_falls_back_to_add_order() {
+    use nautilus_model::enums::AccountType;
+
     let state = Arc::new(TestServerState::default());
     let app = create_router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2432,7 +2771,7 @@ async fn test_spot_domain_submit_orders_batch_singleton_falls_back_to_add_order(
     let client = KrakenSpotHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2471,24 +2810,28 @@ async fn test_spot_domain_submit_orders_batch_singleton_falls_back_to_add_order(
     )));
 
     let statuses = client
-        .submit_orders_batch(vec![(
-            instrument_id,
-            ClientOrderId::new("batch-singleton"),
-            ModelOrderSide::Buy,
-            ModelOrderType::Limit,
-            Quantity::from("0.01"),
-            TimeInForce::Gtc,
-            None,
-            Some(Price::from("50000")),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            None,
-        )])
+        .submit_orders_batch(
+            vec![(
+                instrument_id,
+                ClientOrderId::new("batch-singleton"),
+                ModelOrderSide::Buy,
+                ModelOrderType::Limit,
+                Quantity::from("0.01"),
+                TimeInForce::Gtc,
+                None,
+                Some(Price::from("50000")),
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+            )],
+            AccountType::Cash,
+        )
         .await
         .unwrap();
 
@@ -2515,7 +2858,7 @@ async fn test_futures_domain_edit_orders_batch_preserves_status_order() {
     let client = KrakenFuturesHttpClient::with_credentials(
         "test".to_string(),
         "test".to_string(),
-        KrakenEnvironment::Mainnet,
+        KrakenEnvironment::Live,
         Some(base_url),
         10,
         None,
@@ -2564,4 +2907,919 @@ async fn test_futures_domain_edit_orders_batch_preserves_status_order() {
     assert!(statuses[0].starts_with("validation_error:"));
     assert_eq!(statuses[1], "edited");
     assert_eq!(statuses[2], "insufficientAvailableFunds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_raw_get_trade_balance() {
+    let state = Arc::new(TestServerState::default());
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotRawHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let result = client.get_trade_balance(None).await;
+    assert!(result.is_ok(), "Failed to get trade balance: {result:?}");
+
+    let tb = result.unwrap();
+    assert_eq!(tb.eb, "198750.42");
+    assert_eq!(tb.m, "12500.00");
+    assert_eq!(tb.mf, "185999.67");
+    assert!(tb.ml.is_some());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_request_account_state_margin_does_not_lock_free_margin() {
+    // Kraken TradeBalance exposes a single used-margin value `m` and free margin `mf`,
+    // with no separate maintenance figure. Nautilus `MarginAccount::recalculate_balance`
+    // sums `initial + maintenance` to compute locked, so duplicating `m` would double-lock
+    // equity and diverge from Kraken's `mf = e - m`. Map `m` to `initial` and zero
+    // `maintenance` so locked equals `m`.
+    let state = Arc::new(TestServerState::default());
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let account_id = AccountId::new("KRAKEN-001");
+    let state = client
+        .request_account_state(account_id, AccountType::Margin, None)
+        .await
+        .unwrap();
+
+    assert_eq!(state.account_type, AccountType::Margin);
+    assert_eq!(state.margins.len(), 1, "expected one MarginBalance entry");
+    let mb = &state.margins[0];
+    assert_eq!(mb.initial.as_f64(), 12500.00);
+    assert_eq!(
+        mb.maintenance.as_f64(),
+        0.0,
+        "maintenance must stay zero to avoid double-locking TradeBalance `m`"
+    );
+    assert_eq!(mb.currency.code.as_str(), "USD");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_request_account_state_margin_with_gbp_asset_tags_currency() {
+    let server_state = Arc::new(TestServerState::default());
+    let app = create_router(server_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let account_id = AccountId::new("KRAKEN-001");
+    let state = client
+        .request_account_state(account_id, AccountType::Margin, Some("ZGBP"))
+        .await
+        .unwrap();
+
+    assert_eq!(state.margins.len(), 1);
+    assert_eq!(
+        state.margins[0].currency.code.as_str(),
+        "GBP",
+        "MarginBalance currency should normalize ZGBP -> GBP"
+    );
+
+    let body = server_state
+        .last_trade_balance_body
+        .lock()
+        .await
+        .clone()
+        .expect("TradeBalance handler must capture request body");
+    assert!(
+        body.contains("asset=ZGBP"),
+        "request body should propagate asset=ZGBP, received: {body}"
+    );
+
+    if let Some(usd) = state
+        .balances
+        .iter()
+        .find(|b| b.currency.code.as_str() == "USD")
+    {
+        assert_eq!(
+            usd.locked.as_f64(),
+            0.0,
+            "USD wallet should stay unlocked when margin target is GBP"
+        );
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_request_account_state_margin_locked_from_free_margin() {
+    let state = Arc::new(TestServerState::default());
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let account_id = AccountId::new("KRAKEN-001");
+    let state = client
+        .request_account_state(account_id, AccountType::Margin, None)
+        .await
+        .unwrap();
+
+    let usd = state
+        .balances
+        .iter()
+        .find(|b| b.currency.code.as_str() == "USD")
+        .expect("expected USD balance (equity-based synthetic entry)");
+    assert_eq!(usd.total.as_decimal().normalize(), dec!(198499.67));
+    assert_eq!(usd.free.as_decimal().normalize(), dec!(185999.67));
+    assert_eq!(usd.locked.as_decimal().normalize(), dec!(12500));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_request_account_state_margin_other_wallets_unlocked() {
+    let state = Arc::new(TestServerState::default());
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let account_id = AccountId::new("KRAKEN-001");
+    let state = client
+        .request_account_state(account_id, AccountType::Margin, None)
+        .await
+        .unwrap();
+
+    for balance in state
+        .balances
+        .iter()
+        .filter(|b| b.currency.code.as_str() != "USD")
+    {
+        assert_eq!(
+            balance.locked.as_f64(),
+            0.0,
+            "non-margin-asset wallet {} must have locked=0",
+            balance.currency.code
+        );
+        assert_eq!(balance.free.as_f64(), balance.total.as_f64());
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_request_margin_metrics_returns_full_snapshot() {
+    let server_state = Arc::new(TestServerState::default());
+    let app = create_router(server_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let metrics = client.request_margin_metrics(None).await.unwrap();
+
+    // Fixture values from test_data/http_spot_trade_balance.json.
+    assert_eq!(metrics.get("equity").map(String::as_str), Some("198499.67"));
+    assert_eq!(
+        metrics.get("free_margin").map(String::as_str),
+        Some("185999.67")
+    );
+    assert_eq!(
+        metrics.get("used_margin").map(String::as_str),
+        Some("12500.00")
+    );
+    assert_eq!(
+        metrics.get("unrealized_pnl").map(String::as_str),
+        Some("-250.75")
+    );
+    assert_eq!(
+        metrics.get("margin_level").map(String::as_str),
+        Some("1587.99")
+    );
+    assert_eq!(
+        metrics.get("trade_balance").map(String::as_str),
+        Some("150000.00")
+    );
+    assert_eq!(
+        metrics.get("equivalent_balance").map(String::as_str),
+        Some("198750.42")
+    );
+    assert_eq!(
+        metrics.get("cost_basis").map(String::as_str),
+        Some("12350.00")
+    );
+    assert_eq!(
+        metrics.get("valuation").map(String::as_str),
+        Some("12099.25")
+    );
+    assert_eq!(
+        metrics.get("unexecuted_value").map(String::as_str),
+        Some("0.00")
+    );
+    // None arg defaults to ZUSD -> normalized USD.
+    assert_eq!(metrics.get("asset").map(String::as_str), Some("USD"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_request_margin_metrics_passes_asset_param() {
+    let server_state = Arc::new(TestServerState::default());
+    let app = create_router(server_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let metrics = client.request_margin_metrics(Some("ZGBP")).await.unwrap();
+
+    assert_eq!(metrics.get("asset").map(String::as_str), Some("GBP"));
+
+    let body = server_state
+        .last_trade_balance_body
+        .lock()
+        .await
+        .clone()
+        .expect("TradeBalance handler must capture request body");
+    assert!(
+        body.contains("asset=ZGBP"),
+        "request body should propagate asset=ZGBP, received: {body}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_raw_get_open_positions() {
+    use nautilus_kraken::http::SpotOpenPositionsParams;
+
+    let state = Arc::new(TestServerState::default());
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotRawHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let result = client
+        .get_open_positions(&SpotOpenPositionsParams::default())
+        .await;
+    assert!(result.is_ok(), "Failed to get open positions: {result:?}");
+
+    let positions = result.unwrap();
+    assert_eq!(positions.len(), 1);
+    assert!(positions.contains_key("TF4RHX-FZPAS-ABCDEF"));
+
+    let pos = positions.get("TF4RHX-FZPAS-ABCDEF").unwrap();
+    assert_eq!(pos.pair, "XXBTZUSD");
+    assert_eq!(pos.vol, "0.50000000");
+    assert_eq!(pos.margin, "10000.00");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_add_order_with_leverage() {
+    let state = Arc::new(TestServerState::default());
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotRawHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let params = KrakenSpotAddOrderParamsBuilder::default()
+        .pair("XBTUSD")
+        .side(KrakenOrderSide::Buy)
+        .order_type(KrakenOrderType::Limit)
+        .volume("0.01")
+        .price("50000")
+        .leverage("3:1")
+        .build()
+        .unwrap();
+
+    let result = client.add_order(&params).await;
+    assert!(
+        result.is_ok(),
+        "Failed to add order with leverage: {result:?}"
+    );
+
+    let response = result.unwrap();
+    assert_eq!(response.txid.len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_request_account_state_trade_balance_error() {
+    let state = Arc::new(TestServerState::default());
+    state.trade_balance_error.store(true, Ordering::Relaxed);
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let account_id = AccountId::new("KRAKEN-001");
+    let result = client
+        .request_account_state(account_id, AccountType::Margin, None)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "TradeBalance failure in margin mode must propagate as Err"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_request_account_state_synthetic_margin_balance_error() {
+    let state = Arc::new(TestServerState::default());
+    *state.trade_balance_json.lock().await = Some(
+        r#"{
+            "error": [],
+            "result": {
+                "eb": "20000000000000000.00",
+                "tb": "20000000000000000.00",
+                "m": "1.00",
+                "uv": "0.00",
+                "n": "0.00",
+                "c": "0.00",
+                "v": "0.00",
+                "e": "20000000000000000.00",
+                "mf": "19999999999999999.00",
+                "ml": "2000000000000000000.00"
+            }
+        }"#
+        .to_string(),
+    );
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let account_id = AccountId::new("KRAKEN-001");
+    let result = client
+        .request_account_state(account_id, AccountType::Margin, None)
+        .await;
+
+    let err = result.expect_err("synthetic margin balance failure must propagate as Err");
+    assert!(
+        err.to_string()
+            .contains("Failed to build synthetic margin AccountBalance"),
+        "unexpected error: {err}"
+    );
+}
+
+fn create_xbtusd_spot_instrument() -> (InstrumentId, InstrumentAny) {
+    let instrument_id = InstrumentId::from("XBT/USD.KRAKEN");
+    let inst = InstrumentAny::CurrencyPair(CurrencyPair::new(
+        instrument_id,
+        Symbol::new("XXBTZUSD"),
+        Currency::BTC(),
+        Currency::USD(),
+        1,
+        8,
+        Price::from("0.1"),
+        Quantity::from("0.00000001"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0.into(),
+        0.into(),
+    ));
+    (instrument_id, inst)
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_margin_position_flat_when_fully_closed() {
+    // When a margin position has been fully closed, Kraken removes it from OpenPositions.
+    // request_position_status_reports must emit a FLAT report for the requested instrument.
+    // Otherwise stale positions in the engine cannot be reconciled.
+    use nautilus_model::{
+        enums::{AccountType, PositionSideSpecified},
+        identifiers::AccountId,
+    };
+
+    let state = Arc::new(TestServerState::default());
+    state.open_positions_empty.store(true, Ordering::Relaxed);
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let instrument_id = InstrumentId::from("XBT/USD.KRAKEN");
+    client.cache_instrument(InstrumentAny::CurrencyPair(CurrencyPair::new(
+        instrument_id,
+        Symbol::new("XBTUSD"),
+        Currency::BTC(),
+        Currency::USD(),
+        1,
+        8,
+        Price::from("0.1"),
+        Quantity::from("0.00000001"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0.into(),
+        0.into(),
+    )));
+
+    let account_id = AccountId::new("KRAKEN-001");
+    let reports = client
+        .request_position_status_reports(
+            account_id,
+            Some(instrument_id),
+            AccountType::Margin,
+            false,
+            ustr::Ustr::from("USDT"),
+        )
+        .await
+        .expect("request_position_status_reports should not error");
+
+    assert_eq!(
+        reports.len(),
+        1,
+        "Expected one FLAT PositionStatusReport for closed position: {reports:?}"
+    );
+    let report = &reports[0];
+    assert_eq!(report.instrument_id, instrument_id);
+    assert!(
+        report.quantity.is_zero(),
+        "FLAT report quantity must be zero, received {}",
+        report.quantity
+    );
+    assert_eq!(
+        report.position_side,
+        PositionSideSpecified::Flat,
+        "FLAT report side must be Flat, received {:?}",
+        report.position_side
+    );
+}
+
+fn make_open_positions_json(lots: &[(&str, &str, f64, f64)]) -> String {
+    let entries: Vec<String> = lots
+        .iter()
+        .map(|(pos_id, side, vol, vol_closed)| {
+            format!(
+                r#""{pos_id}": {{"ordertxid": "O-{pos_id}", "pair": "XXBTZUSD", "time": 1714500000.0, "type": "{side}", "ordertype": "market", "cost": "50000.00", "fee": "75.00", "vol": "{vol}", "vol_closed": "{vol_closed}", "margin": "10000.00"}}"#
+            )
+        })
+        .collect();
+    format!(r#"{{"error":[],"result":{{{}}}}}"#, entries.join(","))
+}
+
+async fn setup_margin_position_test(json: String) -> (KrakenSpotHttpClient, InstrumentId) {
+    let state = Arc::new(TestServerState::default());
+    *state.open_positions_json.lock().await = Some(json);
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let (instrument_id, inst) = create_xbtusd_spot_instrument();
+    client.cache_instrument(inst);
+
+    (client, instrument_id)
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_margin_position_opposing_lots_net_to_long() {
+    use nautilus_model::{
+        enums::{AccountType, PositionSideSpecified},
+        identifiers::AccountId,
+    };
+
+    let json = make_open_positions_json(&[("LOT1", "buy", 1.0, 0.0), ("LOT2", "sell", 0.4, 0.0)]);
+    let (client, instrument_id) = setup_margin_position_test(json).await;
+
+    let reports = client
+        .request_position_status_reports(
+            AccountId::new("KRAKEN-001"),
+            None,
+            AccountType::Margin,
+            false,
+            ustr::Ustr::from("USDT"),
+        )
+        .await
+        .expect("should not error");
+
+    assert_eq!(reports.len(), 1);
+    let r = &reports[0];
+    assert_eq!(r.instrument_id, instrument_id);
+    assert_eq!(r.position_side, PositionSideSpecified::Long);
+    assert!(
+        (r.quantity.as_f64() - 0.6).abs() < 1e-7,
+        "expected qty ~0.6, received {}",
+        r.quantity
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_margin_position_opposing_lots_net_to_short() {
+    use nautilus_model::{
+        enums::{AccountType, PositionSideSpecified},
+        identifiers::AccountId,
+    };
+
+    let json = make_open_positions_json(&[("LOT1", "buy", 0.3, 0.0), ("LOT2", "sell", 0.8, 0.0)]);
+    let (client, instrument_id) = setup_margin_position_test(json).await;
+
+    let reports = client
+        .request_position_status_reports(
+            AccountId::new("KRAKEN-001"),
+            None,
+            AccountType::Margin,
+            false,
+            ustr::Ustr::from("USDT"),
+        )
+        .await
+        .expect("should not error");
+
+    assert_eq!(reports.len(), 1);
+    let r = &reports[0];
+    assert_eq!(r.instrument_id, instrument_id);
+    assert_eq!(r.position_side, PositionSideSpecified::Short);
+    assert!(
+        (r.quantity.as_f64() - 0.5).abs() < 1e-7,
+        "expected qty ~0.5, received {}",
+        r.quantity
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_margin_position_opposing_lots_net_to_flat() {
+    use nautilus_model::{
+        enums::{AccountType, PositionSideSpecified},
+        identifiers::AccountId,
+    };
+
+    let json = make_open_positions_json(&[("LOT1", "buy", 0.5, 0.0), ("LOT2", "sell", 0.5, 0.0)]);
+    let (client, instrument_id) = setup_margin_position_test(json).await;
+
+    let reports = client
+        .request_position_status_reports(
+            AccountId::new("KRAKEN-001"),
+            None,
+            AccountType::Margin,
+            false,
+            ustr::Ustr::from("USDT"),
+        )
+        .await
+        .expect("should not error");
+
+    assert_eq!(reports.len(), 1);
+    let r = &reports[0];
+    assert_eq!(r.instrument_id, instrument_id);
+    assert_eq!(r.position_side, PositionSideSpecified::Flat);
+    assert!(
+        r.quantity.is_zero(),
+        "expected zero qty, received {}",
+        r.quantity
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_margin_position_bails_on_unknown_pair_when_cache_missing() {
+    use nautilus_model::{enums::AccountType, identifiers::AccountId};
+
+    let json = make_open_positions_json(&[("LOT1", "buy", 1.0, 0.0)]);
+
+    let state = Arc::new(TestServerState::default());
+    *state.open_positions_json.lock().await = Some(json);
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    wait_for_server(addr, "/0/public/Time").await;
+
+    let client = KrakenSpotHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    // Unknown pair must cause an Err when no instrument is cached
+    let result = client
+        .request_position_status_reports(
+            AccountId::new("KRAKEN-001"),
+            None,
+            AccountType::Margin,
+            false,
+            ustr::Ustr::from("USDT"),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected Err for unknown pair in cache, received Ok({:?})",
+        result.ok()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_margin_position_bails_on_unparsable_volume() {
+    use nautilus_model::{enums::AccountType, identifiers::AccountId};
+
+    let bad_json = r#"{"error":[],"result":{"LOT1":{"ordertxid":"O-LOT1","pair":"XXBTZUSD","time":1714500000.0,"type":"buy","ordertype":"market","cost":"50000.00","fee":"75.00","vol":"not_a_number","vol_closed":"0.0","margin":"10000.00"}}}"#.to_string();
+    let (client, _) = setup_margin_position_test(bad_json).await;
+
+    let result = client
+        .request_position_status_reports(
+            AccountId::new("KRAKEN-001"),
+            None,
+            AccountType::Margin,
+            false,
+            ustr::Ustr::from("USDT"),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected Err for unparsable volume, received Ok({:?})",
+        result.ok()
+    );
 }

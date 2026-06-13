@@ -31,7 +31,7 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 
 use crate::{
     common::{
@@ -421,6 +421,7 @@ pub fn parse_product_book_snapshot(
     let mut deltas = Vec::with_capacity(total_levels + 1);
 
     let mut clear = OrderBookDelta::clear(instrument_id, 0, ts_event, ts_init);
+    clear.flags |= RecordFlag::F_SNAPSHOT as u8;
 
     if total_levels == 0 {
         clear.flags |= RecordFlag::F_LAST as u8;
@@ -476,7 +477,7 @@ fn parse_book_delta(
     let price = parse_price(&level.price, price_precision)?;
     let size = parse_quantity(&level.size, size_precision)?;
 
-    let mut flags = RecordFlag::F_MBP as u8;
+    let mut flags = RecordFlag::F_MBP as u8 | RecordFlag::F_SNAPSHOT as u8;
 
     if is_last {
         flags |= RecordFlag::F_LAST as u8;
@@ -605,6 +606,13 @@ pub fn parse_order_status_report(
         parse_quantity(&order.filled_size, size_precision).context("failed to parse filled_size")?
     };
 
+    // API has no separate ADL flag, so liquidation and ADL share this branch
+    if order.order_type == CoinbaseOrderType::Liquidation || order.is_liquidation {
+        log::warn!(
+            "Forced-close (liquidation/ADL) order: {instrument_id} venue_order_id={venue_order_id} side={order_side} filled={filled_qty}",
+        );
+    }
+
     // Derive the ordered quantity from the order_configuration. For quote-sized
     // market orders the base quantity is not reported pre-fill; fall back to
     // filled_qty when the order is terminal.
@@ -656,10 +664,11 @@ pub fn parse_order_status_report(
     }
 
     if !order.average_filled_price.is_empty()
-        && let Ok(avg_px) = order.average_filled_price.parse::<f64>()
-        && avg_px > 0.0
+        && let Ok(avg_decimal) = Decimal::from_str(&order.average_filled_price)
+        && avg_decimal.is_sign_positive()
+        && !avg_decimal.is_zero()
     {
-        report = report.with_avg_px(avg_px)?;
+        report = report.with_avg_px(avg_decimal.to_f64().unwrap_or_default())?;
     }
 
     if post_only_from_configuration(order) {
@@ -827,6 +836,23 @@ fn parse_money_field(value: Decimal, field: &str, currency: Currency) -> Option<
     }
 }
 
+// Coinbase reports the CFM buffer as a percentage of `liquidation_threshold`
+// (e.g. "100" = 1x cushion). Warn at <20% so operators can react before the
+// liquidation engine (or, on perps, the deleveraging waterfall) fires.
+const CFM_LIQUIDATION_BUFFER_WARN_PCT: Decimal = Decimal::from_parts(20, 0, 0, false, 0);
+
+fn liquidation_buffer_in_warn_band(buffer_percentage: Decimal) -> bool {
+    buffer_percentage < CFM_LIQUIDATION_BUFFER_WARN_PCT
+}
+
+fn warn_if_liquidation_buffer_low(account_id: AccountId, buffer_percentage: Decimal) {
+    if liquidation_buffer_in_warn_band(buffer_percentage) {
+        log::warn!(
+            "Elevated CFM liquidation risk: {account_id} liquidation_buffer_percentage={buffer_percentage}% (warn threshold {CFM_LIQUIDATION_BUFFER_WARN_PCT}%)",
+        );
+    }
+}
+
 /// Parses a CFM balance summary into a single consolidated [`MarginBalance`].
 ///
 /// Coinbase reports two windows (intraday and overnight) with identical
@@ -880,6 +906,10 @@ pub fn parse_cfm_account_state(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<AccountState> {
+    if let Ok(buffer_pct) = Decimal::from_str(&summary.liquidation_buffer_percentage) {
+        warn_if_liquidation_buffer_low(account_id, buffer_pct);
+    }
+
     let usd_currency = Currency::get_or_create_crypto(summary.total_usd_balance.currency.as_str());
 
     // `total_usd_balance` is the venue's equity figure and includes collateral
@@ -924,6 +954,8 @@ pub fn parse_ws_cfm_account_state(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<AccountState> {
+    warn_if_liquidation_buffer_low(account_id, summary.liquidation_buffer_percentage);
+
     let usd = Currency::USD();
 
     // See `parse_cfm_account_state`: `total_usd_balance` is the venue's
@@ -1143,6 +1175,7 @@ mod tests {
     use super::*;
     use crate::{
         common::{
+            consts::COINBASE_VENUE,
             enums::{CoinbaseMarginLevel, CoinbaseMarginWindowType},
             testing::load_test_fixture,
         },
@@ -1150,7 +1183,7 @@ mod tests {
     };
 
     fn coinbase_venue() -> Venue {
-        Venue::new(Ustr::from("COINBASE"))
+        *COINBASE_VENUE
     }
 
     #[rstest]
@@ -1277,14 +1310,14 @@ mod tests {
         assert!(
             matches!(&instruments[0], InstrumentAny::CryptoPerpetual(_)),
             "Expected CryptoPerpetual for BTC PERP, was{:?}",
-            &instruments[0]
+            instruments[0]
         );
 
         // Second product is "BTC 24 APR 26" -> CryptoFuture
         assert!(
             matches!(&instruments[1], InstrumentAny::CryptoFuture(_)),
             "Expected CryptoFuture for dated future, was{:?}",
-            &instruments[1]
+            instruments[1]
         );
     }
 
@@ -1465,6 +1498,38 @@ mod tests {
         // Last delta has F_LAST flag
         let last = deltas.deltas.last().unwrap();
         assert_ne!(last.flags & RecordFlag::F_LAST as u8, 0);
+
+        // Every delta in a snapshot sequence carries F_SNAPSHOT.
+        for delta in &deltas.deltas {
+            assert_ne!(
+                delta.flags & RecordFlag::F_SNAPSHOT as u8,
+                0,
+                "snapshot delta missing F_SNAPSHOT: {delta:?}",
+            );
+        }
+    }
+
+    // Empty-book snapshots must carry F_SNAPSHOT | F_LAST on the lone Clear
+    // delta so buffered consumers receive the clear event; without F_LAST the
+    // DataEngine never flushes and downstream subscribers see nothing.
+    #[rstest]
+    fn test_parse_product_book_snapshot_empty_book_clear_carries_snapshot_and_last() {
+        let pricebook = crate::http::models::PriceBook {
+            product_id: Ustr::from("BTC-USD"),
+            bids: Vec::new(),
+            asks: Vec::new(),
+            time: "2024-01-15T10:30:00Z".to_string(),
+        };
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD"), coinbase_venue());
+
+        let deltas =
+            parse_product_book_snapshot(&pricebook, instrument_id, 2, 8, UnixNanos::default())
+                .unwrap();
+        assert_eq!(deltas.deltas.len(), 1);
+        let clear = &deltas.deltas[0];
+        assert_eq!(clear.action, BookAction::Clear);
+        assert_ne!(clear.flags & RecordFlag::F_SNAPSHOT as u8, 0);
+        assert_ne!(clear.flags & RecordFlag::F_LAST as u8, 0);
     }
 
     fn btc_usd_instrument() -> InstrumentAny {
@@ -1800,6 +1865,48 @@ mod tests {
 
         assert_eq!(report.order_status, expected_status);
         assert_eq!(report.quantity, Quantity::from(base_size));
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_handles_liquidation_order_type() {
+        let mut order =
+            make_limit_gtc_order("0.001", "50000.00", "0.001", CoinbaseOrderStatus::Filled);
+        order.order_type = CoinbaseOrderType::Liquidation;
+        let instrument = btc_usd_instrument();
+
+        let report = parse_order_status_report(
+            &order,
+            &instrument,
+            AccountId::new("COINBASE-001"),
+            UnixNanos::from(1),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, OrderType::Market);
+        assert_eq!(report.order_status, OrderStatus::Filled);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_handles_is_liquidation_flag() {
+        let mut order =
+            make_limit_gtc_order("0.001", "50000.00", "0.001", CoinbaseOrderStatus::Filled);
+        order.is_liquidation = true;
+        let instrument = btc_usd_instrument();
+
+        let report = parse_order_status_report(
+            &order,
+            &instrument,
+            AccountId::new("COINBASE-001"),
+            UnixNanos::from(1),
+        )
+        .unwrap();
+
+        // Pin the fields the warn branch reads so a future refactor that drops
+        // the `is_liquidation` arm cannot accept this fixture by accident.
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.filled_qty, Quantity::from("0.001"));
+        assert_eq!(report.instrument_id, instrument.id());
     }
 
     #[rstest]
@@ -2343,6 +2450,98 @@ mod tests {
             intraday_margin_window_measure: intraday,
             overnight_margin_window_measure: overnight,
         }
+    }
+
+    #[rstest]
+    #[case::below_threshold("15", true)]
+    #[case::at_threshold("20", false)]
+    #[case::just_above("21", false)]
+    #[case::well_above("100", false)]
+    #[case::zero("0", true)]
+    fn test_liquidation_buffer_in_warn_band(#[case] value: &str, #[case] expected_in_band: bool) {
+        let pct = Decimal::from_str(value).unwrap();
+        assert_eq!(liquidation_buffer_in_warn_band(pct), expected_in_band);
+    }
+
+    #[rstest]
+    #[case::below_threshold("5")]
+    #[case::above_threshold("100")]
+    #[case::empty_string_silently_skips_warn("")]
+    fn test_parse_cfm_account_state_buffer_threshold_paths(#[case] buffer_pct: &str) {
+        use nautilus_model::enums::AccountType;
+
+        let mut summary = cfm_summary_with_windows(
+            Some(cfm_window(
+                CoinbaseMarginWindowType::Intraday,
+                "100.00",
+                "50.00",
+            )),
+            None,
+        );
+        summary.total_usd_balance = cfm_amount("100.00");
+        summary.available_margin = cfm_amount("50.00");
+        summary.liquidation_buffer_percentage = buffer_pct.to_string();
+
+        let state = parse_cfm_account_state(
+            &summary,
+            AccountId::new("COINBASE-001"),
+            true,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(state.account_type, AccountType::Margin);
+        assert!(!state.balances.is_empty());
+    }
+
+    #[rstest]
+    #[case::below_threshold("5")]
+    #[case::above_threshold("100")]
+    fn test_parse_ws_cfm_account_state_buffer_threshold_paths(#[case] buffer_pct: &str) {
+        use nautilus_model::enums::AccountType;
+
+        use crate::websocket::messages::{WsFcmBalanceSummary, WsMarginWindowMeasure};
+
+        fn ws_window(kind: CoinbaseMarginWindowType) -> WsMarginWindowMeasure {
+            WsMarginWindowMeasure {
+                margin_window_type: kind,
+                margin_level: CoinbaseMarginLevel::Base,
+                initial_margin: Decimal::from_str("100.00").unwrap(),
+                maintenance_margin: Decimal::from_str("50.00").unwrap(),
+                liquidation_buffer_percentage: Decimal::ZERO,
+                total_hold: Decimal::ZERO,
+                futures_buying_power: Decimal::ZERO,
+            }
+        }
+
+        let summary = WsFcmBalanceSummary {
+            futures_buying_power: Decimal::ZERO,
+            total_usd_balance: Decimal::from_str("100.00").unwrap(),
+            cbi_usd_balance: Decimal::ZERO,
+            cfm_usd_balance: Decimal::ZERO,
+            total_open_orders_hold_amount: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+            daily_realized_pnl: Decimal::ZERO,
+            initial_margin: Decimal::ZERO,
+            available_margin: Decimal::from_str("50.00").unwrap(),
+            liquidation_threshold: Decimal::ZERO,
+            liquidation_buffer_amount: Decimal::ZERO,
+            liquidation_buffer_percentage: Decimal::from_str(buffer_pct).unwrap(),
+            intraday_margin_window_measure: ws_window(CoinbaseMarginWindowType::Intraday),
+            overnight_margin_window_measure: ws_window(CoinbaseMarginWindowType::Overnight),
+        };
+
+        let state = parse_ws_cfm_account_state(
+            &summary,
+            AccountId::new("COINBASE-001"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(state.account_type, AccountType::Margin);
+        assert!(!state.balances.is_empty());
     }
 
     fn cfm_position(

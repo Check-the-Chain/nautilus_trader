@@ -18,6 +18,9 @@
 pub mod config;
 
 #[cfg(feature = "hypersync")]
+pub mod cache;
+
+#[cfg(feature = "hypersync")]
 pub mod factories;
 
 #[cfg(feature = "hypersync")]
@@ -27,6 +30,9 @@ use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 #[cfg(feature = "hypersync")]
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
+
+#[cfg(feature = "hypersync")]
+use crate::constants::BLOCKCHAIN;
 
 /// Extractor function for `BlockchainDataClientFactory`.
 #[cfg(feature = "hypersync")]
@@ -66,14 +72,19 @@ pub fn blockchain(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::config::DexPoolFilters>()?;
     #[cfg(feature = "hypersync")]
     m.add_class::<crate::factories::BlockchainDataClientFactory>()?;
+    #[cfg(feature = "hypersync")]
+    m.add_function(wrap_pyfunction!(
+        crate::python::cache::py_load_pool_snapshot,
+        m
+    )?)?;
 
     // Register extractors with the global registry
     #[cfg(feature = "hypersync")]
     {
         let registry = get_global_pyo3_registry();
 
-        if let Err(e) = registry
-            .register_factory_extractor("BLOCKCHAIN".to_string(), extract_blockchain_factory)
+        if let Err(e) =
+            registry.register_factory_extractor(BLOCKCHAIN.to_string(), extract_blockchain_factory)
         {
             return Err(to_pyruntime_err(format!(
                 "Failed to register blockchain factory extractor: {e}"

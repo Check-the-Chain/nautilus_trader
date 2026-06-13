@@ -111,6 +111,7 @@ class PolymarketWebSocketClient:
         self._subscription_counts: dict[str, int] = {}  # Reference counts per subscription
         self._clients: dict[int, WebSocketClient | None] = {}
         self._client_subscriptions: dict[int, list[str]] = {}
+        self._client_subscriptions_initial: dict[int, set[str]] = {}
         self._is_connecting: dict[int, bool] = {}
         self._next_client_id: int = 0
         self._lock: asyncio.Lock = asyncio.Lock()
@@ -188,6 +189,7 @@ class PolymarketWebSocketClient:
         self._next_client_id += 1
         self._clients[client_id] = None
         self._client_subscriptions[client_id] = []
+        self._client_subscriptions_initial[client_id] = set()
         self._is_connecting[client_id] = False
 
         return client_id
@@ -272,8 +274,8 @@ class PolymarketWebSocketClient:
             await self._connect_client(client_id)
             return
 
-        # Subscription was included in the initial connection message
-        if waited_for_connection:
+        initial_subs = self._client_subscriptions_initial.get(client_id)
+        if waited_for_connection and initial_subs is not None and subscription in initial_subs:
             self._log.debug(f"ws-client {client_id}: {subscription} included in initial connection")
             return
 
@@ -349,7 +351,7 @@ class PolymarketWebSocketClient:
         Connect websocket clients to the server based on existing subscriptions.
         """
         if not self._subscriptions:
-            self._log.error("Cannot connect: no subscriptions")
+            self._log.warning("Cannot connect: no subscriptions")
             return
 
         for client_id, subs in self._client_subscriptions.items():
@@ -359,10 +361,11 @@ class PolymarketWebSocketClient:
     async def _connect_client(self, client_id: int) -> None:
         subs = self._client_subscriptions.get(client_id, [])
         if not subs:
-            self._log.error(f"ws-client {client_id}: Cannot connect: no subscriptions")
+            self._log.warning(f"ws-client {client_id}: Cannot connect: no subscriptions")
             return
 
         self._log.debug(f"ws-client {client_id}: Connecting to {self._ws_url}...")
+        self._client_subscriptions_initial[client_id] = set()
         self._is_connecting[client_id] = True
 
         try:
@@ -393,7 +396,9 @@ class PolymarketWebSocketClient:
             self._is_connecting[client_id] = False
 
     async def _subscribe_all(self, client_id: int) -> None:
-        subs = self._client_subscriptions.get(client_id, [])
+        subs = list(self._client_subscriptions.get(client_id, []))
+        self._client_subscriptions_initial[client_id] = set(subs)
+
         if self._channel == PolymarketWebSocketChannel.USER:
             msg = self._create_subscribe_user_channel_msg(markets=subs)
         else:  # MARKET
@@ -403,7 +408,7 @@ class PolymarketWebSocketClient:
 
     def _handle_reconnect(self, client_id: int) -> None:
         if client_id not in self._client_subscriptions or not self._client_subscriptions[client_id]:
-            self._log.error(f"ws-client {client_id}: Cannot reconnect: no subscriptions")
+            self._log.warning(f"ws-client {client_id}: Cannot reconnect: no subscriptions")
             return
 
         self._log.warning(f"ws-client {client_id}: Reconnected to {self._ws_url}")
@@ -443,7 +448,7 @@ class PolymarketWebSocketClient:
         try:
             await client.disconnect()
         except WebSocketClientError as e:
-            self._log.error(f"ws-client {client_id}: {e!s}")
+            self._log.warning(f"ws-client {client_id}: {e!s}")
 
         self._clients[client_id] = None
 
@@ -488,7 +493,7 @@ class PolymarketWebSocketClient:
     async def _send(self, client_id: int, msg: dict[str, Any]) -> None:
         client = self._clients.get(client_id)
         if client is None:
-            self._log.error(f"ws-client {client_id}: Cannot send message {msg}: not connected")
+            self._log.warning(f"ws-client {client_id}: Cannot send message {msg}: not connected")
             return
 
         self._log.debug(f"ws-client {client_id}: SENDING: {msg}")
@@ -496,7 +501,7 @@ class PolymarketWebSocketClient:
         try:
             await client.send_text(msgspec.json.encode(msg))
         except WebSocketClientError as e:
-            self._log.error(f"ws-client {client_id}: {e!s}")
+            self._log.warning(f"ws-client {client_id}: {e!s}")
 
     # Legacy compatibility methods (deprecated, for backwards compatibility)
 

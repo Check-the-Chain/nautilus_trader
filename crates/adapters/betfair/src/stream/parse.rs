@@ -37,9 +37,11 @@ use rust_decimal::Decimal;
 
 use crate::{
     common::{
-        consts::{BETFAIR_PRICE_PRECISION, BETFAIR_QUANTITY_PRECISION},
         enums::{MarketStatus, RunnerStatus, StreamingOrderStatus, resolve_streaming_order_status},
-        parse::{make_instrument_id, parse_millis_timestamp},
+        parse::{
+            make_instrument_id, normalize_betfair_price, normalize_betfair_quantity,
+            parse_betfair_price, parse_betfair_quantity, parse_millis_timestamp,
+        },
     },
     data_types::{
         BetfairBspBookDelta, BetfairRaceProgress, BetfairRaceRunnerData, BetfairStartingPrice,
@@ -105,6 +107,10 @@ pub fn parse_runner_book_deltas(
 
     // Buy side (bid): atb (available to back) is price-keyed
     for pv in rc.atb.as_deref().unwrap_or(&[]) {
+        if is_snapshot && pv.volume == Decimal::ZERO {
+            continue;
+        }
+
         let action = if is_snapshot {
             BookAction::Add
         } else if pv.volume == Decimal::ZERO {
@@ -118,8 +124,8 @@ pub fn parse_runner_book_deltas(
             action,
             BookOrder::new(
                 OrderSide::Buy,
-                Price::from_decimal_dp(pv.price, BETFAIR_PRICE_PRECISION)?,
-                Quantity::from_decimal_dp(pv.volume, BETFAIR_QUANTITY_PRECISION)?,
+                parse_betfair_price(pv.price)?,
+                parse_betfair_quantity(pv.volume)?,
                 0,
             ),
             snapshot_flags,
@@ -131,6 +137,10 @@ pub fn parse_runner_book_deltas(
 
     // Sell side (ask): atl (available to lay) is price-keyed
     for pv in rc.atl.as_deref().unwrap_or(&[]) {
+        if is_snapshot && pv.volume == Decimal::ZERO {
+            continue;
+        }
+
         let action = if is_snapshot {
             BookAction::Add
         } else if pv.volume == Decimal::ZERO {
@@ -144,8 +154,8 @@ pub fn parse_runner_book_deltas(
             action,
             BookOrder::new(
                 OrderSide::Sell,
-                Price::from_decimal_dp(pv.price, BETFAIR_PRICE_PRECISION)?,
-                Quantity::from_decimal_dp(pv.volume, BETFAIR_QUANTITY_PRECISION)?,
+                parse_betfair_price(pv.price)?,
+                parse_betfair_quantity(pv.volume)?,
                 0,
             ),
             snapshot_flags,
@@ -210,11 +220,20 @@ pub fn parse_instrument_statuses(
     };
     let in_play = def.in_play.unwrap_or(false);
 
+    if status == MarketStatus::Unknown {
+        log::warn!("Skipping unmodeled Betfair market status for market {market_id}");
+        return Vec::new();
+    }
+
     runners
         .iter()
-        .map(|rd| {
+        .filter_map(|rd| {
             let handicap = rd.hc.unwrap_or(Decimal::ZERO);
             let instrument_id = make_instrument_id(market_id, rd.id, handicap);
+            if rd.status == Some(RunnerStatus::Unknown) {
+                log::warn!("Skipping unmodeled Betfair runner status for {instrument_id}");
+                return None;
+            }
             let action = match rd.status {
                 Some(RunnerStatus::Removed | RunnerStatus::RemovedVacant) => {
                     MarketStatusAction::Close
@@ -225,6 +244,8 @@ pub fn parse_instrument_statuses(
                     (MarketStatus::Open, true) => MarketStatusAction::Trading,
                     (MarketStatus::Suspended, _) => MarketStatusAction::Pause,
                     (MarketStatus::Closed, _) => MarketStatusAction::Close,
+                    // Unreachable: unmodeled market status skips the whole definition above.
+                    (MarketStatus::Unknown, _) => MarketStatusAction::None,
                 },
             };
             let is_trading = matches!(status, MarketStatus::Open)
@@ -233,7 +254,7 @@ pub fn parse_instrument_statuses(
                     rd.status,
                     Some(RunnerStatus::Removed | RunnerStatus::RemovedVacant)
                 );
-            InstrumentStatus::new(
+            Some(InstrumentStatus::new(
                 instrument_id,
                 action,
                 ts_event,
@@ -243,7 +264,7 @@ pub fn parse_instrument_statuses(
                 Some(is_trading),
                 None,
                 None,
-            )
+            ))
         })
         .collect()
 }
@@ -253,8 +274,8 @@ pub fn parse_instrument_statuses(
 /// Uses `bet_id` and cumulative `sm` (size matched) which together uniquely
 /// identify each fill state, since `sm` increases monotonically with each fill.
 pub fn make_trade_id(uo: &UnmatchedOrder) -> TradeId {
-    let sm = uo.sm.unwrap_or(Decimal::ZERO);
-    TradeId::new(format!("{}-{sm}", uo.id))
+    let sm = normalize_betfair_quantity(uo.sm.unwrap_or(Decimal::ZERO));
+    make_trade_id_for_size(&uo.id, sm)
 }
 
 /// Tracks cumulative fill state per bet to compute incremental fills from the
@@ -292,7 +313,8 @@ impl FillTracker {
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> Option<FillReport> {
-        let sm = uo.sm?;
+        let raw_sm = uo.sm?;
+        let sm = normalize_betfair_quantity(raw_sm);
 
         if sm <= Decimal::ZERO {
             return None;
@@ -302,13 +324,13 @@ impl FillTracker {
             .filled_qty
             .get(&uo.id)
             .copied()
-            .unwrap_or(Decimal::ZERO);
+            .map_or(Decimal::ZERO, normalize_betfair_quantity);
 
         if sm <= prev_filled {
             return None;
         }
 
-        let order_qty = resolve_stream_order_quantity(order_qty, uo);
+        let order_qty = normalize_betfair_quantity(resolve_stream_order_quantity(order_qty, uo));
 
         // Overfill guard
         if sm > order_qty {
@@ -319,22 +341,25 @@ impl FillTracker {
             return None;
         }
 
-        let trade_id = make_trade_id(uo);
+        let trade_id = make_trade_id_for_size(&uo.id, sm);
+        let raw_trade_id = make_trade_id_for_size(&uo.id, raw_sm);
 
-        if self.published_trade_ids.contains(trade_id.as_str()) {
+        if self.published_trade_ids.contains(trade_id.as_str())
+            || self.published_trade_ids.contains(raw_trade_id.as_str())
+        {
             return None;
         }
 
         let fill_qty_dec = sm - prev_filled;
-        let fill_price = self.compute_fill_price(uo, prev_filled);
+        let fill_price = self.compute_fill_price(uo, prev_filled, sm);
 
-        let last_qty = Quantity::from_decimal_dp(fill_qty_dec, BETFAIR_QUANTITY_PRECISION).ok()?;
-        let last_px = Price::from_decimal_dp(fill_price, BETFAIR_PRICE_PRECISION).ok()?;
+        let last_qty = parse_betfair_quantity(fill_qty_dec).ok()?;
+        let last_px = parse_betfair_price(fill_price).ok()?;
 
         // Update state before emitting
         self.filled_qty.insert(uo.id.clone(), sm);
 
-        if let Some(avp) = uo.avp {
+        if let Some(avp) = uo.avp.map(normalize_betfair_price) {
             self.avg_px.insert(uo.id.clone(), avp);
         }
 
@@ -342,7 +367,11 @@ impl FillTracker {
 
         let venue_order_id = VenueOrderId::from(uo.id.as_str());
         let order_side = OrderSide::from(uo.side);
-        let client_order_id = uo.rfo.as_deref().map(ClientOrderId::from);
+        let client_order_id = uo
+            .rfo
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(ClientOrderId::from);
         let ts_fill = uo.md.map_or(ts_event, parse_millis_timestamp);
 
         Some(make_fill_report(
@@ -366,8 +395,13 @@ impl FillTracker {
     /// For the first fill, the average price IS the fill price. For subsequent
     /// fills, the individual price is derived from:
     /// `fill_price = (avp * sm - prev_avp * prev_sm) / fill_size`
-    fn compute_fill_price(&self, uo: &UnmatchedOrder, prev_filled: Decimal) -> Decimal {
-        let Some(avp) = uo.avp else {
+    fn compute_fill_price(
+        &self,
+        uo: &UnmatchedOrder,
+        prev_filled: Decimal,
+        sm: Decimal,
+    ) -> Decimal {
+        let Some(avp) = uo.avp.map(normalize_betfair_price) else {
             return uo.p;
         };
 
@@ -383,7 +417,6 @@ impl FillTracker {
             return avp;
         }
 
-        let sm = uo.sm.unwrap_or(Decimal::ZERO);
         let fill_size = sm - prev_filled;
 
         if fill_size == Decimal::ZERO {
@@ -405,14 +438,35 @@ impl FillTracker {
 
     /// Pre-populates state for a bet from existing order data.
     ///
-    /// Called during reconnect sync so that the first stream update
-    /// computes a correct incremental fill instead of treating the
-    /// cumulative matched size as a new fill.
+    /// Monotonic in `filled_qty`: keeps the larger of the cached and
+    /// in-memory values so a cache that lags the tracker (engine has
+    /// not yet processed an emitted fill) cannot regress it.
     pub fn sync_order(&mut self, bet_id: &str, filled_qty: Decimal, avg_px: Decimal) {
-        self.filled_qty.insert(bet_id.to_string(), filled_qty);
+        let filled_qty = normalize_betfair_quantity(filled_qty);
+        let avg_px = normalize_betfair_price(avg_px);
+        let current = self
+            .filled_qty
+            .get(bet_id)
+            .copied()
+            .map_or(Decimal::ZERO, normalize_betfair_quantity);
 
-        if avg_px > Decimal::ZERO {
-            self.avg_px.insert(bet_id.to_string(), avg_px);
+        if filled_qty > current {
+            self.filled_qty.insert(bet_id.to_string(), filled_qty);
+            if avg_px > Decimal::ZERO {
+                self.avg_px.insert(bet_id.to_string(), avg_px);
+            }
+        }
+    }
+
+    /// Seeds the trade-id dedup set so fills already published via another
+    /// channel are not re-emitted when the post-reconnect image arrives.
+    pub fn seed_published_trade_ids<I, S>(&mut self, trade_ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for id in trade_ids {
+            self.published_trade_ids.insert(id.into());
         }
     }
 
@@ -425,6 +479,10 @@ impl FillTracker {
         self.published_trade_ids
             .retain(|id| !id.starts_with(&prefix));
     }
+}
+
+fn make_trade_id_for_size(bet_id: &str, size_matched: Decimal) -> TradeId {
+    TradeId::new(format!("{bet_id}-{size_matched}"))
 }
 
 /// Returns `true` if the unmatched order has cancel, lapse, or void quantities.
@@ -487,8 +545,8 @@ pub fn parse_order_status_report(
         uo.sl,
         uo.sv,
     );
-    let quantity = Quantity::from_decimal_dp(quantity_decimal, BETFAIR_QUANTITY_PRECISION)?;
-    let filled_qty = Quantity::from_decimal_dp(size_matched, BETFAIR_QUANTITY_PRECISION)?;
+    let quantity = parse_betfair_quantity(quantity_decimal)?;
+    let filled_qty = parse_betfair_quantity(size_matched)?;
 
     let ts_accepted = parse_millis_timestamp(uo.pd);
 
@@ -500,9 +558,13 @@ pub fn parse_order_status_report(
         .map_or(ts_event, parse_millis_timestamp);
 
     let venue_order_id = VenueOrderId::from(uo.id.as_str());
-    let client_order_id = uo.rfo.as_deref().map(ClientOrderId::from);
+    let client_order_id = uo
+        .rfo
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ClientOrderId::from);
 
-    let price = Price::from_decimal_dp(uo.p, BETFAIR_PRICE_PRECISION)?;
+    let price = parse_betfair_price(uo.p)?;
 
     let mut report = OrderStatusReport::new(
         account_id,
@@ -610,7 +672,7 @@ pub fn make_fill_report(
         order_side,
         last_qty,
         last_px,
-        Money::new(0.0, currency),
+        Money::zero(currency),
         LiquiditySide::NoLiquiditySide,
         client_order_id,
         None,
@@ -636,18 +698,10 @@ pub fn parse_betfair_ticker(
 
     Some(BetfairTicker::new(
         instrument_id,
-        rc.ltp.map_or(f64::NAN, |d| {
-            d.to_string().parse::<f64>().unwrap_or(f64::NAN)
-        }),
-        rc.tv.map_or(f64::NAN, |d| {
-            d.to_string().parse::<f64>().unwrap_or(f64::NAN)
-        }),
-        rc.spn.map_or(f64::NAN, |d| {
-            d.to_string().parse::<f64>().unwrap_or(f64::NAN)
-        }),
-        rc.spf.map_or(f64::NAN, |d| {
-            d.to_string().parse::<f64>().unwrap_or(f64::NAN)
-        }),
+        rc.ltp,
+        rc.tv,
+        rc.spn,
+        rc.spf,
         ts_event,
         ts_init,
     ))
@@ -673,10 +727,9 @@ pub fn parse_betfair_starting_prices(
             let bsp = rd.bsp?;
             let handicap = rd.hc.unwrap_or(Decimal::ZERO);
             let instrument_id = make_instrument_id(market_id, rd.id, handicap);
-            let bsp_f64 = bsp.to_string().parse::<f64>().unwrap_or(f64::NAN);
             Some(BetfairStartingPrice::new(
                 instrument_id,
-                bsp_f64,
+                bsp,
                 ts_event,
                 ts_init,
             ))
@@ -717,8 +770,8 @@ pub fn parse_bsp_book_deltas(
             instrument_id,
             action,
             OrderSide::Sell as u32,
-            pv.price.to_string().parse::<f64>().unwrap_or(f64::NAN),
-            pv.volume.to_string().parse::<f64>().unwrap_or(0.0),
+            pv.price,
+            pv.volume,
             ts_event,
             ts_init,
         ));
@@ -736,8 +789,8 @@ pub fn parse_bsp_book_deltas(
             instrument_id,
             action,
             OrderSide::Buy as u32,
-            pv.price.to_string().parse::<f64>().unwrap_or(f64::NAN),
-            pv.volume.to_string().parse::<f64>().unwrap_or(0.0),
+            pv.price,
+            pv.volume,
             ts_event,
             ts_init,
         ));
@@ -770,7 +823,7 @@ pub fn parse_instrument_closes(
                 RunnerStatus::Loser | RunnerStatus::Removed | RunnerStatus::RemovedVacant => {
                     Price::from("0.00")
                 }
-                RunnerStatus::Active | RunnerStatus::Hidden => return None,
+                RunnerStatus::Active | RunnerStatus::Hidden | RunnerStatus::Unknown => return None,
             };
 
             let handicap = rd.hc.unwrap_or(Decimal::ZERO);
@@ -858,11 +911,16 @@ mod tests {
     use super::*;
     use crate::{
         common::{
+            consts::{BETFAIR_PRICE_PRECISION, BETFAIR_QUANTITY_PRECISION},
             enums::{StreamingOrderType, StreamingPersistenceType, StreamingSide},
             testing::load_test_json,
         },
-        stream::messages::{PV, RunnerDefinition, StreamMessage, stream_decode},
+        stream::messages::{PV, RunnerChange, RunnerDefinition, StreamMessage, stream_decode},
     };
+
+    fn assert_decimal_option_eq(actual: Option<Decimal>, expected: Decimal) {
+        assert_eq!(actual, Some(expected));
+    }
 
     #[rstest]
     fn test_parse_runner_book_snapshot() {
@@ -921,6 +979,40 @@ mod tests {
         } else {
             panic!("expected MarketChange");
         }
+    }
+
+    #[rstest]
+    fn test_parse_runner_book_snapshot_skips_zero_volume_levels() {
+        let rc: RunnerChange = serde_json::from_str(
+            r#"{
+                "id": 123,
+                "atb": [[2.0, 0.0], [2.1, 3.0]],
+                "atl": [[2.2, 0.0], [2.3, 4.0]]
+            }"#,
+        )
+        .unwrap();
+        let instrument_id = make_instrument_id("1.234", rc.id, Decimal::ZERO);
+
+        let deltas = parse_runner_book_deltas(
+            instrument_id,
+            &rc,
+            true,
+            1_551_400_000_000,
+            parse_millis_timestamp(1_551_400_000_000),
+            parse_millis_timestamp(1_551_400_000_000),
+        )
+        .unwrap()
+        .expect("should produce deltas");
+
+        assert_eq!(deltas.deltas.len(), 3);
+        assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+        assert!(
+            deltas
+                .deltas
+                .iter()
+                .filter(|delta| delta.action == BookAction::Add)
+                .all(|delta| !delta.order.size.is_zero())
+        );
     }
 
     #[rstest]
@@ -1122,6 +1214,28 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].action, expected_action);
         assert_eq!(results[0].is_trading, Some(expected_is_trading));
+    }
+
+    #[rstest]
+    fn test_parse_instrument_statuses_skips_unknown_market_status() {
+        // An unmodeled market status must not publish a fabricated non-trading
+        // state; the whole definition is skipped.
+        let def = make_status_def(MarketStatus::Unknown, true, RunnerStatus::Active);
+        let results =
+            parse_instrument_statuses("1.123", &def, UnixNanos::default(), UnixNanos::default());
+
+        assert!(results.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_instrument_statuses_skips_unknown_runner() {
+        // An unmodeled runner status must not be emitted as tradable, even in an
+        // open in-play market; we skip it rather than fabricate tradability.
+        let def = make_status_def(MarketStatus::Open, true, RunnerStatus::Unknown);
+        let results =
+            parse_instrument_statuses("1.123", &def, UnixNanos::default(), UnixNanos::default());
+
+        assert!(results.is_empty());
     }
 
     #[rstest]
@@ -1905,10 +2019,10 @@ mod tests {
         let ticker = parse_betfair_ticker(instrument_id, &rc, ts, ts).unwrap();
 
         assert_eq!(ticker.instrument_id, instrument_id);
-        assert!((ticker.last_traded_price - 5.5).abs() < f64::EPSILON);
-        assert!((ticker.traded_volume - 1890.32).abs() < f64::EPSILON);
-        assert!((ticker.starting_price_near - 5.68).abs() < f64::EPSILON);
-        assert!((ticker.starting_price_far - 5.73).abs() < f64::EPSILON);
+        assert_decimal_option_eq(ticker.last_traded_price, Decimal::new(55, 1));
+        assert_decimal_option_eq(ticker.traded_volume, Decimal::new(189032, 2));
+        assert_decimal_option_eq(ticker.starting_price_near, Decimal::new(568, 2));
+        assert_decimal_option_eq(ticker.starting_price_far, Decimal::new(573, 2));
     }
 
     #[rstest]
@@ -1925,10 +2039,10 @@ mod tests {
 
         let ticker = parse_betfair_ticker(instrument_id, &rc, ts, ts).unwrap();
 
-        assert!((ticker.last_traded_price - 5.5).abs() < f64::EPSILON);
-        assert!((ticker.traded_volume - 1890.32).abs() < f64::EPSILON);
-        assert!(ticker.starting_price_near.is_nan());
-        assert!(ticker.starting_price_far.is_nan());
+        assert_decimal_option_eq(ticker.last_traded_price, Decimal::new(55, 1));
+        assert_decimal_option_eq(ticker.traded_volume, Decimal::new(189032, 2));
+        assert!(ticker.starting_price_near.is_none());
+        assert!(ticker.starting_price_far.is_none());
     }
 
     #[rstest]
@@ -1949,10 +2063,10 @@ mod tests {
 
         let ticker = parse_betfair_ticker(instrument_id, &rc, ts, ts).unwrap();
 
-        assert!(ticker.last_traded_price.is_nan());
-        assert!((ticker.traded_volume - 3201.15).abs() < f64::EPSILON);
-        assert!(ticker.starting_price_near.is_nan());
-        assert!(ticker.starting_price_far.is_nan());
+        assert!(ticker.last_traded_price.is_none());
+        assert_decimal_option_eq(ticker.traded_volume, Decimal::new(320115, 2));
+        assert!(ticker.starting_price_near.is_none());
+        assert!(ticker.starting_price_far.is_none());
     }
 
     #[rstest]
@@ -1972,28 +2086,28 @@ mod tests {
 
             let ticker = parse_betfair_ticker(instrument_id, rc, ts, ts).unwrap();
 
-            assert!((ticker.last_traded_price - 5.5).abs() < f64::EPSILON);
-            assert!((ticker.traded_volume - 1890.32).abs() < f64::EPSILON);
-            assert!((ticker.starting_price_near - 5.68).abs() < f64::EPSILON);
-            assert!((ticker.starting_price_far - 5.73).abs() < f64::EPSILON);
+            assert_decimal_option_eq(ticker.last_traded_price, Decimal::new(55, 1));
+            assert_decimal_option_eq(ticker.traded_volume, Decimal::new(189032, 2));
+            assert_decimal_option_eq(ticker.starting_price_near, Decimal::new(568, 2));
+            assert_decimal_option_eq(ticker.starting_price_far, Decimal::new(573, 2));
 
             // Runner 40273293 has ltp=2.1, tv=3201.15 but no spn/spf
             let rc2 = rc_list.iter().find(|r| r.id == 40273293).unwrap();
             let instrument_id2 = make_instrument_id(&change.id, rc2.id, Decimal::ZERO);
             let ticker2 = parse_betfair_ticker(instrument_id2, rc2, ts, ts).unwrap();
 
-            assert!((ticker2.last_traded_price - 2.1).abs() < f64::EPSILON);
-            assert!((ticker2.traded_volume - 3201.15).abs() < f64::EPSILON);
-            assert!(ticker2.starting_price_near.is_nan());
-            assert!(ticker2.starting_price_far.is_nan());
+            assert_decimal_option_eq(ticker2.last_traded_price, Decimal::new(21, 1));
+            assert_decimal_option_eq(ticker2.traded_volume, Decimal::new(320115, 2));
+            assert!(ticker2.starting_price_near.is_none());
+            assert!(ticker2.starting_price_far.is_none());
 
             // Runner 23678734 has only tv=0, no ltp
             let rc3 = rc_list.iter().find(|r| r.id == 23678734).unwrap();
             let instrument_id3 = make_instrument_id(&change.id, rc3.id, Decimal::ZERO);
             let ticker3 = parse_betfair_ticker(instrument_id3, rc3, ts, ts).unwrap();
 
-            assert!(ticker3.last_traded_price.is_nan());
-            assert!((ticker3.traded_volume - 0.0).abs() < f64::EPSILON);
+            assert!(ticker3.last_traded_price.is_none());
+            assert_decimal_option_eq(ticker3.traded_volume, Decimal::ZERO);
         } else {
             panic!("Expected MarketChange");
         }
@@ -2014,7 +2128,7 @@ mod tests {
             // 3 runners have bsp values, 1 (REMOVED) does not
             assert_eq!(prices.len(), 3);
 
-            let bsp_map: std::collections::HashMap<String, f64> = prices
+            let bsp_map: std::collections::HashMap<String, Decimal> = prices
                 .iter()
                 .map(|p| (p.instrument_id.to_string(), p.bsp))
                 .collect();
@@ -2023,9 +2137,9 @@ mod tests {
             let id_placed = make_instrument_id("1.185781465", 40273293, Decimal::ZERO).to_string();
             let id_loser = make_instrument_id("1.185781465", 11120000, Decimal::ZERO).to_string();
 
-            assert!((bsp_map[&id_winner] - 5.73).abs() < f64::EPSILON);
-            assert!((bsp_map[&id_placed] - 2.14).abs() < f64::EPSILON);
-            assert!((bsp_map[&id_loser] - 28.56).abs() < f64::EPSILON);
+            assert_eq!(bsp_map[&id_winner], Decimal::new(573, 2));
+            assert_eq!(bsp_map[&id_placed], Decimal::new(214, 2));
+            assert_eq!(bsp_map[&id_loser], Decimal::new(2856, 2));
         } else {
             panic!("Expected MarketChange");
         }
@@ -2121,15 +2235,15 @@ mod tests {
 
         // SPB entries are Sell side
         assert_eq!(deltas[0].side, OrderSide::Sell as u32);
-        assert!((deltas[0].price - 1000.0).abs() < f64::EPSILON);
-        assert!((deltas[0].size - 33.38).abs() < f64::EPSILON);
+        assert_eq!(deltas[0].price, Decimal::new(1000, 0));
+        assert_eq!(deltas[0].size, Decimal::new(3338, 2));
         assert_eq!(deltas[0].action, BookAction::Update as u32);
 
         // SPL entries are Buy side
         let spl_start = spb_count;
         assert_eq!(deltas[spl_start].side, OrderSide::Buy as u32);
-        assert!((deltas[spl_start].price - 7.0).abs() < f64::EPSILON);
-        assert!((deltas[spl_start].size - 10.0).abs() < f64::EPSILON);
+        assert_eq!(deltas[spl_start].price, Decimal::new(7, 0));
+        assert_eq!(deltas[spl_start].size, Decimal::new(10, 0));
     }
 
     #[rstest]
@@ -2161,8 +2275,8 @@ mod tests {
 
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].action, BookAction::Delete as u32);
-        assert!((deltas[0].price - 5.0).abs() < f64::EPSILON);
-        assert!((deltas[0].size - 0.0).abs() < f64::EPSILON);
+        assert_eq!(deltas[0].price, Decimal::new(5, 0));
+        assert_eq!(deltas[0].size, Decimal::ZERO);
     }
 
     #[rstest]
@@ -2277,6 +2391,20 @@ mod tests {
     }
 
     #[rstest]
+    fn test_make_trade_id_normalizes_float_tail_sm() {
+        let uo = make_test_uo(
+            "430069890490",
+            Decimal::new(4287, 2),
+            Some(Decimal::new(4_287_000_000_000_001, 14)),
+            Some(Decimal::new(25, 1)),
+        );
+
+        let trade_id = make_trade_id(&uo);
+
+        assert_eq!(trade_id.as_str(), "430069890490-42.87");
+    }
+
+    #[rstest]
     fn test_fill_tracker_sync_order_prevents_duplicate_fill() {
         let mut tracker = FillTracker::new();
 
@@ -2305,6 +2433,36 @@ mod tests {
     }
 
     #[rstest]
+    fn test_fill_tracker_sync_order_is_monotonic() {
+        let mut tracker = FillTracker::new();
+
+        // Tracker already has 10 from prior stream activity
+        tracker.sync_order("123456", Decimal::new(10, 0), Decimal::new(25, 1));
+
+        // Cache lags (engine hasn't processed the last fill yet) and reports 5
+        tracker.sync_order("123456", Decimal::new(5, 0), Decimal::new(20, 1));
+
+        // Next OCM with sm=15 must emit incremental fill of 5, not 10
+        let uo = make_test_uo(
+            "123456",
+            Decimal::new(20, 0),
+            Some(Decimal::new(15, 0)),
+            Some(Decimal::new(25, 1)),
+        );
+        let result = tracker.maybe_fill_report(
+            &uo,
+            uo.s,
+            InstrumentId::from("1.234567-123456-0.0.BETFAIR"),
+            AccountId::from("BETFAIR-001"),
+            Currency::from("GBP"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        let fill = result.expect("should emit incremental fill");
+        assert_eq!(fill.last_qty, Quantity::from("5.00"));
+    }
+
+    #[rstest]
     fn test_fill_tracker_sync_order_allows_incremental_fill() {
         let mut tracker = FillTracker::new();
 
@@ -2329,6 +2487,77 @@ mod tests {
         assert!(result.is_some(), "should emit fill for new matched qty");
         let fill = result.unwrap();
         assert_eq!(fill.last_qty, Quantity::from("5.00"));
+    }
+
+    #[rstest]
+    fn test_fill_tracker_seed_published_trade_ids_blocks_replay() {
+        let mut tracker = FillTracker::new();
+
+        let uo_for_id = make_test_uo(
+            "123456",
+            Decimal::new(20, 0),
+            Some(Decimal::new(10, 0)),
+            Some(Decimal::new(25, 1)),
+        );
+        let trade_id = make_trade_id(&uo_for_id);
+
+        // Seeded trade-id must block even with an empty FillTracker
+        // (cumulative-size gate would otherwise let this fill through)
+        tracker.seed_published_trade_ids([trade_id.to_string()]);
+
+        let result = tracker.maybe_fill_report(
+            &uo_for_id,
+            uo_for_id.s,
+            InstrumentId::from("1.234567-123456-0.0.BETFAIR"),
+            AccountId::from("BETFAIR-001"),
+            Currency::from("GBP"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        assert!(
+            result.is_none(),
+            "seeded trade-id should suppress duplicate fill",
+        );
+    }
+
+    #[rstest]
+    fn test_fill_tracker_accepts_sm_float_tail_at_order_quantity() {
+        let mut tracker = FillTracker::new();
+        let uo = make_test_uo(
+            "430069890490",
+            Decimal::new(4287, 2),
+            Some(Decimal::new(4_287_000_000_000_001, 14)),
+            Some(Decimal::new(25, 1)),
+        );
+
+        let result = tracker.maybe_fill_report(
+            &uo,
+            uo.s,
+            InstrumentId::from("1.234567-430069890490-0.0.BETFAIR"),
+            AccountId::from("BETFAIR-001"),
+            Currency::from("GBP"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        let fill = result.expect("float tail at order quantity should emit fill");
+        assert_eq!(fill.last_qty, Quantity::from("42.87"));
+        assert_eq!(fill.trade_id.as_str(), "430069890490-42.87");
+
+        let duplicate = tracker.maybe_fill_report(
+            &uo,
+            uo.s,
+            InstrumentId::from("1.234567-430069890490-0.0.BETFAIR"),
+            AccountId::from("BETFAIR-001"),
+            Currency::from("GBP"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        assert!(
+            duplicate.is_none(),
+            "same normalized sm should not emit a duplicate fill"
+        );
     }
 
     #[rstest]
@@ -2651,6 +2880,52 @@ mod tests {
 
         assert_eq!(report.order_status, OrderStatus::Canceled);
         assert_eq!(report.cancel_reason.as_deref(), Some("SP_IN_PLAY"));
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_blank_rfo_normalizes_to_none() {
+        // Some venues send rfo:"" instead of omitting it. ClientOrderId rejects
+        // empty strings, so the parser must treat blank refs as missing.
+        let uo = UnmatchedOrder {
+            rfo: Some(String::new()),
+            ..make_test_uo("999013", Decimal::new(10, 0), Some(Decimal::ZERO), None)
+        };
+
+        let report = parse_order_status_report(
+            &uo,
+            InstrumentId::from("1.234567-123456-0.0.BETFAIR"),
+            AccountId::from("BETFAIR-001"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert!(report.client_order_id.is_none());
+    }
+
+    #[rstest]
+    fn test_fill_tracker_blank_rfo_normalizes_to_none() {
+        let mut tracker = FillTracker::new();
+        let uo = UnmatchedOrder {
+            rfo: Some(String::new()),
+            sm: Some(Decimal::new(5, 0)),
+            avp: Some(Decimal::new(25, 1)),
+            ..make_test_uo("999015", Decimal::new(10, 0), Some(Decimal::ZERO), None)
+        };
+
+        let fill = tracker
+            .maybe_fill_report(
+                &uo,
+                uo.s,
+                InstrumentId::from("1.234567-123456-0.0.BETFAIR"),
+                AccountId::from("BETFAIR-001"),
+                Currency::from("GBP"),
+                UnixNanos::default(),
+                UnixNanos::default(),
+            )
+            .expect("blank rfo should still produce a fill");
+
+        assert!(fill.client_order_id.is_none());
     }
 
     #[rstest]

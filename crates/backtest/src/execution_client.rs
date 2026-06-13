@@ -71,7 +71,7 @@ impl Debug for BacktestExecutionClient {
         f.debug_struct(stringify!(BacktestExecutionClient))
             .field("client_id", &self.core.client_id)
             .field("routing", &self.routing)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -107,10 +107,6 @@ impl BacktestExecutionClient {
 
         let factory = OrderEventFactory::new(trader_id, account_id, account_type, base_currency);
 
-        if !frozen_account {
-            // TODO Register calculated account
-        }
-
         Self {
             core,
             factory,
@@ -123,11 +119,11 @@ impl BacktestExecutionClient {
         }
     }
 
-    fn get_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<OrderAny> {
+    fn get_order(&self, client_order_id: ClientOrderId) -> anyhow::Result<OrderAny> {
         self.cache
             .borrow()
-            .order(client_order_id)
-            .cloned()
+            .order(&client_order_id)
+            .map(|o| o.clone())
             .ok_or_else(|| anyhow::anyhow!("Order not found in cache for {client_order_id}"))
     }
 
@@ -164,7 +160,7 @@ impl ExecutionClient for BacktestExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.cache.borrow().account(&self.core.account_id).cloned()
+        self.cache.borrow().account_owned(&self.core.account_id)
     }
 
     fn generate_account_state(
@@ -198,7 +194,7 @@ impl ExecutionClient for BacktestExecutionClient {
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         // Buffer the OrderSubmitted event for deferred processing to avoid
         // RefCell re-entrancy (exec_engine holds a borrow during execute)
-        let order = self.get_order(&cmd.client_order_id)?;
+        let order = self.get_order(cmd.client_order_id)?;
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = self.factory.generate_order_submitted(&order, ts_init);
         self.queued_events.borrow_mut().push(event);

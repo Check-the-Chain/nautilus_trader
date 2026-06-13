@@ -762,13 +762,13 @@ BitMEX API credentials can be provided either directly in the configuration or v
 
 - `BITMEX_API_KEY`: Your BitMEX API key for production.
 - `BITMEX_API_SECRET`: Your BitMEX API secret for production.
-- `BITMEX_TESTNET_API_KEY`: Your BitMEX API key for testnet (when `testnet=True`).
-- `BITMEX_TESTNET_API_SECRET`: Your BitMEX API secret for testnet (when `testnet=True`).
+- `BITMEX_TESTNET_API_KEY`: Your BitMEX API key for testnet.
+- `BITMEX_TESTNET_API_SECRET`: Your BitMEX API secret for testnet.
 
 To generate API keys:
 
 1. Log in to your BitMEX account.
-2. Navigate to Account & Security → API Keys.
+2. Navigate to Account & Security -> API Keys.
 3. Create a new API key with appropriate permissions.
 4. For testnet, use [testnet.bitmex.com](https://testnet.bitmex.com).
 
@@ -778,54 +778,57 @@ To generate API keys:
 - REST API: `https://testnet.bitmex.com/api/v1`
 - WebSocket: `wss://ws.testnet.bitmex.com/realtime`
 
-The adapter automatically routes requests to the correct endpoints when `testnet=True` is configured.
+The adapter automatically routes requests to the correct endpoints when
+`environment=BitmexEnvironment.TESTNET` is configured.
 :::
 
 ### Data client configuration options
 
 The BitMEX data client provides the following configuration options:
 
-| Option                            | Default  | Description |
-|-----------------------------------|----------|-------------|
-| `api_key`                         | `None`   | Optional API key; if `None`, loaded from `BITMEX_API_KEY` or `BITMEX_TESTNET_API_KEY` (when `testnet=True`). |
-| `api_secret`                      | `None`   | Optional API secret; if `None`, loaded from `BITMEX_API_SECRET` or `BITMEX_TESTNET_API_SECRET` (when `testnet=True`). |
-| `base_url_http`                   | `None`   | Override for the REST base URL (defaults to production). |
-| `base_url_ws`                     | `None`   | Override for the WebSocket base URL (defaults to production). |
-| `testnet`                     | `False`  | Route requests to the BitMEX testnet when `True`. |
-| `http_timeout_secs`               | `60`     | Request timeout applied to HTTP calls. |
-| `max_retries`                     | `3`      | Maximum retry attempts for HTTP calls. |
-| `retry_delay_initial_ms`          | `1,000`  | Initial backoff delay (milliseconds) between retries. |
-| `retry_delay_max_ms`              | `10,000` | Maximum backoff delay (milliseconds) between retries. |
-| `recv_window_ms`                  | `10,000` | Expiration window (milliseconds) for signed requests. See [Request authentication](#request-authentication-and-expiration). |
-| `update_instruments_interval_mins`| `60`     | Interval (minutes) between instrument catalogue refreshes. |
-| `max_requests_per_second`         | `10`     | Burst rate limit enforced by the adapter for REST calls. |
-| `max_requests_per_minute`         | `120`    | Rolling minute rate limit enforced by the adapter for REST calls. |
-| `proxy_url`                       | `None`   | Optional proxy URL for HTTP and WebSocket transports. |
+| Option                             | Default   | Description |
+|------------------------------------|-----------|-------------|
+| `api_key`                          | `None`    | Optional API key; if `None`, loaded from the environment selected by `environment`. |
+| `api_secret`                       | `None`    | Optional API secret; if `None`, loaded from the environment selected by `environment`. |
+| `environment`                      | `None`    | Environment enum (`MAINNET` or `TESTNET`). |
+| `base_url_http`                    | `None`    | Override for the REST base URL (defaults to production). |
+| `base_url_ws`                      | `None`    | Override for the WebSocket base URL (defaults to production). |
+| `http_timeout_secs`                | `60`      | Request timeout applied to HTTP calls. |
+| `max_retries`                      | `3`       | Maximum retry attempts for HTTP calls. |
+| `retry_delay_initial_ms`           | `1,000`   | Initial backoff delay (milliseconds) between retries. |
+| `retry_delay_max_ms`               | `10,000`  | Maximum backoff delay (milliseconds) between retries. |
+| `recv_window_ms`                   | `10,000`  | Expiration window (milliseconds) for signed requests. See [Request authentication](#request-authentication-and-expiration). |
+| `update_instruments_interval_mins` | `60`      | Interval (minutes) between instrument catalogue refreshes. |
+| `max_requests_per_second`          | `10`      | Burst rate limit enforced by the adapter for REST calls. |
+| `max_requests_per_minute`          | `120`     | Rolling minute rate limit enforced by the adapter for REST calls. |
+| `proxy_url`                        | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `transport_backend`                | `Sockudo` | WebSocket transport backend. |
 
 ### Execution client configuration options
 
 The BitMEX execution client provides the following configuration options:
 
-| Option                   | Default  | Description |
-|--------------------------|----------|-------------|
-| `api_key`                | `None`   | Optional API key; if `None`, loaded from `BITMEX_API_KEY` or `BITMEX_TESTNET_API_KEY` (when `testnet=True`). |
-| `api_secret`             | `None`   | Optional API secret; if `None`, loaded from `BITMEX_API_SECRET` or `BITMEX_TESTNET_API_SECRET` (when `testnet=True`). |
-| `base_url_http`          | `None`   | Override for the REST base URL (defaults to production). |
-| `base_url_ws`            | `None`   | Override for the WebSocket base URL (defaults to production). |
-| `testnet`                | `False`  | Route orders to the BitMEX testnet when `True`. |
-| `http_timeout_secs`      | `60`     | Request timeout applied to HTTP calls. |
-| `max_retries`            | `3`      | Maximum retry attempts for HTTP calls. |
-| `retry_delay_initial_ms` | `1,000`  | Initial backoff delay (milliseconds) between retries. |
-| `retry_delay_max_ms`     | `10,000` | Maximum backoff delay (milliseconds) between retries. |
-| `recv_window_ms`         | `10,000` | Expiration window (milliseconds) for signed requests. See [Request authentication](#request-authentication-and-expiration). |
-| `max_requests_per_second`| `10`     | Burst rate limit enforced by the adapter for REST calls. |
-| `max_requests_per_minute`| `120`    | Rolling minute rate limit enforced by the adapter for REST calls. |
-| `deadmans_switch_timeout_secs` | `None`   | Timeout in seconds for the dead man's switch. `None` disables. See [Dead man's switch](#dead-mans-switch). |
-| `canceller_pool_size`    | `None`   | Number of HTTP clients in the cancel broadcaster pool. `None` resolves to 1. See [Cancel broadcaster](#cancel-broadcaster). |
-| `submitter_pool_size`    | `None`   | Number of HTTP clients in the submit broadcaster pool. `None` resolves to 1. See [Submit broadcaster](#submit-broadcaster). |
-| `proxy_url`              | `None`   | Optional proxy URL for HTTP and WebSocket transports. |
-| `submitter_proxy_urls`   | `None`   | Optional list of proxy URLs for submit broadcaster path diversity. *Not yet wired through Python integration.* |
-| `canceller_proxy_urls`   | `None`   | Optional list of proxy URLs for cancel broadcaster path diversity. *Not yet wired through Python integration.* |
+| Option                         | Default   | Description |
+|--------------------------------|-----------|-------------|
+| `api_key`                      | `None`    | Optional API key; if `None`, loaded from the environment selected by `environment`. |
+| `api_secret`                   | `None`    | Optional API secret; if `None`, loaded from the environment selected by `environment`. |
+| `environment`                  | `None`    | Environment enum (`MAINNET` or `TESTNET`). |
+| `base_url_http`                | `None`    | Override for the REST base URL (defaults to production). |
+| `base_url_ws`                  | `None`    | Override for the WebSocket base URL (defaults to production). |
+| `http_timeout_secs`            | `60`      | Request timeout applied to HTTP calls. |
+| `max_retries`                  | `3`       | Maximum retry attempts for HTTP calls. |
+| `retry_delay_initial_ms`       | `1,000`   | Initial backoff delay (milliseconds) between retries. |
+| `retry_delay_max_ms`           | `10,000`  | Maximum backoff delay (milliseconds) between retries. |
+| `recv_window_ms`               | `10,000`  | Expiration window (milliseconds) for signed requests. See [Request authentication](#request-authentication-and-expiration). |
+| `max_requests_per_second`      | `10`      | Burst rate limit enforced by the adapter for REST calls. |
+| `max_requests_per_minute`      | `120`     | Rolling minute rate limit enforced by the adapter for REST calls. |
+| `deadmans_switch_timeout_secs` | `None`    | Timeout in seconds for the dead man's switch. `None` disables. See [Dead man's switch](#dead-mans-switch). |
+| `canceller_pool_size`          | `None`    | Number of HTTP clients in the cancel broadcaster pool. `None` resolves to 1. See [Cancel broadcaster](#cancel-broadcaster). |
+| `submitter_pool_size`          | `None`    | Number of HTTP clients in the submit broadcaster pool. `None` resolves to 1. See [Submit broadcaster](#submit-broadcaster). |
+| `proxy_url`                    | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `submitter_proxy_urls`         | `None`    | Optional list of proxy URLs for submit broadcaster path diversity. *Not yet wired through Python integration.* |
+| `canceller_proxy_urls`         | `None`    | Optional list of proxy URLs for cancel broadcaster path diversity. *Not yet wired through Python integration.* |
+| `transport_backend`            | `Sockudo` | WebSocket transport backend. |
 
 ### Configuration examples
 
@@ -834,23 +837,24 @@ A typical BitMEX configuration for live trading includes both testnet and mainne
 ```python
 from nautilus_trader.adapters.bitmex.config import BitmexDataClientConfig
 from nautilus_trader.adapters.bitmex.config import BitmexExecClientConfig
+from nautilus_trader.core.nautilus_pyo3 import BitmexEnvironment
 
 # Using environment variables (recommended)
 testnet_data_config = BitmexDataClientConfig(
-    testnet=True,  # API credentials loaded from BITMEX_TESTNET_API_KEY and BITMEX_TESTNET_API_SECRET
+    environment=BitmexEnvironment.TESTNET,
 )
 
 # Using explicit credentials
 mainnet_data_config = BitmexDataClientConfig(
     api_key="YOUR_API_KEY",  # Or use os.getenv("BITMEX_API_KEY")
     api_secret="YOUR_API_SECRET",  # Or use os.getenv("BITMEX_API_SECRET")
-    testnet=False,
+    environment=BitmexEnvironment.MAINNET,
 )
 
 mainnet_exec_config = BitmexExecClientConfig(
     api_key="YOUR_API_KEY",
     api_secret="YOUR_API_SECRET",
-    testnet=False,
+    environment=BitmexEnvironment.MAINNET,
 )
 ```
 

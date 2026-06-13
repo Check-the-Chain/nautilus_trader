@@ -30,6 +30,7 @@ use ustr::Ustr;
 
 use crate::{
     common::{
+        consts::TARDIS,
         enums::{TardisExchange, TardisInstrumentType},
         parse::normalize_symbol_str,
     },
@@ -43,7 +44,7 @@ use crate::{
 ///
 /// Returns a `PyErr` if the `exchange` or `instrument_type` cannot be parsed.
 #[pyfunction(name = "tardis_normalize_symbol_str")]
-#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.tardis")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.tardis")]
 #[pyo3(signature = (symbol, exchange, instrument_type, is_inverse=None))]
 pub fn py_tardis_normalize_symbol_str(
     symbol: &str,
@@ -126,9 +127,15 @@ pub fn tardis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_quotes, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_trades, m)?)?;
+    m.add_function(wrap_pyfunction!(csv::py_load_tardis_options_chain, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        csv::py_convert_tardis_options_chain_csv,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_deltas, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_batched_deltas, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_quotes, m)?)?;
+    m.add_function(wrap_pyfunction!(csv::py_stream_tardis_options_chain, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_trades, m)?)?;
     m.add_function(wrap_pyfunction!(
         csv::py_stream_tardis_depth10_from_snapshot5,
@@ -144,7 +151,7 @@ pub fn tardis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let registry = get_global_pyo3_registry();
 
     if let Err(e) =
-        registry.register_factory_extractor("TARDIS".to_string(), extract_tardis_data_factory)
+        registry.register_factory_extractor(TARDIS.to_string(), extract_tardis_data_factory)
     {
         return Err(to_pyruntime_err(format!(
             "Failed to register Tardis data factory extractor: {e}"

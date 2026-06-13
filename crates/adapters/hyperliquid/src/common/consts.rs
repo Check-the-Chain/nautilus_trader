@@ -15,14 +15,24 @@
 
 use std::{sync::LazyLock, time::Duration};
 
-use nautilus_model::{enums::OrderType, identifiers::Venue};
+use nautilus_model::{
+    enums::OrderType,
+    identifiers::{ClientId, Venue},
+};
 use ustr::Ustr;
 
 use super::enums::HyperliquidEnvironment;
 
+/// Venue identifier string.
 pub const HYPERLIQUID: &str = "HYPERLIQUID";
+
+/// Static venue instance.
 pub static HYPERLIQUID_VENUE: LazyLock<Venue> =
     LazyLock::new(|| Venue::new(Ustr::from(HYPERLIQUID)));
+
+/// Static client ID instance.
+pub static HYPERLIQUID_CLIENT_ID: LazyLock<ClientId> =
+    LazyLock::new(|| ClientId::new(Ustr::from(HYPERLIQUID)));
 
 pub const HYPERLIQUID_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
@@ -36,12 +46,17 @@ pub const HYPERLIQUID_TESTNET_EXCHANGE_URL: &str = "https://api.hyperliquid-test
 // Address MUST be lowercase for msgpack serialization
 pub const NAUTILUS_BUILDER_ADDRESS: &str = "0x0c8d970c462726e014ad36f6c5a63e99db48a8e7";
 
+/// Public docs anchor for builder fee approval.
+pub const HYPERLIQUID_BUILDER_APPROVAL_DOCS_URL: &str =
+    "https://nautilustrader.io/docs/nightly/integrations/hyperliquid.html#builder-fee-approval";
+
 /// Hyperliquid signing chain ID (0x66eee = 421614 decimal).
 pub const HYPERLIQUID_CHAIN_ID: u64 = 421614;
 
 // Error message substrings for detecting specific rejection reasons
 pub const HYPERLIQUID_POST_ONLY_WOULD_MATCH: &str =
     "Post only order would have immediately matched";
+pub const HYPERLIQUID_BUILDER_FEE_NOT_APPROVED: &str = "Builder fee has not been approved";
 
 /// Hyperliquid supported order types.
 ///

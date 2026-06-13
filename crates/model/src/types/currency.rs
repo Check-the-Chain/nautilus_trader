@@ -306,8 +306,8 @@ impl<'de> Deserialize<'de> for Currency {
     where
         D: serde::Deserializer<'de>,
     {
-        let currency_str: String = Deserialize::deserialize(deserializer)?;
-        Self::from_str(&currency_str).map_err(serde::de::Error::custom)
+        let currency_str: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+        Self::from_str(currency_str.as_ref()).map_err(serde::de::Error::custom)
     }
 }
 
@@ -322,9 +322,7 @@ mod tests {
         let currency = Currency::AUD();
         assert_eq!(
             format!("{currency:?}"),
-            format!(
-                "Currency(code='AUD', precision=2, iso4217=36, name='Australian dollar', currency_type=FIAT)"
-            )
+            "Currency(code='AUD', precision=2, iso4217=36, name='Australian dollar', currency_type=FIAT)".to_string()
         );
     }
 

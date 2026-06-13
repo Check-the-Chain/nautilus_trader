@@ -73,6 +73,7 @@ pub struct TardisReplayConfig {
     pub output_path: Option<String>,
     /// The Tardis Machine replay options.
     #[builder(default)]
+    #[serde(default)]
     pub options: Vec<ReplayNormalizedRequestOptions>,
     /// Optional proxy URL for the Tardis HTTP API client.
     /// The Tardis Machine WebSocket transport does not yet support proxying.
@@ -82,6 +83,8 @@ pub struct TardisReplayConfig {
     /// - `deltas`: Convert to `OrderBookDeltas` and write to `order_book_deltas/` (default).
     /// - `depth10`: Convert to `OrderBookDepth10` and write to `order_book_depths/`.
     pub book_snapshot_output: Option<BookSnapshotOutput>,
+    /// If best bid/offer fields from Tardis `option_summary` messages should emit `QuoteTick`.
+    pub extract_bbo_as_quotes: Option<bool>,
     /// The compression codec for written data files.
     ///
     /// - `zstd`: Use Zstandard compression level 3 (default).
@@ -91,14 +94,15 @@ pub struct TardisReplayConfig {
 }
 
 /// Configuration for the Tardis data client.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.tardis", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.tardis")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.tardis")
 )]
 pub struct TardisDataClientConfig {
     /// Tardis API key for HTTP instrument fetching.
@@ -116,6 +120,9 @@ pub struct TardisDataClientConfig {
     /// Output format for `book_snapshot_*` messages.
     #[builder(default)]
     pub book_snapshot_output: BookSnapshotOutput,
+    /// Whether to emit `QuoteTick` from Tardis `option_summary` best bid/offer fields.
+    #[builder(default)]
+    pub extract_bbo_as_quotes: bool,
     /// Replay options defining exchanges, symbols, date ranges, and data types.
     /// When non-empty the client connects to `ws-replay-normalized`.
     #[builder(default)]
@@ -150,6 +157,7 @@ mod tests {
             config.book_snapshot_output,
             BookSnapshotOutput::Deltas
         ));
+        assert!(!config.extract_bbo_as_quotes);
         assert!(config.options.is_empty());
         assert!(config.stream_options.is_empty());
     }
@@ -213,6 +221,41 @@ mod tests {
     }
 
     #[rstest]
+    fn test_data_client_config_toml_minimal() {
+        let config: TardisDataClientConfig = toml::from_str(
+            r#"
+normalize_symbols = false
+book_snapshot_output = "depth10"
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.normalize_symbols);
+        assert!(matches!(
+            config.book_snapshot_output,
+            BookSnapshotOutput::Depth10
+        ));
+        assert!(!config.extract_bbo_as_quotes);
+        assert!(config.options.is_empty());
+    }
+
+    #[rstest]
+    fn test_replay_config_omits_options_uses_empty_default() {
+        let config: TardisReplayConfig = toml::from_str(
+            r#"
+tardis_ws_url = "wss://example.com"
+normalize_symbols = false
+"#,
+        )
+        .unwrap();
+
+        assert!(config.options.is_empty());
+        assert_eq!(config.tardis_ws_url.as_deref(), Some("wss://example.com"));
+        assert_eq!(config.normalize_symbols, Some(false));
+        assert_eq!(config.extract_bbo_as_quotes, None);
+    }
+
+    #[rstest]
     fn test_replay_config_deserializes_compression() {
         let json = r#"{
             "tardis_ws_url": null,
@@ -221,6 +264,7 @@ mod tests {
             "options": [],
             "proxy_url": null,
             "book_snapshot_output": "depth10",
+            "extract_bbo_as_quotes": true,
             "compression": "zstd"
         }"#;
 
@@ -230,6 +274,7 @@ mod tests {
             config.book_snapshot_output,
             Some(BookSnapshotOutput::Depth10)
         ));
+        assert_eq!(config.extract_bbo_as_quotes, Some(true));
         assert!(matches!(config.compression, Some(ParquetCompression::Zstd)));
     }
 }

@@ -71,7 +71,10 @@ use crate::{
         },
         urls::get_kraken_http_base_url,
     },
-    http::{error::KrakenHttpError, models::OhlcData},
+    http::{
+        error::{KrakenHttpError, kraken_http_should_retry},
+        models::OhlcData,
+    },
 };
 
 /// Default Kraken Futures REST API rate limit (requests per second).
@@ -103,7 +106,7 @@ pub struct KrakenFuturesRawHttpClient {
 impl Default for KrakenFuturesRawHttpClient {
     fn default() -> Self {
         Self::new(
-            KrakenEnvironment::Mainnet,
+            KrakenEnvironment::Live,
             None,
             60,
             None,
@@ -373,8 +376,7 @@ impl KrakenFuturesRawHttpClient {
             }
         };
 
-        let should_retry =
-            |error: &KrakenHttpError| -> bool { matches!(error, KrakenHttpError::NetworkError(_)) };
+        let should_retry = kraken_http_should_retry;
         let create_error = |msg: String| -> KrakenHttpError { KrakenHttpError::NetworkError(msg) };
 
         self.retry_manager
@@ -880,16 +882,25 @@ impl KrakenFuturesRawHttpClient {
         &self,
         order_ids: Vec<String>,
     ) -> anyhow::Result<FuturesBatchCancelResponse, KrakenHttpError> {
+        let batch_items: Vec<KrakenFuturesBatchCancelItem> = order_ids
+            .into_iter()
+            .map(KrakenFuturesBatchCancelItem::from_order_id)
+            .collect();
+
+        self.cancel_order_items_batch(batch_items).await
+    }
+
+    /// Cancels multiple order IDs or client order IDs in a single batch request
+    /// (requires authentication).
+    pub async fn cancel_order_items_batch(
+        &self,
+        batch_items: Vec<KrakenFuturesBatchCancelItem>,
+    ) -> anyhow::Result<FuturesBatchCancelResponse, KrakenHttpError> {
         if self.credential.is_none() {
             return Err(KrakenHttpError::AuthenticationError(
                 "API credentials required for batch orders".to_string(),
             ));
         }
-
-        let batch_items: Vec<KrakenFuturesBatchCancelItem> = order_ids
-            .into_iter()
-            .map(KrakenFuturesBatchCancelItem::from_order_id)
-            .collect();
 
         let params = KrakenFuturesBatchOrderParams::new(batch_items);
         let post_data = params
@@ -973,7 +984,7 @@ impl KrakenFuturesRawHttpClient {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.kraken")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.kraken")
 )]
 pub struct KrakenFuturesHttpClient {
     pub(crate) inner: Arc<KrakenFuturesRawHttpClient>,
@@ -996,7 +1007,7 @@ impl Clone for KrakenFuturesHttpClient {
 impl Default for KrakenFuturesHttpClient {
     fn default() -> Self {
         Self::new(
-            KrakenEnvironment::Mainnet,
+            KrakenEnvironment::Live,
             None,
             60,
             None,
@@ -1082,7 +1093,7 @@ impl KrakenFuturesHttpClient {
 
     /// Creates a new [`KrakenFuturesHttpClient`] loading credentials from environment variables.
     ///
-    /// Looks for `KRAKEN_FUTURES_API_KEY` and `KRAKEN_FUTURES_API_SECRET` (mainnet)
+    /// Looks for `KRAKEN_FUTURES_API_KEY` and `KRAKEN_FUTURES_API_SECRET` (live)
     /// or `KRAKEN_FUTURES_DEMO_API_KEY` and `KRAKEN_FUTURES_DEMO_API_SECRET` (demo).
     ///
     /// Falls back to unauthenticated client if credentials are not set.
@@ -2525,7 +2536,7 @@ fn parse_multi_collateral_balances(account: &FuturesAccount, balances: &mut Vec<
 }
 
 // Kraken Futures serves balances as JSON numbers, which serde already parsed to
-// f64. Converting to Decimal here just moves the value into the fixed-point
+// f64. Converting to Decimal here moves the value into the fixed-point
 // constructor; it does not recover any precision lost at the wire parse.
 fn push_balance_from_f64(
     balances: &mut Vec<AccountBalance>,
@@ -2647,7 +2658,7 @@ mod tests {
         let client = KrakenFuturesRawHttpClient::with_credentials(
             "test_key".to_string(),
             "test_secret".to_string(),
-            KrakenEnvironment::Mainnet,
+            KrakenEnvironment::Live,
             None,
             60,
             None,
@@ -2671,7 +2682,7 @@ mod tests {
         let client = KrakenFuturesHttpClient::with_credentials(
             "test_key".to_string(),
             "test_secret".to_string(),
-            KrakenEnvironment::Mainnet,
+            KrakenEnvironment::Live,
             None,
             60,
             None,
@@ -2816,10 +2827,9 @@ mod tests {
 
     #[rstest]
     fn test_parse_margin_account_balances_free_is_derived_from_total_minus_locked() {
-        // Regression: `free` must be derived via Money fixed-point subtraction so
-        // the `AccountBalance` invariant `total == locked + free` holds exactly,
-        // rather than using the raw Kraken `af` (available funds) value which
-        // can drift at the currency precision and violate the invariant in
+        // `free` must be derived via Money fixed-point subtraction so the
+        // `AccountBalance` invariant `total == locked + free` holds exactly.
+        // Kraken's raw `af` can drift at currency precision and violate
         // `AccountBalance::new_checked`.
         let mut bals = AHashMap::new();
         // Values chosen so that Kraken's raw `af` rounds independently from

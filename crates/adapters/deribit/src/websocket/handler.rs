@@ -31,7 +31,7 @@ use ahash::AHashMap;
 use nautilus_common::cache::fifo::FifoCache;
 use nautilus_core::{AtomicSet, AtomicTime, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
-    data::{Bar, Data, InstrumentStatus},
+    data::{Bar, CustomData, Data, DataType, InstrumentStatus},
     enums::MarketStatusAction,
     events::{AccountState, OrderCancelRejected, OrderModifyRejected, OrderRejected},
     identifiers::{
@@ -48,15 +48,15 @@ use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 
 use super::{
-    enums::{DeribitBookMsgType, DeribitHeartbeatType, DeribitWsChannel},
+    enums::{DeribitBookMsgType, DeribitHeartbeatType, DeribitWsChannel, DeribitWsMethod},
     error::DeribitWsError,
     messages::{
         DeribitAuthResult, DeribitBookMsg, DeribitCancelAllByInstrumentParams, DeribitCancelParams,
         DeribitChartMsg, DeribitEditParams, DeribitHeartbeatParams, DeribitInstrumentStateMsg,
         DeribitJsonRpcRequest, DeribitOrderMsg, DeribitOrderParams, DeribitOrderResponse,
         DeribitPerpetualMsg, DeribitPortfolioMsg, DeribitQuoteMsg, DeribitSubscribeParams,
-        DeribitTickerMsg, DeribitTradeMsg, DeribitUserTradeMsg, DeribitWsMessage,
-        NautilusWsMessage, parse_raw_message,
+        DeribitTickerMsg, DeribitTradeMsg, DeribitUserTradeMsg, DeribitVolatilityIndexMsg,
+        DeribitWsMessage, NautilusWsMessage, parse_raw_message,
     },
     parse::{
         OrderEventType, determine_order_event_type, parse_book_msg, parse_chart_msg,
@@ -66,10 +66,13 @@ use super::{
         parse_user_order_msg, parse_user_trade_msg, resolution_to_bar_type,
     },
 };
-use crate::common::{
-    consts::{DERIBIT_POST_ONLY_ERROR_CODE, DERIBIT_RATE_LIMIT_KEY_ORDER, DERIBIT_VENUE},
-    enums::DeribitInstrumentState,
-    parse::parse_portfolio_to_account_state,
+use crate::{
+    common::{
+        consts::{DERIBIT_POST_ONLY_ERROR_CODE, DERIBIT_RATE_LIMIT_KEY_ORDER, DERIBIT_VENUE},
+        enums::DeribitInstrumentState,
+        parse::{parse_portfolio_to_account_state, use_cost_for_bar_volume},
+    },
+    data_types::DeribitVolatilityIndex,
 };
 
 /// Type of pending request for request ID correlation.
@@ -392,11 +395,7 @@ impl DeribitWsFeedHandler {
                 return Err(e);
             }
         };
-        let result = self.send_with_retry(payload, rate_limit_keys).await;
-        if result.is_err() {
-            self.pending_requests.remove(&request_id);
-        }
-        result
+        self.send_with_retry(payload, rate_limit_keys).await
     }
 
     /// Sends a message over the WebSocket with retry logic.
@@ -448,14 +447,14 @@ impl DeribitWsFeedHandler {
             .iter()
             .any(|ch| DeribitWsChannel::requires_auth(ch))
         {
-            "private/subscribe"
+            DeribitWsMethod::PrivateSubscribe
         } else {
-            "public/subscribe"
+            DeribitWsMethod::PublicSubscribe
         };
 
         let request = DeribitJsonRpcRequest::new(
             request_id,
-            method,
+            method.as_method_str(),
             DeribitSubscribeParams {
                 channels: channels.clone(),
             },
@@ -484,14 +483,14 @@ impl DeribitWsFeedHandler {
             .iter()
             .any(|ch| DeribitWsChannel::requires_auth(ch))
         {
-            "private/unsubscribe"
+            DeribitWsMethod::PrivateUnsubscribe
         } else {
-            "public/unsubscribe"
+            DeribitWsMethod::PublicUnsubscribe
         };
 
         let request = DeribitJsonRpcRequest::new(
             request_id,
-            method,
+            method.as_method_str(),
             DeribitSubscribeParams {
                 channels: channels.clone(),
             },
@@ -514,7 +513,7 @@ impl DeribitWsFeedHandler {
 
         let request = DeribitJsonRpcRequest::new(
             request_id,
-            "public/set_heartbeat",
+            DeribitWsMethod::SetHeartbeat.as_method_str(),
             DeribitHeartbeatParams { interval },
         );
 
@@ -535,7 +534,11 @@ impl DeribitWsFeedHandler {
         self.pending_requests
             .insert(request_id, PendingRequestType::Test);
 
-        let request = DeribitJsonRpcRequest::new(request_id, "public/test", serde_json::json!({}));
+        let request = DeribitJsonRpcRequest::new(
+            request_id,
+            DeribitWsMethod::Test.as_method_str(),
+            serde_json::json!({}),
+        );
 
         let payload =
             serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
@@ -565,7 +568,8 @@ impl DeribitWsFeedHandler {
             },
         );
 
-        let request = DeribitJsonRpcRequest::new(request_id, "private/buy", params);
+        let request =
+            DeribitJsonRpcRequest::new(request_id, DeribitWsMethod::Buy.as_method_str(), params);
 
         let payload =
             serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
@@ -600,7 +604,8 @@ impl DeribitWsFeedHandler {
             },
         );
 
-        let request = DeribitJsonRpcRequest::new(request_id, "private/sell", params);
+        let request =
+            DeribitJsonRpcRequest::new(request_id, DeribitWsMethod::Sell.as_method_str(), params);
 
         let payload =
             serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
@@ -636,7 +641,8 @@ impl DeribitWsFeedHandler {
             },
         );
 
-        let request = DeribitJsonRpcRequest::new(request_id, "private/edit", params);
+        let request =
+            DeribitJsonRpcRequest::new(request_id, DeribitWsMethod::Edit.as_method_str(), params);
 
         let payload =
             serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
@@ -672,7 +678,8 @@ impl DeribitWsFeedHandler {
             },
         );
 
-        let request = DeribitJsonRpcRequest::new(request_id, "private/cancel", params);
+        let request =
+            DeribitJsonRpcRequest::new(request_id, DeribitWsMethod::Cancel.as_method_str(), params);
 
         let payload =
             serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
@@ -701,8 +708,11 @@ impl DeribitWsFeedHandler {
             PendingRequestType::CancelAllByInstrument { instrument_id },
         );
 
-        let request =
-            DeribitJsonRpcRequest::new(request_id, "private/cancel_all_by_instrument", params);
+        let request = DeribitJsonRpcRequest::new(
+            request_id,
+            DeribitWsMethod::CancelAllByInstrument.as_method_str(),
+            params,
+        );
 
         let payload =
             serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
@@ -744,7 +754,11 @@ impl DeribitWsFeedHandler {
             "order_id": order_id
         });
 
-        let request = DeribitJsonRpcRequest::new(request_id, "private/get_order_state", params);
+        let request = DeribitJsonRpcRequest::new(
+            request_id,
+            DeribitWsMethod::GetOrderState.as_method_str(),
+            params,
+        );
 
         let payload =
             serde_json::to_string(&request).map_err(|e| DeribitWsError::Json(e.to_string()));
@@ -780,7 +794,12 @@ impl DeribitWsFeedHandler {
                 self.pending_requests
                     .insert(request_id, PendingRequestType::Authenticate);
 
-                let request = DeribitJsonRpcRequest::new(request_id, "public/auth", auth_params);
+                let request = DeribitJsonRpcRequest::new(
+                    request_id,
+                    DeribitWsMethod::PublicAuth.as_method_str(),
+                    auth_params,
+                );
+
                 match serde_json::to_string(&request) {
                     Ok(payload) => {
                         if let Err(e) = self.send_with_retry(payload, None).await {
@@ -1279,24 +1298,6 @@ impl DeribitWsFeedHandler {
                                         log::error!(
                                             "Failed to parse order response: request_id={request_id}, error={e}"
                                         );
-                                        return Some(NautilusWsMessage::OrderRejected(
-                                            OrderRejected::new(
-                                                trader_id,
-                                                strategy_id,
-                                                instrument_id,
-                                                client_order_id,
-                                                self.account_id
-                                                    .unwrap_or(AccountId::new("DERIBIT-UNKNOWN")),
-                                                ustr::ustr(&format!(
-                                                    "Failed to parse response: {e}"
-                                                )),
-                                                UUID4::new(),
-                                                ts_init,
-                                                ts_init,
-                                                false,
-                                                false,
-                                            ),
-                                        ));
                                     }
                                 }
                             } else if let Some(error) = &response.error {
@@ -1391,23 +1392,6 @@ impl DeribitWsFeedHandler {
                                         log::error!(
                                             "Failed to parse edit response: request_id={request_id}, error={e}"
                                         );
-                                        return Some(NautilusWsMessage::OrderModifyRejected(
-                                            OrderModifyRejected::new(
-                                                trader_id,
-                                                strategy_id,
-                                                instrument_id,
-                                                client_order_id,
-                                                ustr::ustr(&format!(
-                                                    "Failed to parse response: {e}"
-                                                )),
-                                                UUID4::new(),
-                                                ts_init,
-                                                ts_init,
-                                                false,
-                                                None, // venue_order_id not available
-                                                self.account_id,
-                                            ),
-                                        ));
                                     }
                                 }
                             } else if let Some(error) = &response.error {
@@ -1559,12 +1543,29 @@ impl DeribitWsFeedHandler {
                                         ts_init,
                                     );
 
-                                    if data_vec.is_empty() {
-                                        log::debug!(
-                                            "No trades parsed - instrument cache size: {}",
-                                            self.instruments_cache.len()
-                                        );
-                                    } else {
+                                    if data_vec.is_empty() && !trades.is_empty() {
+                                        let missing: Vec<&Ustr> = trades
+                                            .iter()
+                                            .map(|t| &t.instrument_name)
+                                            .filter(|name| {
+                                                !self.instruments_cache.contains_key(name)
+                                            })
+                                            .collect();
+
+                                        if missing.is_empty() {
+                                            log::warn!(
+                                                "Received {} trades but parsed 0 (parse failures); cache size: {}",
+                                                trades.len(),
+                                                self.instruments_cache.len()
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                "Trade message received but instrument(s) not found in cache: {:?} (cache size: {})",
+                                                missing,
+                                                self.instruments_cache.len()
+                                            );
+                                        }
+                                    } else if !data_vec.is_empty() {
                                         log::debug!("Parsed {} trade ticks", data_vec.len());
                                         return Some(NautilusWsMessage::Data(data_vec));
                                     }
@@ -1686,57 +1687,77 @@ impl DeribitWsFeedHandler {
                             }
                         }
                         DeribitWsChannel::Ticker => {
-                            if let Ok(ticker_msg) =
-                                serde_json::from_value::<DeribitTickerMsg>(data.clone())
-                                && let Some(instrument) =
-                                    self.instruments_cache.get(&ticker_msg.instrument_name)
-                            {
-                                // Emit OptionGreeks only if subscribed
-                                if self.option_greeks_subs.contains(&instrument.id())
-                                    && let Some(option_greeks) = parse_ticker_to_option_greeks(
-                                        &ticker_msg,
-                                        instrument,
-                                        ts_init,
-                                    )
-                                {
-                                    let _ = self
-                                        .out_tx
-                                        .send(NautilusWsMessage::OptionGreeks(option_greeks));
-                                }
-
-                                let instrument_id = instrument.id();
-                                let mut data_vec = Vec::new();
-
-                                // Emit MarkPriceUpdate only if subscribed
-                                if self.mark_price_subs.contains(&instrument_id) {
-                                    match parse_ticker_to_mark_price(
-                                        &ticker_msg,
-                                        instrument,
-                                        ts_init,
-                                    ) {
-                                        Ok(mark_price) => {
-                                            data_vec.push(Data::MarkPriceUpdate(mark_price));
+                            match serde_json::from_value::<DeribitTickerMsg>(data.clone()) {
+                                Ok(ticker_msg) => {
+                                    if let Some(instrument) =
+                                        self.instruments_cache.get(&ticker_msg.instrument_name)
+                                    {
+                                        // Emit OptionGreeks only if subscribed
+                                        if self.option_greeks_subs.contains(&instrument.id())
+                                            && let Some(option_greeks) =
+                                                parse_ticker_to_option_greeks(
+                                                    &ticker_msg,
+                                                    instrument,
+                                                    ts_init,
+                                                )
+                                        {
+                                            let _ = self.out_tx.send(
+                                                NautilusWsMessage::OptionGreeks(option_greeks),
+                                            );
                                         }
-                                        Err(e) => log::warn!("Failed to parse mark price: {e}"),
+
+                                        let instrument_id = instrument.id();
+                                        let mut data_vec = Vec::new();
+
+                                        // Emit MarkPriceUpdate only if subscribed
+                                        if self.mark_price_subs.contains(&instrument_id) {
+                                            match parse_ticker_to_mark_price(
+                                                &ticker_msg,
+                                                instrument,
+                                                ts_init,
+                                            ) {
+                                                Ok(mark_price) => {
+                                                    data_vec
+                                                        .push(Data::MarkPriceUpdate(mark_price));
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Failed to parse mark price: {e}");
+                                                }
+                                            }
+                                        }
+
+                                        // Emit IndexPriceUpdate only if subscribed
+                                        if self.index_price_subs.contains(&instrument_id) {
+                                            match parse_ticker_to_index_price(
+                                                &ticker_msg,
+                                                instrument,
+                                                ts_init,
+                                            ) {
+                                                Ok(index_price) => {
+                                                    data_vec
+                                                        .push(Data::IndexPriceUpdate(index_price));
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Failed to parse index price: {e}");
+                                                }
+                                            }
+                                        }
+
+                                        if !data_vec.is_empty() {
+                                            return Some(NautilusWsMessage::Data(data_vec));
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "Ticker message received but instrument '{}' not found in cache (cache size: {})",
+                                            ticker_msg.instrument_name,
+                                            self.instruments_cache.len()
+                                        );
                                     }
                                 }
-
-                                // Emit IndexPriceUpdate only if subscribed
-                                if self.index_price_subs.contains(&instrument_id) {
-                                    match parse_ticker_to_index_price(
-                                        &ticker_msg,
-                                        instrument,
-                                        ts_init,
-                                    ) {
-                                        Ok(index_price) => {
-                                            data_vec.push(Data::IndexPriceUpdate(index_price));
-                                        }
-                                        Err(e) => log::warn!("Failed to parse index price: {e}"),
-                                    }
-                                }
-
-                                if !data_vec.is_empty() {
-                                    return Some(NautilusWsMessage::Data(data_vec));
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to deserialize ticker message: {e}, channel: {channel}"
+                                    );
                                 }
                             }
                         }
@@ -1780,20 +1801,65 @@ impl DeribitWsFeedHandler {
                         }
                         DeribitWsChannel::Quote => {
                             // Parse quote messages
-                            if let Ok(quote_msg) =
-                                serde_json::from_value::<DeribitQuoteMsg>(data.clone())
-                                && let Some(instrument) =
-                                    self.instruments_cache.get(&quote_msg.instrument_name)
+                            match serde_json::from_value::<DeribitQuoteMsg>(data.clone()) {
+                                Ok(quote_msg) => {
+                                    if let Some(instrument) =
+                                        self.instruments_cache.get(&quote_msg.instrument_name)
+                                    {
+                                        match parse_quote_msg(&quote_msg, instrument, ts_init) {
+                                            Ok(quote) => {
+                                                return Some(NautilusWsMessage::Data(vec![
+                                                    Data::Quote(quote),
+                                                ]));
+                                            }
+                                            Err(e) => {
+                                                log::warn!("Failed to parse quote message: {e}");
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "Quote message received but instrument '{}' not found in cache (cache size: {})",
+                                            quote_msg.instrument_name,
+                                            self.instruments_cache.len()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to deserialize quote message: {e}, channel: {channel}"
+                                    );
+                                }
+                            }
+                        }
+                        DeribitWsChannel::VolatilityIndex => {
+                            match serde_json::from_value::<DeribitVolatilityIndexMsg>(data.clone())
                             {
-                                match parse_quote_msg(&quote_msg, instrument, ts_init) {
-                                    Ok(quote) => {
-                                        return Some(NautilusWsMessage::Data(vec![Data::Quote(
-                                            quote,
-                                        )]));
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Failed to parse quote message: {e}");
-                                    }
+                                Ok(msg) => {
+                                    let ts_event = UnixNanos::from(msg.timestamp * 1_000_000);
+                                    let mut metadata = nautilus_core::Params::new();
+                                    metadata.insert(
+                                        "index_name".to_string(),
+                                        serde_json::Value::String(msg.index_name.clone()),
+                                    );
+                                    let data_type = DataType::new(
+                                        "DeribitVolatilityIndex",
+                                        Some(metadata),
+                                        None,
+                                    );
+
+                                    let dvol = DeribitVolatilityIndex::new(
+                                        msg.index_name,
+                                        msg.volatility,
+                                        ts_event,
+                                        ts_init,
+                                    );
+
+                                    return Some(NautilusWsMessage::Data(vec![Data::Custom(
+                                        CustomData::new(Arc::new(dvol), data_type),
+                                    )]));
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to deserialize volatility index: {e}");
                                 }
                             }
                         }
@@ -1869,12 +1935,15 @@ impl DeribitWsFeedHandler {
                                             Ok(bar_type) => {
                                                 let price_precision = instrument.price_precision();
                                                 let size_precision = instrument.size_precision();
+                                                let use_cost_for_volume =
+                                                    use_cost_for_bar_volume(instrument);
 
                                                 match parse_chart_msg(
                                                     &chart_msg,
                                                     bar_type,
                                                     price_precision,
                                                     size_precision,
+                                                    use_cost_for_volume,
                                                     self.bars_timestamp_on_close,
                                                     ts_init,
                                                 ) {

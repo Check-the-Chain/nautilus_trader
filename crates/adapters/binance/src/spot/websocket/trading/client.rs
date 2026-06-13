@@ -308,7 +308,7 @@ impl BinanceSpotWsTradingClient {
             .await
             .send(BinanceSpotWsTradingCommand::Disconnect)
         {
-            log::warn!("Failed to send disconnect command: {e}");
+            log::debug!("Failed to send disconnect command: {e}");
         }
 
         self.cancellation_token.cancel();
@@ -316,7 +316,7 @@ impl BinanceSpotWsTradingClient {
         if let Some(handle) = self.task_handle.take()
             && let Ok(handle) = Arc::try_unwrap(handle)
         {
-            let _ = handle.await;
+            let _result = handle.await;
         }
     }
 

@@ -25,12 +25,6 @@ mod core_updates;
 #[path = "core_tests.rs"]
 mod tests;
 
-#[cfg(feature = "python")]
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    rc::Rc,
-};
 use std::{
     collections::VecDeque,
     fmt::Debug,
@@ -44,14 +38,15 @@ use std::{
 
 use ahash::AHashMap;
 use anyhow::Context;
-// removed unused async_trait
 use ibapi::{
     accounts::PositionUpdate,
     client::Client,
+    contracts::{Contract, SecurityType},
     orders::{
-        ExecutionData, ExecutionFilter, Executions, OcaType, OrderStatus as IBOrderStatus,
-        OrderUpdate, Orders,
+        ExecutionData, ExecutionFilter, Executions, OrderStatus as IBOrderStatus, OrderUpdate,
+        Orders,
     },
+    prelude::{StreamExt, SubscriptionItemStreamExt},
 };
 use nautilus_common::{
     cache::Cache,
@@ -76,47 +71,37 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::ExecutionClientCore;
-#[cfg(feature = "python")]
-use nautilus_model::events::{OrderAcceptedBatch, OrderCanceledBatch, OrderSubmittedBatch};
-#[cfg(feature = "python")]
-use nautilus_model::identifiers::{ExecAlgorithmId, OrderListId, PositionId};
-#[cfg(feature = "python")]
-use nautilus_model::orders::OrderList;
-#[cfg(feature = "python")]
-use nautilus_model::python::events::order::order_event_to_pyobject;
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        LiquiditySide, OmsType, OrderSide, OrderType, PositionSideSpecified, TrailingOffsetType,
+        LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSideSpecified,
+        TimeInForce, TrailingOffsetType,
     },
     events::{
-        AccountState, OrderAccepted, OrderCanceled, OrderEventAny, OrderPendingCancel,
-        OrderRejected, OrderSubmitted,
+        AccountState, OrderAccepted, OrderCanceled, OrderDenied, OrderEventAny, OrderPendingCancel,
+        OrderRejected, OrderSubmitted, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, Venue,
         VenueOrderId,
     },
-    instruments::Instrument,
+    instruments::{Instrument, InstrumentAny},
     orders::{Order, any::OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
-#[cfg(feature = "python")]
-use nautilus_model::{enums::AccountType, events::OrderInitialized};
-#[cfg(feature = "python")]
-use pyo3::{IntoPyObjectExt, prelude::*};
-use rust_decimal::Decimal;
-use tokio::task::JoinHandle;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+use tokio::{sync::Mutex as AsyncMutex, task::JoinHandle};
 use ustr::Ustr;
 
 use super::{
-    account::{PositionTracker, create_position_tracker},
-    parse::{parse_execution_time, parse_execution_to_fill_report, parse_order_status_to_report},
+    account::{PositionTracker, create_position_tracker, raw_ib_account_code},
+    parse::{
+        ib_venue_order_id, parse_execution_time, parse_execution_to_fill_report,
+        parse_order_status_to_report,
+    },
     transform::nautilus_order_to_ib_order,
 };
-#[cfg(feature = "python")]
-use crate::common::consts::IB_VENUE;
 use crate::{
     common::{
         parse::{ib_contract_to_instrument_id_simple, is_spread_instrument_id},
@@ -152,6 +137,8 @@ pub struct InteractiveBrokersExecutionClient {
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Order ID counter.
     next_order_id: Arc<Mutex<i32>>,
+    /// Serializes order submissions so TWS receives monotonically increasing order IDs.
+    order_submit_lock: Arc<AsyncMutex<()>>,
     /// Order update subscription handle.
     order_update_handle: Mutex<Option<JoinHandle<()>>>,
     /// Client order ID to venue order ID mapping.
@@ -202,107 +189,43 @@ struct PendingComboFill {
     ts_init: UnixNanos,
 }
 
-#[cfg(feature = "python")]
-static EXEC_EVENT_CALLBACK: std::sync::OnceLock<std::sync::Mutex<Option<Py<PyAny>>>> =
-    std::sync::OnceLock::new();
-
-#[cfg(feature = "python")]
-thread_local! {
-    static EXEC_EVENT_BRIDGE_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IbOrderSelector {
+    OrderId(i32),
+    PermId(i64),
 }
 
-#[cfg(feature = "python")]
-fn exec_event_callback() -> &'static std::sync::Mutex<Option<Py<PyAny>>> {
-    EXEC_EVENT_CALLBACK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(feature = "python")]
-fn string_hash_map_to_params(
-    params: Option<HashMap<String, String>>,
-) -> Option<nautilus_core::Params> {
-    params.map(|items| {
-        let mut mapped = nautilus_core::Params::new();
-        for (key, value) in items {
-            mapped.insert(key, serde_json::Value::String(value));
+impl IbOrderSelector {
+    fn from_venue_order_id(venue_order_id: &VenueOrderId) -> anyhow::Result<Self> {
+        let raw = venue_order_id.as_str();
+        if let Some(perm_id) = raw.strip_prefix("PERM-") {
+            return Ok(Self::PermId(perm_id.parse::<i64>().with_context(|| {
+                format!("Failed to parse venue_order_id {raw:?} as IB perm_id")
+            })?));
         }
-        mapped
-    })
-}
 
-#[cfg(feature = "python")]
-fn dispatch_python_exec_event(
-    py: Python<'_>,
-    callback: &Py<PyAny>,
-    event: ExecutionEvent,
-) -> PyResult<()> {
-    let (kind, payload) = match event {
-        ExecutionEvent::Order(order_event) => {
-            ("order_event", order_event_to_pyobject(py, order_event)?)
+        Ok(Self::OrderId(raw.parse::<i32>().with_context(|| {
+            format!("Failed to parse venue_order_id {raw:?} as IB order_id")
+        })?))
+    }
+
+    fn matches(self, order_id: i32, perm_id: i64) -> bool {
+        match self {
+            Self::OrderId(target_order_id) => order_id == target_order_id,
+            Self::PermId(target_perm_id) => perm_id == target_perm_id,
         }
-        ExecutionEvent::OrderSubmittedBatch(batch) => (
-            "order_submitted_batch",
-            order_submitted_batch_to_pyobject(py, batch)?,
-        ),
-        ExecutionEvent::OrderAcceptedBatch(batch) => (
-            "order_accepted_batch",
-            order_accepted_batch_to_pyobject(py, batch)?,
-        ),
-        ExecutionEvent::OrderCanceledBatch(batch) => (
-            "order_canceled_batch",
-            order_canceled_batch_to_pyobject(py, batch)?,
-        ),
-        ExecutionEvent::Report(report) => match report {
-            ExecutionReport::Order(report) => ("order_report", (*report).into_py_any(py)?),
-            ExecutionReport::Fill(report) => ("fill_report", (*report).into_py_any(py)?),
-            ExecutionReport::Position(report) => ("position_report", (*report).into_py_any(py)?),
-            ExecutionReport::MassStatus(report) => {
-                ("mass_status_report", (*report).into_py_any(py)?)
-            }
-            // The IB adapter never emits OrderWithFills; this arm exists only to
-            // keep the match exhaustive against the shared ExecutionReport enum.
-            ExecutionReport::OrderWithFills(..) => return Ok(()),
-        },
-        ExecutionEvent::Account(account_state) => ("account_state", account_state.into_py_any(py)?),
-    };
+    }
 
-    callback.call1(py, (kind, payload))?;
-    Ok(())
-}
+    fn venue_order_id(self) -> VenueOrderId {
+        match self {
+            Self::OrderId(order_id) => VenueOrderId::from(order_id.to_string()),
+            Self::PermId(perm_id) => VenueOrderId::from(format!("PERM-{perm_id}")),
+        }
+    }
 
-#[cfg(feature = "python")]
-fn order_accepted_batch_to_pyobject(
-    py: Python<'_>,
-    batch: OrderAcceptedBatch,
-) -> PyResult<Py<PyAny>> {
-    batch
-        .into_iter()
-        .map(|event| order_event_to_pyobject(py, OrderEventAny::Accepted(event)))
-        .collect::<PyResult<Vec<Py<PyAny>>>>()?
-        .into_py_any(py)
-}
-
-#[cfg(feature = "python")]
-fn order_submitted_batch_to_pyobject(
-    py: Python<'_>,
-    batch: OrderSubmittedBatch,
-) -> PyResult<Py<PyAny>> {
-    batch
-        .into_iter()
-        .map(|event| order_event_to_pyobject(py, OrderEventAny::Submitted(event)))
-        .collect::<PyResult<Vec<Py<PyAny>>>>()?
-        .into_py_any(py)
-}
-
-#[cfg(feature = "python")]
-fn order_canceled_batch_to_pyobject(
-    py: Python<'_>,
-    batch: OrderCanceledBatch,
-) -> PyResult<Py<PyAny>> {
-    batch
-        .into_iter()
-        .map(|event| order_event_to_pyobject(py, OrderEventAny::Canceled(event)))
-        .collect::<PyResult<Vec<Py<PyAny>>>>()?
-        .into_py_any(py)
+    fn label(self) -> String {
+        self.venue_order_id().to_string()
+    }
 }
 
 impl Debug for InteractiveBrokersExecutionClient {
@@ -334,6 +257,12 @@ impl InteractiveBrokersExecutionClient {
         config: InteractiveBrokersExecClientConfig,
         instrument_provider: Arc<InteractiveBrokersInstrumentProvider>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !config.client_id.unsigned_abs().is_multiple_of(1000),
+            "Interactive Brokers execution client_id must not be a multiple of 1000 because order ID partitioning uses client_id % 1000; got {}",
+            config.client_id
+        );
+
         // If account_id is provided in config, use it
         if let Some(account_id) = &config.account_id {
             core.account_id = AccountId::from(account_id.clone());
@@ -347,6 +276,7 @@ impl InteractiveBrokersExecutionClient {
             ib_client: None,
             pending_tasks: Mutex::new(Vec::new()),
             next_order_id: Arc::new(Mutex::new(0)),
+            order_submit_lock: Arc::new(AsyncMutex::new(())),
             order_update_handle: Mutex::new(None),
             order_id_map: Arc::new(Mutex::new(AHashMap::new())),
             venue_order_id_map: Arc::new(Mutex::new(AHashMap::new())),
@@ -365,453 +295,63 @@ impl InteractiveBrokersExecutionClient {
         })
     }
 
-    #[cfg(feature = "python")]
-    pub(crate) fn new_for_python(
-        mut config: InteractiveBrokersExecClientConfig,
-        instrument_provider: crate::providers::instruments::InteractiveBrokersInstrumentProvider,
-    ) -> anyhow::Result<Self> {
-        Self::ensure_python_event_bridge();
-
-        let account_id_value = config
-            .account_id
-            .clone()
-            .unwrap_or_else(|| "UNKNOWN".to_string());
-        let normalized_account_id = if account_id_value.starts_with("IB-") {
-            account_id_value
-        } else {
-            format!("IB-{account_id_value}")
-        };
-
-        config.account_id = Some(normalized_account_id.clone());
-
-        let core = ExecutionClientCore::new(
-            TraderId::from("TRADER-001"),
-            ClientId::from("IB"),
-            *IB_VENUE,
-            OmsType::Netting,
-            AccountId::from(normalized_account_id),
-            AccountType::Margin,
-            None,
-            Rc::new(RefCell::new(Cache::default())),
-        );
-
-        Self::new(core, config, Arc::new(instrument_provider))
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) fn register_python_event_callback(&self, callback: Py<PyAny>) {
-        *exec_event_callback()
-            .lock()
-            .expect("execution event callback mutex poisoned") = Some(callback);
-    }
-
-    #[cfg(feature = "python")]
-    fn ensure_python_event_bridge() {
-        if nautilus_common::live::runner::try_get_exec_event_sender().is_some() {
-            return;
-        }
-
-        EXEC_EVENT_BRIDGE_INITIALIZED.with(|initialized| {
-            if initialized.replace(true) {
-                return;
-            }
-
-            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-            nautilus_common::live::runner::set_exec_event_sender(sender);
-
-            get_runtime().spawn(async move {
-                while let Some(event) = receiver.recv().await {
-                    Python::attach(|py| {
-                        let callback_guard = exec_event_callback()
-                            .lock()
-                            .expect("execution event callback mutex poisoned");
-
-                        let Some(callback) = callback_guard.as_ref() else {
-                            return;
-                        };
-
-                        if let Err(e) = dispatch_python_exec_event(py, callback, event) {
-                            tracing::error!("Failed to dispatch IB execution event to Python: {e}");
-                        }
-                    });
-                }
-            });
-        });
-    }
-
-    #[cfg(feature = "python")]
-    #[allow(clippy::needless_pass_by_value)]
-    pub(crate) fn submit_order_for_python(
+    fn submit_order_list_with_orders(
         &self,
-        trader_id: TraderId,
-        order: OrderAny,
-        instrument_id: InstrumentId,
-        strategy_id: StrategyId,
-        exec_algorithm_id: Option<ExecAlgorithmId>,
-        position_id: Option<PositionId>,
-        params: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<()> {
-        self.cache_order_for_python(order.clone(), position_id)?;
-
-        let cmd = SubmitOrder {
-            trader_id,
-            client_id: Some(self.client_id()),
-            strategy_id,
-            instrument_id,
-            client_order_id: order.client_order_id(),
-            order_init: order.init_event().clone(),
-            exec_algorithm_id,
-            position_id,
-            params: string_hash_map_to_params(params),
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-        };
-
-        ExecutionClient::submit_order(self, cmd)
-    }
-
-    #[cfg(feature = "python")]
-    #[allow(clippy::needless_pass_by_value)]
-    pub(crate) fn submit_order_list_for_python(
-        &self,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
+        cmd: SubmitOrderList,
         orders: Vec<OrderAny>,
-        exec_algorithm_id: Option<ExecAlgorithmId>,
-        position_id: Option<PositionId>,
-        params: Option<HashMap<String, String>>,
     ) -> anyhow::Result<()> {
-        if orders.is_empty() {
-            anyhow::bail!("Order list cannot be empty");
-        }
+        let client = self.ib_client.as_ref().context("IB client not connected")?;
 
-        for order in &orders {
-            self.cache_order_for_python(order.clone(), position_id)?;
-        }
+        let order_id_map = Arc::clone(&self.order_id_map);
+        let venue_order_id_map = Arc::clone(&self.venue_order_id_map);
+        let instrument_id_map = Arc::clone(&self.instrument_id_map);
+        let trader_id_map = Arc::clone(&self.trader_id_map);
+        let strategy_id_map = Arc::clone(&self.strategy_id_map);
+        let next_order_id = Arc::clone(&self.next_order_id);
+        let instrument_provider = Arc::clone(&self.instrument_provider);
+        let exec_sender = get_exec_event_sender();
+        let clock = get_atomic_clock_realtime();
+        let account_id = self.core.account_id;
+        let strategy_id = cmd.strategy_id;
+        let accepted_orders = Arc::clone(&self.accepted_orders);
+        let client_clone = client.as_arc().clone();
+        let order_submit_lock = Arc::clone(&self.order_submit_lock);
 
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let instrument_id = orders[0].instrument_id();
-        let client_order_ids: Vec<ClientOrderId> =
-            orders.iter().map(|o| o.client_order_id()).collect();
-        let order_list_id = OrderListId::from(UUID4::new().to_string());
-        let order_list = OrderList::new(
-            order_list_id,
-            instrument_id,
-            strategy_id,
-            client_order_ids,
-            ts_init,
-        );
-        let order_inits: Vec<OrderInitialized> =
-            orders.iter().map(|o| o.init_event().clone()).collect();
-
-        let cmd = SubmitOrderList::new(
-            trader_id,
-            Some(self.client_id()),
-            strategy_id,
-            order_list,
-            order_inits,
-            exec_algorithm_id,
-            position_id,
-            string_hash_map_to_params(params),
-            UUID4::new(),
-            ts_init,
-        );
-
-        ExecutionClient::submit_order_list(self, cmd)
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) fn modify_order_for_python(
-        &self,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        client_order_id: ClientOrderId,
-        venue_order_id: Option<VenueOrderId>,
-        instrument_id: InstrumentId,
-        quantity: Option<Quantity>,
-        price: Option<Price>,
-        trigger_price: Option<Price>,
-        params: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<()> {
-        let cmd = ModifyOrder {
-            trader_id,
-            client_id: Some(self.client_id()),
-            strategy_id,
-            instrument_id,
-            client_order_id,
-            venue_order_id,
-            quantity,
-            price,
-            trigger_price,
-            params: string_hash_map_to_params(params),
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-        };
-
-        ExecutionClient::modify_order(self, cmd)
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) fn cancel_order_for_python(
-        &self,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        client_order_id: ClientOrderId,
-        venue_order_id: Option<VenueOrderId>,
-        instrument_id: InstrumentId,
-        params: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<()> {
-        let cmd = CancelOrder {
-            trader_id,
-            client_id: Some(self.client_id()),
-            strategy_id,
-            instrument_id,
-            client_order_id,
-            venue_order_id,
-            params: string_hash_map_to_params(params),
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-        };
-
-        ExecutionClient::cancel_order(self, cmd)
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) fn cancel_all_orders_for_python(
-        &self,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        order_side: OrderSide,
-        params: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<()> {
-        let cmd = CancelAllOrders {
-            trader_id,
-            client_id: Some(self.client_id()),
-            strategy_id,
-            instrument_id,
-            order_side,
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-            params: string_hash_map_to_params(params),
-        };
-
-        ExecutionClient::cancel_all_orders(self, cmd)
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) fn batch_cancel_orders_for_python(
-        &self,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        client_order_ids: Vec<ClientOrderId>,
-        params: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<()> {
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let cancels = client_order_ids
-            .into_iter()
-            .map(|client_order_id| CancelOrder {
-                trader_id,
-                client_id: Some(self.client_id()),
+        let handle = get_runtime().spawn(async move {
+            if let Err(e) = Self::handle_submit_order_list_async(
+                &cmd,
+                &orders,
+                &client_clone,
+                &order_id_map,
+                &venue_order_id_map,
+                &instrument_id_map,
+                &trader_id_map,
+                &strategy_id_map,
+                &next_order_id,
+                &instrument_provider,
+                &exec_sender,
+                clock,
+                account_id,
                 strategy_id,
-                instrument_id,
-                client_order_id,
-                venue_order_id: None,
-                command_id: UUID4::new(),
-                ts_init,
-                params: None,
-            })
-            .collect();
+                &accepted_orders,
+                &order_submit_lock,
+            )
+            .await
+            {
+                tracing::error!("Error submitting order list: {e}");
+            }
+        });
 
-        let cmd = BatchCancelOrders {
-            trader_id,
-            client_id: Some(self.client_id()),
-            strategy_id,
-            instrument_id,
-            cancels,
-            command_id: UUID4::new(),
-            ts_init,
-            params: string_hash_map_to_params(params),
-        };
+        self.pending_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock pending tasks"))?
+            .push(handle);
 
-        ExecutionClient::batch_cancel_orders(self, cmd)
+        Ok(())
     }
 
-    #[cfg(feature = "python")]
-    pub(crate) fn query_account_for_python(&self, trader_id: TraderId) -> anyhow::Result<()> {
-        let cmd = QueryAccount {
-            trader_id,
-            client_id: Some(self.client_id()),
-            account_id: ExecutionClient::account_id(self),
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-            params: None,
-        };
-
-        ExecutionClient::query_account(self, cmd)
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) fn query_order_for_python(
-        &self,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-        venue_order_id: Option<VenueOrderId>,
-    ) -> anyhow::Result<()> {
-        let cmd = QueryOrder {
-            trader_id,
-            client_id: Some(self.client_id()),
-            strategy_id,
-            instrument_id,
-            client_order_id,
-            venue_order_id,
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-            params: None,
-        };
-
-        ExecutionClient::query_order(self, cmd)
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) async fn generate_order_status_report_for_python(
-        &self,
-        instrument_id: Option<InstrumentId>,
-        client_order_id: Option<ClientOrderId>,
-        venue_order_id: Option<VenueOrderId>,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let cmd = GenerateOrderStatusReport {
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-            instrument_id,
-            client_order_id,
-            venue_order_id,
-            params: None,
-            correlation_id: None,
-        };
-
-        self.generate_order_status_report(&cmd).await
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) async fn generate_order_status_reports_for_python(
-        &self,
-        open_only: bool,
-        instrument_id: Option<InstrumentId>,
-        start: Option<u64>,
-        end: Option<u64>,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let start_ns = start.map(nautilus_core::UnixNanos::from);
-        let end_ns = end.map(nautilus_core::UnixNanos::from);
-
-        let cmd = GenerateOrderStatusReports {
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-            open_only,
-            instrument_id,
-            start: start_ns,
-            end: end_ns,
-            params: None,
-            log_receipt_level: LogLevel::Info,
-            correlation_id: None,
-        };
-
-        let mut reports = self.generate_order_status_reports(&cmd).await?;
-
-        if open_only {
-            use nautilus_model::enums::OrderStatus;
-            reports.retain(|report| {
-                matches!(
-                    report.order_status,
-                    OrderStatus::Initialized
-                        | OrderStatus::Submitted
-                        | OrderStatus::Accepted
-                        | OrderStatus::Triggered
-                        | OrderStatus::PendingUpdate
-                        | OrderStatus::PendingCancel
-                )
-            });
-        }
-
-        if start_ns.is_some() || end_ns.is_some() {
-            reports.retain(|report| {
-                let ts = report.ts_last;
-
-                if let Some(start) = start_ns
-                    && ts < start
-                {
-                    return false;
-                }
-
-                if let Some(end) = end_ns
-                    && ts > end
-                {
-                    return false;
-                }
-
-                true
-            });
-        }
-
-        Ok(reports)
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) async fn generate_fill_reports_for_python(
-        &self,
-        instrument_id: Option<InstrumentId>,
-        venue_order_id: Option<VenueOrderId>,
-        start: Option<u64>,
-        end: Option<u64>,
-    ) -> anyhow::Result<Vec<FillReport>> {
-        let cmd = GenerateFillReports {
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-            instrument_id,
-            venue_order_id,
-            start: start.map(nautilus_core::UnixNanos::from),
-            end: end.map(nautilus_core::UnixNanos::from),
-            params: None,
-            log_receipt_level: LogLevel::Info,
-            correlation_id: None,
-        };
-
-        self.generate_fill_reports(cmd).await
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) async fn generate_position_status_reports_for_python(
-        &self,
-        instrument_id: Option<InstrumentId>,
-        start: Option<u64>,
-        end: Option<u64>,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let cmd = GeneratePositionStatusReports {
-            command_id: UUID4::new(),
-            ts_init: get_atomic_clock_realtime().get_time_ns(),
-            instrument_id,
-            start: start.map(nautilus_core::UnixNanos::from),
-            end: end.map(nautilus_core::UnixNanos::from),
-            params: None,
-            log_receipt_level: LogLevel::Info,
-            correlation_id: None,
-        };
-
-        self.generate_position_status_reports(&cmd).await
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) fn cache_order_for_python(
-        &self,
-        order: OrderAny,
-        position_id: Option<PositionId>,
-    ) -> anyhow::Result<()> {
-        self.core
-            .cache_mut()
-            .add_order(order, position_id, Some(self.client_id()), true)
+    fn cached_order_for_modify(&self, client_order_id: &ClientOrderId) -> Option<OrderAny> {
+        self.core.cache().order(client_order_id).map(|o| o.clone())
     }
 
     fn reserve_next_local_order_id(next_order_id: &Arc<Mutex<i32>>) -> anyhow::Result<i32> {
@@ -825,6 +365,20 @@ impl InteractiveBrokersExecutionClient {
         let order_id = *guard;
         *guard += 1;
         Ok(order_id)
+    }
+
+    fn apply_client_order_id_floor(next_id: i32, client_id: i32) -> i32 {
+        let client_slot = client_id.unsigned_abs() % 1000;
+        if client_slot == 0 {
+            return next_id;
+        }
+
+        let order_id_floor = (client_slot as i32) * 1_000_000;
+        if next_id > order_id_floor {
+            next_id
+        } else {
+            order_id_floor.saturating_add(next_id.max(1))
+        }
     }
 
     /// Gets the next valid order ID from IB.
@@ -844,9 +398,10 @@ impl InteractiveBrokersExecutionClient {
 
     async fn get_highest_open_order_id(&self, client: &Client) -> anyhow::Result<Option<i32>> {
         let timeout_dur = Duration::from_secs(self.config.request_timeout);
-        let mut subscription = tokio::time::timeout(timeout_dur, client.all_open_orders())
+        let subscription = tokio::time::timeout(timeout_dur, client.all_open_orders())
             .await
             .context("Timeout requesting open orders for next order ID initialization")??;
+        let mut subscription = subscription.filter_data();
         let mut highest_order_id = None;
 
         while let Some(order_result) = subscription.next().await {
@@ -906,12 +461,18 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         self.core.venue
     }
 
+    // IB uses a broker venue for the client while routing exchange-MIC instruments;
+    // contract transformation remains the authority for actual venue support.
+    fn handles_order_venue(&self, _venue: Venue) -> bool {
+        true
+    }
+
     fn oms_type(&self) -> OmsType {
         self.core.oms_type
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
+        self.core.cache().account_owned(&self.core.account_id)
     }
 
     fn generate_account_state(
@@ -950,6 +511,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        if let Err(reason) = self.ensure_client_ready_for_order_request("submit order") {
+            self.deny_submit_order_not_ready(&cmd, &reason)?;
+            return Ok(());
+        }
+
         let client = self.ib_client.as_ref().context("IB client not connected")?;
 
         let order_id_map = Arc::clone(&self.order_id_map);
@@ -962,6 +528,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let exec_sender = get_exec_event_sender();
         let clock = get_atomic_clock_realtime();
         let accepted_orders = Arc::clone(&self.accepted_orders);
+        let order_submit_lock = Arc::clone(&self.order_submit_lock);
 
         let client_clone = client.as_arc().clone();
 
@@ -982,6 +549,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 clock,
                 account_id,
                 &accepted_orders,
+                &order_submit_lock,
             )
             .await
             {
@@ -1034,25 +602,20 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
         self.ib_client = Some(handle);
 
-        // Initialize provider and load instruments from cache if configured
+        // Initialize provider and load instruments from cache/config if configured
         log::debug!("Initializing IB execution instrument provider");
-        if let Err(e) = self.instrument_provider.initialize().await {
-            tracing::warn!("Failed to initialize instrument provider: {}", e);
-        }
-
-        // Load instruments from config
-        log::debug!("Loading configured IB execution instruments");
 
         if let Err(e) = self
             .instrument_provider
-            .load_all_async(
-                self.ib_client.as_ref().unwrap().as_arc().as_ref(),
-                None,
-                None,
-                false,
-            )
+            .initialize_with_client(self.ib_client.as_ref().unwrap().as_arc().as_ref())
             .await
         {
+            if !self.config.instrument_provider.load_ids.is_empty()
+                || !self.config.instrument_provider.load_contracts.is_empty()
+            {
+                return Err(e).context("Failed to load configured IB instruments on startup");
+            }
+
             tracing::warn!("Failed to load instruments on startup: {}", e);
         }
 
@@ -1066,12 +629,16 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let next_id = self.get_next_order_id().await?;
         log::debug!("Requesting highest open IB order ID");
         let highest_open_order_id = self.get_highest_open_order_id(client.as_ref()).await?;
+        let client_scoped_next_id =
+            Self::apply_client_order_id_floor(next_id, self.config.client_id);
         let starting_order_id = highest_open_order_id
             .map(|order_id| next_id.max(order_id.saturating_add(1)))
-            .unwrap_or(next_id);
+            .unwrap_or(next_id)
+            .max(client_scoped_next_id);
+
         if starting_order_id != next_id {
             tracing::info!(
-                "Adjusted next Interactive Brokers order ID from {} to {} based on existing open orders",
+                "Adjusted next Interactive Brokers order ID from {} to {} based on client ID/open orders",
                 next_id,
                 starting_order_id
             );
@@ -1217,6 +784,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             params: cmd.params.clone(),
             log_receipt_level: LogLevel::Info,
             correlation_id: cmd.correlation_id,
+            causation_id: cmd.causation_id,
         };
 
         let reports = self.generate_order_status_reports(&plural_cmd).await?;
@@ -1246,18 +814,38 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let client = self.ib_client.as_ref().context("IB client not connected")?;
 
         let timeout_dur = Duration::from_secs(self.config.request_timeout);
-        let mut subscription = tokio::time::timeout(timeout_dur, client.all_open_orders())
+        let subscription = tokio::time::timeout(timeout_dur, client.all_open_orders())
             .await
             .context("Timeout requesting open orders")??;
+        let mut subscription = subscription.filter_data();
         let mut reports = Vec::new();
+        let mut open_order_fills: AHashMap<InstrumentId, Decimal> = AHashMap::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
+        let raw_account_id = raw_ib_account_code(&self.core.account_id);
 
         while let Some(order_result) = subscription.next().await {
             match order_result {
                 Ok(Orders::OrderData(data)) => {
+                    if !data.order.account.is_empty() && data.order.account != raw_account_id {
+                        continue;
+                    }
+
                     // Convert IB contract to instrument ID
-                    let instrument_id = ib_contract_to_instrument_id_simple(&data.contract)
-                        .context("Failed to convert contract to instrument ID")?;
+                    let instrument_id =
+                        match self.resolve_report_contract_instrument_id(&data.contract) {
+                            Ok(instrument_id) => instrument_id,
+                            Err(e) => {
+                                tracing::warn!(
+                                    order_id = data.order_id,
+                                    sec_type = ?data.contract.security_type,
+                                    symbol = data.contract.symbol.as_str(),
+                                    con_id = data.contract.contract_id,
+                                    error = %e,
+                                    "Failed to resolve IBKR order status report instrument ID",
+                                );
+                                continue;
+                            }
+                        };
 
                     // Filter by instrument_id if specified
                     if let Some(filter_id) = cmd.instrument_id {
@@ -1271,16 +859,17 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     match parse_order_status_to_report(
                         &IBOrderStatus {
                             order_id: data.order_id,
-                            status: data.order_state.status.clone(),
-                            filled: 0.0,             // Not available in OrderState
-                            remaining: 0.0,          // Not available in OrderState
-                            average_fill_price: 0.0, // Not available in OrderState
+                            status: data.order_state.status,
+                            filled: data.order.filled_quantity,
+                            remaining: (data.order.total_quantity - data.order.filled_quantity)
+                                .max(0.0),
+                            average_fill_price: None, // Not available in OrderState
                             perm_id: data.order.perm_id,
-                            parent_id: 0,         // Not available in OrderState
-                            last_fill_price: 0.0, // Not available in OrderState
+                            parent_id: 0,          // Not available in OrderState
+                            last_fill_price: None, // Not available in OrderState
                             client_id: data.order.client_id,
                             why_held: String::new(), // Not available in OrderState
-                            market_cap_price: 0.0,   // Not available in OrderState
+                            market_cap_price: None,  // Not available in OrderState
                         },
                         Some(&data.order),
                         instrument_id,
@@ -1288,7 +877,20 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         &self.instrument_provider,
                         ts_init,
                     ) {
-                        Ok(report) => reports.push(report),
+                        Ok(report) => {
+                            if !cmd.open_only && report.filled_qty.as_decimal() > Decimal::ZERO {
+                                let signed_filled = if report.order_side == OrderSide::Buy {
+                                    report.filled_qty.as_decimal()
+                                } else {
+                                    -report.filled_qty.as_decimal()
+                                };
+                                open_order_fills
+                                    .entry(report.instrument_id)
+                                    .and_modify(|qty| *qty += signed_filled)
+                                    .or_insert(signed_filled);
+                            }
+                            reports.push(report);
+                        }
                         Err(e) => {
                             tracing::warn!("Failed to parse order status report: {e}");
                         }
@@ -1299,6 +901,103 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 }
                 Err(e) => {
                     tracing::warn!("Error receiving order data: {e}");
+                }
+            }
+        }
+
+        if !cmd.open_only {
+            let positions = tokio::time::timeout(timeout_dur, client.positions())
+                .await
+                .context("Timeout requesting positions for synthetic order reports")??;
+            let mut positions = positions.filter_data();
+
+            while let Some(position_result) = positions.next().await {
+                match position_result {
+                    Ok(PositionUpdate::Position(position)) => {
+                        if position.account != raw_account_id {
+                            continue;
+                        }
+
+                        let instrument = match self
+                            .instrument_provider
+                            .get_instrument(client.as_arc().as_ref(), &position.contract)
+                            .await
+                        {
+                            Ok(Some(instrument)) => instrument,
+                            Ok(None) => {
+                                tracing::warn!(
+                                    con_id = position.contract.contract_id,
+                                    sec_type = ?position.contract.security_type,
+                                    "Cannot generate synthetic order report: instrument not found",
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    con_id = position.contract.contract_id,
+                                    sec_type = ?position.contract.security_type,
+                                    error = %e,
+                                    "Failed to resolve instrument for synthetic order report",
+                                );
+                                continue;
+                            }
+                        };
+
+                        let instrument_id = instrument.id();
+                        if let Some(filter_id) = cmd.instrument_id
+                            && instrument_id != filter_id
+                        {
+                            continue;
+                        }
+
+                        let position_qty =
+                            Decimal::from_f64_retain(position.position).unwrap_or_default();
+                        let open_fills = open_order_fills
+                            .get(&instrument_id)
+                            .copied()
+                            .unwrap_or_default();
+                        let adjusted_qty = position_qty - open_fills;
+                        if adjusted_qty.is_zero() {
+                            continue;
+                        }
+
+                        let quantity = Quantity::new(
+                            adjusted_qty.abs().to_f64().unwrap_or_default(),
+                            instrument.size_precision(),
+                        );
+                        let order_side = if adjusted_qty > Decimal::ZERO {
+                            OrderSide::Buy
+                        } else {
+                            OrderSide::Sell
+                        };
+                        let id = instrument_id.to_string();
+                        let mut report = OrderStatusReport::new(
+                            self.core.account_id,
+                            instrument_id,
+                            Some(ClientOrderId::new(id.clone())),
+                            VenueOrderId::new(id),
+                            order_side,
+                            OrderType::Market,
+                            TimeInForce::Fok,
+                            OrderStatus::Filled,
+                            quantity,
+                            quantity,
+                            ts_init,
+                            ts_init,
+                            ts_init,
+                            Some(UUID4::new()),
+                        );
+                        report.avg_px = self.position_avg_px_open(
+                            &instrument_id,
+                            &instrument,
+                            position.average_cost,
+                        );
+                        reports.push(report);
+                    }
+                    Ok(PositionUpdate::PositionEnd) => break,
+                    Err(e) => tracing::warn!(
+                        "Error receiving position data for synthetic order report: {e}"
+                    ),
                 }
             }
         }
@@ -1315,13 +1014,10 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         // Get account code from account ID
         let account_code = self.core.account_id.to_string();
 
-        // Build time filter from start/end if provided
-        let time_filter = if let (Some(start), Some(end)) = (cmd.start, cmd.end) {
-            // Format: YYYYMMDD
-            // Convert UnixNanos to DateTime<Utc> then format
+        // Build time filter from start if provided.
+        let time_filter = if let Some(start) = cmd.start {
             let start_dt = start.to_datetime_utc();
-            let end_dt = end.to_datetime_utc();
-            format!("{} {}", start_dt.format("%Y%m%d"), end_dt.format("%Y%m%d"))
+            start_dt.format("%Y%m%d-%H:%M:%S").to_string()
         } else {
             String::new()
         };
@@ -1333,64 +1029,70 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             symbol: String::new(),
             security_type: String::new(),
             exchange: String::new(),
-            side: String::new(),
+            side: None,
             last_n_days: 0,
             specific_dates: Vec::new(),
         };
 
         let timeout_dur = Duration::from_secs(self.config.request_timeout);
-        let mut subscription = tokio::time::timeout(timeout_dur, client.executions(filter))
+        let subscription = tokio::time::timeout(timeout_dur, client.executions(filter))
             .await
             .context("Timeout requesting executions")??;
+        let mut subscription = subscription.filter_data();
         let mut reports = Vec::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let mut current_exec_data: Option<ExecutionData> = None;
+        let mut pending_exec_data: AHashMap<String, ExecutionData> = AHashMap::new();
+        let mut pending_commissions: AHashMap<String, (f64, String)> = AHashMap::new();
 
         while let Some(exec_result) = subscription.next().await {
             match exec_result {
                 Ok(Executions::ExecutionData(exec_data)) => {
-                    current_exec_data = Some(exec_data);
-                }
-                Ok(Executions::CommissionReport(commission)) => {
-                    if let Some(exec_data) = current_exec_data.take() {
-                        // Convert IB contract to instrument ID
-                        let instrument_id =
-                            ib_contract_to_instrument_id_simple(&exec_data.contract)
-                                .context("Failed to convert contract to instrument ID")?;
-
-                        // Filter by instrument_id if specified
-                        if let Some(filter_id) = cmd.instrument_id
-                            && instrument_id != filter_id
-                        {
-                            continue;
-                        }
-
-                        // Parse to fill report
-                        match parse_execution_to_fill_report(
-                            &exec_data.execution,
-                            &exec_data.contract,
-                            commission.commission,
-                            &commission.currency,
-                            instrument_id,
-                            self.core.account_id,
-                            &self.instrument_provider,
+                    let execution_id = exec_data.execution.execution_id.clone();
+                    if let Some((commission, commission_currency)) =
+                        pending_commissions.remove(&execution_id)
+                    {
+                        if let Some(report) = self.parse_historical_fill_report(
+                            &cmd,
+                            &exec_data,
+                            commission,
+                            &commission_currency,
                             ts_init,
-                            None, // avg_px (not available in historical fills)
                         ) {
-                            Ok(report) => reports.push(report),
-                            Err(e) => {
-                                tracing::warn!("Failed to parse fill report: {e}");
-                            }
+                            reports.push(report);
                         }
+                    } else {
+                        pending_exec_data.insert(execution_id, exec_data);
                     }
                 }
-                Ok(_) => {
-                    // Ignore other message types (Notice, etc.)
+                Ok(Executions::CommissionReport(commission)) => {
+                    if let Some(exec_data) = pending_exec_data.remove(&commission.execution_id) {
+                        if let Some(report) = self.parse_historical_fill_report(
+                            &cmd,
+                            &exec_data,
+                            commission.commission,
+                            &commission.currency,
+                            ts_init,
+                        ) {
+                            reports.push(report);
+                        }
+                    } else {
+                        pending_commissions.insert(
+                            commission.execution_id,
+                            (commission.commission, commission.currency),
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Error receiving execution data: {e}");
                 }
             }
+        }
+
+        if !pending_exec_data.is_empty() {
+            tracing::warn!(
+                "Skipped {} historical fill reports because IB did not provide matching commission reports",
+                pending_exec_data.len()
+            );
         }
 
         Ok(reports)
@@ -1403,11 +1105,13 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let client = self.ib_client.as_ref().context("IB client not connected")?;
 
         let timeout_dur = Duration::from_secs(self.config.request_timeout);
-        let mut subscription = tokio::time::timeout(timeout_dur, client.positions())
+        let subscription = tokio::time::timeout(timeout_dur, client.positions())
             .await
             .context("Timeout requesting positions")??;
+        let mut subscription = subscription.filter_data();
         let mut reports = Vec::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
+        let raw_account_id = raw_ib_account_code(&self.core.account_id);
 
         // Process positions until PositionEnd; return empty list when none (reconciliation parity:
         // never return None/missing for "no positions").
@@ -1415,13 +1119,35 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             match position_result {
                 Ok(PositionUpdate::Position(position)) => {
                     // Filter for the specific account
-                    if position.account != self.core.account_id.to_string() {
+                    if position.account != raw_account_id {
                         continue;
                     }
 
-                    // Convert IB contract to instrument ID
-                    let instrument_id = ib_contract_to_instrument_id_simple(&position.contract)
-                        .context("Failed to convert contract to instrument ID")?;
+                    let instrument = match self
+                        .instrument_provider
+                        .get_instrument(client.as_arc().as_ref(), &position.contract)
+                        .await
+                    {
+                        Ok(Some(instrument)) => instrument,
+                        Ok(None) => {
+                            tracing::warn!(
+                                con_id = position.contract.contract_id,
+                                sec_type = ?position.contract.security_type,
+                                "Cannot generate position status report: instrument not found",
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                con_id = position.contract.contract_id,
+                                sec_type = ?position.contract.security_type,
+                                error = %e,
+                                "Failed to resolve position instrument",
+                            );
+                            continue;
+                        }
+                    };
+                    let instrument_id = instrument.id();
 
                     // Filter by instrument_id if specified
                     if let Some(filter_id) = cmd.instrument_id
@@ -1429,12 +1155,6 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     {
                         continue;
                     }
-
-                    // Get instrument for precision
-                    let instrument = self
-                        .instrument_provider
-                        .find(&instrument_id)
-                        .context("Instrument not found")?;
 
                     // Determine position side
                     let position_side = if position.position == 0.0 {
@@ -1450,25 +1170,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
                     // Convert IB avg_cost to Nautilus Price, accounting for price magnifier and multiplier
                     // Python: converted_avg_cost = avg_cost / (multiplier * price_magnifier)
-                    let avg_px_open = if position.average_cost > 0.0 {
-                        let price_magnifier =
-                            self.instrument_provider.get_price_magnifier(&instrument_id) as f64;
-                        let multiplier = instrument.multiplier().as_f64();
-                        let converted_avg_cost =
-                            position.average_cost / (multiplier * price_magnifier);
-                        let price_precision = instrument.price_precision();
-                        Some(
-                            rust_decimal::Decimal::from_f64_retain(converted_avg_cost)
-                                .and_then(|d| {
-                                    // Round to price precision
-                                    let rounded = d.round_dp(price_precision as u32);
-                                    Some(rounded)
-                                })
-                                .unwrap_or_default(),
-                        )
-                    } else {
-                        None
-                    };
+                    let avg_px_open = self.position_avg_px_open(
+                        &instrument_id,
+                        &instrument,
+                        position.average_cost,
+                    );
 
                     let report = PositionStatusReport::new(
                         self.core.account_id,
@@ -1492,6 +1198,26 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     tracing::warn!("Error receiving position data: {e}");
                 }
             }
+        }
+
+        if reports.is_empty()
+            && let Some(instrument_id) = cmd.instrument_id
+        {
+            let precision = self
+                .instrument_provider
+                .find(&instrument_id)
+                .map_or(0, |instrument| instrument.size_precision());
+            reports.push(PositionStatusReport::new(
+                self.core.account_id,
+                instrument_id,
+                PositionSideSpecified::Flat,
+                Quantity::zero(precision),
+                ts_init,
+                ts_init,
+                None,
+                None,
+                None,
+            ));
         }
 
         Ok(reports)
@@ -1616,18 +1342,17 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
 
-        let target_ib_order_id: i32 = if let Some(venue_order_id) = &cmd.venue_order_id {
-            venue_order_id
-                .as_str()
-                .parse()
-                .context("Failed to parse venue_order_id as IB order id")?
+        let target_order = if let Some(venue_order_id) = &cmd.venue_order_id {
+            IbOrderSelector::from_venue_order_id(venue_order_id)?
         } else {
             let map = self
                 .order_id_map
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Failed to lock order_id_map"))?;
-            *map.get(&cmd.client_order_id)
-                .context("No venue order id for client_order_id")?
+            IbOrderSelector::OrderId(
+                *map.get(&cmd.client_order_id)
+                    .context("No venue order id for client_order_id")?,
+            )
         };
 
         let client_clone = client.as_arc().clone();
@@ -1638,10 +1363,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let request_timeout_secs = self.config.request_timeout;
         let pending_cancel_orders = Arc::clone(&self.pending_cancel_orders);
+        let raw_account_id = raw_ib_account_code(&self.core.account_id);
 
         let handle = get_runtime().spawn(async move {
             let timeout_dur = Duration::from_secs(request_timeout_secs);
-            let mut subscription =
+            let subscription =
                 match tokio::time::timeout(timeout_dur, client_clone.all_open_orders()).await {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
@@ -1653,10 +1379,15 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         return;
                     }
                 };
+            let mut subscription = subscription.filter_data();
 
             while let Some(order_result) = subscription.next().await {
                 if let Ok(Orders::OrderData(data)) = order_result {
-                    if data.order_id != target_ib_order_id {
+                    if !data.order.account.is_empty() && data.order.account != raw_account_id {
+                        continue;
+                    }
+
+                    if !target_order.matches(data.order_id, data.order.perm_id) {
                         continue;
                     }
 
@@ -1666,7 +1397,9 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     };
                     let instrument_id = match instrument_id {
                         Some(id) => id,
-                        None => match ib_contract_to_instrument_id_simple(&data.contract) {
+                        None => match instrument_provider
+                            .resolve_instrument_id_for_contract(&data.contract)
+                        {
                             Ok(id) => id,
                             Err(e) => {
                                 tracing::warn!("query_order: failed to convert contract: {e}");
@@ -1678,16 +1411,17 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     let report = match parse_order_status_to_report(
                         &IBOrderStatus {
                             order_id: data.order_id,
-                            status: data.order_state.status.clone(),
-                            filled: 0.0,
-                            remaining: 0.0,
-                            average_fill_price: 0.0,
+                            status: data.order_state.status,
+                            filled: data.order.filled_quantity,
+                            remaining: (data.order.total_quantity - data.order.filled_quantity)
+                                .max(0.0),
+                            average_fill_price: None,
                             perm_id: data.order.perm_id,
                             parent_id: 0,
-                            last_fill_price: 0.0,
+                            last_fill_price: None,
                             client_id: data.order.client_id,
                             why_held: String::new(),
-                            market_cap_price: 0.0,
+                            market_cap_price: None,
                         },
                         Some(&data.order),
                         instrument_id,
@@ -1729,7 +1463,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     ts_init,
                     ts_init,
                     false,
-                    Some(VenueOrderId::from(target_ib_order_id.to_string())),
+                    Some(target_order.venue_order_id()),
                     Some(account_id),
                 );
 
@@ -1742,7 +1476,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     tracing::info!(
                         "query_order: inferred cancel for {} from missing open order {}",
                         client_order_id,
-                        target_ib_order_id
+                        target_order.label()
                     );
                 }
                 return;
@@ -1750,7 +1484,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
             tracing::debug!(
                 "query_order: order {} not found in open orders (may be filled or canceled)",
-                target_ib_order_id
+                target_order.label()
             );
         });
 
@@ -1763,76 +1497,46 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
-        let client = self.ib_client.as_ref().context("IB client not connected")?;
+        if let Err(reason) = self.ensure_client_ready_for_order_request("submit order list") {
+            self.deny_submit_order_list_not_ready(&cmd, &reason)?;
+            return Ok(());
+        }
 
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+        self.submit_order_list_with_orders(cmd, orders)
+    }
+
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        // Not-ready warning already logged; leave the modify outcome for
+        // in-flight resolution.
+        if self
+            .ensure_client_ready_for_order_request("modify order")
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let client = self.ib_client.as_ref().context("IB client not connected")?;
 
         let order_id_map = Arc::clone(&self.order_id_map);
         let venue_order_id_map = Arc::clone(&self.venue_order_id_map);
         let instrument_id_map = Arc::clone(&self.instrument_id_map);
-        let trader_id_map = Arc::clone(&self.trader_id_map);
-        let strategy_id_map = Arc::clone(&self.strategy_id_map);
-        let next_order_id = Arc::clone(&self.next_order_id);
-        let instrument_provider = Arc::clone(&self.instrument_provider);
-        let exec_sender = get_exec_event_sender();
-        let clock = get_atomic_clock_realtime();
-        let account_id = self.core.account_id;
-        let strategy_id = cmd.strategy_id;
-        let accepted_orders = Arc::clone(&self.accepted_orders);
-        let client_clone = client.as_arc().clone();
-
-        let handle = get_runtime().spawn(async move {
-            if let Err(e) = Self::handle_submit_order_list_async(
-                &cmd,
-                &orders,
-                &client_clone,
-                &order_id_map,
-                &venue_order_id_map,
-                &instrument_id_map,
-                &trader_id_map,
-                &strategy_id_map,
-                &next_order_id,
-                &instrument_provider,
-                &exec_sender,
-                clock,
-                account_id,
-                strategy_id,
-                &accepted_orders,
-            )
-            .await
-            {
-                tracing::error!("Error submitting order list: {e}");
-            }
-        });
-
-        self.pending_tasks
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Failed to lock pending tasks"))?
-            .push(handle);
-
-        Ok(())
-    }
-
-    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
-        let client = self.ib_client.as_ref().context("IB client not connected")?;
-
-        // Get order from cache before spawning async task (Rc doesn't work across async boundaries)
-        let original_order = {
-            let cache = self.core.cache();
-            cache
-                .order(&cmd.client_order_id)
-                .cloned()
-                .context("Order not found in cache")?
-        };
-
-        let order_id_map = Arc::clone(&self.order_id_map);
-        let venue_order_id_map = Arc::clone(&self.venue_order_id_map);
         let instrument_provider = Arc::clone(&self.instrument_provider);
         let exec_sender = get_exec_event_sender();
         let clock = get_atomic_clock_realtime();
         let account_id = self.core.account_id;
         let client_clone = client.as_arc().clone();
-        let original_order = Arc::new(original_order);
+        let request_timeout_secs = self.config.request_timeout;
+        let original_order = self
+            .cached_order_for_modify(&cmd.client_order_id)
+            .map(Arc::new);
+
+        if original_order.is_none() {
+            tracing::info!(
+                "Order {} not found in cache for modify; querying IB open orders",
+                cmd.client_order_id
+            );
+        }
 
         let handle = get_runtime().spawn(async move {
             if let Err(e) = Self::handle_modify_order_async(
@@ -1840,11 +1544,13 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 &client_clone,
                 &order_id_map,
                 &venue_order_id_map,
+                &instrument_id_map,
                 &instrument_provider,
                 &exec_sender,
                 clock,
                 account_id,
-                &original_order,
+                original_order.as_ref(),
+                request_timeout_secs,
             )
             .await
             {
@@ -1861,6 +1567,15 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+        // Not-ready warning already logged; leave the cancel outcome for
+        // in-flight resolution.
+        if self
+            .ensure_client_ready_for_order_request("cancel order")
+            .is_err()
+        {
+            return Ok(());
+        }
+
         let client = self.ib_client.as_ref().context("IB client not connected")?;
 
         let order_id_map = Arc::clone(&self.order_id_map);
@@ -1872,6 +1587,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let clock = get_atomic_clock_realtime();
         let account_id = self.core.account_id;
         let client_clone = client.as_arc().clone();
+        let request_timeout_secs = self.config.request_timeout;
 
         let handle = get_runtime().spawn(async move {
             if let Err(e) = Self::handle_cancel_order_async(
@@ -1885,6 +1601,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 &exec_sender,
                 clock.get_time_ns(),
                 account_id,
+                request_timeout_secs,
             )
             .await
             {
@@ -1901,8 +1618,6 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
-        let client = self.ib_client.as_ref().context("IB client not connected")?;
-
         // Warn if order_side is specified (IB doesn't support side filtering)
         if cmd.order_side != OrderSide::NoOrderSide {
             tracing::warn!(
@@ -1911,6 +1626,17 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 cmd.order_side
             );
         }
+
+        // Not-ready warning already logged; a whole-request failure must not
+        // fan out per-order rejections.
+        if self
+            .ensure_client_ready_for_order_request("cancel orders")
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let client = self.ib_client.as_ref().context("IB client not connected")?;
 
         // Get open orders from cache before spawning async task (Rc doesn't work across async boundaries)
         // Note: In Rust, instrument_id is always required, so we always filter by it
@@ -2017,8 +1743,210 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
     }
 }
 
+impl InteractiveBrokersExecutionClient {
+    fn is_ready_for_order_request(&self) -> bool {
+        if !self.is_connected.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        if !self
+            .ib_client
+            .as_ref()
+            .is_some_and(|client| client.is_connected())
+        {
+            return false;
+        }
+
+        self.next_order_id
+            .lock()
+            .is_ok_and(|next_order_id| *next_order_id > 0)
+    }
+
+    fn ensure_client_ready_for_order_request(&self, request: &str) -> Result<(), String> {
+        if self.is_ready_for_order_request() {
+            return Ok(());
+        }
+
+        let reason = format!("Interactive Brokers client is not ready; refusing to {request}");
+        tracing::warn!("{reason}");
+        Err(reason)
+    }
+
+    fn deny_submit_order_not_ready(&self, cmd: &SubmitOrder, reason: &str) -> anyhow::Result<()> {
+        Self::send_order_denied(
+            cmd.order_init.trader_id,
+            cmd.strategy_id,
+            cmd.instrument_id,
+            cmd.order_init.client_order_id,
+            reason,
+        )
+    }
+
+    fn deny_submit_order_list_not_ready(
+        &self,
+        cmd: &SubmitOrderList,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        for order_init in &cmd.order_inits {
+            Self::send_order_denied(
+                order_init.trader_id,
+                cmd.strategy_id,
+                cmd.instrument_id,
+                order_init.client_order_id,
+                reason,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn send_order_denied(
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let ts_event = get_atomic_clock_realtime().get_time_ns();
+        let event = OrderDenied::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            Ustr::from(reason),
+            UUID4::new(),
+            ts_event,
+            ts_event,
+        );
+
+        get_exec_event_sender()
+            .send(ExecutionEvent::Order(OrderEventAny::Denied(event)))
+            .map_err(|e| anyhow::anyhow!("Failed to send order denied event: {e}"))
+    }
+}
+
 #[allow(dead_code)]
 impl InteractiveBrokersExecutionClient {
+    fn parse_historical_fill_report(
+        &self,
+        cmd: &GenerateFillReports,
+        exec_data: &ExecutionData,
+        commission: f64,
+        commission_currency: &str,
+        ts_init: UnixNanos,
+    ) -> Option<FillReport> {
+        let instrument_id = match self.resolve_historical_execution_instrument_id(exec_data) {
+            Ok(instrument_id) => instrument_id,
+            Err(e) => {
+                Self::warn_historical_fill_report_parse_error(exec_data, &e);
+                return None;
+            }
+        };
+
+        if let Some(filter_id) = cmd.instrument_id
+            && instrument_id != filter_id
+        {
+            return None;
+        }
+
+        if let Some(filter_venue_order_id) = cmd.venue_order_id
+            && ib_venue_order_id(exec_data.execution.order_id, exec_data.execution.perm_id)
+                != filter_venue_order_id
+        {
+            return None;
+        }
+
+        if let Some(end) = cmd.end {
+            match parse_execution_time(&exec_data.execution.time) {
+                Ok(ts_event) if ts_event > end => return None,
+                Ok(_) => {}
+                Err(e) => {
+                    Self::warn_historical_fill_report_parse_error(exec_data, &e);
+                    return None;
+                }
+            }
+        }
+
+        match parse_execution_to_fill_report(
+            &exec_data.execution,
+            &exec_data.contract,
+            commission,
+            commission_currency,
+            instrument_id,
+            self.core.account_id,
+            &self.instrument_provider,
+            ts_init,
+            None, // avg_px (not available in historical fills)
+        ) {
+            Ok(report) => Some(report),
+            Err(e) => {
+                Self::warn_historical_fill_report_parse_error(exec_data, &e);
+                None
+            }
+        }
+    }
+
+    fn resolve_historical_execution_instrument_id(
+        &self,
+        exec_data: &ExecutionData,
+    ) -> anyhow::Result<InstrumentId> {
+        self.resolve_report_contract_instrument_id(&exec_data.contract)
+    }
+
+    fn resolve_report_contract_instrument_id(
+        &self,
+        contract: &Contract,
+    ) -> anyhow::Result<InstrumentId> {
+        match self
+            .instrument_provider
+            .resolve_instrument_id_for_contract(contract)
+        {
+            Ok(instrument_id) => Ok(instrument_id),
+            Err(provider_error) if contract.security_type != SecurityType::Spread => {
+                ib_contract_to_instrument_id_simple(contract).with_context(|| {
+                    format!(
+                        "Failed to resolve IBKR contract to instrument ID using provider ({provider_error}) or simple conversion",
+                    )
+                })
+            }
+            Err(provider_error) => Err(provider_error)
+                .context("Failed to resolve BAG contract to spread instrument ID"),
+        }
+    }
+
+    fn position_avg_px_open(
+        &self,
+        instrument_id: &InstrumentId,
+        instrument: &InstrumentAny,
+        average_cost: f64,
+    ) -> Option<Decimal> {
+        if average_cost <= 0.0 {
+            return None;
+        }
+
+        let price_magnifier = self.instrument_provider.get_price_magnifier(instrument_id) as f64;
+        let multiplier = instrument.multiplier().as_f64();
+        let converted_avg_cost = average_cost / (multiplier * price_magnifier);
+        Decimal::from_f64_retain(converted_avg_cost)
+            .map(|price| price.round_dp(instrument.price_precision() as u32))
+    }
+
+    fn warn_historical_fill_report_parse_error(exec_data: &ExecutionData, error: &anyhow::Error) {
+        tracing::warn!(
+            symbol = exec_data.contract.symbol.as_str(),
+            sec_type = ?exec_data.contract.security_type,
+            exchange = exec_data.contract.exchange.as_str(),
+            primary_exchange = exec_data.contract.primary_exchange.as_str(),
+            local_symbol = exec_data.contract.local_symbol.as_str(),
+            con_id = exec_data.contract.contract_id,
+            order_id = exec_data.execution.order_id,
+            order_ref = exec_data.execution.order_reference.as_str(),
+            execution_id = exec_data.execution.execution_id.as_str(),
+            error = %error,
+            "Failed to parse IBKR historical fill report",
+        );
+    }
+
     /// Handles cancel all orders asynchronously.
     ///
     /// # Errors
@@ -2035,23 +1963,28 @@ impl InteractiveBrokersExecutionClient {
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         ts_init: UnixNanos,
         account_id: AccountId,
+        request_timeout_secs: u64,
     ) -> anyhow::Result<()> {
-        let ib_order_id = if let Some(venue_order_id) = &cmd.venue_order_id {
-            // Use venue order ID directly if available
-            venue_order_id
-                .as_str()
-                .parse::<i32>()
-                .map_err(|e| anyhow::anyhow!("Failed to parse venue order ID: {e}"))?
+        let order_selector = if let Some(venue_order_id) = &cmd.venue_order_id {
+            IbOrderSelector::from_venue_order_id(venue_order_id)?
         } else {
-            // Otherwise look it up from mapping
             let map = order_id_map
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Failed to lock order ID map"))?;
-            *map.get(&cmd.client_order_id)
-                .context("No IB order ID mapping found for client order ID")?
+            IbOrderSelector::OrderId(
+                *map.get(&cmd.client_order_id)
+                    .context("No IB order ID mapping found for client order ID")?,
+            )
         };
+        let ib_order_id = Self::resolve_ib_order_id_for_cancel(
+            client,
+            order_selector,
+            account_id,
+            request_timeout_secs,
+        )
+        .await?;
 
-        client
+        let _cancel_subscription = client
             .cancel_order(ib_order_id, "")
             .await
             .context("Failed to cancel order with IB")?;
@@ -2069,6 +2002,51 @@ impl InteractiveBrokersExecutionClient {
         )?;
 
         Ok(())
+    }
+
+    async fn resolve_ib_order_id_for_cancel(
+        client: &Arc<Client>,
+        order_selector: IbOrderSelector,
+        account_id: AccountId,
+        request_timeout_secs: u64,
+    ) -> anyhow::Result<i32> {
+        let target_perm_id = match order_selector {
+            IbOrderSelector::OrderId(order_id) => return Ok(order_id),
+            IbOrderSelector::PermId(perm_id) => perm_id,
+        };
+
+        let timeout_dur = Duration::from_secs(request_timeout_secs);
+        let raw_account_id = raw_ib_account_code(&account_id);
+        let subscription = match tokio::time::timeout(timeout_dur, client.all_open_orders()).await {
+            Ok(Ok(subscription)) => subscription,
+            Ok(Err(e)) => anyhow::bail!("Failed to request open orders for perm_id lookup: {e}"),
+            Err(_) => anyhow::bail!("Timed out requesting open orders for perm_id lookup"),
+        };
+        let mut subscription = subscription.filter_data();
+
+        while let Some(order_result) = subscription.next().await {
+            let Orders::OrderData(data) = order_result? else {
+                continue;
+            };
+
+            if !data.order.account.is_empty() && data.order.account != raw_account_id {
+                continue;
+            }
+
+            if data.order.perm_id != target_perm_id {
+                continue;
+            }
+
+            if data.order_id == 0 {
+                anyhow::bail!(
+                    "Cannot cancel PERM-{target_perm_id}: matching open order has no IB order_id"
+                );
+            }
+
+            return Ok(data.order_id);
+        }
+
+        anyhow::bail!("No open order found for PERM-{target_perm_id}")
     }
 
     async fn handle_cancel_all_orders_async(

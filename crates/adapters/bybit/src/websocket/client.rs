@@ -54,8 +54,9 @@ use crate::{
         consts::{BYBIT_NAUTILUS_BROKER_ID, BYBIT_WS_TOPIC_DELIMITER},
         credential::Credential,
         enums::{
-            BybitEnvironment, BybitOrderSide, BybitOrderType, BybitPositionIdx, BybitProductType,
-            BybitTimeInForce, BybitTpSlMode, BybitWsOrderRequestOp, resolve_trigger_type,
+            BybitBboSideType, BybitEnvironment, BybitOrderSide, BybitOrderType, BybitPositionIdx,
+            BybitProductType, BybitTimeInForce, BybitTpSlMode, BybitWsOrderRequestOp,
+            resolve_trigger_type,
         },
         parse::{
             bar_spec_to_bybit_interval, extract_base_coin, extract_raw_symbol, map_time_in_force,
@@ -97,7 +98,7 @@ pub struct PendingPyRequest {
 #[cfg_attr(feature = "python", pyo3::pyclass(from_py_object))]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bybit")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 pub struct BybitWebSocketClient {
     url: String,
@@ -595,7 +596,11 @@ impl BybitWebSocketClient {
 
                         // Forward to out_tx so caller sees the Reconnected message
                         if out_tx.send(BybitWsMessage::Reconnected).is_err() {
-                            log::debug!("Receiver dropped, stopping");
+                            if handler.is_stopped() {
+                                log::debug!("Receiver dropped, stopping");
+                            } else {
+                                log::error!("Receiver dropped, stopping");
+                            }
                             break;
                         }
                     }
@@ -607,13 +612,21 @@ impl BybitWebSocketClient {
                         }
 
                         if out_tx.send(BybitWsMessage::Auth(auth.clone())).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }
                     Some(msg) => {
                         if out_tx.send(msg).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }
@@ -1161,6 +1174,35 @@ impl BybitWebSocketClient {
             .await
     }
 
+    /// Subscribes to fast execution updates (slim payload, lower latency).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails or if not authenticated.
+    ///
+    /// # References
+    ///
+    /// <https://bybit-exchange.github.io/docs/v5/websocket/private/fast-execution>
+    pub async fn subscribe_executions_fast(&self) -> BybitWsResult<()> {
+        if !self.requires_auth {
+            return Err(BybitWsError::Authentication(
+                "Fast execution subscription requires authentication".to_string(),
+            ));
+        }
+        self.subscribe(vec![
+            BybitWsPrivateChannel::ExecutionFast.as_ref().to_string(),
+        ])
+        .await
+    }
+
+    /// Unsubscribes from fast execution updates.
+    pub async fn unsubscribe_executions_fast(&self) -> BybitWsResult<()> {
+        self.unsubscribe(vec![
+            BybitWsPrivateChannel::ExecutionFast.as_ref().to_string(),
+        ])
+        .await
+    }
+
     /// Subscribes to position updates.
     ///
     /// # Errors
@@ -1399,6 +1441,8 @@ impl BybitWebSocketClient {
                 order_iv: order.order_iv,
                 mmp: order.mmp,
                 position_idx: order.position_idx,
+                bbo_side_type: order.bbo_side_type,
+                bbo_level: order.bbo_level,
             })
             .collect();
 
@@ -1552,6 +1596,8 @@ impl BybitWebSocketClient {
         reduce_only: Option<bool>,
         is_leverage: bool,
         position_idx: Option<BybitPositionIdx>,
+        bbo_side_type: Option<BybitBboSideType>,
+        bbo_level: Option<String>,
     ) -> BybitWsResult<String> {
         let params = self.build_place_order_params(
             product_type,
@@ -1571,6 +1617,8 @@ impl BybitWebSocketClient {
             None,
             None,
             position_idx,
+            bbo_side_type,
+            bbo_level,
         )?;
 
         self.place_order(params).await
@@ -1645,6 +1693,8 @@ impl BybitWebSocketClient {
         take_profit: Option<Price>,
         stop_loss: Option<Price>,
         position_idx: Option<BybitPositionIdx>,
+        bbo_side_type: Option<BybitBboSideType>,
+        bbo_level: Option<String>,
     ) -> BybitWsResult<BybitWsPlaceOrderParams> {
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())
             .map_err(|e| BybitWsError::ClientError(e.to_string()))?;
@@ -1690,7 +1740,11 @@ impl BybitWebSocketClient {
                 qty: quantity.to_string(),
                 is_leverage: is_leverage_value,
                 market_unit,
-                price: price.map(|p| p.to_string()),
+                price: if bbo_side_type.is_some() {
+                    None
+                } else {
+                    price.map(|p| p.to_string())
+                },
                 time_in_force: bybit_tif,
                 order_link_id: Some(client_order_id.to_string()),
                 reduce_only: reduce_only.filter(|&r| r),
@@ -1716,6 +1770,8 @@ impl BybitWebSocketClient {
                 order_iv: None,
                 mmp: None,
                 position_idx,
+                bbo_side_type,
+                bbo_level,
             }
         } else {
             BybitWsPlaceOrderParams {
@@ -1726,7 +1782,11 @@ impl BybitWebSocketClient {
                 qty: quantity.to_string(),
                 is_leverage: is_leverage_value,
                 market_unit,
-                price: price.map(|p| p.to_string()),
+                price: if bbo_side_type.is_some() {
+                    None
+                } else {
+                    price.map(|p| p.to_string())
+                },
                 time_in_force: bybit_tif,
                 order_link_id: Some(client_order_id.to_string()),
                 reduce_only: reduce_only.filter(|&r| r),
@@ -1752,6 +1812,8 @@ impl BybitWebSocketClient {
                 order_iv: None,
                 mmp: None,
                 position_idx,
+                bbo_side_type,
+                bbo_level,
             }
         };
 
@@ -2100,6 +2162,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .expect("Failed to build params");
 
@@ -2173,9 +2237,52 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .expect("Failed to build params");
 
         assert_eq!(params.market_unit, expected);
+    }
+
+    #[rstest]
+    fn test_build_place_order_params_with_bbo_omits_price() {
+        let client = BybitWebSocketClient::new_trade(
+            BybitEnvironment::Testnet,
+            Some("test-key".to_string()),
+            Some("test-secret".to_string()),
+            None,
+            20,
+            TransportBackend::default(),
+            None,
+        );
+
+        let params = client
+            .build_place_order_params(
+                BybitProductType::Linear,
+                InstrumentId::from("ETHUSDT-LINEAR.BYBIT"),
+                ClientOrderId::from("test-bbo-order-1"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                Quantity::from("1.0"),
+                false,
+                Some(TimeInForce::Gtc),
+                Some(Price::from("50000.0")),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                Some(BybitBboSideType::Queue),
+                Some("2".to_string()),
+            )
+            .expect("Failed to build params");
+
+        assert_eq!(params.price, None);
+        assert_eq!(params.bbo_side_type, Some(BybitBboSideType::Queue));
+        assert_eq!(params.bbo_level.as_deref(), Some("2"));
     }
 }

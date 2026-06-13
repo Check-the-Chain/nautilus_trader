@@ -19,6 +19,10 @@
     clippy::missing_errors_doc,
     reason = "errors documented on underlying Rust methods"
 )]
+#![allow(
+    clippy::unused_self,
+    reason = "PyO3 stub methods take &self for Python API parity even when the body is empty"
+)]
 
 pub mod actor;
 pub mod cache;
@@ -72,6 +76,7 @@ pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::logging::writer::FileWriterConfig>()?;
     m.add_function(wrap_pyfunction!(logging::py_init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_logger_flush, m)?)?;
+    m.add_function(wrap_pyfunction!(logging::py_logging_sync_to_disk, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_logger_log, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_log_header, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_log_sysinfo, m)?)?;

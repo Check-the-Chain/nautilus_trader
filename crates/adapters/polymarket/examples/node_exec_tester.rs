@@ -34,14 +34,13 @@ use std::sync::Arc;
 
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
-use nautilus_network::websocket::TransportBackend;
 use nautilus_polymarket::{
-    common::enums::SignatureType,
+    common::{consts::POLYMARKET_CLIENT_ID, enums::SignatureType},
     config::{PolymarketDataClientConfig, PolymarketExecClientConfig},
     factories::{PolymarketDataClientFactory, PolymarketExecutionClientFactory},
     filters::EventSlugFilter,
@@ -57,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("POLYMARKET-001");
     let node_name = "POLYMARKET-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("POLYMARKET");
+    let client_id = *POLYMARKET_CLIENT_ID;
 
     // GTA VI Released Before June 2026 (Yes)
     // https://polymarket.com/event/gta-vi-released-before-june-2026
@@ -71,7 +70,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data_config = PolymarketDataClientConfig {
         filters: vec![Arc::new(data_filter)],
-        transport_backend: TransportBackend::Sockudo,
         ..Default::default()
     };
     let data_factory = PolymarketDataClientFactory;
@@ -81,7 +79,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trader_id,
         account_id,
         signature_type: SignatureType::PolyGnosisSafe,
-        transport_backend: TransportBackend::Sockudo,
         ..Default::default()
     };
     let exec_factory = PolymarketExecutionClientFactory;
@@ -90,10 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout_level: LevelFilter::Info,
         ..Default::default()
     };
+    let exec_engine_config = LiveExecEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
         .with_logging(log_config)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)

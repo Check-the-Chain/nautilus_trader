@@ -37,12 +37,15 @@ use nautilus_model::{
 
 use super::{
     OrderIdentity, WsDispatchState, ensure_accepted_emitted, fill_report_to_order_filled,
-    lookup_instrument, resolve_client_order_id,
+    resolve_client_order_id,
 };
-use crate::websocket::spot_v2::{
-    enums::KrakenExecType,
-    messages::KrakenWsExecutionData,
-    parse::{parse_ws_fill_report, parse_ws_order_status_report},
+use crate::{
+    common::lookup_instrument_in_snapshot,
+    websocket::spot_v2::{
+        enums::KrakenExecType,
+        messages::KrakenWsExecutionData,
+        parse::{parse_ws_fill_report, parse_ws_order_status_report},
+    },
 };
 
 /// Dispatches a Kraken Spot v2 execution message.
@@ -57,18 +60,66 @@ pub fn execution(
     account_id: AccountId,
     ts_init: UnixNanos,
 ) {
-    let symbol = match &exec.symbol {
-        Some(s) => s.as_str(),
-        None => {
-            log::debug!(
-                "Execution message without symbol: exec_type={:?}, order_id={}",
-                exec.exec_type,
-                exec.order_id
-            );
-            return;
+    execution_inner(
+        exec,
+        state,
+        emitter,
+        instruments,
+        truncated_id_map,
+        order_qty_cache,
+        account_id,
+        ts_init,
+    );
+
+    // Run terminal cache cleanup regardless of which early return the inner
+    // dispatch hit (symbol miss, instrument miss, stale-filled suppression,
+    // parse error). Keying eviction off `exec.order_id` means it does not
+    // depend on `cl_ord_id` or identity resolution succeeding.
+    if is_terminal_exec_type(exec.exec_type) {
+        state.forget_order_symbol(&exec.order_id);
+        state.forget_order_client_id(&exec.order_id);
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn execution_inner(
+    exec: &KrakenWsExecutionData,
+    state: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    truncated_id_map: &Arc<AtomicMap<String, ClientOrderId>>,
+    order_qty_cache: &Arc<AtomicMap<String, f64>>,
+    account_id: AccountId,
+    ts_init: UnixNanos,
+) {
+    // Resolve the trading symbol. Per Kraken's executions docs, follow-up
+    // frames (`new`, `amended`, `restated`, `status`) carry only changed
+    // fields and omit `symbol`. We cache the symbol from the first frame for
+    // the venue order id and consult it here when the current frame omits it.
+    let cached_symbol;
+    let symbol = match exec.symbol.as_deref() {
+        Some(s) => {
+            state.cache_order_symbol(&exec.order_id, s);
+            s
         }
+        None => match state.lookup_order_symbol(&exec.order_id) {
+            Some(s) => {
+                cached_symbol = s;
+                cached_symbol.as_str()
+            }
+            None => {
+                log::debug!(
+                    "Execution message without symbol and no cached mapping: \
+                     exec_type={:?}, order_id={}",
+                    exec.exec_type,
+                    exec.order_id
+                );
+                return;
+            }
+        },
     };
-    let Some(instrument) = lookup_instrument(instruments, symbol) else {
+    let instruments = instruments.load();
+    let Some(instrument) = lookup_instrument_in_snapshot(&instruments, symbol) else {
         log::warn!("No instrument for symbol: {symbol}");
         return;
     };
@@ -83,10 +134,20 @@ pub fn execution(
         order_qty_cache.insert(cl_ord_id.clone(), qty);
     }
 
-    let resolved_id = exec
-        .cl_ord_id
-        .as_ref()
-        .map(|id| resolve_client_order_id(id, truncated_id_map));
+    // Resolve the `ClientOrderId`. When the frame carries `cl_ord_id` we
+    // resolve it through the truncation map and seed the venue-id cache so
+    // later delta frames (which routinely omit `cl_ord_id`) can recover it.
+    // When `cl_ord_id` is absent we consult the cache; without this lookup a
+    // tracked order's delta `new` would fall through to the untracked report
+    // path and the strategy would never see `OrderAccepted` (issue #4051).
+    let resolved_id = match exec.cl_ord_id.as_ref() {
+        Some(id) => {
+            let cid = resolve_client_order_id(id, truncated_id_map);
+            state.cache_order_client_id(&exec.order_id, cid);
+            Some(cid)
+        }
+        None => state.lookup_order_client_id(&exec.order_id),
+    };
 
     // Stale-report suppression for previously-tracked orders that already
     // reached the filled terminal state.
@@ -103,7 +164,7 @@ pub fn execution(
     let identity = resolved_id.and_then(|cid| state.lookup_identity(&cid));
 
     // Status update.
-    match parse_ws_order_status_report(exec, &instrument, account_id, cached_qty, ts_init) {
+    match parse_ws_order_status_report(exec, instrument, account_id, cached_qty, ts_init) {
         Ok(mut report) => {
             if let Some(cid) = resolved_id {
                 report = report.with_client_order_id(cid);
@@ -130,7 +191,7 @@ pub fn execution(
 
     // Fill (when present).
     if exec.exec_id.is_some() {
-        match parse_ws_fill_report(exec, &instrument, account_id, ts_init) {
+        match parse_ws_fill_report(exec, instrument, account_id, ts_init) {
             Ok(mut report) => {
                 if let Some(cid) = resolved_id {
                     report.client_order_id = Some(cid);
@@ -141,7 +202,7 @@ pub fn execution(
                         &report,
                         client_order_id,
                         identity,
-                        &instrument,
+                        instrument,
                         state,
                         emitter,
                         account_id,
@@ -211,12 +272,11 @@ fn status_tracked(
 
     match report.order_status {
         OrderStatus::Accepted => {
-            if state.emitted_accepted.contains(&client_order_id) {
+            if !state.insert_accepted(client_order_id) {
                 // Already accepted; this is a redundant New / Restated / Status
                 // exec. The strategy already saw OrderAccepted; nothing to emit.
                 return;
             }
-            state.insert_accepted(client_order_id);
             let accepted = OrderAccepted::new(
                 trader_id,
                 identity.strategy_id,

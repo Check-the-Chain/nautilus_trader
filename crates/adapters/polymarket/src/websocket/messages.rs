@@ -407,6 +407,24 @@ mod tests {
         assert_eq!(order.size_matched, "0.0");
     }
 
+    /// Repro for issue #3987: venue cancels a FOK order with a status field
+    /// containing a trailing reason ("CANCELED_<reason>") and empty fields
+    /// on `size_matched`, `outcome`, and `created_at`.
+    #[rstest]
+    fn test_user_order_fok_killed() {
+        let msg: UserWsMessage = load("ws_user_order_fok_killed.json");
+
+        let UserWsMessage::Order(order) = msg else {
+            panic!("Expected UserWsMessage::Order");
+        };
+        assert_eq!(order.event_type, PolymarketEventType::Cancellation);
+        assert_eq!(order.status, PolymarketOrderStatus::Canceled);
+        assert_eq!(order.order_type, PolymarketOrderType::FOK);
+        assert_eq!(order.size_matched, "");
+        assert_eq!(order.created_at, "");
+        assert_eq!(order.outcome.as_str(), "");
+    }
+
     #[rstest]
     fn test_user_trade() {
         let trade: PolymarketUserTrade = load("ws_user_trade.json");
@@ -499,6 +517,10 @@ mod tests {
         if let MarketWsMessage::NewMarket(nm) = msg {
             assert_eq!(nm.id, "1031769");
             assert_eq!(nm.slug, "nvda-above-240-on-january-30-2026");
+            assert_eq!(
+                nm.market.as_str(),
+                "0x311d0c4b6671ab54af4970c06fcf58662516f5168997bdda209ec3db5aa6b0c1"
+            );
             assert_eq!(
                 nm.condition_id,
                 "0x311d0c4b6671ab54af4970c06fcf58662516f5168997bdda209ec3db5aa6b0c1"

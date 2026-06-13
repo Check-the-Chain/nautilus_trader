@@ -18,6 +18,7 @@
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{OrderSide, TimeInForce},
+    identifiers::VenueOrderId,
     orders::OrderAny,
     types::{Price, Quantity},
 };
@@ -34,7 +35,7 @@ pub(crate) enum CancelOutcome {
 }
 
 impl CancelOutcome {
-    pub fn classify(reason: &str) -> Self {
+    pub(crate) fn classify(reason: &str) -> Self {
         if reason.contains(CANCEL_ALREADY_DONE) {
             Self::AlreadyDone
         } else {
@@ -61,6 +62,7 @@ pub(crate) struct SignedLimitOrderSubmission {
     pub(crate) order: PolymarketOrder,
     pub(crate) order_type: PolymarketOrderType,
     pub(crate) post_only: bool,
+    pub(crate) expected_venue_order_id: VenueOrderId,
 }
 
 #[derive(Clone, Debug)]

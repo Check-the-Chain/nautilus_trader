@@ -64,7 +64,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     io::Cursor,
     ops::Bound as RangeBound,
@@ -73,8 +73,13 @@ use std::{
 };
 
 use ahash::AHashMap;
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::{
+    array::{Array, UInt64Array},
+    compute::{SortOptions, concat_batches, sort_to_indices, take_record_batch},
+    record_batch::RecordBatch,
+};
 use futures::StreamExt;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use nautilus_common::live::get_runtime;
 use nautilus_core::{
@@ -85,7 +90,7 @@ use nautilus_core::{
 use nautilus_model::{
     data::{
         Bar, CustomData, Data, FundingRateUpdate, HasTsInit, IndexPriceUpdate, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
+        MarkPriceUpdate, OptionGreeks, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
         close::InstrumentClose, is_monotonically_increasing_by_init, to_variant,
     },
     events::{
@@ -99,8 +104,8 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
 };
 use nautilus_serialization::arrow::{
-    DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch, EncodeToRecordBatch,
-    custom::CustomDataDecoder,
+    ArrowSchemaProvider, DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch,
+    EncodeToRecordBatch, custom::CustomDataDecoder,
 };
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use serde::Serialize;
@@ -168,7 +173,7 @@ impl Debug for ParquetDataCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(ParquetDataCatalog))
             .field("base_path", &self.base_path)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -355,6 +360,11 @@ impl ParquetDataCatalog {
     /// - Each data type is written to its own directory structure.
     /// - Instrument data handling is not yet implemented (TODO).
     ///
+    /// # Errors
+    ///
+    /// Returns an error if type-specific writes, custom data writes, or instrument
+    /// writes fail.
+    ///
     /// # Examples
     ///
     /// ```rust,no_run
@@ -366,6 +376,10 @@ impl ParquetDataCatalog {
     ///
     /// catalog.write_data_enum(mixed_data, None, None)?;
     /// ```
+    #[allow(
+        clippy::match_wildcard_for_single_variants,
+        reason = "Data::Defi appears through nautilus-model feature unification"
+    )]
     pub fn write_data_enum(
         &self,
         data: &[Data],
@@ -380,7 +394,9 @@ impl ParquetDataCatalog {
         let mut bars: Vec<Bar> = Vec::new();
         let mut mark_prices: Vec<MarkPriceUpdate> = Vec::new();
         let mut index_prices: Vec<IndexPriceUpdate> = Vec::new();
+        let mut funding_rates: Vec<FundingRateUpdate> = Vec::new();
         let mut statuses: Vec<InstrumentStatus> = Vec::new();
+        let mut option_greeks: Vec<OptionGreeks> = Vec::new();
         let mut closes: Vec<InstrumentClose> = Vec::new();
         // Group custom data by full DataType identity (type_name + identifier + metadata)
         // so each batch is written to the correct path with consistent schema/metadata.
@@ -418,8 +434,14 @@ impl ParquetDataCatalog {
                 Data::IndexPriceUpdate(p) => {
                     index_prices.push(p);
                 }
+                Data::FundingRateUpdate(p) => {
+                    funding_rates.push(p);
+                }
                 Data::InstrumentStatus(s) => {
                     statuses.push(s);
+                }
+                Data::OptionGreeks(g) => {
+                    option_greeks.push(g);
                 }
                 Data::InstrumentClose(c) => {
                     closes.push(c);
@@ -427,6 +449,10 @@ impl ParquetDataCatalog {
                 Data::Custom(c) => {
                     custom_data.entry(custom_data_key(&c)).or_default().push(c);
                 }
+                #[cfg(feature = "defi")]
+                Data::Defi(_) => anyhow::bail!("Unsupported Data::Defi variant for catalog writes"),
+                #[allow(unreachable_patterns)]
+                _ => anyhow::bail!("Unsupported Data variant for catalog writes"),
             }
         }
 
@@ -439,7 +465,9 @@ impl ParquetDataCatalog {
         self.write_to_parquet(bars, start, end, skip_disjoint_check)?;
         self.write_to_parquet(mark_prices, start, end, skip_disjoint_check)?;
         self.write_to_parquet(index_prices, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(funding_rates, start, end, skip_disjoint_check)?;
         self.write_to_parquet(statuses, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(option_greeks, start, end, skip_disjoint_check)?;
         self.write_to_parquet(closes, start, end, skip_disjoint_check)?;
 
         for (_, items) in custom_data {
@@ -722,8 +750,14 @@ impl ParquetDataCatalog {
         for ((_instrument_type, instrument_id), instrument_group) in by_type_and_id {
             Self::check_ascending_timestamps(&instrument_group, "instrument")?;
 
-            let start_ts = HasTsInit::ts_init(instrument_group.first().unwrap());
-            let end_ts = HasTsInit::ts_init(instrument_group.last().unwrap());
+            let Some(first_instrument) = instrument_group.first() else {
+                continue;
+            };
+            let Some(last_instrument) = instrument_group.last() else {
+                continue;
+            };
+            let start_ts = HasTsInit::ts_init(first_instrument);
+            let end_ts = HasTsInit::ts_init(last_instrument);
             let batches = self.data_to_record_batches(instrument_group)?;
             if batches.is_empty() {
                 continue;
@@ -832,6 +866,11 @@ impl ParquetDataCatalog {
     /// This reads all matching parquet files under `data/instruments/{instrument_id}/`,
     /// including legacy `instrument.parquet` files, decodes the records back to
     /// `InstrumentAny`, and filters them by `ts_init` when a range is provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if path construction, object store listing, parquet reads, or
+    /// instrument decoding fails.
     pub fn query_instruments_filtered(
         &self,
         instrument_ids: Option<&[String]>,
@@ -1035,6 +1074,9 @@ impl ParquetDataCatalog {
     /// - `data`: Slice of data records to validate.
     /// - `type_name`: Name of the data type for error messages.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if any adjacent timestamps are out of ascending order.
     pub fn check_ascending_timestamps<T: HasTsInit>(
         data: &[T],
         type_name: &str,
@@ -1056,7 +1098,9 @@ impl ParquetDataCatalog {
             InstrumentAny::Cfd(_) => "Cfd",
             InstrumentAny::Commodity(_) => "Commodity",
             InstrumentAny::CryptoFuture(_) => "CryptoFuture",
+            InstrumentAny::CryptoFuturesSpread(_) => "CryptoFuturesSpread",
             InstrumentAny::CryptoOption(_) => "CryptoOption",
+            InstrumentAny::CryptoOptionSpread(_) => "CryptoOptionSpread",
             InstrumentAny::CryptoPerpetual(_) => "CryptoPerpetual",
             InstrumentAny::CurrencyPair(_) => "CurrencyPair",
             InstrumentAny::Equity(_) => "Equity",
@@ -1115,7 +1159,7 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `data_cls`: The data type directory name (e.g., "quotes", "trades").
-    /// - `identifier`: Optional identifier to target a specific instrument's data. Can be an instrument_id (e.g., "EUR/USD.SIM") or a bar_type (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifier`: Optional identifier to target a specific instrument's data. Can be an `instrument_id` (e.g., "EUR/USD.SIM") or a `bar_type` (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     /// - `start`: Start timestamp of the new range to extend to.
     /// - `end`: End timestamp of the new range to extend to.
     ///
@@ -1374,7 +1418,7 @@ impl ParquetDataCatalog {
                 // Use platform-appropriate path separator for display
                 // but object store paths always use forward slashes
                 let base_str = base_path.to_string_lossy();
-                return self.join_paths(&base_str, path_str);
+                return Self::join_paths(&base_str, path_str);
             }
         }
 
@@ -1385,23 +1429,23 @@ impl ParquetDataCatalog {
                 // Fallback: return the path as-is
                 path_str.to_string()
             } else {
-                self.join_paths(self.original_uri.trim_end_matches('/'), path_str)
+                Self::join_paths(self.original_uri.trim_end_matches('/'), path_str)
             }
         } else {
             let base = self.base_path.trim_end_matches('/');
-            self.join_paths(base, path_str)
+            Self::join_paths(base, path_str)
         }
     }
 
     /// Helper method to join paths using forward slashes (object store convention)
     #[must_use]
-    fn join_paths(&self, base: &str, path: &str) -> String {
+    fn join_paths(base: &str, path: &str) -> String {
         make_object_store_path(base, &[path])
     }
 
     /// Resolves a path for use with DataFusion (avoiding Windows path doubling for file://).
     /// Returns the path as-is if it is already a full URI or absolute; otherwise builds
-    /// file:// base + path for local catalogs or reconstruct_full_uri for remote.
+    /// file:// base + path for local catalogs or `reconstruct_full_uri` for remote.
     #[must_use]
     fn resolve_path_for_datafusion(&self, path: &str) -> String {
         if path.contains("://") {
@@ -1420,7 +1464,7 @@ impl ParquetDataCatalog {
         self.reconstruct_full_uri(path)
     }
 
-    /// Like resolve_path_for_datafusion but ensures the result ends with a trailing slash.
+    /// Like `resolve_path_for_datafusion` but ensures the result ends with a trailing slash.
     #[must_use]
     fn resolve_directory_for_datafusion(&self, directory: &str) -> String {
         let mut resolved = self.resolve_path_for_datafusion(directory);
@@ -1430,8 +1474,8 @@ impl ParquetDataCatalog {
         resolved
     }
 
-    /// Returns the path string to push in query_files result list: relative for file://,
-    /// full URI for remote (so callers can pass to resolve_path_for_datafusion later).
+    /// Returns the path string to push in `query_files` result list: relative for file://,
+    /// full URI for remote (so callers can pass to `resolve_path_for_datafusion` later).
     #[must_use]
     fn path_for_query_list(&self, path: &str) -> String {
         if self.original_uri.starts_with("file://") {
@@ -1441,8 +1485,8 @@ impl ParquetDataCatalog {
         }
     }
 
-    /// Returns the native path string for the catalog root (for std::fs). Only valid when
-    /// !is_remote_uri(); uses parquet's file_uri_to_native_path for file:// URIs.
+    /// Returns the native path string for the catalog root (for `std::fs`). Only valid when
+    /// !`is_remote_uri()`; uses parquet's `file_uri_to_native_path` for file:// URIs.
     #[must_use]
     fn native_base_path_string(&self) -> String {
         if self.original_uri.starts_with("file://") {
@@ -1473,8 +1517,8 @@ impl ParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `identifiers`: Optional list of identifiers to filter by. Can be instrument_id strings (e.g., "EUR/USD.SIM")
-    ///   or bar_type strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL"). If `None`, queries all identifiers.
+    /// - `identifiers`: Optional list of identifiers to filter by. Can be `instrument_id` strings (e.g., "EUR/USD.SIM")
+    ///   or `bar_type` strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL"). If `None`, queries all identifiers.
     ///   For bars, partial matching is supported (e.g., "EUR/USD.SIM" will match "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     /// - `start`: Optional start timestamp for filtering (inclusive). If `None`, queries from the beginning.
     /// - `end`: Optional end timestamp for filtering (inclusive). If `None`, queries to the end.
@@ -1568,7 +1612,7 @@ impl ParquetDataCatalog {
             // Use directory-based registration for efficiency. DataFusion handles
             // reading all files in each directory, which is more memory-efficient
             // than registering many individual file tables.
-            let directories: HashSet<String> = files_list
+            let directories: IndexSet<String> = files_list
                 .iter()
                 .filter_map(|file_uri| {
                     // Extract directory path (everything except the filename)
@@ -1635,8 +1679,8 @@ impl ParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `identifiers`: Optional list of identifiers to filter by. Can be instrument_id strings (e.g., "EUR/USD.SIM")
-    ///   or bar_type strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL"). If `None`, queries all identifiers.
+    /// - `identifiers`: Optional list of identifiers to filter by. Can be `instrument_id` strings (e.g., "EUR/USD.SIM")
+    ///   or `bar_type` strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL"). If `None`, queries all identifiers.
     ///   For bars, partial matching is supported (e.g., "EUR/USD.SIM" will match "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     /// - `start`: Optional start timestamp for filtering (inclusive). If `None`, queries from the beginning.
     /// - `end`: Optional end timestamp for filtering (inclusive). If `None`, queries to the end.
@@ -1753,6 +1797,11 @@ impl ParquetDataCatalog {
     }
 
     /// Queries typed records that are not represented by the [`Data`] enum.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if object store registration, file discovery, query execution,
+    /// or record decoding fails.
     pub fn query_typed<T>(
         &mut self,
         identifiers: Option<Vec<String>>,
@@ -1778,7 +1827,7 @@ impl ParquetDataCatalog {
         let mut all_records = Vec::new();
 
         if optimize_file_loading {
-            let directories: HashSet<String> = files_list
+            let directories: IndexSet<String> = files_list
                 .iter()
                 .filter_map(|file_uri| {
                     Path::new(file_uri)
@@ -1804,7 +1853,7 @@ impl ParquetDataCatalog {
                     Some(&query),
                 )?;
 
-                all_records.extend(self.convert_record_batches_to_typed::<T>(batches)?);
+                all_records.extend(Self::convert_record_batches_to_typed::<T>(batches)?);
             }
         } else {
             for file_uri in &files_list {
@@ -1825,12 +1874,12 @@ impl ParquetDataCatalog {
                     Some(&query),
                 )?;
 
-                all_records.extend(self.convert_record_batches_to_typed::<T>(batches)?);
+                all_records.extend(Self::convert_record_batches_to_typed::<T>(batches)?);
             }
         }
 
         if !is_monotonically_increasing_by_init(&all_records) {
-            all_records.sort_by_key(|record| record.ts_init());
+            all_records.sort_by_key(HasTsInit::ts_init);
         }
 
         Ok(all_records)
@@ -1890,18 +1939,35 @@ impl ParquetDataCatalog {
             return Ok(Vec::new());
         }
 
-        let table_name = "custom_data_table";
-
         // Use CustomDataDecoder for all custom data. Pass type_name so decode can look up
         // the type when Parquet/DataFusion does not preserve schema metadata. Callers must
         // ensure Rust custom types are registered via ensure_custom_data_registered::<T>().
-        for file in files {
-            let resolved_path = self.resolve_path_for_datafusion(&file);
-            let sql_query = build_query(table_name, start, end, where_clause);
+        let mut lookup_metadata = HashMap::new();
+        lookup_metadata.insert("type_name".to_string(), type_name.to_string());
+        let registered_schema = CustomDataDecoder::get_schema(Some(lookup_metadata));
+        registered_schema.field_with_name("ts_init").map_err(|_| {
+            anyhow::anyhow!(
+                "custom data type '{type_name}' is not registered with an Arrow schema containing ts_init; \
+                 call ensure_custom_data_registered::<T>() before querying"
+            )
+        })?;
 
+        for file in files {
+            let identifier = extract_identifier_from_path(&file);
+            let safe_type_name = make_sql_safe_identifier(type_name);
+            let safe_sql_identifier = make_sql_safe_identifier(&identifier);
+            let safe_filename = extract_sql_safe_filename(&file);
+            let table_name =
+                format!("custom_{safe_type_name}_{safe_sql_identifier}_{safe_filename}");
+            let resolved_path = self.resolve_path_for_datafusion(&file);
+            let sql_query = build_query(&table_name, start, end, where_clause);
+
+            // Use schemaless registration so DataFusion preserves the parquet file's
+            // schema metadata (e.g. `bar_type`) on output batches, since the
+            // explicit-schema variant strips per-batch metadata that decoders rely on.
             self.session
                 .add_file::<CustomDataDecoder>(
-                    table_name,
+                    &table_name,
                     &resolved_path,
                     Some(&sql_query),
                     Some(type_name),
@@ -1922,8 +1988,8 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `data_cls`: The data type directory name (e.g., "quotes", "trades").
-    /// - `identifiers`: Optional list of identifiers to filter by. Can be instrument_id strings
-    ///   (e.g., "EUR/USD.SIM") or bar_type strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifiers`: Optional list of identifiers to filter by. Can be `instrument_id` strings
+    ///   (e.g., "EUR/USD.SIM") or `bar_type` strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///   For bars, partial matching is supported.
     /// - `start`: Optional start timestamp to filter files by their time range.
     /// - `end`: Optional end timestamp to filter files by their time range.
@@ -1996,6 +2062,7 @@ impl ParquetDataCatalog {
                 }
             })
             .collect();
+        file_paths.sort();
 
         // Apply identifier filtering if provided
         if let Some(identifiers) = identifiers {
@@ -2049,6 +2116,11 @@ impl ParquetDataCatalog {
         Ok(files)
     }
 
+    /// Queries quote tick data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
     pub fn quote_ticks(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2059,6 +2131,10 @@ impl ParquetDataCatalog {
     }
 
     /// Queries trade tick data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
     pub fn trade_ticks(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2069,6 +2145,10 @@ impl ParquetDataCatalog {
     }
 
     /// Queries bar data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
     pub fn bars(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2079,6 +2159,10 @@ impl ParquetDataCatalog {
     }
 
     /// Queries order book delta data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
     pub fn order_book_deltas(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2089,6 +2173,10 @@ impl ParquetDataCatalog {
     }
 
     /// Queries order book depth L10 data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
     pub fn order_book_depth10(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2098,7 +2186,25 @@ impl ParquetDataCatalog {
         self.query_typed_data::<OrderBookDepth10>(instrument_ids, start, end, None, None, true)
     }
 
+    /// Queries funding rate updates for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
+    pub fn funding_rates(
+        &mut self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<Vec<FundingRateUpdate>> {
+        self.query_typed::<FundingRateUpdate>(instrument_ids, start, end, None, None, true)
+    }
+
     /// Queries instrument close data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
     pub fn instrument_closes(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2108,14 +2214,32 @@ impl ParquetDataCatalog {
         self.query_typed_data::<InstrumentClose>(instrument_ids, start, end, None, None, true)
     }
 
+    /// Queries option greeks data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
+    pub fn option_greeks(
+        &mut self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<Vec<OptionGreeks>> {
+        self.query_typed_data::<OptionGreeks>(instrument_ids, start, end, None, None, true)
+    }
+
     /// Queries any instrument data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or instrument decoding fails.
     pub fn instruments(
         &self,
         instrument_ids: Option<&[String]>,
-        _start: Option<UnixNanos>,
-        _end: Option<UnixNanos>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<InstrumentAny>> {
-        self.query_instruments(instrument_ids)
+        self.query_instruments_filtered(instrument_ids, start, end)
     }
 
     /// Retrieves a list of file paths for a given data type.
@@ -2201,6 +2325,11 @@ impl ParquetDataCatalog {
     /// For Bar data types, if exact identifier matching fails, the function attempts
     /// partial matching by checking if the file's identifier starts with the provided identifier
     /// followed by a dash (to match bar type patterns).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if identifier filtering needs bar-type fallback and path
+    /// resolution fails.
     ///
     /// # Examples
     ///
@@ -2356,7 +2485,7 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `data_cls`: The data type directory name (e.g., "quotes", "trades").
-    /// - `identifier`: Optional identifier to target a specific instrument's data. Can be an instrument_id (e.g., "EUR/USD.SIM") or a bar_type (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifier`: Optional identifier to target a specific instrument's data. Can be an `instrument_id` (e.g., "EUR/USD.SIM") or a `bar_type` (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///
     /// # Returns
     ///
@@ -2404,7 +2533,7 @@ impl ParquetDataCatalog {
             return Ok(None);
         }
 
-        Ok(Some(intervals.first().unwrap().0))
+        Ok(intervals.first().map(|interval| interval.0))
     }
 
     /// Gets the last (most recent) timestamp for a specific data type and identifier.
@@ -2416,7 +2545,7 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `data_cls`: The data type directory name (e.g., "quotes", "trades").
-    /// - `identifier`: Optional identifier to target a specific instrument's data. Can be an instrument_id (e.g., "EUR/USD.SIM") or a bar_type (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifier`: Optional identifier to target a specific instrument's data. Can be an `instrument_id` (e.g., "EUR/USD.SIM") or a `bar_type` (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///
     /// # Returns
     ///
@@ -2464,7 +2593,7 @@ impl ParquetDataCatalog {
             return Ok(None);
         }
 
-        Ok(Some(intervals.last().unwrap().1))
+        Ok(intervals.last().map(|interval| interval.1))
     }
 
     /// Gets the time intervals covered by Parquet files for a specific data type and identifier.
@@ -2476,7 +2605,7 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `data_cls`: The data type directory name (e.g., "quotes", "trades").
-    /// - `identifier`: Optional identifier to target a specific instrument's data. Can be an instrument_id (e.g., "EUR/USD.SIM") or a bar_type (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifier`: Optional identifier to target a specific instrument's data. Can be an `instrument_id` (e.g., "EUR/USD.SIM") or a `bar_type` (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///
     /// # Returns
     ///
@@ -2541,7 +2670,10 @@ impl ParquetDataCatalog {
             return Ok(intervals);
         }
 
-        let safe_id = urisafe_instrument_id(identifier.unwrap());
+        let Some(identifier) = identifier else {
+            return Ok(intervals);
+        };
+        let safe_id = urisafe_instrument_id(identifier);
 
         // Use relative path so list_directory_stems doesn't double-prefix
         // for remote catalogs (make_path already includes base_path)
@@ -2665,7 +2797,7 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `type_name`: The data type directory name (e.g., "quotes", "trades", "bars").
-    /// - `identifier`: Optional identifier. Can be an instrument_id (e.g., "EUR/USD.SIM") or a bar_type (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL"). If provided, creates a subdirectory for the identifier. If `None`, returns the path to the data type directory.
+    /// - `identifier`: Optional identifier. Can be an `instrument_id` (e.g., "EUR/USD.SIM") or a `bar_type` (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL"). If provided, creates a subdirectory for the identifier. If `None`, returns the path to the data type directory.
     ///
     /// # Returns
     ///
@@ -2717,6 +2849,11 @@ impl ParquetDataCatalog {
 
     /// Builds the directory path for custom data: `data/custom/{type_name}[/{identifier segments}]`.
     /// Identifier can contain `//` for subdirectories (normalized to `/`); path is safe for writing.
+    ///
+    /// # Errors
+    ///
+    /// Currently this function does not return an error; it keeps the catalog path-building
+    /// API shape for compatibility with fallible path constructors.
     pub fn make_path_custom_data(
         &self,
         type_name: &str,
@@ -2916,11 +3053,15 @@ impl ParquetDataCatalog {
     }
 
     #[allow(dead_code)]
-    fn to_file_path(&self, path: &ObjectPath) -> String {
+    fn to_file_path(path: &ObjectPath) -> String {
         path.to_string()
     }
 
     /// Helper method to move a file using object store rename operation
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store rename operation fails.
     pub fn move_file(&self, old_path: &ObjectPath, new_path: &ObjectPath) -> anyhow::Result<()> {
         self.execute_async(async {
             self.object_store
@@ -2931,6 +3072,10 @@ impl ParquetDataCatalog {
     }
 
     /// Helper method to execute async operations with a runtime
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the future resolves to an error.
     pub fn execute_async<F, R>(&self, future: F) -> anyhow::Result<R>
     where
         F: std::future::Future<Output = anyhow::Result<R>>,
@@ -3237,6 +3382,10 @@ impl ParquetDataCatalog {
     ///
     /// Returns a vector of `Data` objects from the run, sorted by timestamp,
     /// or an error if the operation fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "run data loading keeps local and remote discovery paths together"
+    )]
     fn read_run_data(&self, subdirectory: &str, instance_id: &str) -> anyhow::Result<Vec<Data>> {
         // List all data types in the instance directory
         let instance_dir = make_object_store_path(&self.base_path, &[subdirectory, instance_id]);
@@ -3334,51 +3483,61 @@ impl ParquetDataCatalog {
                 let file_data: Vec<Data> = match data_cls.as_str() {
                     "quotes" => {
                         let quotes: Vec<QuoteTick> =
-                            self.convert_record_batches_to_data(batches, false)?;
+                            Self::convert_record_batches_to_data(batches, false)?;
                         quotes.into_iter().map(Data::from).collect()
                     }
                     "trades" => {
                         let trades: Vec<TradeTick> =
-                            self.convert_record_batches_to_data(batches, false)?;
+                            Self::convert_record_batches_to_data(batches, false)?;
                         trades.into_iter().map(Data::from).collect()
                     }
                     "order_book_deltas" => {
                         let deltas: Vec<OrderBookDelta> =
-                            self.convert_record_batches_to_data(batches, false)?;
+                            Self::convert_record_batches_to_data(batches, false)?;
                         deltas.into_iter().map(Data::from).collect()
                     }
                     "order_book_depths" => {
                         let depths: Vec<OrderBookDepth10> =
-                            self.convert_record_batches_to_data(batches, false)?;
+                            Self::convert_record_batches_to_data(batches, false)?;
                         depths.into_iter().map(Data::from).collect()
                     }
                     "bars" => {
-                        let bars: Vec<Bar> = self.convert_record_batches_to_data(batches, false)?;
+                        let bars: Vec<Bar> = Self::convert_record_batches_to_data(batches, false)?;
                         bars.into_iter().map(Data::from).collect()
                     }
                     "index_prices" => {
                         let prices: Vec<IndexPriceUpdate> =
-                            self.convert_record_batches_to_data(batches, false)?;
+                            Self::convert_record_batches_to_data(batches, false)?;
                         prices.into_iter().map(Data::from).collect()
                     }
                     "mark_prices" => {
                         let prices: Vec<MarkPriceUpdate> =
-                            self.convert_record_batches_to_data(batches, false)?;
+                            Self::convert_record_batches_to_data(batches, false)?;
                         prices.into_iter().map(Data::from).collect()
+                    }
+                    "funding_rate_update" => {
+                        let funding_rates: Vec<FundingRateUpdate> =
+                            Self::convert_record_batches_to_data(batches, false)?;
+                        funding_rates.into_iter().map(Data::from).collect()
+                    }
+                    "option_greeks" => {
+                        let greeks: Vec<OptionGreeks> =
+                            Self::convert_record_batches_to_data(batches, false)?;
+                        greeks.into_iter().map(Data::from).collect()
                     }
                     "instrument_status" => {
                         let statuses: Vec<InstrumentStatus> =
-                            self.convert_record_batches_to_data(batches, false)?;
+                            Self::convert_record_batches_to_data(batches, false)?;
                         statuses.into_iter().map(Data::from).collect()
                     }
                     "instrument_closes" => {
                         let closes: Vec<InstrumentClose> =
-                            self.convert_record_batches_to_data(batches, false)?;
+                            Self::convert_record_batches_to_data(batches, false)?;
                         closes.into_iter().map(Data::from).collect()
                     }
                     _ => {
                         if data_cls.starts_with("custom/") {
-                            self.decode_custom_batches_to_data(batches, false)?
+                            Self::decode_custom_batches_to_data(batches, false)?
                         } else {
                             // Unknown data type - skip it
                             continue;
@@ -3400,21 +3559,20 @@ impl ParquetDataCatalog {
         Ok(all_data)
     }
 
-    /// Decodes multiple record batches of custom data (data_cls starts with "custom/") into a single
+    /// Decodes multiple record batches of custom data (`data_cls` starts with "custom/") into a single
     /// `Vec<Data>`. Optionally replaces `ts_init` column with `ts_event` before decoding.
     ///
     /// # Errors
     ///
     /// Returns an error if any batch fails to decode.
     fn decode_custom_batches_to_data(
-        &self,
         batches: Vec<RecordBatch>,
         use_ts_event_for_ts_init: bool,
     ) -> anyhow::Result<Vec<Data>> {
         orchestration_decode_custom_batches_to_data(batches, use_ts_event_for_ts_init)
     }
 
-    /// Decodes a RecordBatch to Data objects based on metadata.
+    /// Decodes a `RecordBatch` to Data objects based on metadata.
     ///
     /// This method determines the data type from metadata and decodes the batch accordingly.
     /// It supports both standard data types and custom data types when `allow_custom_fallback`
@@ -3425,9 +3583,9 @@ impl ParquetDataCatalog {
     /// # Parameters
     ///
     /// - `metadata`: Schema metadata containing type information.
-    /// - `batch`: The RecordBatch to decode.
-    /// - `allow_custom_fallback`: If true, unknown type_name is decoded via custom data
-    ///   registry; if false, unknown type_name returns an error.
+    /// - `batch`: The `RecordBatch` to decode.
+    /// - `allow_custom_fallback`: If true, unknown `type_name` is decoded via custom data
+    ///   registry; if false, unknown `type_name` returns an error.
     ///
     /// # Returns
     ///
@@ -3438,7 +3596,6 @@ impl ParquetDataCatalog {
     /// Returns an error if decoding fails or the type is unknown (and custom fallback not allowed).
     #[allow(dead_code)] // used by tests
     fn decode_batch_to_data(
-        &self,
         metadata: &std::collections::HashMap<String, String>,
         batch: RecordBatch,
         allow_custom_fallback: bool,
@@ -3470,16 +3627,16 @@ impl ParquetDataCatalog {
     /// - The instance ID doesn't exist.
     /// - Feather file listing fails.
     /// - Feather file reading fails.
-    /// - Data deserialization fails.
     /// - Writing to parquet fails.
     ///
     /// # Note
     ///
-    /// This method is currently not fully implemented. It requires:
+    /// This method converts directly between Arrow IPC stream batches and Parquet batches without
+    /// materializing Nautilus data objects. It requires:
     /// - Listing feather files in the specified subdirectory
     /// - Reading feather files (Arrow IPC stream reading)
-    /// - Converting Arrow tables to Nautilus data objects
-    /// - Writing data to the catalog using existing write methods
+    /// - Applying table-only stream conversion transforms
+    /// - Writing Arrow batches to the catalog
     ///
     /// # Examples
     ///
@@ -3509,57 +3666,47 @@ impl ParquetDataCatalog {
         data_name: &str,
         identifiers: Option<&[String]>,
     ) -> anyhow::Result<Vec<String>> {
-        // Construct the base directory path: {subdirectory}/{instance_id}/{data_name}
         let base_dir = make_object_store_path(&self.base_path, &[subdirectory, instance_id]);
-        let data_dir = make_object_store_path(&base_dir, &[data_name]);
 
         let mut files = Vec::new();
 
-        // Try to list files in the data directory (for per-instrument subdirectories)
-        let subdir_prefix = ObjectPath::from(format!("{data_dir}/"));
         let list_result = self.execute_async(async {
-            let mut stream = self.object_store.list(Some(&subdir_prefix));
-            let mut subdirs = Vec::new();
-            let mut flat_files = Vec::new();
+            let prefix = ObjectPath::from(format!("{base_dir}/"));
+            let mut stream = self.object_store.list(Some(&prefix));
+            let mut feather_files = Vec::new();
 
             while let Some(object) = stream.next().await {
                 let object = object?;
                 let path_str = object.location.to_string();
 
-                // Check if this is a subdirectory (per-instrument) or a flat file
-                if let Some(relative_path) = path_str.strip_prefix(&format!("{data_dir}/")) {
-                    if relative_path.ends_with(".feather") {
-                        // Flat file format: {data_name}_*.feather
-                        if path_str.contains(&format!("{data_name}_")) {
-                            flat_files.push(path_str);
-                        }
-                    } else {
-                        // This might be a subdirectory - check if it contains feather files
-                        let subdir_path = format!("{path_str}/");
-                        let mut subdir_stream = self
-                            .object_store
-                            .list(Some(&ObjectPath::from(subdir_path.as_str())));
+                if !path_str.ends_with(".feather") {
+                    continue;
+                }
 
-                        while let Some(subdir_object) = subdir_stream.next().await {
-                            let subdir_object = subdir_object?;
-                            let subdir_file_path = subdir_object.location.to_string();
+                let Some(relative_path) = path_str.strip_prefix(&format!("{base_dir}/")) else {
+                    continue;
+                };
 
-                            if subdir_file_path.ends_with(".feather") {
-                                // Check identifier filter if provided
-                                if let Some(identifiers) = identifiers {
-                                    let subdir_name = relative_path.split('/').next().unwrap_or("");
-                                    if !identifiers.iter().any(|id| subdir_name.contains(id)) {
-                                        continue;
-                                    }
-                                }
-                                subdirs.push(subdir_file_path);
-                            }
+                if let Some(data_relative_path) =
+                    relative_path.strip_prefix(&format!("{data_name}/"))
+                {
+                    if let Some(identifiers) = identifiers {
+                        let identifier_path = data_relative_path
+                            .split_once('/')
+                            .map_or(data_relative_path, |(identifier, _)| identifier);
+
+                        if !Self::stream_identifier_matches(identifier_path, identifiers) {
+                            continue;
                         }
                     }
+
+                    feather_files.push(path_str);
+                } else if Self::is_flat_stream_file(relative_path, data_name) {
+                    feather_files.push(path_str);
                 }
             }
 
-            Ok::<Vec<String>, anyhow::Error>([subdirs, flat_files].concat())
+            Ok::<Vec<String>, anyhow::Error>(feather_files)
         })?;
 
         files.extend(list_result);
@@ -3567,10 +3714,32 @@ impl ParquetDataCatalog {
         Ok(files)
     }
 
-    /// Reads a feather file and returns all RecordBatches.
+    fn is_flat_stream_file(relative_path: &str, data_name: &str) -> bool {
+        if relative_path.contains('/') {
+            return false;
+        }
+
+        let Some(file_stem) = relative_path.strip_suffix(".feather") else {
+            return false;
+        };
+        let Some(timestamp) = file_stem.strip_prefix(&format!("{data_name}_")) else {
+            return false;
+        };
+
+        !timestamp.is_empty() && timestamp.chars().all(|ch| ch.is_ascii_digit())
+    }
+
+    fn stream_identifier_matches(candidate: &str, identifiers: &[String]) -> bool {
+        identifiers.iter().any(|id| {
+            let safe_id = urisafe_instrument_id(id);
+            candidate.contains(id) || candidate.contains(&safe_id)
+        })
+    }
+
+    /// Reads a feather file and returns all `RecordBatches`.
     ///
     /// This function reads an Arrow IPC stream file from the object store
-    /// and returns all RecordBatches contained within it.
+    /// and returns all `RecordBatches` contained within it.
     fn read_feather_file(&self, file_path: &str) -> anyhow::Result<Vec<RecordBatch>> {
         use datafusion::arrow::ipc::reader::StreamReader;
 
@@ -3601,25 +3770,23 @@ impl ParquetDataCatalog {
         Ok(batches)
     }
 
-    /// Converts RecordBatches to Data objects, optionally replacing ts_init with ts_event.
+    /// Converts `RecordBatches` to Data objects, optionally replacing `ts_init` with `ts_event`.
     fn convert_record_batches_to_data<T>(
-        &self,
         batches: Vec<RecordBatch>,
         use_ts_event_for_ts_init: bool,
     ) -> anyhow::Result<Vec<T>>
     where
         T: DecodeDataFromRecordBatch + TryFrom<Data>,
     {
-        self.convert_record_batches_to_data_with_bar_type_conversion(
+        Self::convert_record_batches_to_data_with_bar_type_conversion(
             batches,
             use_ts_event_for_ts_init,
             false,
         )
     }
 
-    /// Converts RecordBatches to Data objects with optional transforms for stream conversion.
+    /// Converts `RecordBatches` to Data objects with optional transforms for stream conversion.
     fn convert_record_batches_to_data_with_bar_type_conversion<T>(
-        &self,
         batches: Vec<RecordBatch>,
         use_ts_event_for_ts_init: bool,
         convert_bar_type_to_external: bool,
@@ -3631,24 +3798,22 @@ impl ParquetDataCatalog {
             return Ok(Vec::new());
         }
 
-        // Get schema and metadata from first batch
         let schema = batches[0].schema();
         let mut metadata = schema.metadata().clone();
 
-        // Convert bar_type from INTERNAL to EXTERNAL if requested
         if convert_bar_type_to_external
             && let Some(bar_type_str) = metadata.get("bar_type").cloned()
             && bar_type_str.ends_with("-INTERNAL")
         {
-            let external = bar_type_str.replace("-INTERNAL", "-EXTERNAL");
-            metadata.insert("bar_type".to_string(), external);
+            metadata.insert(
+                "bar_type".to_string(),
+                bar_type_str.replace("-INTERNAL", "-EXTERNAL"),
+            );
         }
 
-        // Process each batch
         let mut all_data = Vec::new();
 
         for mut batch in batches {
-            // Handle ts_event/ts_init replacement if requested
             if use_ts_event_for_ts_init {
                 let column_names: Vec<String> =
                     schema.fields().iter().map(|f| f.name().clone()).collect();
@@ -3662,31 +3827,24 @@ impl ParquetDataCatalog {
                     .position(|n| n == "ts_init")
                     .ok_or_else(|| anyhow::anyhow!("ts_init column not found"))?;
 
-                // Create new arrays with ts_init replaced by ts_event
                 let mut new_columns = batch.columns().to_vec();
                 new_columns[ts_init_idx] = new_columns[ts_event_idx].clone();
 
-                // Create new batch with updated columns
                 batch = RecordBatch::try_new(schema.clone(), new_columns)
                     .map_err(|e| anyhow::anyhow!("Failed to create new batch: {e}"))?;
             }
 
-            // Decode the batch to Data objects
             let data_vec = T::decode_data_batch(&metadata, batch)
                 .map_err(|e| anyhow::anyhow!("Failed to decode batch: {e}"))?;
 
             all_data.extend(data_vec);
         }
 
-        // Convert Data enum to specific type T
         Ok(to_variant::<T>(all_data))
     }
 
-    /// Converts RecordBatches directly to strongly typed values.
-    fn convert_record_batches_to_typed<T>(
-        &self,
-        batches: Vec<RecordBatch>,
-    ) -> anyhow::Result<Vec<T>>
+    /// Converts `RecordBatches` directly to strongly typed values.
+    fn convert_record_batches_to_typed<T>(batches: Vec<RecordBatch>) -> anyhow::Result<Vec<T>>
     where
         T: DecodeTypedFromRecordBatch,
     {
@@ -3706,20 +3864,12 @@ impl ParquetDataCatalog {
         Ok(all_data)
     }
 
-    fn write_typed_batches<T>(&self, batches: Vec<RecordBatch>) -> anyhow::Result<()>
-    where
-        T: DecodeTypedFromRecordBatch + EncodeToRecordBatch + CatalogPathPrefix + HasTsInit,
-    {
-        let mut data: Vec<T> = self.convert_record_batches_to_typed(batches)?;
-
-        if !is_monotonically_increasing_by_init(&data) {
-            data.sort_by_key(|item| item.ts_init());
-        }
-
-        self.write_to_parquet(data, None, None, None)?;
-        Ok(())
-    }
-
+    /// Converts stream data from feather files to catalog data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stream file discovery, record batch conversion, or catalog
+    /// writes fail.
     pub fn convert_stream_to_data(
         &mut self,
         instance_id: &str,
@@ -3747,205 +3897,300 @@ impl ParquetDataCatalog {
             return Ok(());
         }
 
+        if !Self::is_supported_stream_data_type(&data_name) {
+            anyhow::bail!("Unknown data class: {data_cls}");
+        }
+
         // Process each feather file independently so that each file's identifier
         // (instrument_id or bar_type from schema metadata) is preserved when writing
         // to parquet. This matches the Python _convert_feather_table_to_parquet approach.
-        let convert_bar_type = data_cls == "bars";
-
         for file_path in feather_files {
             let batches = self.read_feather_file(&file_path)?;
-
-            if batches.is_empty() {
-                continue;
-            }
-
-            match data_cls {
-                "quotes" => {
-                    let mut data: Vec<QuoteTick> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "trades" => {
-                    let mut data: Vec<TradeTick> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "order_book_deltas" => {
-                    let mut data: Vec<OrderBookDelta> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "order_book_depths" => {
-                    let mut data: Vec<OrderBookDepth10> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "bars" => {
-                    let mut data: Vec<Bar> = self
-                        .convert_record_batches_to_data_with_bar_type_conversion(
-                            batches,
-                            use_ts_event_for_ts_init,
-                            convert_bar_type,
-                        )?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "index_prices" => {
-                    let mut data: Vec<IndexPriceUpdate> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "mark_prices" => {
-                    let mut data: Vec<MarkPriceUpdate> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "instrument_status" => {
-                    self.write_typed_batches::<InstrumentStatus>(batches)?;
-                }
-                "instrument_closes" => {
-                    let mut data: Vec<InstrumentClose> =
-                        self.convert_record_batches_to_data(batches, use_ts_event_for_ts_init)?;
-
-                    if !is_monotonically_increasing_by_init(&data) {
-                        data.sort_by_key(|d| d.ts_init);
-                    }
-                    self.write_to_parquet(data, None, None, None)?;
-                }
-                "funding_rate_update" => {
-                    self.write_typed_batches::<FundingRateUpdate>(batches)?;
-                }
-                "account_state" => {
-                    self.write_typed_batches::<AccountState>(batches)?;
-                }
-                "order_initialized" => {
-                    self.write_typed_batches::<OrderInitialized>(batches)?;
-                }
-                "order_denied" => {
-                    self.write_typed_batches::<OrderDenied>(batches)?;
-                }
-                "order_emulated" => {
-                    self.write_typed_batches::<OrderEmulated>(batches)?;
-                }
-                "order_submitted" => {
-                    self.write_typed_batches::<OrderSubmitted>(batches)?;
-                }
-                "order_accepted" => {
-                    self.write_typed_batches::<OrderAccepted>(batches)?;
-                }
-                "order_rejected" => {
-                    self.write_typed_batches::<OrderRejected>(batches)?;
-                }
-                "order_pending_cancel" => {
-                    self.write_typed_batches::<OrderPendingCancel>(batches)?;
-                }
-                "order_canceled" => {
-                    self.write_typed_batches::<OrderCanceled>(batches)?;
-                }
-                "order_cancel_rejected" => {
-                    self.write_typed_batches::<OrderCancelRejected>(batches)?;
-                }
-                "order_expired" => {
-                    self.write_typed_batches::<OrderExpired>(batches)?;
-                }
-                "order_triggered" => {
-                    self.write_typed_batches::<OrderTriggered>(batches)?;
-                }
-                "order_pending_update" => {
-                    self.write_typed_batches::<OrderPendingUpdate>(batches)?;
-                }
-                "order_released" => {
-                    self.write_typed_batches::<OrderReleased>(batches)?;
-                }
-                "order_modify_rejected" => {
-                    self.write_typed_batches::<OrderModifyRejected>(batches)?;
-                }
-                "order_updated" => {
-                    self.write_typed_batches::<OrderUpdated>(batches)?;
-                }
-                "order_filled" => {
-                    self.write_typed_batches::<OrderFilled>(batches)?;
-                }
-                "position_opened" => {
-                    self.write_typed_batches::<PositionOpened>(batches)?;
-                }
-                "position_changed" => {
-                    self.write_typed_batches::<PositionChanged>(batches)?;
-                }
-                "position_closed" => {
-                    self.write_typed_batches::<PositionClosed>(batches)?;
-                }
-                "position_adjusted" => {
-                    self.write_typed_batches::<PositionAdjusted>(batches)?;
-                }
-                "order_snapshot" => {
-                    self.write_typed_batches::<OrderSnapshot>(batches)?;
-                }
-                "position_snapshot" => {
-                    self.write_typed_batches::<PositionSnapshot>(batches)?;
-                }
-                "order_status_report" => {
-                    self.write_typed_batches::<OrderStatusReport>(batches)?;
-                }
-                "fill_report" => {
-                    self.write_typed_batches::<FillReport>(batches)?;
-                }
-                "position_status_report" => {
-                    self.write_typed_batches::<PositionStatusReport>(batches)?;
-                }
-                "execution_mass_status" => {
-                    self.write_typed_batches::<ExecutionMassStatus>(batches)?;
-                }
-                _ => {
-                    if data_cls.starts_with("custom/") {
-                        let data =
-                            self.decode_custom_batches_to_data(batches, use_ts_event_for_ts_init)?;
-                        let custom_items: Vec<CustomData> = data
-                            .into_iter()
-                            .filter_map(|d| match d {
-                                Data::Custom(c) => Some(c),
-                                _ => None,
-                            })
-                            .collect();
-
-                        if !custom_items.is_empty() {
-                            self.write_custom_data_batch(custom_items, None, None, None)?;
-                        }
-                    } else {
-                        anyhow::bail!("Unknown data class: {data_cls}");
-                    }
-                }
-            }
+            self.convert_feather_batches_to_parquet(
+                &data_name,
+                &file_path,
+                batches,
+                use_ts_event_for_ts_init,
+            )?;
         }
 
         Ok(())
+    }
+
+    fn convert_feather_batches_to_parquet(
+        &self,
+        data_name: &str,
+        feather_path: &str,
+        batches: Vec<RecordBatch>,
+        use_ts_event_for_ts_init: bool,
+    ) -> anyhow::Result<()> {
+        let Some(batch) = Self::apply_stream_conversion_transforms(
+            batches,
+            use_ts_event_for_ts_init,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to apply stream conversion transforms for {feather_path}: {e}")
+        })?
+        else {
+            return Ok(());
+        };
+
+        let (start_ts, end_ts) = Self::ts_init_range(&batch).map_err(|e| {
+            anyhow::anyhow!("Failed to determine ts_init range for {feather_path}: {e}")
+        })?;
+        let identifier = Self::identifier_from_batch_or_path(&batch, data_name, feather_path);
+        let directory = if let Some(type_name) = data_name.strip_prefix("custom/") {
+            self.make_path_custom_data(type_name, identifier.as_deref())?
+        } else {
+            self.make_path(data_name, identifier.as_deref())?
+        };
+        let filename = timestamps_to_filename(UnixNanos::from(start_ts), UnixNanos::from(end_ts));
+        let path = PathBuf::from(format!("{directory}/{filename}"));
+        let object_path = self.to_object_path(&path.to_string_lossy())?;
+
+        let file_exists = self.execute_async(async {
+            let exists = self.object_store.head(&object_path).await.is_ok();
+            Ok::<_, anyhow::Error>(exists)
+        })?;
+
+        if file_exists {
+            log::info!("File {} already exists, skipping write", path.display());
+            return Ok(());
+        }
+
+        let current_intervals = self.get_directory_intervals(&directory)?;
+        let mut new_intervals = current_intervals.clone();
+        new_intervals.push((start_ts, end_ts));
+
+        if !are_intervals_disjoint(&new_intervals) {
+            anyhow::bail!(
+                "Writing file {filename} with interval ({start_ts}, {end_ts}) would create \
+                non-disjoint intervals. Existing intervals: {current_intervals:?}"
+            );
+        }
+
+        let batches = vec![batch];
+        self.execute_async(async {
+            write_batches_to_object_store(
+                &batches,
+                self.object_store.clone(),
+                &object_path,
+                Some(self.compression),
+                Some(self.max_row_group_size),
+                None,
+            )
+            .await
+        })?;
+
+        Ok(())
+    }
+
+    fn apply_stream_conversion_transforms(
+        mut batches: Vec<RecordBatch>,
+        use_ts_event_for_ts_init: bool,
+    ) -> anyhow::Result<Option<RecordBatch>> {
+        if batches.is_empty() {
+            return Ok(None);
+        }
+
+        let schema = batches[0].schema();
+        let mut metadata = schema.metadata().clone();
+        let mut metadata_changed = false;
+
+        if let Some(bar_type_str) = metadata.get("bar_type").cloned()
+            && bar_type_str.ends_with("-INTERNAL")
+        {
+            metadata.insert(
+                "bar_type".to_string(),
+                bar_type_str.replace("-INTERNAL", "-EXTERNAL"),
+            );
+            metadata_changed = true;
+        }
+
+        let schema = if metadata_changed {
+            Arc::new(schema.as_ref().clone().with_metadata(metadata))
+        } else {
+            schema
+        };
+
+        if use_ts_event_for_ts_init {
+            let ts_event_idx = schema
+                .index_of("ts_event")
+                .map_err(|_| anyhow::anyhow!("ts_event column not found"))?;
+            let ts_init_idx = schema
+                .index_of("ts_init")
+                .map_err(|_| anyhow::anyhow!("ts_init column not found"))?;
+
+            for batch in &mut batches {
+                let mut columns = batch.columns().to_vec();
+                columns[ts_init_idx] = columns[ts_event_idx].clone();
+
+                *batch = RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+                    anyhow::anyhow!("Failed to create stream conversion batch: {e}")
+                })?;
+            }
+        } else if metadata_changed {
+            for batch in &mut batches {
+                *batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).map_err(
+                    |e| anyhow::anyhow!("Failed to create stream conversion batch: {e}"),
+                )?;
+            }
+        }
+
+        let mut batch = concat_batches(&schema, batches.iter())
+            .map_err(|e| anyhow::anyhow!("Failed to concatenate stream batches: {e}"))?;
+
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        if !Self::is_record_batch_monotonic_by_ts_init(&batch)? {
+            let indices = sort_to_indices(
+                Self::ts_init_array(&batch)?,
+                Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to sort stream conversion batch: {e}"))?;
+            batch = take_record_batch(&batch, &indices)
+                .map_err(|e| anyhow::anyhow!("Failed to reorder stream conversion batch: {e}"))?;
+        }
+
+        let ts_init = Self::ts_init_array(&batch)?;
+        if ts_init.null_count() > 0 {
+            anyhow::bail!("ts_init column contains null values");
+        }
+
+        Ok(Some(batch))
+    }
+
+    fn is_record_batch_monotonic_by_ts_init(batch: &RecordBatch) -> anyhow::Result<bool> {
+        let ts_init = Self::ts_init_array(batch)?;
+        if ts_init.null_count() > 0 {
+            anyhow::bail!("ts_init column contains null values");
+        }
+
+        for idx in 1..ts_init.len() {
+            if ts_init.value(idx) < ts_init.value(idx - 1) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn ts_init_range(batch: &RecordBatch) -> anyhow::Result<(u64, u64)> {
+        let ts_init = Self::ts_init_array(batch)?;
+        if ts_init.is_empty() {
+            anyhow::bail!("Cannot convert empty stream batch to parquet");
+        }
+
+        if ts_init.null_count() > 0 {
+            anyhow::bail!("ts_init column contains null values");
+        }
+
+        Ok((ts_init.value(0), ts_init.value(ts_init.len() - 1)))
+    }
+
+    fn ts_init_array(batch: &RecordBatch) -> anyhow::Result<&UInt64Array> {
+        let ts_init_idx = batch
+            .schema()
+            .index_of("ts_init")
+            .map_err(|_| anyhow::anyhow!("ts_init column not found"))?;
+        batch
+            .column(ts_init_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow::anyhow!("ts_init column is not UInt64"))
+    }
+
+    fn identifier_from_batch_or_path(
+        batch: &RecordBatch,
+        data_name: &str,
+        feather_path: &str,
+    ) -> Option<String> {
+        let metadata = batch.schema().metadata().clone();
+        if let Some(bar_type) = metadata.get("bar_type") {
+            return Some(bar_type.clone());
+        }
+
+        if let Some(instrument_id) = metadata.get("instrument_id") {
+            return Some(instrument_id.clone());
+        }
+
+        let parts: Vec<&str> = feather_path.trim_matches('/').split('/').collect();
+        if let Some(type_name) = data_name.strip_prefix("custom/") {
+            return Self::custom_identifier_from_path(&parts, type_name);
+        }
+
+        // Stream data currently uses .../{data_name}/{identifier}/{file}.feather.
+        // Keep this fallback explicit because it depends on data_name being one path segment.
+        if parts.len() >= 3 && parts[parts.len() - 3] == data_name {
+            return Some(parts[parts.len() - 2].to_string());
+        }
+
+        None
+    }
+
+    fn custom_identifier_from_path(parts: &[&str], type_name: &str) -> Option<String> {
+        let type_idx = parts
+            .windows(2)
+            .position(|window| window[0] == "custom" && window[1] == type_name)?
+            + 1;
+        let identifier_start = type_idx + 1;
+        let file_idx = parts.len().checked_sub(1)?;
+
+        if identifier_start >= file_idx {
+            return None;
+        }
+
+        Some(parts[identifier_start..file_idx].join("/"))
+    }
+
+    fn is_supported_stream_data_type(data_name: &str) -> bool {
+        data_name.starts_with("custom/")
+            || matches!(
+                data_name,
+                "quotes"
+                    | "trades"
+                    | "order_book_deltas"
+                    | "order_book_depths"
+                    | "bars"
+                    | "index_prices"
+                    | "mark_prices"
+                    | "option_greeks"
+                    | "instrument_status"
+                    | "instrument_closes"
+                    | "funding_rate_update"
+                    | "account_state"
+                    | "order_initialized"
+                    | "order_denied"
+                    | "order_emulated"
+                    | "order_submitted"
+                    | "order_accepted"
+                    | "order_rejected"
+                    | "order_pending_cancel"
+                    | "order_canceled"
+                    | "order_cancel_rejected"
+                    | "order_expired"
+                    | "order_triggered"
+                    | "order_pending_update"
+                    | "order_released"
+                    | "order_modify_rejected"
+                    | "order_updated"
+                    | "order_filled"
+                    | "position_opened"
+                    | "position_changed"
+                    | "position_closed"
+                    | "position_adjusted"
+                    | "order_snapshot"
+                    | "position_snapshot"
+                    | "order_status_report"
+                    | "fill_report"
+                    | "position_status_report"
+                    | "execution_mass_status"
+            )
     }
 }
 
@@ -4006,6 +4251,7 @@ impl_catalog_path_prefix!(IndexPriceUpdate, "index_prices");
 impl_catalog_path_prefix!(MarkPriceUpdate, "mark_prices");
 impl_catalog_path_prefix!(FundingRateUpdate, "funding_rate_update");
 impl_catalog_path_prefix!(InstrumentStatus, "instrument_status");
+impl_catalog_path_prefix!(OptionGreeks, "option_greeks");
 impl_catalog_path_prefix!(InstrumentClose, "instrument_closes");
 impl_catalog_path_prefix!(InstrumentAny, "instruments");
 impl_catalog_path_prefix!(AccountState, "account_state");
@@ -4183,6 +4429,7 @@ fn iso_to_unix_nanos(iso_timestamp: &str) -> anyhow::Result<u64> {
 /// assert_eq!(urisafe_instrument_id("EUR-USD"), "EUR-USD");
 /// assert_eq!(urisafe_instrument_id("^SPX.CBOE"), "_SPX.CBOE");
 /// ```
+#[must_use]
 pub fn urisafe_instrument_id(instrument_id: &str) -> String {
     instrument_id.replace('/', "").replace('^', "_")
 }
@@ -4231,12 +4478,19 @@ pub fn extract_identifier_from_path(file_path: &str) -> String {
 
 /// Makes an identifier safe for use in SQL table names.
 ///
-/// Removes forward slashes, replaces dots, hyphens, and spaces with underscores, and converts to lowercase.
+/// Keeps ASCII alphanumerics and underscores; replaces everything else with `_`, then lowercases.
 #[must_use]
 pub fn make_sql_safe_identifier(identifier: &str) -> String {
     urisafe_instrument_id(identifier)
-        .replace(['.', '-', ' ', '%'], "_")
-        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Extracts the filename from a file path and makes it SQL-safe.
@@ -4271,8 +4525,8 @@ pub fn extract_sql_safe_filename(file_path: &str) -> String {
 ///
 /// # Arguments
 ///
-/// * `base_path` - The base directory path
-/// * `components` - Path components to join
+/// - `base_path` - The base directory path
+/// - `components` - Path components to join
 ///
 /// # Returns
 ///
@@ -4301,8 +4555,8 @@ pub fn make_local_path<P: AsRef<Path>>(base_path: P, components: &[&str]) -> Pat
 ///
 /// # Arguments
 ///
-/// * `base_path` - The base path (can be empty)
-/// * `components` - Path components to join
+/// - `base_path` - The base path (can be empty)
+/// - `components` - Path components to join
 ///
 /// # Returns
 ///
@@ -4351,8 +4605,8 @@ pub fn make_object_store_path(base_path: &str, components: &[&str]) -> String {
 ///
 /// # Arguments
 ///
-/// * `base_path` - The base path (can be empty)
-/// * `components` - Path components to join (owned strings)
+/// - `base_path` - The base path (can be empty)
+/// - `components` - Path components to join (owned strings)
 ///
 /// # Returns
 ///
@@ -4394,7 +4648,7 @@ pub fn make_object_store_path_owned(base_path: &str, components: Vec<String>) ->
 ///
 /// # Arguments
 ///
-/// * `local_path` - The local `PathBuf` to convert
+/// - `local_path` - The local `PathBuf` to convert
 ///
 /// # Returns
 ///
@@ -4421,7 +4675,7 @@ pub fn local_to_object_store_path(local_path: &Path) -> String {
 ///
 /// # Arguments
 ///
-/// * `path_str` - The path string to parse
+/// - `path_str` - The path string to parse
 ///
 /// # Returns
 ///

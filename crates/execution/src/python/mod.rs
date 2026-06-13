@@ -31,7 +31,7 @@ use pyo3::prelude::*;
 #[pymodule]
 pub fn execution(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(
-        reconciliation::py_adjust_fills_for_partial_window,
+        reconciliation::py_process_mass_status_for_reconciliation,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
@@ -51,6 +51,8 @@ pub fn execution(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::models::fee::FixedFeeModel>()?;
     m.add_class::<crate::models::fee::MakerTakerFeeModel>()?;
     m.add_class::<crate::models::fee::PerContractFeeModel>()?;
+    m.add_class::<crate::models::fee::CappedOptionFeeModel>()?;
+    m.add_class::<crate::models::fee::TieredNotionalOptionFeeModel>()?;
     m.add_class::<crate::models::fill::DefaultFillModel>()?;
     m.add_class::<crate::models::fill::BestPriceFillModel>()?;
     m.add_class::<crate::models::fill::OneTickSlippageFillModel>()?;

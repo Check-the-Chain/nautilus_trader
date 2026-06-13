@@ -99,6 +99,9 @@ pub struct InteractiveBrokersDataClientConfig {
     /// Whether to use batch quotes (reqMktData) by default instead of tick-by-tick.
     #[builder(default = true)]
     pub batch_quotes: bool,
+    /// Instrument provider configuration.
+    #[builder(default)]
+    pub instrument_provider: InteractiveBrokersInstrumentProviderConfig,
 }
 
 impl Default for InteractiveBrokersDataClientConfig {
@@ -142,6 +145,9 @@ pub struct InteractiveBrokersExecClientConfig {
     /// Whether to track option exercise from position updates.
     #[builder(default)]
     pub track_option_exercise_from_position_update: bool,
+    /// Instrument provider configuration.
+    #[builder(default)]
+    pub instrument_provider: InteractiveBrokersInstrumentProviderConfig,
 }
 
 impl Default for InteractiveBrokersExecClientConfig {
@@ -210,6 +216,10 @@ pub struct InteractiveBrokersInstrumentProviderConfig {
     /// Security types to filter out.
     #[builder(default)]
     pub filter_sec_types: HashSet<String>,
+    /// Fully-qualified Python callable path for custom instrument filtering.
+    ///
+    /// Configuring this without the Python feature enabled is an error.
+    pub filter_callable: Option<String>,
     /// Path to cache file for persistent instrument caching (equivalent to pickle_path in Python).
     /// If provided, instruments will be cached to disk and loaded from cache if still valid.
     pub cache_path: Option<String>,

@@ -72,17 +72,31 @@ impl TwapAlgorithm {
     }
 
     /// Completes the execution sequence for a primary order.
-    fn complete_sequence(&mut self, primary_id: &ClientOrderId) {
+    fn complete_sequence(&mut self, primary_id: ClientOrderId) {
         let timer_name = primary_id.as_str();
         if self.core.clock().timer_names().contains(&timer_name) {
             self.core.clock().cancel_timer(timer_name);
         }
-        self.scheduled_sizes.remove(primary_id);
+        self.scheduled_sizes.remove(&primary_id);
         log::info!("Completed TWAP execution for {primary_id}");
     }
 }
 
-impl DataActor for TwapAlgorithm {}
+// The clock and component lifecycle dispatch through the `DataActor` hooks,
+// so forward them to the `ExecutionAlgorithm` implementations.
+impl DataActor for TwapAlgorithm {
+    fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
+        ExecutionAlgorithm::on_time_event(self, event)
+    }
+
+    fn on_stop(&mut self) -> anyhow::Result<()> {
+        ExecutionAlgorithm::on_stop(self)
+    }
+
+    fn on_reset(&mut self) -> anyhow::Result<()> {
+        ExecutionAlgorithm::on_reset(self)
+    }
+}
 
 nautilus_actor!(TwapAlgorithm);
 
@@ -213,11 +227,14 @@ impl ExecutionAlgorithm for TwapAlgorithm {
 
         log::info!("Order execution size schedule: {scheduled_sizes:?}");
 
-        // Add primary order to cache so on_time_event can retrieve it
+        // Add primary order to cache so on_time_event can retrieve it,
+        // it is already present when routed through the engine's submit path.
         {
             let cache_rc = self.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            cache.add_order(order.clone(), None, None, false)?;
+            if !cache.order_exists(&primary_id) {
+                cache.add_order(order.clone(), None, None, false)?;
+            }
         }
 
         self.scheduled_sizes
@@ -232,7 +249,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         // Single slice: submit the primary order directly
         if is_single_slice {
             self.submit_order(order, None, None)?;
-            self.complete_sequence(&primary_id);
+            self.complete_sequence(primary_id);
             return Ok(());
         }
 
@@ -250,12 +267,6 @@ impl ExecutionAlgorithm for TwapAlgorithm {
             true,
         );
         self.submit_order(spawned.into(), None, None)?;
-
-        {
-            let cache_rc = self.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&order)?;
-        }
 
         self.core.clock().set_timer(
             primary_id.as_str(),
@@ -281,7 +292,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
 
         let primary = {
             let cache = self.core.cache();
-            cache.order(&primary_id).cloned()
+            cache.order(&primary_id).map(|o| o.clone())
         };
 
         let Some(primary) = primary else {
@@ -290,7 +301,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         };
 
         if primary.is_closed() {
-            self.complete_sequence(&primary_id);
+            self.complete_sequence(primary_id);
             return Ok(());
         }
 
@@ -310,7 +321,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         // Final slice: submit the primary order (already reduced to remaining quantity)
         if is_final_slice {
             self.submit_order(primary, None, None)?;
-            self.complete_sequence(&primary_id);
+            self.complete_sequence(primary_id);
             return Ok(());
         }
 
@@ -328,12 +339,6 @@ impl ExecutionAlgorithm for TwapAlgorithm {
             true,
         );
         self.submit_order(spawned.into(), None, None)?;
-
-        {
-            let cache_rc = self.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&primary)?;
-        }
 
         Ok(())
     }
@@ -365,7 +370,7 @@ mod tests {
     use nautilus_core::UUID4;
     use nautilus_model::{
         enums::{OrderSide, TimeInForce},
-        events::OrderEventAny,
+        events::{OrderEventAny, order::spec::OrderCanceledSpec},
         identifiers::{ExecAlgorithmId, InstrumentId, StrategyId, TraderId},
         orders::{LimitOrder, MarketOrder},
         types::Price,
@@ -473,7 +478,8 @@ mod tests {
 
         assert!(!algo.scheduled_sizes.is_empty());
 
-        ExecutionAlgorithm::on_reset(&mut algo).unwrap();
+        // Dispatch through the DataActor entry point the component lifecycle uses
+        DataActor::on_reset(&mut algo).unwrap();
 
         assert!(algo.scheduled_sizes.is_empty());
     }
@@ -619,6 +625,63 @@ mod tests {
     }
 
     #[rstest]
+    fn test_twap_reduces_cached_primary_after_first_child_spawn() {
+        let mut algo = create_twap_algorithm();
+        register_algorithm(&mut algo);
+
+        add_instrument_to_cache(&algo);
+
+        let mut params = IndexMap::new();
+        params.insert(Ustr::from("horizon_secs"), Ustr::from("60"));
+        params.insert(Ustr::from("interval_secs"), Ustr::from("30"));
+
+        let order = create_market_order_with_params_and_qty(params, Quantity::from("1.2"));
+        let primary_id = order.client_order_id();
+
+        algo.on_order(order).unwrap();
+
+        let (primary, spawned) = {
+            let cache = algo.core.cache();
+            let primary = cache.order(&primary_id).map(|o| o.clone()).unwrap();
+            let spawned = cache
+                .order(&ClientOrderId::from("O-001-E1"))
+                .map(|o| o.clone())
+                .unwrap();
+            (primary, spawned)
+        };
+
+        assert_eq!(primary.quantity(), Quantity::from("0.6"));
+        assert_eq!(spawned.quantity(), Quantity::from("0.6"));
+        assert_eq!(spawned.exec_spawn_id(), Some(primary_id));
+    }
+
+    #[rstest]
+    fn test_twap_on_order_accepts_already_cached_primary() {
+        let mut algo = create_twap_algorithm();
+        register_algorithm(&mut algo);
+
+        add_instrument_to_cache(&algo);
+
+        let mut params = IndexMap::new();
+        params.insert(Ustr::from("horizon_secs"), Ustr::from("60"));
+        params.insert(Ustr::from("interval_secs"), Ustr::from("20"));
+
+        let order = create_market_order_with_params_and_qty(params, Quantity::from("1.2"));
+        let primary_id = order.client_order_id();
+
+        // The engine submit path caches the primary before routing to the algorithm
+        {
+            let cache_rc = algo.core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            cache.add_order(order.clone(), None, None, false).unwrap();
+        }
+
+        algo.on_order(order).unwrap();
+
+        assert_eq!(algo.scheduled_sizes.get(&primary_id).unwrap().len(), 2);
+    }
+
+    #[rstest]
     fn test_twap_calculates_size_schedule_with_remainder() {
         let mut algo = create_twap_algorithm();
         register_algorithm(&mut algo);
@@ -686,6 +749,30 @@ mod tests {
     }
 
     #[rstest]
+    fn test_twap_data_actor_dispatch_spawns_next_slice() {
+        let mut algo = create_twap_algorithm();
+        register_algorithm(&mut algo);
+
+        add_instrument_to_cache(&algo);
+
+        let mut params = IndexMap::new();
+        params.insert(Ustr::from("horizon_secs"), Ustr::from("60"));
+        params.insert(Ustr::from("interval_secs"), Ustr::from("20"));
+
+        let order = create_market_order_with_params_and_qty(params, Quantity::from("1.2"));
+        let primary_id = order.client_order_id();
+
+        algo.on_order(order).unwrap();
+        assert_eq!(algo.scheduled_sizes.get(&primary_id).unwrap().len(), 2);
+
+        // Dispatch through the DataActor entry point the clock callback uses
+        let event = TimeEvent::new(primary_id.inner(), UUID4::new(), 0.into(), 0.into());
+        algo.handle_time_event(&event);
+
+        assert_eq!(algo.scheduled_sizes.get(&primary_id).unwrap().len(), 1);
+    }
+
+    #[rstest]
     fn test_twap_on_time_event_completes_on_final_slice() {
         let mut algo = create_twap_algorithm();
         register_algorithm(&mut algo);
@@ -713,8 +800,6 @@ mod tests {
 
     #[rstest]
     fn test_twap_on_time_event_completes_when_primary_closed() {
-        use nautilus_model::events::OrderCanceled;
-
         let mut algo = create_twap_algorithm();
         register_algorithm(&mut algo);
 
@@ -734,22 +819,17 @@ mod tests {
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            let mut primary = cache.order(&primary_id).cloned().unwrap();
+            let primary = cache.order(&primary_id).map(|o| o.clone()).unwrap();
 
-            let canceled = OrderCanceled::new(
-                primary.trader_id(),
-                primary.strategy_id(),
-                primary.instrument_id(),
-                primary.client_order_id(),
-                UUID4::new(),
-                0.into(),
-                0.into(),
-                false,
-                None,
-                None,
-            );
-            primary.apply(OrderEventAny::Canceled(canceled)).unwrap();
-            cache.update_order(&primary).unwrap();
+            let canceled = OrderCanceledSpec::builder()
+                .trader_id(primary.trader_id())
+                .strategy_id(primary.strategy_id())
+                .instrument_id(primary.instrument_id())
+                .client_order_id(primary.client_order_id())
+                .build();
+            cache
+                .update_order(&OrderEventAny::Canceled(canceled))
+                .unwrap();
         }
 
         // Timer fires but primary is closed
@@ -784,8 +864,8 @@ mod tests {
                 .contains(&primary_id.as_str())
         );
 
-        // Stop the algorithm
-        ExecutionAlgorithm::on_stop(&mut algo).unwrap();
+        // Stop through the DataActor entry point the component lifecycle uses
+        DataActor::on_stop(&mut algo).unwrap();
 
         // Timer should be canceled
         assert!(algo.core.clock().timer_names().is_empty());

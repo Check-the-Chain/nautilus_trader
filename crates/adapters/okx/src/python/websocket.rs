@@ -48,7 +48,7 @@ use futures_util::StreamExt;
 use nautilus_common::{cache::quote::QuoteCache, live::get_runtime};
 use nautilus_core::{
     UUID4, UnixNanos,
-    python::{call_python_threadsafe, to_pyruntime_err, to_pyvalue_err},
+    python::{call_python_threadsafe, params::value_to_pyobject, to_pyruntime_err, to_pyvalue_err},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
@@ -64,7 +64,11 @@ use nautilus_model::{
     types::{Money, Price, Quantity},
 };
 use nautilus_network::websocket::TransportBackend;
-use pyo3::{IntoPyObjectExt, prelude::*, types::PyDict};
+use pyo3::{
+    IntoPyObjectExt,
+    prelude::*,
+    types::{PyDict, PyTuple},
+};
 use ustr::Ustr;
 
 use super::{extract_optional_string, extract_optional_trigger_type};
@@ -78,10 +82,11 @@ use crate::{
         models::OKXInstrument,
         parse::{
             okx_status_to_market_action, parse_account_state, parse_instrument_any,
-            parse_millisecond_timestamp, parse_position_status_report, parse_price, parse_quantity,
+            parse_instrument_id, parse_millisecond_timestamp, parse_position_status_report,
+            parse_price, parse_quantity,
         },
     },
-    http::models::{OKXAccount, OKXPosition},
+    http::models::{OKXAccount, OKXPosition, OKXSpreadOrder},
     websocket::{
         OKXWebSocketClient,
         enums::{OKXWsChannel, OKXWsOperation},
@@ -93,10 +98,116 @@ use crate::{
         parse::{
             extract_fees_from_cached_instrument, parse_algo_order_msg, parse_book_msg_vec,
             parse_index_price_msg_vec, parse_option_summary_greeks, parse_order_msg_vec,
-            parse_ws_message_data,
+            parse_spread_order_msg, parse_ws_message_data,
         },
     },
 };
+
+type PyBatchSubmitOrder = (
+    OKXInstrumentType,
+    InstrumentId,
+    OKXTradeMode,
+    ClientOrderId,
+    OrderSide,
+    OrderType,
+    Quantity,
+    Option<PositionSide>,
+    Option<Price>,
+    Option<Price>,
+    Option<bool>,
+    Option<bool>,
+    Option<String>,
+    Option<String>,
+);
+
+type PyLegacyBatchSubmitOrder = (
+    OKXInstrumentType,
+    InstrumentId,
+    OKXTradeMode,
+    ClientOrderId,
+    OrderSide,
+    OrderType,
+    Quantity,
+    Option<PositionSide>,
+    Option<Price>,
+    Option<Price>,
+    Option<bool>,
+    Option<bool>,
+);
+
+type PyBatchModifyOrder = (
+    String,
+    InstrumentId,
+    ClientOrderId,
+    ClientOrderId,
+    Option<Price>,
+    Option<Quantity>,
+    Option<String>,
+);
+
+type PyLegacyBatchModifyOrder = (
+    String,
+    InstrumentId,
+    ClientOrderId,
+    ClientOrderId,
+    Option<Price>,
+    Option<Quantity>,
+);
+
+fn extract_batch_submit_order(py: Python<'_>, obj: &Py<PyAny>) -> PyResult<PyBatchSubmitOrder> {
+    if let Ok(tuple) = obj.bind(py).cast::<PyTuple>()
+        && tuple.len() == 14
+    {
+        return Ok((
+            tuple.get_item(0)?.extract()?,
+            tuple.get_item(1)?.extract()?,
+            tuple.get_item(2)?.extract()?,
+            tuple.get_item(3)?.extract()?,
+            tuple.get_item(4)?.extract()?,
+            tuple.get_item(5)?.extract()?,
+            tuple.get_item(6)?.extract()?,
+            tuple.get_item(7)?.extract()?,
+            tuple.get_item(8)?.extract()?,
+            tuple.get_item(9)?.extract()?,
+            tuple.get_item(10)?.extract()?,
+            tuple.get_item(11)?.extract()?,
+            tuple.get_item(12)?.extract()?,
+            tuple.get_item(13)?.extract()?,
+        ));
+    }
+
+    let (
+        instrument_type,
+        instrument_id,
+        td_mode,
+        client_order_id,
+        order_side,
+        order_type,
+        quantity,
+        position_side,
+        price,
+        trigger_price,
+        post_only,
+        reduce_only,
+    ): PyLegacyBatchSubmitOrder = obj.extract(py).map_err(to_pyruntime_err)?;
+
+    Ok((
+        instrument_type,
+        instrument_id,
+        td_mode,
+        client_order_id,
+        order_side,
+        order_type,
+        quantity,
+        position_side,
+        price,
+        trigger_price,
+        post_only,
+        reduce_only,
+        None,
+        None,
+    ))
+}
 
 fn parse_attach_algo_ords(
     py: Python<'_>,
@@ -138,6 +249,30 @@ fn parse_attach_algo_ords(
                     if let Some(value) = extract_optional_trigger_type(dict, "tp_trigger_px_type")?
                     {
                         builder.tp_trigger_px_type(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "callback_ratio")? {
+                        builder.callback_ratio(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "callback_spread")? {
+                        builder.callback_spread(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "active_px")? {
+                        builder.active_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "new_callback_ratio")? {
+                        builder.new_callback_ratio(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "new_callback_spread")? {
+                        builder.new_callback_spread(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "new_active_px")? {
+                        builder.new_active_px(value);
                     }
 
                     builder.build().map_err(to_pyvalue_err)
@@ -400,6 +535,17 @@ impl OKXWebSocketClient {
                                 &callback,
                             );
                         }
+                        OKXWsMessage::SpreadOrders(order_msgs) => {
+                            handle_spread_orders(
+                                &order_msgs,
+                                account_id,
+                                &instruments_by_symbol,
+                                &mut filled_qty_cache,
+                                clock,
+                                &call_soon,
+                                &callback,
+                            );
+                        }
                         OKXWsMessage::AlgoOrders(algo_msgs) => {
                             handle_algo_orders(
                                 algo_msgs,
@@ -499,7 +645,7 @@ impl OKXWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.close().await {
-                log::error!("Error on close: {e}");
+                log::warn!("Error on close: {e}");
             }
             Ok(())
         })
@@ -964,6 +1110,36 @@ impl OKXWebSocketClient {
         })
     }
 
+    #[pyo3(name = "subscribe_event_contract_markets")]
+    fn py_subscribe_event_contract_markets<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_event_contract_markets().await {
+                log::error!("Failed to subscribe to event contract markets: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_event_contract_markets")]
+    fn py_unsubscribe_event_contract_markets<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_event_contract_markets().await {
+                log::error!("Failed to unsubscribe from event contract markets: {e}");
+            }
+            Ok(())
+        })
+    }
+
     #[pyo3(name = "subscribe_orders")]
     fn py_subscribe_orders<'py>(
         &self,
@@ -991,6 +1167,30 @@ impl OKXWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.unsubscribe_orders(instrument_type).await {
                 log::error!("Failed to unsubscribe from orders '{instrument_type}': {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "subscribe_spread_orders")]
+    fn py_subscribe_spread_orders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_spread_orders().await {
+                log::error!("Failed to subscribe to spread orders: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_spread_orders")]
+    fn py_unsubscribe_spread_orders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_spread_orders().await {
+                log::error!("Failed to unsubscribe from spread orders: {e}");
             }
             Ok(())
         })
@@ -1136,6 +1336,9 @@ impl OKXWebSocketClient {
         attach_algo_ords=None,
         px_usd=None,
         px_vol=None,
+        speed_bump=None,
+        outcome=None,
+        slippage_pct=None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
@@ -1159,6 +1362,9 @@ impl OKXWebSocketClient {
         attach_algo_ords: Option<Vec<Py<PyDict>>>,
         px_usd: Option<String>,
         px_vol: Option<String>,
+        speed_bump: Option<String>,
+        outcome: Option<String>,
+        slippage_pct: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let attach_algo_ords = parse_attach_algo_ords(py, attach_algo_ords)?;
         let client = self.clone();
@@ -1184,6 +1390,9 @@ impl OKXWebSocketClient {
                     attach_algo_ords,
                     px_usd,
                     px_vol,
+                    speed_bump,
+                    outcome,
+                    slippage_pct,
                 )
                 .await
                 .map_err(to_pyvalue_err)
@@ -1233,6 +1442,7 @@ impl OKXWebSocketClient {
         quantity=None,
         new_px_usd=None,
         new_px_vol=None,
+        speed_bump=None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_modify_order<'py>(
@@ -1247,6 +1457,7 @@ impl OKXWebSocketClient {
         quantity: Option<Quantity>,
         new_px_usd: Option<String>,
         new_px_vol: Option<String>,
+        speed_bump: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -1262,13 +1473,13 @@ impl OKXWebSocketClient {
                     venue_order_id,
                     new_px_usd,
                     new_px_vol,
+                    speed_bump,
                 )
                 .await
                 .map_err(to_pyvalue_err)
         })
     }
 
-    #[expect(clippy::type_complexity)]
     #[pyo3(name = "batch_submit_orders")]
     fn py_batch_submit_orders<'py>(
         &self,
@@ -1291,20 +1502,9 @@ impl OKXWebSocketClient {
                 trigger_price,
                 post_only,
                 reduce_only,
-            ): (
-                OKXInstrumentType,
-                InstrumentId,
-                OKXTradeMode,
-                ClientOrderId,
-                OrderSide,
-                OrderType,
-                Quantity,
-                Option<PositionSide>,
-                Option<Price>,
-                Option<Price>,
-                Option<bool>,
-                Option<bool>,
-            ) = obj.extract(py).map_err(to_pyruntime_err)?;
+                speed_bump,
+                outcome,
+            ) = extract_batch_submit_order(py, &obj)?;
 
             domain_orders.push((
                 instrument_type,
@@ -1319,6 +1519,8 @@ impl OKXWebSocketClient {
                 trigger_price,
                 post_only,
                 reduce_only,
+                speed_bump,
+                outcome,
             ));
         }
 
@@ -1369,6 +1571,9 @@ impl OKXWebSocketClient {
         let mut domain_orders = Vec::with_capacity(orders.len());
 
         for obj in orders {
+            let extracted_with_event_params: PyResult<PyBatchModifyOrder> =
+                obj.extract(py).map_err(to_pyruntime_err);
+
             let (
                 instrument_type,
                 instrument_id,
@@ -1376,14 +1581,29 @@ impl OKXWebSocketClient {
                 new_client_order_id,
                 price,
                 quantity,
-            ): (
-                String,
-                InstrumentId,
-                ClientOrderId,
-                ClientOrderId,
-                Option<Price>,
-                Option<Quantity>,
-            ) = obj.extract(py).map_err(to_pyruntime_err)?;
+                speed_bump,
+            ) = if let Ok(values) = extracted_with_event_params {
+                values
+            } else {
+                let (
+                    instrument_type,
+                    instrument_id,
+                    client_order_id,
+                    new_client_order_id,
+                    price,
+                    quantity,
+                ): PyLegacyBatchModifyOrder = obj.extract(py).map_err(to_pyruntime_err)?;
+
+                (
+                    instrument_type,
+                    instrument_id,
+                    client_order_id,
+                    new_client_order_id,
+                    price,
+                    quantity,
+                    None,
+                )
+            };
             let inst_type =
                 OKXInstrumentType::from_str(&instrument_type).map_err(to_pyvalue_err)?;
             domain_orders.push((
@@ -1393,6 +1613,7 @@ impl OKXWebSocketClient {
                 new_client_order_id,
                 price,
                 quantity,
+                speed_bump,
             ));
         }
 
@@ -1542,6 +1763,11 @@ fn handle_channel_data(
         return;
     }
 
+    if matches!(channel, OKXWsChannel::EventContractMarkets) {
+        dispatch_json_value_to_python(&data, call_soon, callback);
+        return;
+    }
+
     let Some(inst_id) = inst_id else { return };
 
     if matches!(channel, OKXWsChannel::IndexTickers) {
@@ -1686,7 +1912,7 @@ fn handle_instruments(
         let status_action = okx_status_to_market_action(okx_inst.state);
         let is_live = matches!(okx_inst.state, OKXInstrumentStatus::Live);
 
-        if let Ok(Some(inst_any)) = parse_instrument_any(
+        match parse_instrument_any(
             &okx_inst,
             margin_init,
             margin_maint,
@@ -1694,23 +1920,60 @@ fn handle_instruments(
             taker_fee,
             ts_init,
         ) {
-            let instrument_id = inst_any.id();
-            instruments_by_symbol.insert(inst_any.symbol().inner(), inst_any.clone());
-            call_python_with_data(call_soon, callback, |py| {
-                instrument_any_to_pyobject(py, inst_any)
-            });
-            let status = InstrumentStatus::new(
-                instrument_id,
-                status_action,
-                ts_init,
-                ts_init,
-                None,
-                None,
-                Some(is_live),
-                None,
-                None,
-            );
-            call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+            Ok(Some(inst_any)) => {
+                let instrument_id = inst_any.id();
+                instruments_by_symbol.insert(inst_any.symbol().inner(), inst_any.clone());
+                call_python_with_data(call_soon, callback, |py| {
+                    instrument_any_to_pyobject(py, inst_any)
+                });
+                let status = InstrumentStatus::new(
+                    instrument_id,
+                    status_action,
+                    ts_init,
+                    ts_init,
+                    None,
+                    None,
+                    Some(is_live),
+                    None,
+                    None,
+                );
+                call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+            }
+            Ok(None) => {
+                let instrument_id = instruments_by_symbol
+                    .get(&inst_key)
+                    .map_or_else(|| parse_instrument_id(inst_key), |i| i.id());
+                let status = InstrumentStatus::new(
+                    instrument_id,
+                    status_action,
+                    ts_init,
+                    ts_init,
+                    None,
+                    None,
+                    Some(is_live),
+                    None,
+                    None,
+                );
+                call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+            }
+            Err(e) => {
+                log::warn!("Failed to parse instrument {}: {e}", okx_inst.inst_id);
+                let instrument_id = instruments_by_symbol
+                    .get(&inst_key)
+                    .map_or_else(|| parse_instrument_id(inst_key), |i| i.id());
+                let status = InstrumentStatus::new(
+                    instrument_id,
+                    status_action,
+                    ts_init,
+                    ts_init,
+                    None,
+                    None,
+                    Some(is_live),
+                    None,
+                    None,
+                );
+                call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+            }
         }
     }
 }
@@ -1743,6 +2006,43 @@ fn handle_orders(
             log::error!("Failed to parse order messages: {e}");
         }
     }
+}
+
+fn handle_spread_orders(
+    order_msgs: &[OKXSpreadOrder],
+    account_id: AccountId,
+    instruments_by_symbol: &AHashMap<Ustr, InstrumentAny>,
+    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    clock: &AtomicTime,
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+) {
+    let ts_init = clock.get_time_ns();
+    let mut reports = Vec::with_capacity(order_msgs.len());
+
+    for msg in order_msgs {
+        match parse_spread_order_msg(
+            msg,
+            account_id,
+            instruments_by_symbol,
+            filled_qty_cache,
+            ts_init,
+        ) {
+            Ok(report) => {
+                if let Some(instrument) = instruments_by_symbol.get(&msg.sprd_id)
+                    && !msg.acc_fill_sz.is_empty()
+                    && msg.acc_fill_sz != "0"
+                    && let Ok(qty) = parse_quantity(&msg.acc_fill_sz, instrument.size_precision())
+                {
+                    filled_qty_cache.insert(msg.ord_id, qty);
+                }
+                reports.push(report);
+            }
+            Err(e) => log::error!("Failed to parse spread order message: {e}"),
+        }
+    }
+
+    dispatch_execution_reports_to_python(reports, call_soon, callback);
 }
 
 fn handle_algo_orders(
@@ -2070,6 +2370,14 @@ where
     });
 }
 
+fn dispatch_json_value_to_python(
+    data: &serde_json::Value,
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+) {
+    call_python_with_data(call_soon, callback, |py| value_to_pyobject(py, data));
+}
+
 fn dispatch_nautilus_ws_msg_to_python(
     msg: NautilusWsMessage,
     call_soon: &Py<PyAny>,
@@ -2101,6 +2409,12 @@ fn dispatch_nautilus_ws_msg_to_python(
             if let Some(status) = status {
                 call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
             }
+        }
+        NautilusWsMessage::InstrumentStatus(status) => {
+            call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+        }
+        NautilusWsMessage::Raw(data) => {
+            dispatch_json_value_to_python(&data, call_soon, callback);
         }
         _ => {}
     }

@@ -28,8 +28,10 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            SubscribeBookDeltas, SubscribeInstrumentStatus, SubscribeTrades, UnsubscribeBookDeltas,
-            UnsubscribeInstrumentStatus, UnsubscribeTrades,
+            SubscribeBookDeltas, SubscribeInstrumentClose, SubscribeInstrumentStatus,
+            SubscribeTrades, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeCustomData,
+            UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
+            UnsubscribeInstruments, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
     providers::InstrumentProvider,
@@ -42,7 +44,7 @@ use nautilus_model::{
     },
     identifiers::{ClientId, InstrumentId, TradeId, Venue},
     instruments::{Instrument, InstrumentAny},
-    types::{Currency, Money, Price, Quantity},
+    types::{Currency, Money},
 };
 use nautilus_network::socket::TcpMessageHandler;
 use rust_decimal::Decimal;
@@ -50,14 +52,12 @@ use tokio::task::JoinHandle;
 
 use crate::{
     common::{
-        consts::{
-            BETFAIR_PRICE_PRECISION, BETFAIR_QUANTITY_PRECISION, BETFAIR_RACE_STREAM_HOST,
-            BETFAIR_VENUE,
-        },
+        consts::{BETFAIR_RACE_STREAM_HOST, BETFAIR_VENUE},
         credential::BetfairCredential,
         enums::{MarketDataFilterField, MarketStatus},
         parse::{
-            extract_market_id, make_instrument_id, parse_market_definition, parse_millis_timestamp,
+            extract_market_id, make_instrument_id, parse_betfair_price, parse_betfair_quantity,
+            parse_market_definition, parse_millis_timestamp,
         },
     },
     config::BetfairDataConfig,
@@ -322,26 +322,21 @@ impl BetfairDataClient {
                                             volumes.get(&key).copied().unwrap_or(Decimal::ZERO);
 
                                         if pv.volume <= prev_volume {
+                                            volumes.insert(key, pv.volume);
                                             continue;
                                         }
 
                                         let trade_volume = pv.volume - prev_volume;
                                         volumes.insert(key, pv.volume);
 
-                                        let price = match Price::from_decimal_dp(
-                                            pv.price,
-                                            BETFAIR_PRICE_PRECISION,
-                                        ) {
+                                        let price = match parse_betfair_price(pv.price) {
                                             Ok(p) => p,
                                             Err(e) => {
                                                 log::warn!("Invalid trade price: {e}");
                                                 continue;
                                             }
                                         };
-                                        let size = match Quantity::from_decimal_dp(
-                                            trade_volume,
-                                            BETFAIR_QUANTITY_PRECISION,
-                                        ) {
+                                        let size = match parse_betfair_quantity(trade_volume) {
                                             Ok(q) => q,
                                             Err(e) => {
                                                 log::warn!("Invalid trade size: {e}");
@@ -444,7 +439,7 @@ impl BetfairDataClient {
                 }
                 StreamMessage::RaceChange(rcm) => {
                     if let Some(race_changes) = &rcm.rc {
-                        let fallback_ts = parse_millis_timestamp(rcm.pt);
+                        let ts_init = parse_millis_timestamp(rcm.pt);
 
                         for rc in race_changes {
                             let race_id = rc.id.as_deref().unwrap_or("");
@@ -452,11 +447,10 @@ impl BetfairDataClient {
 
                             if let Some(runners) = &rc.rrc {
                                 for rrc in runners {
-                                    let ts_event =
-                                        rrc.ft.map_or(fallback_ts, parse_millis_timestamp);
+                                    let ts_event = rrc.ft.map_or(ts_init, parse_millis_timestamp);
 
                                     if let Some(runner) = parse_race_runner_data(
-                                        race_id, market_id, rrc, ts_event, ts_event,
+                                        race_id, market_id, rrc, ts_event, ts_init,
                                     ) {
                                         let selection_id = rrc.id.unwrap_or(0);
                                         let mut metadata = Params::new();
@@ -479,10 +473,9 @@ impl BetfairDataClient {
                             }
 
                             if let Some(rpc) = &rc.rpc {
-                                let ts_event = rpc.ft.map_or(fallback_ts, parse_millis_timestamp);
-                                let progress = parse_race_progress(
-                                    race_id, market_id, rpc, ts_event, ts_event,
-                                );
+                                let ts_event = rpc.ft.map_or(ts_init, parse_millis_timestamp);
+                                let progress =
+                                    parse_race_progress(race_id, market_id, rpc, ts_event, ts_init);
                                 let mut metadata = Params::new();
                                 metadata.insert(
                                     "race_id".to_string(),
@@ -866,8 +859,8 @@ impl DataClient for BetfairDataClient {
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
-        log::info!(
-            "Unsubscribe book deltas not supported for Betfair: {}",
+        log::debug!(
+            "Skipping unsubscribe book deltas for Betfair: {}",
             cmd.instrument_id
         );
         Ok(())
@@ -883,8 +876,8 @@ impl DataClient for BetfairDataClient {
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        log::info!(
-            "Unsubscribe trades not supported for Betfair: {}",
+        log::debug!(
+            "Skipping unsubscribe trades for Betfair: {}",
             cmd.instrument_id
         );
         Ok(())
@@ -906,10 +899,62 @@ impl DataClient for BetfairDataClient {
         &mut self,
         cmd: &UnsubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        log::info!(
-            "Unsubscribe instrument status not supported for Betfair: {}",
+        log::debug!(
+            "Skipping unsubscribe instrument status for Betfair: {}",
             cmd.instrument_id
         );
+        Ok(())
+    }
+
+    fn subscribe_instrument_close(&mut self, cmd: SubscribeInstrumentClose) -> anyhow::Result<()> {
+        // Close transitions arrive via marketDefinition.status="CLOSED" on the
+        // existing market subscription; no separate venue subscription exists.
+        log::debug!(
+            "Instrument close included in book subscription for {}",
+            cmd.instrument_id
+        );
+        Ok(())
+    }
+
+    fn unsubscribe_instrument_close(
+        &mut self,
+        cmd: &UnsubscribeInstrumentClose,
+    ) -> anyhow::Result<()> {
+        log::debug!(
+            "Skipping unsubscribe instrument close for Betfair: {}",
+            cmd.instrument_id
+        );
+        Ok(())
+    }
+
+    fn unsubscribe(&mut self, _cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
+        log::debug!("Skipping unsubscribe custom data for Betfair");
+        Ok(())
+    }
+
+    fn unsubscribe_instrument(&mut self, cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        log::debug!(
+            "Skipping unsubscribe instrument for Betfair: {}",
+            cmd.instrument_id
+        );
+        Ok(())
+    }
+
+    fn unsubscribe_instruments(&mut self, _cmd: &UnsubscribeInstruments) -> anyhow::Result<()> {
+        log::debug!("Skipping unsubscribe instruments for Betfair");
+        Ok(())
+    }
+
+    fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        log::debug!(
+            "Skipping unsubscribe quotes for Betfair: {}",
+            cmd.instrument_id
+        );
+        Ok(())
+    }
+
+    fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
+        log::debug!("Skipping unsubscribe bars for Betfair: {}", cmd.bar_type);
         Ok(())
     }
 }

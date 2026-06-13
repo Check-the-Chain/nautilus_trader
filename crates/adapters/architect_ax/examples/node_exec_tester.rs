@@ -31,17 +31,16 @@
 //! - `EURUSD-PERP` (fx, qty=100, ~$1.15)
 
 use nautilus_architect_ax::{
-    common::enums::AxEnvironment,
+    common::{consts::AX_CLIENT_ID, enums::AxEnvironment},
     config::{AxDataClientConfig, AxExecClientConfig},
     factories::{AxDataClientFactory, AxExecutionClientFactory},
 };
 use nautilus_common::enums::Environment;
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
-use nautilus_network::websocket::TransportBackend;
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
 use nautilus_trading::strategy::StrategyConfig;
 
@@ -53,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("AX-001");
     let node_name = "AX-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("AX");
+    let client_id = *AX_CLIENT_ID;
     let symbol = std::env::var("AX_SYMBOL").unwrap_or_else(|_| "XAU-PERP".to_string());
     let instrument_id = InstrumentId::from(format!("{symbol}.AX"));
 
@@ -69,7 +68,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data_config = AxDataClientConfig {
         environment: ax_environment,
-        transport_backend: TransportBackend::Sockudo,
         ..Default::default()
     };
 
@@ -77,15 +75,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trader_id,
         account_id,
         environment: ax_environment,
-        transport_backend: TransportBackend::Sockudo,
         ..Default::default()
     };
 
     let data_factory = AxDataClientFactory::new();
     let exec_factory = AxExecutionClientFactory::new();
+    let exec_engine_config = LiveExecEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)

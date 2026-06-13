@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+#![warn(clippy::pedantic)]
+
 use clap::Parser;
 use nautilus_cli::opt::NautilusCli;
 use nautilus_common::logging::ensure_logging_initialized;
@@ -22,7 +24,7 @@ async fn main() {
     dotenvy::dotenv().ok();
     ensure_logging_initialized();
 
-    if let Err(e) = nautilus_cli::run(NautilusCli::parse()).await {
+    if let Err(e) = Box::pin(nautilus_cli::run(NautilusCli::parse())).await {
         log::error!("Error executing Nautilus CLI: {e}");
     }
 }

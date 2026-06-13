@@ -7,8 +7,13 @@
 //  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
 // -------------------------------------------------------------------------------------------------
 
+use ibapi::subscriptions::SubscriptionItem;
+
 use super::*;
-use crate::execution::parse;
+use crate::{
+    common::enums::{IbAction, IbOrderStatus},
+    execution::parse,
+};
 
 impl InteractiveBrokersExecutionClient {
     /// Starts the order update subscription stream.
@@ -103,9 +108,12 @@ impl InteractiveBrokersExecutionClient {
         accepted_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
         pending_cancel_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
     ) {
+        let pending_live_exec_data = Arc::new(Mutex::new(AHashMap::new()));
+        let pending_terminal_orders = Arc::new(Mutex::new(AHashMap::new()));
+
         while let Some(update_result) = subscription.next().await {
             match update_result {
-                Ok(update) => {
+                Ok(SubscriptionItem::Data(update)) => {
                     if let Err(e) = Self::handle_order_update(
                         &update,
                         order_id_map,
@@ -125,11 +133,16 @@ impl InteractiveBrokersExecutionClient {
                         order_fill_progress,
                         accepted_orders,
                         pending_cancel_orders,
+                        &pending_live_exec_data,
+                        &pending_terminal_orders,
                     )
                     .await
                     {
                         tracing::error!("Error handling order update: {e}");
                     }
+                }
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    tracing::debug!("Received IB order update notice: {notice:?}");
                 }
                 Err(e) => {
                     tracing::error!("Error receiving order update: {e}");
@@ -158,6 +171,8 @@ impl InteractiveBrokersExecutionClient {
         order_fill_progress: &Arc<Mutex<AHashMap<ClientOrderId, (Decimal, Decimal)>>>,
         accepted_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
         pending_cancel_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
+        pending_live_exec_data: &Arc<Mutex<AHashMap<String, ExecutionData>>>,
+        pending_terminal_orders: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
     ) -> anyhow::Result<()> {
         let ts_init = clock.get_time_ns();
 
@@ -180,10 +195,31 @@ impl InteractiveBrokersExecutionClient {
                     order_fill_progress,
                     accepted_orders,
                     pending_cancel_orders,
+                    spread_fill_tracking,
+                    pending_live_exec_data,
+                    pending_terminal_orders,
                 )
                 .await?;
             }
             OrderUpdate::ExecutionData(exec_data) => {
+                let execution_id = exec_data.execution.execution_id.clone();
+                let has_commission = commission_cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Failed to lock commission cache"))?
+                    .contains_key(&execution_id);
+
+                if !has_commission {
+                    tracing::debug!(
+                        "Buffering execution data {} until commission report arrives",
+                        execution_id
+                    );
+                    pending_live_exec_data
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Failed to lock pending live execution data"))?
+                        .insert(execution_id, exec_data.clone());
+                    return Ok(());
+                }
+
                 Self::handle_execution_data(
                     exec_data,
                     order_id_map,
@@ -205,16 +241,81 @@ impl InteractiveBrokersExecutionClient {
                 .await?;
             }
             OrderUpdate::CommissionReport(commission) => {
-                let mut cache = commission_cache
+                let pending_exec_data = pending_live_exec_data
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("Failed to lock commission cache"))?;
-                cache.insert(
-                    commission.execution_id.clone(),
-                    (commission.commission, commission.currency.clone()),
-                );
+                    .map_err(|_| anyhow::anyhow!("Failed to lock pending live execution data"))?
+                    .remove(&commission.execution_id);
+
+                {
+                    let mut cache = commission_cache
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Failed to lock commission cache"))?;
+                    // IB uses -1.0 as a pending-sentinel before the real commission arrives;
+                    // clamp only that sentinel to zero (legitimate rebates can be negative).
+                    let commission_value = if commission.commission == -1.0_f64 {
+                        0.0_f64
+                    } else {
+                        commission.commission
+                    };
+                    cache.insert(
+                        commission.execution_id.clone(),
+                        (commission_value, commission.currency.clone()),
+                    );
+                }
+
+                if let Some(exec_data) = pending_exec_data {
+                    let order_id = exec_data.execution.order_id;
+                    Self::handle_execution_data(
+                        &exec_data,
+                        order_id_map,
+                        venue_order_id_map,
+                        instrument_provider,
+                        exec_sender,
+                        ts_init,
+                        account_id,
+                        commission_cache,
+                        spread_fill_tracking,
+                        instrument_id_map,
+                        trader_id_map,
+                        strategy_id_map,
+                        order_avg_prices,
+                        pending_combo_fills,
+                        pending_combo_fill_avgs,
+                        order_fill_progress,
+                    )
+                    .await?;
+
+                    let terminal_client_order_id = pending_terminal_orders
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Failed to lock pending terminal orders"))?
+                        .remove(&order_id);
+
+                    if let Some(client_order_id) = terminal_client_order_id {
+                        Self::evict_terminal_order_state(
+                            client_order_id,
+                            order_id,
+                            order_id_map,
+                            venue_order_id_map,
+                            instrument_id_map,
+                            trader_id_map,
+                            strategy_id_map,
+                            order_avg_prices,
+                            pending_combo_fills,
+                            pending_combo_fill_avgs,
+                            order_fill_progress,
+                            accepted_orders,
+                            pending_cancel_orders,
+                            spread_fill_tracking,
+                            pending_live_exec_data,
+                        )?;
+                    }
+                }
             }
             OrderUpdate::OpenOrder(order_data) => {
-                if order_data.order.what_if && order_data.order_state.status == "PreSubmitted" {
+                if order_data.order.what_if
+                    && IbOrderStatus::from_str(order_data.order_state.status.as_str())
+                        .is_ok_and(|status| status == IbOrderStatus::PreSubmitted)
+                {
                     Self::handle_whatif_order(
                         order_data,
                         venue_order_id_map,
@@ -236,12 +337,9 @@ impl InteractiveBrokersExecutionClient {
                         order_data.order.order_ref
                     );
 
-                    let client_order_id = if !order_data.order.order_ref.is_empty() {
-                        let order_ref = if let Some(pos) = order_data.order.order_ref.rfind(':') {
-                            &order_data.order.order_ref[..pos]
-                        } else {
-                            &order_data.order.order_ref
-                        };
+                    let client_order_id = if let Some(order_ref) =
+                        parse::normalized_order_ref(&order_data.order.order_ref)
+                    {
                         Some(ClientOrderId::from(order_ref))
                     } else {
                         let map = venue_order_id_map
@@ -251,8 +349,23 @@ impl InteractiveBrokersExecutionClient {
                     };
 
                     if let Some(client_order_id) = client_order_id
-                        && matches!(status_str, "Submitted" | "PreSubmitted")
+                        && IbOrderStatus::from_str(status_str).is_ok_and(IbOrderStatus::is_accepted)
                     {
+                        let instrument_id = {
+                            Self::get_mapped_instrument_id(order_data.order_id, instrument_id_map)?
+                                .map(Ok)
+                                .unwrap_or_else(|| {
+                                    Self::resolve_contract_instrument_id(
+                                        instrument_provider,
+                                        &order_data.contract,
+                                    )
+                                })?
+                        };
+                        let (trader_id, strategy_id) = Self::get_required_order_actor_ids(
+                            order_data.order_id,
+                            trader_id_map,
+                            strategy_id_map,
+                        )?;
                         let mut accepted = accepted_orders
                             .lock()
                             .map_err(|_| anyhow::anyhow!("Failed to lock accepted orders map"))?;
@@ -260,31 +373,16 @@ impl InteractiveBrokersExecutionClient {
                         if !accepted.contains(&client_order_id) {
                             accepted.insert(client_order_id);
 
-                            let instrument_id = {
-                                Self::get_mapped_instrument_id(
-                                    order_data.order_id,
-                                    instrument_id_map,
-                                )?
-                                .map(Ok)
-                                .unwrap_or_else(|| {
-                                    crate::common::parse::ib_contract_to_instrument_id_simple(
-                                        &order_data.contract,
-                                    )
-                                })?
-                            };
-
-                            let (trader_id, strategy_id) = Self::get_required_order_actor_ids(
+                            let venue_order_id = parse::ib_venue_order_id(
                                 order_data.order_id,
-                                trader_id_map,
-                                strategy_id_map,
-                            )?;
-
+                                order_data.order.perm_id,
+                            );
                             let event = OrderAccepted::new(
                                 trader_id,
                                 strategy_id,
                                 instrument_id,
                                 client_order_id,
-                                VenueOrderId::from(order_data.order_id.to_string()),
+                                venue_order_id,
                                 account_id,
                                 UUID4::new(),
                                 ts_init,
@@ -303,11 +401,20 @@ impl InteractiveBrokersExecutionClient {
                                 status_str
                             );
                         }
+
+                        Self::emit_order_updated_from_open_order(
+                            order_data,
+                            client_order_id,
+                            instrument_id,
+                            trader_id_map,
+                            strategy_id_map,
+                            instrument_provider,
+                            exec_sender,
+                            ts_init,
+                            account_id,
+                        )?;
                     }
                 }
-            }
-            OrderUpdate::Message(notice) => {
-                tracing::debug!("Received notice: {notice:?}");
             }
         }
 
@@ -315,9 +422,69 @@ impl InteractiveBrokersExecutionClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn emit_order_updated_from_open_order(
+        order_data: &ibapi::orders::OrderData,
+        client_order_id: ClientOrderId,
+        instrument_id: InstrumentId,
+        trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
+        strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
+        instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        ts_init: UnixNanos,
+        account_id: AccountId,
+    ) -> anyhow::Result<()> {
+        let Some(instrument) = instrument_provider.find(&instrument_id) else {
+            return Ok(());
+        };
+
+        if order_data.order.total_quantity <= 0.0 {
+            return Ok(());
+        }
+
+        let (trader_id, strategy_id) = Self::get_required_order_actor_ids(
+            order_data.order_id,
+            trader_id_map,
+            strategy_id_map,
+        )?;
+        let price_magnifier = instrument_provider.get_price_magnifier(&instrument_id) as f64;
+        let price = order_data
+            .order
+            .limit_price
+            .map(|price| Price::new(price * price_magnifier, instrument.price_precision()));
+        let trigger_price = order_data
+            .order
+            .aux_price
+            .map(|price| Price::new(price * price_magnifier, instrument.price_precision()));
+        let quantity = Quantity::new(order_data.order.total_quantity, instrument.size_precision());
+        let venue_order_id =
+            parse::ib_venue_order_id(order_data.order_id, order_data.order.perm_id);
+        let event = OrderUpdated::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            quantity,
+            UUID4::new(),
+            ts_init,
+            ts_init,
+            false,
+            Some(venue_order_id),
+            Some(account_id),
+            price,
+            trigger_price,
+            None,
+            false,
+        );
+
+        exec_sender
+            .send(ExecutionEvent::Order(OrderEventAny::Updated(event)))
+            .map_err(|e| anyhow::anyhow!("Failed to send order updated event: {e}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_order_status(
         status: &IBOrderStatus,
-        _order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
+        order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
         venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
@@ -332,6 +499,9 @@ impl InteractiveBrokersExecutionClient {
         order_fill_progress: &Arc<Mutex<AHashMap<ClientOrderId, (Decimal, Decimal)>>>,
         accepted_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
         pending_cancel_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
+        spread_fill_tracking: &Arc<Mutex<AHashMap<ClientOrderId, ahash::AHashSet<String>>>>,
+        pending_live_exec_data: &Arc<Mutex<AHashMap<String, ExecutionData>>>,
+        pending_terminal_orders: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
     ) -> anyhow::Result<()> {
         let client_order_id = {
             let map = venue_order_id_map
@@ -355,7 +525,7 @@ impl InteractiveBrokersExecutionClient {
         Self::update_order_avg_price(
             client_order_id,
             &instrument_id,
-            status.average_fill_price,
+            status.average_fill_price.unwrap_or(0.0),
             status.filled,
             instrument_provider,
             order_avg_prices,
@@ -363,10 +533,19 @@ impl InteractiveBrokersExecutionClient {
             order_fill_progress,
         )?;
 
-        if matches!(
-            status.status.as_str(),
-            "Filled" | "ApiCancelled" | "Cancelled" | "Inactive"
-        ) {
+        let ib_order_status = IbOrderStatus::from_str(status.status.as_str()).ok();
+
+        if ib_order_status == Some(IbOrderStatus::Inactive) && status.why_held == "locate" {
+            tracing::warn!(
+                "Order {} held for short-sell locate, order remains active",
+                client_order_id
+            );
+            return Ok(());
+        }
+
+        let is_terminal = ib_order_status.is_some_and(IbOrderStatus::is_terminal);
+
+        if is_terminal {
             Self::flush_pending_combo_fills(
                 client_order_id,
                 pending_combo_fills,
@@ -388,11 +567,11 @@ impl InteractiveBrokersExecutionClient {
                 .remove(&client_order_id);
         }
 
-        let venue_order_id = VenueOrderId::from(format!("{}", status.order_id));
+        let venue_order_id = parse::ib_venue_order_id(status.order_id, status.perm_id);
         let status_str = status.status.as_str();
 
-        match status_str {
-            "Submitted" | "PreSubmitted" => {
+        match ib_order_status {
+            Some(IbOrderStatus::Submitted | IbOrderStatus::PreSubmitted) => {
                 let mut accepted = accepted_orders
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Failed to lock accepted orders map"))?;
@@ -435,14 +614,14 @@ impl InteractiveBrokersExecutionClient {
                     );
                 }
             }
-            "Filled" => {
+            Some(IbOrderStatus::Filled) => {
                 tracing::debug!(
                     "Order {} filled (IB status: {})",
                     client_order_id,
                     status_str
                 );
             }
-            "Cancelled" | "ApiCancelled" => {
+            Some(IbOrderStatus::Cancelled | IbOrderStatus::ApiCancelled) => {
                 pending_cancel_orders
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Failed to lock pending cancel orders map"))?
@@ -471,7 +650,7 @@ impl InteractiveBrokersExecutionClient {
                     .map_err(|e| anyhow::anyhow!("Failed to send order canceled event: {e}"))?;
                 tracing::info!("Order {} canceled", client_order_id);
             }
-            "PendingCancel" => {
+            Some(IbOrderStatus::PendingCancel) => {
                 Self::emit_order_pending_cancel(
                     status.order_id,
                     client_order_id,
@@ -495,13 +674,120 @@ impl InteractiveBrokersExecutionClient {
             }
         }
 
+        if is_terminal {
+            let has_pending_execution = pending_live_exec_data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Failed to lock pending live execution data"))?
+                .values()
+                .any(|exec_data| exec_data.execution.order_id == status.order_id);
+
+            if has_pending_execution {
+                pending_terminal_orders
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Failed to lock pending terminal orders"))?
+                    .insert(status.order_id, client_order_id);
+            } else {
+                Self::evict_terminal_order_state(
+                    client_order_id,
+                    status.order_id,
+                    order_id_map,
+                    venue_order_id_map,
+                    instrument_id_map,
+                    trader_id_map,
+                    strategy_id_map,
+                    order_avg_prices,
+                    pending_combo_fills,
+                    pending_combo_fill_avgs,
+                    order_fill_progress,
+                    accepted_orders,
+                    pending_cancel_orders,
+                    spread_fill_tracking,
+                    pending_live_exec_data,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evict_terminal_order_state(
+        client_order_id: ClientOrderId,
+        order_id: i32,
+        order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
+        venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
+        instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
+        trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
+        strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
+        order_avg_prices: &Arc<Mutex<AHashMap<ClientOrderId, Price>>>,
+        pending_combo_fills: &Arc<Mutex<AHashMap<ClientOrderId, VecDeque<PendingComboFill>>>>,
+        pending_combo_fill_avgs: &Arc<Mutex<AHashMap<ClientOrderId, VecDeque<(Decimal, Price)>>>>,
+        order_fill_progress: &Arc<Mutex<AHashMap<ClientOrderId, (Decimal, Decimal)>>>,
+        accepted_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
+        pending_cancel_orders: &Arc<Mutex<ahash::AHashSet<ClientOrderId>>>,
+        spread_fill_tracking: &Arc<Mutex<AHashMap<ClientOrderId, ahash::AHashSet<String>>>>,
+        pending_live_exec_data: &Arc<Mutex<AHashMap<String, ExecutionData>>>,
+    ) -> anyhow::Result<()> {
+        order_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock order ID map"))?
+            .remove(&client_order_id);
+        venue_order_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock venue order ID map"))?
+            .remove(&order_id);
+        instrument_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock instrument ID map"))?
+            .remove(&order_id);
+        trader_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock trader ID map"))?
+            .remove(&order_id);
+        strategy_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock strategy ID map"))?
+            .remove(&order_id);
+        order_avg_prices
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock order avg prices"))?
+            .remove(&client_order_id);
+        pending_combo_fills
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock pending combo fills"))?
+            .remove(&client_order_id);
+        pending_combo_fill_avgs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock pending combo avg chunks"))?
+            .remove(&client_order_id);
+        order_fill_progress
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock order fill progress"))?
+            .remove(&client_order_id);
+        accepted_orders
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock accepted orders map"))?
+            .remove(&client_order_id);
+        pending_cancel_orders
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock pending cancel orders map"))?
+            .remove(&client_order_id);
+        spread_fill_tracking
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock spread fill tracking"))?
+            .remove(&client_order_id);
+        pending_live_exec_data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock pending live execution data"))?
+            .retain(|_, exec_data| exec_data.execution.order_id != order_id);
+
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_execution_data(
         exec_data: &ExecutionData,
-        _order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
+        order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
         venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
@@ -517,14 +803,29 @@ impl InteractiveBrokersExecutionClient {
         pending_combo_fill_avgs: &Arc<Mutex<AHashMap<ClientOrderId, VecDeque<(Decimal, Price)>>>>,
         order_fill_progress: &Arc<Mutex<AHashMap<ClientOrderId, (Decimal, Decimal)>>>,
     ) -> anyhow::Result<()> {
-        let client_order_id = {
+        let mapped_client_order_id = {
             let map = venue_order_id_map
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Failed to lock venue order ID map"))?;
             map.get(&exec_data.execution.order_id).copied()
         };
 
-        let Some(client_order_id) = client_order_id else {
+        let client_order_id = if let Some(client_order_id) = mapped_client_order_id {
+            client_order_id
+        } else if let Some(order_ref) =
+            parse::normalized_order_ref(&exec_data.execution.order_reference)
+        {
+            let client_order_id = ClientOrderId::from(order_ref);
+            order_id_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Failed to lock order ID map"))?
+                .insert(client_order_id, exec_data.execution.order_id);
+            venue_order_id_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Failed to lock venue order ID map"))?
+                .insert(exec_data.execution.order_id, client_order_id);
+            client_order_id
+        } else {
             tracing::debug!(
                 "Execution data for unknown order ID: {}",
                 exec_data.execution.order_id
@@ -541,18 +842,23 @@ impl InteractiveBrokersExecutionClient {
         {
             cached_id
         } else {
-            crate::common::parse::ib_contract_to_instrument_id_simple(&exec_data.contract)
-                .context("Failed to convert IB contract to instrument ID")?
+            Self::resolve_contract_instrument_id(instrument_provider, &exec_data.contract)?
         };
 
         let (commission, commission_currency) = {
-            let cache = commission_cache
+            let mut cache = commission_cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Failed to lock commission cache"))?;
-            cache.get(&exec_data.execution.execution_id).map_or_else(
-                || (0.0, "USD".to_string()),
-                |(comm, curr)| (*comm, curr.clone()),
-            )
+            let Some((commission, commission_currency)) =
+                cache.remove(&exec_data.execution.execution_id)
+            else {
+                tracing::debug!(
+                    "Execution data {} is waiting for commission report",
+                    exec_data.execution.execution_id
+                );
+                return Ok(());
+            };
+            (commission, commission_currency)
         };
 
         let is_bag = matches!(
@@ -669,10 +975,11 @@ impl InteractiveBrokersExecutionClient {
             .map_err(|_| anyhow::anyhow!("Failed to lock order avg prices"))?
             .insert(client_order_id, avg_px);
 
-        let filled_decimal = Decimal::from_str(&filled.to_string())
-            .map_err(|e| anyhow::anyhow!("Failed to convert filled qty to Decimal: {e}"))?;
-        let avg_decimal = Decimal::from_str(&converted_avg_price.to_string())
-            .map_err(|e| anyhow::anyhow!("Failed to convert avg fill price to Decimal: {e}"))?;
+        let filled_decimal = Decimal::from_f64_retain(filled)
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert filled qty to Decimal: {filled}"))?;
+        let avg_decimal = Decimal::from_f64_retain(converted_avg_price).ok_or_else(|| {
+            anyhow::anyhow!("Failed to convert avg fill price to Decimal: {converted_avg_price}")
+        })?;
 
         let mut progress = order_fill_progress
             .lock()
@@ -797,7 +1104,7 @@ impl InteractiveBrokersExecutionClient {
         instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
         trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
         strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
-        _instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+        instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         ts_init: UnixNanos,
         account_id: AccountId,
@@ -821,7 +1128,7 @@ impl InteractiveBrokersExecutionClient {
         let instrument_id = Self::get_mapped_instrument_id(order_data.order_id, instrument_id_map)?
             .map(Ok)
             .unwrap_or_else(|| {
-                crate::common::parse::ib_contract_to_instrument_id_simple(&order_data.contract)
+                Self::resolve_contract_instrument_id(instrument_provider, &order_data.contract)
             })?;
 
         let (trader_id, strategy_id) = Self::get_required_order_actor_ids(
@@ -939,7 +1246,9 @@ impl InteractiveBrokersExecutionClient {
             instrument_provider,
         );
 
-        let spread_n_legs = spread_instrument_id.symbol.as_str().matches('_').count() + 1;
+        let spread_n_legs =
+            crate::common::parse::parse_spread_instrument_id_to_legs(&spread_instrument_id)?.len();
+
         if (fill_count - 1) % spread_n_legs == 0 {
             let pending_combo_fill = Self::build_pending_combo_fill(
                 exec_data,
@@ -1005,11 +1314,10 @@ impl InteractiveBrokersExecutionClient {
                     false
                 }
             }) {
-                let ratio = if combo_leg.action == "BUY" {
-                    combo_leg.ratio
-                } else {
-                    -combo_leg.ratio
-                };
+                let ratio = IbAction::from_str(combo_leg.action.as_str())
+                    .map_or(-combo_leg.ratio, |action| {
+                        action.signed_multiplier() * combo_leg.ratio
+                    });
                 return (leg_id, ratio);
             }
         }
@@ -1042,11 +1350,8 @@ impl InteractiveBrokersExecutionClient {
         let combo_quantity =
             Quantity::new(combo_quantity_value, spread_instrument.size_precision());
 
-        let execution_side_numeric = match exec_data.execution.side.as_str() {
-            "BUY" | "BOT" => 1,
-            "SELL" | "SLD" => -1,
-            _ => anyhow::bail!("Unknown execution side: {}", exec_data.execution.side),
-        };
+        let execution_side_numeric =
+            IbAction::from_str(exec_data.execution.side.as_str())?.signed_multiplier();
         let leg_side_numeric = if ratio >= 0 { 1 } else { -1 };
         let combo_order_side = if execution_side_numeric == leg_side_numeric {
             OrderSide::Buy
@@ -1064,7 +1369,10 @@ impl InteractiveBrokersExecutionClient {
         Ok(PendingComboFill {
             account_id,
             instrument_id: spread_instrument_id,
-            venue_order_id: VenueOrderId::new(exec_data.execution.order_id.to_string()),
+            venue_order_id: parse::ib_venue_order_id(
+                exec_data.execution.order_id,
+                exec_data.execution.perm_id,
+            ),
             trade_id: TradeId::new(&exec_data.execution.execution_id),
             order_side: combo_order_side,
             last_qty: combo_quantity,
@@ -1105,11 +1413,7 @@ impl InteractiveBrokersExecutionClient {
         let leg_quantity =
             Quantity::new(exec_data.execution.shares, leg_instrument.size_precision());
 
-        let order_side = match exec_data.execution.side.as_str() {
-            "BUY" | "BOT" => OrderSide::Buy,
-            "SELL" | "SLD" => OrderSide::Sell,
-            _ => anyhow::bail!("Unknown execution side: {}", exec_data.execution.side),
-        };
+        let order_side = IbAction::from_str(exec_data.execution.side.as_str())?.order_side();
 
         let commission_money = Money::new(commission, Currency::from(commission_currency));
 
@@ -1122,10 +1426,10 @@ impl InteractiveBrokersExecutionClient {
             "{}-{}",
             exec_data.execution.execution_id, leg_position
         ));
-        let leg_venue_order_id = VenueOrderId::new(format!(
-            "{}-LEG-{}",
-            exec_data.execution.order_id, leg_position
-        ));
+        let venue_order_id =
+            parse::ib_venue_order_id(exec_data.execution.order_id, exec_data.execution.perm_id);
+        let leg_venue_order_id =
+            VenueOrderId::new(format!("{}-LEG-{}", venue_order_id.as_str(), leg_position));
 
         let ts_event = parse_execution_time(&exec_data.execution.time)?;
 
@@ -1169,31 +1473,47 @@ impl InteractiveBrokersExecutionClient {
         spread_instrument_id: &InstrumentId,
         leg_instrument_id: &InstrumentId,
     ) -> usize {
-        let symbol_str = spread_instrument_id.symbol.as_str();
-        let components: Vec<&str> = symbol_str.split('_').collect();
-
-        for (idx, component) in components.iter().enumerate() {
-            let symbol_part = if component.contains("((") {
-                if let Some(end) = component.find("))") {
-                    &component[end + 2..]
-                } else {
-                    continue;
+        let legs =
+            match crate::common::parse::parse_spread_instrument_id_to_legs(spread_instrument_id) {
+                Ok(legs) => legs,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to parse spread instrument ID {} for leg position: {e}",
+                        spread_instrument_id
+                    );
+                    return 0;
                 }
-            } else if component.starts_with('(') {
-                if let Some(end) = component.find(')') {
-                    &component[end + 1..]
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
             };
 
-            if leg_instrument_id.symbol.as_str() == symbol_part {
+        for (idx, (parsed_leg_id, _)) in legs.iter().enumerate() {
+            if *parsed_leg_id == *leg_instrument_id {
                 return idx;
             }
         }
 
+        log::warn!(
+            "Leg instrument ID {} not found in spread instrument ID {}",
+            leg_instrument_id,
+            spread_instrument_id
+        );
         0
+    }
+
+    fn resolve_contract_instrument_id(
+        instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+        contract: &Contract,
+    ) -> anyhow::Result<InstrumentId> {
+        match instrument_provider.resolve_instrument_id_for_contract(contract) {
+            Ok(instrument_id) => Ok(instrument_id),
+            Err(provider_error) if contract.security_type != SecurityType::Spread => {
+                ib_contract_to_instrument_id_simple(contract).with_context(|| {
+                    format!(
+                        "Failed to resolve IBKR contract to instrument ID using provider ({provider_error}) or simple conversion",
+                    )
+                })
+            }
+            Err(provider_error) => Err(provider_error)
+                .context("Failed to resolve BAG contract to spread instrument ID"),
+        }
     }
 }

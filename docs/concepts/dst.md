@@ -137,15 +137,23 @@ The contract holds only when all of the following are true:
 
 ## Static enforcement
 
-A pre-commit hook named `check-dst-conventions` enforces the structural conditions in source.
+Static enforcement has two layers:
+
+- Clippy policy in `clippy.toml` and `[workspace.lints.clippy]` blocks APIs that are invalid
+  across the workspace DST contract: direct `getrandom::{fill,u32,u64}` calls and
+  `tokio::task::LocalSet`.
+- A pre-commit hook named `check-dst-conventions` enforces scoped, path-aware, and cfg-aware
+  structural checks that Clippy cannot express cleanly.
+
 The hook lives at `.pre-commit-hooks/check_dst_conventions.sh`, runs as part of the standard
 pre-commit suite, and runs in continuous integration. It covers the 16 in-scope workspace crates
 and fails the commit when it detects any of:
 
-- Raw `std::time::Instant::now()` or `SystemTime::now()` reads, including bare forms when the
-  enclosing file imports the type from `std::time`.
+- Raw `std::time::Instant::now()`, `SystemTime::now()`, or `chrono::Utc::now()` reads,
+  including bare forms when the enclosing file imports the type from `std::time`, or from
+  `chrono` for `Utc`.
 - Raw RNG usage (`rand::thread_rng`, `rand::rng()`, `fastrand::`, `getrandom::`, `OsRng`)
-  without cfg gating.
+  or `Uuid::new_v4()` without cfg gating.
 - `tokio::select!` blocks missing `biased;` within the first three lines.
 - `std::thread::spawn`, `std::thread::Builder::new`, or `tokio::task::spawn_blocking` calls that
   lack a preceding `#[cfg(test)]`, `#[cfg(not(madsim))]`, or
@@ -178,6 +186,40 @@ The hook applies to the 16 workspace crates in the transitive closure of `nautil
 
 Adapter crates and infrastructure crates (Redis, Postgres) are out of scope. Their DST
 suitability requires a separate audit before they enter the DST path.
+
+## Network seed soaks
+
+The `nautilus-network` Turmoil tests use two layers:
+
+- Fixed-seed tests run in the nightly test suite. These cover connect, reconnect, partition,
+  close during reconnect, close during backoff, and repeated server-drop scenarios with
+  reproducible seeds.
+- An ignored reconnect soak sweeps Turmoil seeds until stopped, or until
+  `NAUTILUS_TURMOIL_SOAK_COUNT` seeds have run. Each seed runs the Tungstenite WebSocket backend
+  first and the Sockudo backend second when `transport-sockudo` is enabled, so both backends see
+  the same schedule search path.
+
+Run the continuous soak with:
+
+```bash
+scripts/soak-network-turmoil.sh
+```
+
+Run a bounded soak with:
+
+```bash
+env NAUTILUS_TURMOIL_SOAK_COUNT=100 scripts/soak-network-turmoil.sh
+```
+
+The soak uses deterministic seed sweep, random node order, randomized link latency, repeated
+server-side drops, reconnect state cycling, and exact application-message order checks. It does
+not enable Turmoil `fail_rate`: for TCP, that breaks links without a retransmit model, which
+would overstate the client delivery contract for an order-preservation test.
+
+These Turmoil tests run against the simulated network and are not gated to Linux. Several real
+localhost socket and WebSocket unit tests use `target_os = "linux"` for CI stability, so macOS
+local runs do not exercise that host TCP coverage. Use macOS for the Turmoil seed sweep and use
+Linux CI, or a Linux workstation, before treating the full network test set as covered.
 
 ## Implementation notes
 
@@ -379,6 +421,52 @@ Adapter crates are out of scope for the initial DST contract. Each adapter has i
 `chrono::Utc::now`, `SystemTime::now`, `Uuid::new_v4`, and transport-layer call sites. An
 adapter that enters the DST path must be audited for direct clock, RNG, and transport usage
 before its behavior can be covered by the contract.
+
+### Process-global lazy state consumes RNG bytes on first call
+
+The contract holds within a single run-of-the-runtime. A few process-global lazy
+initialisations consume RNG bytes on first call, which matters for harnesses that
+run two seeded executions inside one process and compare traces.
+
+- The `Ustr::from()` interner allocates and seeds its internal map on first use.
+- `ahash::RandomState` seeds itself via `getrandom` (which `madsim` hooks under
+  `cfg(madsim)`) on first instance creation.
+
+Single-runtime tests (one body invocation per seed, fresh process) are unaffected:
+the consumption is part of the seeded execution and reproduces deterministically.
+
+Same-seed equality frameworks that invoke the body twice in one process to diff
+the traces will see drift between runs. Run 1 pays the lazy-init cost and consumes
+RNG bytes; run 2 inherits the warm state and starts at a different offset in the
+RNG sequence.
+
+Workaround: pre-warm process-global state outside the runtime before the
+comparison, for example by calling `Ustr::from("")` and constructing one
+`ahash::RandomState` once at process start. Both runs then start with the warmed
+state and consume the RNG sequence identically.
+
+### Adapter factories no longer expose `Rc<RefCell<Cache>>`
+
+Commit `f0ea66da15` ("Standardize adapter cache access via `CacheView`") replaced
+the mutable `Rc<RefCell<Cache>>` parameter on `DataClientFactory::create` and
+`ExecutionClientFactory::create` with a `CacheView`. `CacheView` exposes
+`borrow()` for read access but does not expose the inner `Rc` handle.
+
+This blocks DST-style harness factories that need to construct an
+`OrderMatchingEngine` inline inside the factory, because
+`OrderMatchingEngine::new` still takes `Rc<RefCell<Cache>>` and there is no
+public accessor to recover that handle from a `CacheView`.
+
+Workarounds:
+
+- Pin the harness consumer to a commit before `f0ea66da15`.
+- Refactor the harness so it builds the `OrderMatchingEngine` outside the
+  factory (where the kernel `Cache` handle is still reachable) and passes the
+  constructed engine into the client.
+
+A longer-term escape hatch would be either an accessor on `CacheView` for the
+inner handle or an alternative `OrderMatchingEngine` constructor that accepts a
+`CacheView`. Neither is in the tree today.
 
 ## Relationship to other testing layers
 

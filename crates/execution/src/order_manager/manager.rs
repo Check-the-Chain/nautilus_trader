@@ -162,10 +162,17 @@ impl OrderManager {
         order: &OrderAny,
         position_id: Option<PositionId>,
         client_id: Option<ClientId>,
+        correlation_id: Option<UUID4>,
     ) -> anyhow::Result<()> {
+        let order_exists = self.cache.borrow().order_exists(&order.client_order_id());
+
         self.cache
             .borrow_mut()
             .add_order(order.clone(), position_id, client_id, true)?;
+
+        if !order_exists {
+            publish_order_initialized(order);
+        }
 
         let submit = SubmitOrder::new(
             order.trader_id(),
@@ -179,6 +186,7 @@ impl OrderManager {
             None, // params
             UUID4::new(),
             self.clock.borrow().timestamp_ns(),
+            correlation_id,
         );
 
         if order.emulation_trigger() == Some(TriggerType::NoTrigger) {
@@ -226,7 +234,7 @@ impl OrderManager {
             .cache
             .borrow()
             .order(&rejected.client_order_id)
-            .cloned();
+            .map(|o| o.clone());
 
         if let Some(order) = cloned_order {
             if order.contingency_type() != Some(ContingencyType::NoContingency) {
@@ -246,7 +254,7 @@ impl OrderManager {
             .cache
             .borrow()
             .order(&canceled.client_order_id)
-            .cloned();
+            .map(|o| o.clone());
 
         if let Some(order) = cloned_order {
             if order.contingency_type() != Some(ContingencyType::NoContingency) {
@@ -262,7 +270,11 @@ impl OrderManager {
     }
 
     pub fn handle_order_expired(&mut self, expired: OrderExpired) {
-        let cloned_order = self.cache.borrow().order(&expired.client_order_id).cloned();
+        let cloned_order = self
+            .cache
+            .borrow()
+            .order(&expired.client_order_id)
+            .map(|o| o.clone());
         if let Some(order) = cloned_order {
             if order.contingency_type() != Some(ContingencyType::NoContingency) {
                 self.handle_contingencies(&order);
@@ -277,7 +289,11 @@ impl OrderManager {
     }
 
     pub fn handle_order_updated(&mut self, updated: OrderUpdated) {
-        let cloned_order = self.cache.borrow().order(&updated.client_order_id).cloned();
+        let cloned_order = self
+            .cache
+            .borrow()
+            .order(&updated.client_order_id)
+            .map(|o| o.clone());
         if let Some(order) = cloned_order {
             if order.contingency_type() != Some(ContingencyType::NoContingency) {
                 self.handle_contingencies_update(&order);
@@ -291,11 +307,12 @@ impl OrderManager {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if the OTO child order cannot be found for the given client order ID.
     pub fn handle_order_filled(&mut self, filled: OrderFilled) {
-        let order = if let Some(order) = self.cache.borrow().order(&filled.client_order_id).cloned()
+        let order = if let Some(order) = self
+            .cache
+            .borrow()
+            .order(&filled.client_order_id)
+            .map(|o| o.clone())
         {
             order
         } else {
@@ -344,14 +361,19 @@ impl OrderManager {
                 };
 
                 for client_order_id in linked_orders {
-                    let mut child_order =
-                        if let Some(order) = self.cache.borrow().order(client_order_id).cloned() {
-                            order
-                        } else {
-                            panic!(
-                                "Cannot find OTO child order for client_order_id: {client_order_id}"
-                            );
-                        };
+                    let mut child_order = if let Some(order) = self
+                        .cache
+                        .borrow()
+                        .order(client_order_id)
+                        .map(|o| o.clone())
+                    {
+                        order
+                    } else {
+                        log::error!(
+                            "Cannot find OTO child order for client_order_id: {client_order_id}"
+                        );
+                        continue;
+                    };
 
                     if !self.should_manage_order(&child_order) {
                         continue;
@@ -373,7 +395,7 @@ impl OrderManager {
                         .submit_order_commands
                         .contains_key(&child_order.client_order_id())
                         && let Err(e) =
-                            self.create_new_submit_order(&child_order, position_id, client_id)
+                            self.create_new_submit_order(&child_order, position_id, client_id, None)
                     {
                         log::error!("Failed to create new submit order: {e}");
                     }
@@ -388,13 +410,18 @@ impl OrderManager {
                 };
 
                 for client_order_id in linked_orders {
-                    let contingent_order = match self.cache.borrow().order(client_order_id).cloned()
+                    let contingent_order = match self
+                        .cache
+                        .borrow()
+                        .order(client_order_id)
+                        .map(|o| o.clone())
                     {
                         Some(contingent_order) => contingent_order,
                         None => {
-                            panic!(
+                            log::error!(
                                 "Cannot find OCO contingent order for client_order_id: {client_order_id}"
                             );
+                            continue;
                         }
                     };
 
@@ -414,9 +441,6 @@ impl OrderManager {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if a contingent order cannot be found for the given client order ID.
     pub fn handle_contingencies(&mut self, order: &OrderAny) {
         let (filled_qty, leaves_qty, is_spawn_active) =
             if let Some(exec_spawn_id) = order.exec_spawn_id() {
@@ -445,12 +469,17 @@ impl OrderManager {
         };
 
         for client_order_id in linked_orders {
-            let contingent_order =
-                if let Some(order) = self.cache.borrow().order(client_order_id).cloned() {
-                    order
-                } else {
-                    panic!("Cannot find contingent order for client_order_id: {client_order_id}");
-                };
+            let contingent_order = if let Some(order) = self
+                .cache
+                .borrow()
+                .order(client_order_id)
+                .map(|o| o.clone())
+            {
+                order
+            } else {
+                log::error!("Cannot find contingent order for client_order_id: {client_order_id}");
+                continue;
+            };
 
             if !self.should_manage_order(&contingent_order)
                 || client_order_id == &order.client_order_id()
@@ -495,9 +524,6 @@ impl OrderManager {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if an OCO contingent order cannot be found for the given client order ID.
     pub fn handle_contingencies_update(&mut self, order: &OrderAny) {
         let quantity = match order.exec_spawn_id() {
             Some(exec_spawn_id) => {
@@ -527,11 +553,19 @@ impl OrderManager {
         };
 
         for client_order_id in linked_orders {
-            let contingent_order = match self.cache.borrow().order(client_order_id).cloned() {
+            let contingent_order = match self
+                .cache
+                .borrow()
+                .order(client_order_id)
+                .map(|o| o.clone())
+            {
                 Some(contingent_order) => contingent_order,
-                None => panic!(
-                    "Cannot find OCO contingent order for client_order_id: {client_order_id}"
-                ),
+                None => {
+                    log::error!(
+                        "Cannot find OCO contingent order for client_order_id: {client_order_id}"
+                    );
+                    continue;
+                }
             };
 
             if !self.should_manage_order(&contingent_order)
@@ -616,17 +650,23 @@ fn log_evt_send(event: &OrderEventAny) {
     log::info!("{id} {EVT}{SEND} {event}");
 }
 
+fn publish_order_initialized(order: &OrderAny) {
+    let event = OrderEventAny::Initialized(order.init_event().clone());
+    let topic = format!("events.order.{}", order.strategy_id());
+    msgbus::publish_order_event(topic.into(), &event);
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use nautilus_common::{cache::Cache, clock::TestClock};
+    use nautilus_common::{cache::Cache, clock::TestClock, msgbus, msgbus::TypedHandler};
     use nautilus_core::{UUID4, UnixNanos, WeakCell};
     use nautilus_model::{
-        enums::{OrderSide, OrderType, TriggerType},
+        enums::{ContingencyType, OrderSide, OrderType, TriggerType},
         events::{OrderAccepted, OrderSubmitted},
         identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
-        instruments::{Instrument, stubs::audusd_sim},
+        instruments::{Instrument, InstrumentAny, stubs::audusd_sim},
         orders::{Order, OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{Price, Quantity},
     };
@@ -653,6 +693,7 @@ mod tests {
             event_id: UUID4::new(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
+            causation_id: None,
         });
         let accepted = OrderEventAny::Accepted(OrderAccepted {
             trader_id: TraderId::from("TRADER-001"),
@@ -664,7 +705,8 @@ mod tests {
             event_id: UUID4::new(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
+            causation_id: None,
         });
 
         match submitted {
@@ -727,7 +769,26 @@ mod tests {
             None,
             UUID4::new(),
             UnixNanos::default(),
+            None, // correlation_id
         )
+    }
+
+    fn subscribe_order_topic(
+        strategy_id: StrategyId,
+    ) -> (TypedHandler<OrderEventAny>, Rc<RefCell<Vec<OrderEventAny>>>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let handler = TypedHandler::from({
+            let events = events.clone();
+            move |event: &OrderEventAny| {
+                events.borrow_mut().push(event.clone());
+            }
+        });
+        msgbus::subscribe_order_events(
+            format!("events.order.{strategy_id}").into(),
+            handler.clone(),
+            None,
+        );
+        (handler, events)
     }
 
     #[rstest]
@@ -793,6 +854,48 @@ mod tests {
     }
 
     #[rstest]
+    fn test_create_new_submit_order_publishes_initialized_for_new_order() {
+        let (clock, cache, _emulator) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache, true, None, None, None);
+        let order = create_test_stop_order();
+        let strategy_id = order.strategy_id();
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
+        manager
+            .create_new_submit_order(&order, None, None, None)
+            .unwrap();
+
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        let events = events.borrow();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            OrderEventAny::Initialized(event) if event.client_order_id == order.client_order_id()
+        ));
+    }
+
+    #[rstest]
+    fn test_create_new_submit_order_does_not_republish_initialized_for_existing_order() {
+        let (clock, cache, _emulator) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), true, None, None, None);
+        let order = create_test_stop_order();
+        let strategy_id = order.strategy_id();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, true)
+            .unwrap();
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
+        manager
+            .create_new_submit_order(&order, None, None, None)
+            .unwrap();
+
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        assert!(events.borrow().is_empty());
+    }
+
+    #[rstest]
     fn test_order_manager_without_handlers() {
         let (clock, cache, _emulator) = create_test_components();
         let mut manager = OrderManager::new(clock, cache.clone(), true, None, None, None);
@@ -814,6 +917,162 @@ mod tests {
                 .contains_key(&order.client_order_id()),
             "no-handler dispatch path should still remove the submit command",
         );
+    }
+
+    #[rstest]
+    fn test_handle_order_filled_skips_missing_oco_contingent_order() {
+        let (clock, cache, _emulator) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), true, None, None, None);
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let missing_client_order_id = ClientOrderId::from("O-MISSING");
+        let valid_client_order_id = ClientOrderId::from("O-CHILD");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-PARENT"))
+            .side(OrderSide::Buy)
+            .price(Price::from("1.00000"))
+            .quantity(Quantity::from(100_000))
+            .contingency_type(ContingencyType::Oco)
+            .linked_order_ids(vec![missing_client_order_id, valid_client_order_id])
+            .build();
+        let child_order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(valid_client_order_id)
+            .side(OrderSide::Buy)
+            .price(Price::from("1.00000"))
+            .quantity(Quantity::from(100_000))
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(child_order.clone(), None, None, false)
+            .unwrap();
+        manager
+            .submit_order_commands
+            .insert(valid_client_order_id, make_submit_command(&child_order));
+        let filled = match TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(AccountId::from("SIM-001")),
+        ) {
+            OrderEventAny::Filled(event) => event,
+            event => panic!("expected OrderFilled, was {event:?}"),
+        };
+
+        manager.handle_order_filled(filled);
+
+        assert!(
+            !manager
+                .submit_order_commands
+                .contains_key(&valid_client_order_id)
+        );
+    }
+
+    #[rstest]
+    fn test_handle_order_filled_skips_missing_oto_child_order() {
+        let (clock, cache, _emulator) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), true, None, None, None);
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let missing_client_order_id = ClientOrderId::from("O-MISSING");
+        let valid_client_order_id = ClientOrderId::from("O-CHILD");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-PARENT"))
+            .side(OrderSide::Buy)
+            .price(Price::from("1.00000"))
+            .quantity(Quantity::from(100_000))
+            .contingency_type(ContingencyType::Oto)
+            .linked_order_ids(vec![missing_client_order_id, valid_client_order_id])
+            .build();
+        let child_order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(valid_client_order_id)
+            .side(OrderSide::Buy)
+            .price(Price::from("1.00000"))
+            .quantity(Quantity::from(100_000))
+            .emulation_trigger(TriggerType::NoTrigger)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(child_order, None, None, false)
+            .unwrap();
+        let filled = match TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(AccountId::from("SIM-001")),
+        ) {
+            OrderEventAny::Filled(event) => event,
+            event => panic!("expected OrderFilled, was {event:?}"),
+        };
+
+        manager.handle_order_filled(filled);
+
+        assert!(
+            manager
+                .submit_order_commands
+                .contains_key(&valid_client_order_id)
+        );
+    }
+
+    #[rstest]
+    fn test_handle_contingencies_skips_missing_linked_order() {
+        let (clock, cache, _emulator) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache, true, None, None, None);
+        let instrument = audusd_sim();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-PARENT"))
+            .side(OrderSide::Buy)
+            .price(Price::from("1.00000"))
+            .quantity(Quantity::from(100_000))
+            .contingency_type(ContingencyType::Oco)
+            .linked_order_ids(vec![ClientOrderId::from("O-MISSING")])
+            .build();
+
+        manager.handle_contingencies(&order);
+
+        assert!(manager.submit_order_commands.is_empty());
+    }
+
+    #[rstest]
+    fn test_handle_contingencies_update_skips_missing_linked_order() {
+        let (clock, cache, _emulator) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache, true, None, None, None);
+        let instrument = audusd_sim();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-PARENT"))
+            .side(OrderSide::Buy)
+            .price(Price::from("1.00000"))
+            .quantity(Quantity::from(100_000))
+            .contingency_type(ContingencyType::Oco)
+            .linked_order_ids(vec![ClientOrderId::from("O-MISSING")])
+            .build();
+
+        manager.handle_contingencies_update(&order);
+
+        assert!(manager.submit_order_commands.is_empty());
     }
 
     #[rstest]
@@ -909,8 +1168,7 @@ mod tests {
 
         let canceled_event =
             TestOrderEventStubs::canceled(&order, AccountId::from("ACCOUNT-001"), None);
-        order.apply(canceled_event).unwrap();
-        cache.borrow_mut().update_order(&order).unwrap();
+        order = cache.borrow_mut().update_order(&canceled_event).unwrap();
 
         assert!(cache.borrow().is_order_closed(&order.client_order_id()));
 

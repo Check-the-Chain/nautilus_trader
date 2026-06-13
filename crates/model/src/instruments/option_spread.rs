@@ -107,12 +107,13 @@ pub struct OptionSpread {
 impl OptionSpread {
     /// Creates a new [`OptionSpread`] instance with correctness checking.
     ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     /// # Errors
     ///
     /// Returns an error if any input validation fails.
+    ///
+    /// # Notes
+    ///
+    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     #[expect(clippy::too_many_arguments)]
     pub fn new_checked(
         instrument_id: InstrumentId,
@@ -311,6 +312,10 @@ impl Instrument for OptionSpread {
         None
     }
 
+    fn strategy_type(&self) -> Option<Ustr> {
+        Some(self.strategy_type)
+    }
+
     fn activation_ns(&self) -> Option<UnixNanos> {
         Some(self.activation_ns)
     }
@@ -328,7 +333,7 @@ impl Instrument for OptionSpread {
     }
 
     fn size_precision(&self) -> u8 {
-        0
+        0 // No fractional units
     }
 
     fn price_increment(&self) -> Price {

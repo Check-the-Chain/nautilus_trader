@@ -48,14 +48,15 @@ from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.trading.config import StrategyConfig
 
 
-def test_repr_with_redacted_password() -> None:
+@pytest.mark.parametrize("password", ["password", "abc", ""])
+def test_repr_with_redacted_password(password: str) -> None:
     # Arrange
-    config = DatabaseConfig(username="username", password="password")
+    config = DatabaseConfig(username="username", password=password)
 
     # Act, Assert
     assert (
         repr(config)
-        == "DatabaseConfig(type=redis, host=None, port=None, username=username, password=pa...rd, "
+        == "DatabaseConfig(type=redis, host=None, port=None, username=username, password=***, "
         "ssl=False, connection_timeout=20, response_timeout=20, number_of_retries=100, "
         "exponent_base=2, max_delay=1000, factor=2)"
     )
@@ -107,6 +108,12 @@ def test_fully_qualified_name() -> None:
 def test_json_schema(config_cls):
     schema = config_cls.json_schema()
     assert isinstance(schema, dict), f"Schema for {config_cls.__name__} is not a dict"
+
+
+def test_trading_node_config_defaults_to_60_second_connection_timeout() -> None:
+    config = TradingNodeConfig()
+
+    assert config.timeout_connection == 60.0
 
 
 def test_parse_rejects_unknown_field() -> None:

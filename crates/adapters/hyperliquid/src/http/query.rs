@@ -198,6 +198,14 @@ impl InfoRequest {
         }
     }
 
+    /// Creates a request to get the list of perp dexes.
+    pub fn perp_dexs() -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::PerpDexs,
+            params: InfoRequestParams::None,
+        }
+    }
+
     /// Creates a request to get spot metadata (tokens and pairs).
     pub fn spot_meta() -> Self {
         Self {
@@ -218,6 +226,14 @@ impl InfoRequest {
     pub fn spot_meta_and_asset_ctxs() -> Self {
         Self {
             request_type: HyperliquidInfoRequestType::SpotMetaAndAssetCtxs,
+            params: InfoRequestParams::None,
+        }
+    }
+
+    /// Creates a request to get outcome metadata.
+    pub fn outcome_meta() -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::OutcomeMeta,
             params: InfoRequestParams::None,
         }
     }
@@ -458,6 +474,16 @@ mod tests {
         assert_eq!(req.request_type, HyperliquidInfoRequestType::AllPerpMetas);
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains(r#""type":"allPerpMetas""#));
+    }
+
+    #[rstest]
+    fn test_info_request_outcome_meta() {
+        let req = InfoRequest::outcome_meta();
+
+        assert_eq!(req.request_type, HyperliquidInfoRequestType::OutcomeMeta);
+        assert!(matches!(req.params, InfoRequestParams::None));
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"outcomeMeta"}"#);
     }
 
     #[rstest]

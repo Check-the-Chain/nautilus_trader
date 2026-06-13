@@ -25,12 +25,12 @@ use std::{
 use bytes::Bytes;
 use indexmap::IndexMap;
 use log::LevelFilter;
-use nautilus_core::UnixNanos;
+use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, BarType, BookOrder, CustomData, DataType, FundingRateUpdate, HasTsInit,
         IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
-        QuoteTick, TradeTick,
+        OrderBookDepth10, QuoteTick, TradeTick,
         close::InstrumentClose,
         custom::CustomDataTrait,
         greeks::OptionGreekValues,
@@ -38,7 +38,7 @@ use nautilus_model::{
         stubs::*,
     },
     enums::{BookAction, BookType, GreeksConvention, OrderSide},
-    identifiers::{ClientId, InstrumentId, OptionSeriesId, TraderId, Venue},
+    identifiers::{ActorId, ClientId, InstrumentId, OptionSeriesId, TraderId, Venue},
     instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::*},
     orderbook::OrderBook,
     stubs::TestDefault,
@@ -69,8 +69,9 @@ use crate::{
     component::Component,
     logging::{logger::LogGuard, logging_is_initialized},
     messages::data::{
-        BarsResponse, BookResponse, CustomDataResponse, DataResponse, FundingRatesResponse,
-        InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
+        BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
+        DataResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
+        PARAMS_IS_PARENT, QuotesResponse, TradesResponse,
     },
     msgbus::{
         self, MessageBus, get_message_bus,
@@ -144,6 +145,7 @@ struct TestDataActor {
     pub received_data: Vec<String>, // Use string for simplicity
     pub received_books: Vec<OrderBook>,
     pub received_deltas: Vec<OrderBookDelta>,
+    pub received_depths: Vec<OrderBookDepth10>,
     pub received_quotes: Vec<QuoteTick>,
     pub received_trades: Vec<TradeTick>,
     pub received_bars: Vec<Bar>,
@@ -232,6 +234,16 @@ impl DataActor for TestDataActor {
         Ok(())
     }
 
+    fn on_historical_book_deltas(&mut self, deltas: &[OrderBookDelta]) -> anyhow::Result<()> {
+        self.received_deltas.extend(deltas);
+        Ok(())
+    }
+
+    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth10]) -> anyhow::Result<()> {
+        self.received_depths.extend(depths);
+        Ok(())
+    }
+
     fn on_historical_funding_rates(
         &mut self,
         funding_rates: &[FundingRateUpdate],
@@ -313,7 +325,7 @@ impl DataActor for TestDataActor {
 
 // Custom functionality as required
 impl TestDataActor {
-    pub fn new(config: DataActorConfig) -> Self {
+    pub(crate) fn new(config: DataActorConfig) -> Self {
         Self {
             core: DataActorCore::new(config),
             received_time_events: Vec::new(),
@@ -321,6 +333,7 @@ impl TestDataActor {
             received_data: Vec::new(),
             received_books: Vec::new(),
             received_deltas: Vec::new(),
+            received_depths: Vec::new(),
             received_quotes: Vec::new(),
             received_trades: Vec::new(),
             received_bars: Vec::new(),
@@ -345,7 +358,7 @@ impl TestDataActor {
     }
 
     #[allow(dead_code)]
-    pub fn custom_function(&self) {}
+    pub(crate) fn custom_function(&self) {}
 }
 
 #[fixture]
@@ -560,6 +573,171 @@ fn test_subscribe_and_receive_book_deltas(
     msgbus::publish_deltas(topic, &deltas);
 
     assert_eq!(actor.received_deltas.len(), 1);
+}
+
+fn parent_params() -> Params {
+    let mut params = Params::new();
+    params.insert(PARAMS_IS_PARENT.to_string(), serde_json::json!(true));
+    params
+}
+
+#[rstest]
+fn test_parent_book_deltas_subscription_receives_per_underlying(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let parent_id = InstrumentId::from("ES.FUT.XCME");
+    let underlying_id = InstrumentId::from("ESZ24.XCME");
+
+    actor.subscribe_book_deltas(
+        parent_id,
+        BookType::L2_MBP,
+        None,
+        None,
+        false,
+        Some(parent_params()),
+    );
+
+    let underlying_topic = get_book_deltas_topic(underlying_id);
+
+    let order = BookOrder::new(
+        OrderSide::Buy,
+        Price::from("4000.00"),
+        Quantity::from("1"),
+        123456,
+    );
+    let delta = OrderBookDelta::new(
+        underlying_id,
+        BookAction::Add,
+        order,
+        0,
+        1,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+    );
+    let deltas = OrderBookDeltas::new(underlying_id, vec![delta]);
+
+    msgbus::publish_deltas(underlying_topic, &deltas);
+
+    assert_eq!(actor.received_deltas.len(), 1);
+}
+
+#[rstest]
+fn test_parent_book_deltas_unsubscribe_removes_per_underlying_handler(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let parent_id = InstrumentId::from("ES.FUT.XCME");
+    let underlying_id = InstrumentId::from("ESZ24.XCME");
+
+    actor.subscribe_book_deltas(
+        parent_id,
+        BookType::L2_MBP,
+        None,
+        None,
+        false,
+        Some(parent_params()),
+    );
+    assert_eq!(actor.deltas_handler_count(), 1);
+
+    actor.unsubscribe_book_deltas(parent_id, None, Some(parent_params()));
+    assert_eq!(actor.deltas_handler_count(), 0);
+
+    let underlying_topic = get_book_deltas_topic(underlying_id);
+    let order = BookOrder::new(
+        OrderSide::Buy,
+        Price::from("4000.00"),
+        Quantity::from("1"),
+        123456,
+    );
+    let delta = OrderBookDelta::new(
+        underlying_id,
+        BookAction::Add,
+        order,
+        0,
+        1,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+    );
+    let deltas = OrderBookDeltas::new(underlying_id, vec![delta]);
+
+    msgbus::publish_deltas(underlying_topic, &deltas);
+
+    assert_eq!(actor.received_deltas.len(), 0);
+}
+
+#[rstest]
+fn test_betfair_runner_subscription_does_not_cross_leak(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let runner_a = InstrumentId::from("1.211334112-31570229.BETFAIR");
+    let runner_b = InstrumentId::from("1.211334112-99887766.BETFAIR");
+
+    actor.subscribe_book_deltas(runner_a, BookType::L2_MBP, None, None, false, None);
+
+    let runner_b_topic = get_book_deltas_topic(runner_b);
+    let order = BookOrder::new(
+        OrderSide::Buy,
+        Price::from("2.00"),
+        Quantity::from("100"),
+        1,
+    );
+    let delta = OrderBookDelta::new(
+        runner_b,
+        BookAction::Add,
+        order,
+        0,
+        1,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+    );
+    let deltas = OrderBookDeltas::new(runner_b, vec![delta]);
+
+    msgbus::publish_deltas(runner_b_topic, &deltas);
+
+    assert_eq!(
+        actor.received_deltas.len(),
+        0,
+        "subscriber for runner A must not receive deltas published for runner B \
+         even though their symbols share the leading digit `1`",
+    );
+
+    let runner_a_topic = get_book_deltas_topic(runner_a);
+    let runner_a_delta = OrderBookDelta::new(
+        runner_a,
+        BookAction::Add,
+        BookOrder::new(OrderSide::Buy, Price::from("3.00"), Quantity::from("50"), 2),
+        0,
+        1,
+        UnixNanos::from(3),
+        UnixNanos::from(4),
+    );
+    let runner_a_deltas = OrderBookDeltas::new(runner_a, vec![runner_a_delta]);
+
+    msgbus::publish_deltas(runner_a_topic, &runner_a_deltas);
+
+    assert_eq!(
+        actor.received_deltas.len(),
+        1,
+        "subscriber for runner A must receive deltas published on runner A",
+    );
+    assert_eq!(actor.received_deltas[0].instrument_id, runner_a);
 }
 
 #[rstest]
@@ -1010,6 +1188,75 @@ fn test_request_trades(
 }
 
 #[rstest]
+fn test_request_book_deltas(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let request_id = actor
+        .request_book_deltas(audusd_sim.id, None, None, None, None, None)
+        .unwrap();
+
+    let client_id = ClientId::new("TestClient");
+    let delta = stub_delta();
+    let response = BookDeltasResponse::new(
+        request_id,
+        client_id,
+        audusd_sim.id,
+        vec![delta],
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    );
+
+    msgbus::send_response(&request_id, &DataResponse::BookDeltas(response));
+
+    assert_eq!(actor.received_deltas.len(), 1);
+    assert_eq!(actor.received_deltas[0], delta);
+}
+
+#[rstest]
+fn test_request_book_depth(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let request_id = actor
+        .request_book_depth(audusd_sim.id, None, None, None, None, None, None)
+        .unwrap();
+
+    let client_id = ClientId::new("TestClient");
+    let mut depth = stub_depth10();
+    depth.instrument_id = audusd_sim.id;
+    let response = BookDepthResponse::new(
+        request_id,
+        client_id,
+        audusd_sim.id,
+        vec![depth],
+        None,
+        None,
+        UnixNanos::default(),
+        None,
+    );
+
+    msgbus::send_response(&request_id, &DataResponse::BookDepth(response));
+
+    assert_eq!(actor.received_depths.len(), 1);
+    assert_eq!(actor.received_depths[0], depth);
+}
+
+#[rstest]
 fn test_request_funding_rates(
     clock: Rc<RefCell<TestClock>>,
     cache: Rc<RefCell<Cache>>,
@@ -1109,10 +1356,10 @@ fn test_subscribe_and_receive_instruments(
 
     let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
     let topic1 = get_instrument_topic(inst1.id());
-    msgbus::publish_any(topic1, &inst1);
+    msgbus::publish_instrument(topic1, &inst1);
     let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
     let topic2 = get_instrument_topic(inst2.id());
-    msgbus::publish_any(topic2, &inst2);
+    msgbus::publish_instrument(topic2, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
     assert_eq!(actor.received_instruments[0], inst1);
@@ -1136,8 +1383,8 @@ fn test_subscribe_and_receive_instrument(
     let topic = get_instrument_topic(audusd_sim.id);
     let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
     let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish_any(topic, &inst1);
-    msgbus::publish_any(topic, &inst2);
+    msgbus::publish_instrument(topic, &inst1);
+    msgbus::publish_instrument(topic, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
     assert_eq!(actor.received_instruments[0], inst1);
@@ -1378,19 +1625,19 @@ fn test_unsubscribe_instruments(
 
     let inst1 = InstrumentAny::CurrencyPair(audusd_sim.clone());
     let topic1 = get_instrument_topic(inst1.id());
-    msgbus::publish_any(topic1, &inst1);
+    msgbus::publish_instrument(topic1, &inst1);
     let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim.clone());
     let topic2 = get_instrument_topic(inst2.id());
-    msgbus::publish_any(topic2, &inst2);
+    msgbus::publish_instrument(topic2, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
 
     actor.unsubscribe_instruments(venue, None, None);
 
     let inst3 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish_any(topic1, &inst3);
+    msgbus::publish_instrument(topic1, &inst3);
     let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish_any(topic2, &inst4);
+    msgbus::publish_instrument(topic2, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 }
@@ -1410,18 +1657,18 @@ fn test_unsubscribe_instrument(
 
     let topic = get_instrument_topic(audusd_sim.id);
     let inst3 = InstrumentAny::CurrencyPair(audusd_sim.clone());
-    msgbus::publish_any(topic, &inst3);
+    msgbus::publish_instrument(topic, &inst3);
     let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim.clone());
-    msgbus::publish_any(topic, &inst4);
+    msgbus::publish_instrument(topic, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 
     actor.unsubscribe_instrument(audusd_sim.id, None, None);
 
     let inst3 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish_any(topic, &inst3);
+    msgbus::publish_instrument(topic, &inst3);
     let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish_any(topic, &inst4);
+    msgbus::publish_instrument(topic, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 }
@@ -1960,7 +2207,8 @@ fn test_subscribe_and_receive_pool_swaps(
         "0x123".to_string(),
         0,
         0,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
         Address::from([0x12; 20]),
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),
@@ -2021,7 +2269,8 @@ fn test_unsubscribe_pool_swaps(
         "0x123".to_string(),
         0,
         0,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
         Address::from([0x12; 20]),
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),
@@ -2044,7 +2293,8 @@ fn test_unsubscribe_pool_swaps(
         "0x456".to_string(),
         0,
         0,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
         Address::from([0x12; 20]),
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),
@@ -2427,7 +2677,7 @@ fn test_publish_signal_panics_when_unregistered() {
 #[should_panic(expected = "Actor has not been registered")]
 fn test_subscribe_signal_panics_when_unregistered() {
     let mut actor = TestDataActor::new(DataActorConfig::default());
-    actor.subscribe_signal("example");
+    actor.subscribe_signal("example", None);
 }
 
 #[rstest]
@@ -2499,7 +2749,7 @@ fn test_subscribe_signal_multi_word_name_matches_published_topic(
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    actor.subscribe_signal("hello world");
+    actor.subscribe_signal("hello world", None);
     drop(actor);
 
     let publisher = get_actor_unchecked::<TestDataActor>(&actor_id);
@@ -2530,7 +2780,7 @@ fn test_publish_signal_reaches_subscriber(
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    actor.subscribe_signal(name);
+    actor.subscribe_signal(name, None);
     drop(actor);
 
     let publisher = get_actor_unchecked::<TestDataActor>(&actor_id);
@@ -2558,7 +2808,7 @@ fn test_subscribe_signal_wildcard_matches_all_names(
     actor.start().unwrap();
 
     // Empty name = subscribe to all signals
-    actor.subscribe_signal("");
+    actor.subscribe_signal("", None);
     drop(actor);
 
     let publisher = get_actor_unchecked::<TestDataActor>(&actor_id);
@@ -2582,7 +2832,7 @@ fn test_unsubscribe_signal_stops_delivery(
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    actor.subscribe_signal("alpha");
+    actor.subscribe_signal("alpha", None);
     drop(actor);
 
     let publisher = get_actor_unchecked::<TestDataActor>(&actor_id);
@@ -2601,6 +2851,92 @@ fn test_unsubscribe_signal_stops_delivery(
 
     let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     assert_eq!(actor.received_signals.len(), 1);
+}
+
+#[rstest]
+#[case(100, 10)]
+#[case(1_000_000, 10)] // Above old u8 ceiling: locks in u32 widening
+#[case(u32::MAX, 0)] // Saturated boundary
+fn test_subscribe_signal_dispatches_in_priority_order(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    #[case] high_priority: u32,
+    #[case] low_priority: u32,
+) {
+    use crate::msgbus::switchboard::get_signal_topic;
+
+    set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+    *get_message_bus().borrow_mut() = MessageBus::default();
+
+    let mut actor_high = TestDataActor::new(DataActorConfig {
+        actor_id: Some(ActorId::new("ACTOR-HIGH")),
+        ..DataActorConfig::default()
+    });
+    actor_high
+        .register(trader_id, clock.clone(), cache.clone())
+        .unwrap();
+    let high_id = actor_high.actor_id().inner();
+    register_actor(actor_high);
+
+    let mut actor_low = TestDataActor::new(DataActorConfig {
+        actor_id: Some(ActorId::new("ACTOR-LOW")),
+        ..DataActorConfig::default()
+    });
+    actor_low.register(trader_id, clock, cache).unwrap();
+    let low_id = actor_low.actor_id().inner();
+    register_actor(actor_low);
+
+    let mut high = get_actor_unchecked::<TestDataActor>(&high_id);
+    high.start().unwrap();
+    high.subscribe_signal("trigger", Some(high_priority));
+    drop(high);
+
+    let mut low = get_actor_unchecked::<TestDataActor>(&low_id);
+    low.start().unwrap();
+    low.subscribe_signal("trigger", Some(low_priority));
+    drop(low);
+
+    // Bus must dispatch the high-priority subscription first regardless of
+    // registration order, including for priorities above the old u8 ceiling.
+    let topic = get_signal_topic("trigger");
+    let subs = get_message_bus().borrow_mut().matching_subscriptions(topic);
+    assert_eq!(subs.len(), 2);
+    assert_eq!(subs[0].priority, high_priority);
+    assert_eq!(subs[1].priority, low_priority);
+
+    // Both actors still receive the signal end-to-end.
+    let publisher = get_actor_unchecked::<TestDataActor>(&high_id);
+    publisher.publish_signal("trigger", "go".to_string(), UnixNanos::default());
+    drop(publisher);
+
+    let high = get_actor_unchecked::<TestDataActor>(&high_id);
+    let low = get_actor_unchecked::<TestDataActor>(&low_id);
+    assert_eq!(high.received_signals.len(), 1);
+    assert_eq!(low.received_signals.len(), 1);
+}
+
+#[rstest]
+fn test_subscribe_signal_resubscribe_does_not_update_priority(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    use crate::msgbus::switchboard::get_signal_topic;
+
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    // First subscription wins; second is silently dropped (warn-only).
+    actor.subscribe_signal("trigger", Some(10));
+    actor.subscribe_signal("trigger", Some(100));
+    drop(actor);
+
+    let topic = get_signal_topic("trigger");
+    let subs = get_message_bus().borrow_mut().matching_subscriptions(topic);
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].priority, 10);
 }
 
 #[rstest]

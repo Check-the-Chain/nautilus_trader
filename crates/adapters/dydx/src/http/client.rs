@@ -86,6 +86,7 @@ use nautilus_network::{
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
+use ustr::Ustr;
 
 use super::error::DydxHttpError;
 use crate::{
@@ -103,6 +104,9 @@ const DYDX_MAX_BARS_PER_REQUEST: u32 = 1_000;
 
 /// Perpetual markets endpoint (shared between `get_markets` and `get_market`).
 const ENDPOINT_PERPETUAL_MARKETS: &str = "/v4/perpetualMarkets";
+
+const QUERY_MARKET_TYPE_PERPETUAL: &str = "marketType=PERPETUAL";
+const DYDX_INDEXER_REPORT_LIMIT: u32 = 1_000;
 
 fn bar_type_to_resolution(bar_type: &BarType) -> anyhow::Result<DydxCandleResolution> {
     if bar_type.aggregation_source() != AggregationSource::External {
@@ -125,12 +129,18 @@ fn bar_type_to_resolution(bar_type: &BarType) -> anyhow::Result<DydxCandleResolu
 
 /// Default dYdX Indexer REST API rate limit.
 ///
-/// The dYdX Indexer API rate limits are generous for read-only operations:
-/// - General: 100 requests per 10 seconds per IP
-/// - We use a conservative 10 requests per second as the default quota.
+/// The dYdX Indexer API rate limit is 100 requests per 10 seconds per IP.
+/// We use 9 req/s (vs the exact 10) to avoid edge-case 429s from
+/// GCRA vs server sliding-window misalignment at the boundary.
 pub static DYDX_REST_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
-    Quota::per_second(NonZeroU32::new(10).expect("non-zero")).expect("valid constant")
+    Quota::per_second(NonZeroU32::new(9).expect("non-zero")).expect("valid constant")
 });
+
+static DYDX_RATE_LIMIT_KEY: LazyLock<Ustr> = LazyLock::new(|| Ustr::from("dydx:rest"));
+
+fn rate_limit_keys() -> Vec<Ustr> {
+    vec![*DYDX_RATE_LIMIT_KEY]
+}
 
 /// Represents a dYdX HTTP response wrapper.
 ///
@@ -276,11 +286,11 @@ impl DydxRawHttpClient {
                 .request_with_ustr_keys(
                     method.clone(),
                     url.clone(),
-                    None, // No params
-                    None, // No additional headers
-                    None, // No body for GET requests
-                    None, // Use default timeout
-                    None, // No specific rate limit keys (using global quota)
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(rate_limit_keys()),
                 )
                 .await
                 .map_err(|e| DydxHttpError::HttpClientError(e.to_string()))?;
@@ -368,11 +378,11 @@ impl DydxRawHttpClient {
                 .request_with_ustr_keys(
                     Method::POST,
                     url.clone(),
-                    None, // No params
-                    None, // No additional headers (content-type handled by body)
+                    None,
+                    None,
                     Some(body_bytes.clone()),
-                    None, // Use default timeout
-                    None, // No specific rate limit keys (using global quota)
+                    None,
+                    Some(rate_limit_keys()),
                 )
                 .await
                 .map_err(|e| DydxHttpError::HttpClientError(e.to_string()))?;
@@ -561,7 +571,7 @@ impl DydxRawHttpClient {
 
         if let Some(m) = market {
             query_parts.push(format!("market={m}"));
-            query_parts.push("marketType=PERPETUAL".to_string());
+            query_parts.push(QUERY_MARKET_TYPE_PERPETUAL.to_string());
         }
 
         if let Some(l) = limit {
@@ -591,7 +601,7 @@ impl DydxRawHttpClient {
 
         if let Some(m) = market {
             query_parts.push(format!("market={m}"));
-            query_parts.push("marketType=PERPETUAL".to_string());
+            query_parts.push(QUERY_MARKET_TYPE_PERPETUAL.to_string());
         }
 
         if let Some(l) = limit {
@@ -706,7 +716,7 @@ impl DydxRawHttpClient {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.dydx")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")
 )]
 pub struct DydxHttpClient {
     /// Raw HTTP client wrapped in Arc for efficient cloning.
@@ -1560,7 +1570,12 @@ impl DydxHttpClient {
 
         let orders = self
             .inner
-            .get_orders(address, subaccount_number, market.as_deref(), None)
+            .get_orders(
+                address,
+                subaccount_number,
+                market.as_deref(),
+                Some(DYDX_INDEXER_REPORT_LIMIT),
+            )
             .await?;
 
         let mut reports = Vec::new();
@@ -1621,7 +1636,12 @@ impl DydxHttpClient {
 
         let fills_response = self
             .inner
-            .get_fills(address, subaccount_number, market.as_deref(), None)
+            .get_fills(
+                address,
+                subaccount_number,
+                market.as_deref(),
+                Some(DYDX_INDEXER_REPORT_LIMIT),
+            )
             .await?;
 
         let mut reports = Vec::new();
@@ -1756,11 +1776,11 @@ impl DydxHttpClient {
 #[cfg(test)]
 mod tests {
     use axum::{Router, routing::get};
-    use nautilus_model::identifiers::{Symbol, Venue};
+    use nautilus_model::identifiers::Symbol;
     use rstest::rstest;
 
     use super::*;
-    use crate::http::error;
+    use crate::{common::consts::DYDX_VENUE, http::error};
 
     #[tokio::test]
     async fn test_raw_client_creation() {
@@ -1831,7 +1851,7 @@ mod tests {
     #[rstest]
     fn test_domain_client_get_instrument_not_found() {
         let client = DydxHttpClient::default();
-        let instrument_id = InstrumentId::new(Symbol::new("ETH-USD-PERP"), Venue::new("DYDX"));
+        let instrument_id = InstrumentId::new(Symbol::new("ETH-USD-PERP"), *DYDX_VENUE);
         let result = client.get_instrument(&instrument_id);
         assert!(result.is_none());
     }
