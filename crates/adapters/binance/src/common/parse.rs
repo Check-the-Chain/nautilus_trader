@@ -1340,9 +1340,9 @@ mod tests {
     #[rstest]
     fn test_parse_usdm_tradifi_perpetual() {
         let mut symbol = sample_usdm_symbol();
-        symbol.symbol = "SPCXUSDT".to_string();
-        symbol.pair = "SPCXUSDT".to_string();
-        symbol.base_asset = "SPCX".to_string();
+        symbol.symbol = "SPCXUSDT".into();
+        symbol.pair = "SPCXUSDT".into();
+        symbol.base_asset = "SPCX".into();
         symbol.contract_type = CONTRACT_TYPE_TRADIFI_PERPETUAL.to_string();
         let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
 
