@@ -60,6 +60,7 @@ use crate::{
     },
 };
 const CONTRACT_TYPE_PERPETUAL: &str = "PERPETUAL";
+const CONTRACT_TYPE_TRADIFI_PERPETUAL: &str = "TRADIFI_PERPETUAL";
 
 /// Returns a currency from the internal map or creates a new crypto currency.
 pub fn get_currency(code: &str) -> Currency {
@@ -95,6 +96,20 @@ fn parse_filter_quantity(filter: &Value, field: &str) -> anyhow::Result<Quantity
     let value = parse_filter_string(filter, field)?;
     Quantity::from_str(&value)
         .map_err(|e| anyhow::anyhow!("Failed to parse {field}='{value}': {e}"))
+}
+
+/// Parses the futures `MIN_NOTIONAL` filter into a `Money` value in `currency`.
+///
+/// Returns `None` when the filter is absent, the `notional` field cannot be
+/// parsed, or the value is non-positive.
+fn parse_futures_min_notional(filters: &[Value], currency: Currency) -> Option<Money> {
+    let filter = get_filter(filters, "MIN_NOTIONAL")?;
+    let raw = filter.get("notional").and_then(|v| v.as_str())?;
+    let amount = f64::from_str(raw).ok()?;
+    if amount <= 0.0 {
+        return None;
+    }
+    Some(Money::new(amount, currency))
 }
 
 /// Parses a venue quantity string into a `Quantity` at the given precision.
@@ -172,19 +187,21 @@ pub(crate) fn price_at_precision(price: Price, precision: u8) -> Option<Price> {
 /// Returns an error if:
 /// - Required filter values are missing (PRICE_FILTER, LOT_SIZE).
 /// - Price or quantity values cannot be parsed.
-/// - The contract type is not PERPETUAL.
+/// - The contract type is not a supported perpetual variant.
 pub fn parse_usdm_instrument(
     symbol: &BinanceFuturesUsdSymbol,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    // Only handle perpetual contracts for now
-    if symbol.contract_type != CONTRACT_TYPE_PERPETUAL {
+    // Only handle perpetual contracts for now. Some USD-M products such as
+    // listed equity perpetuals use Binance's TRADIFI_PERPETUAL label.
+    if !is_supported_usdm_perpetual_contract_type(&symbol.contract_type) {
         anyhow::bail!(
-            "Unsupported contract type '{}' for symbol '{}', expected '{}'",
+            "Unsupported contract type '{}' for symbol '{}', expected '{}' or '{}'",
             symbol.contract_type,
             symbol.symbol,
-            CONTRACT_TYPE_PERPETUAL
+            CONTRACT_TYPE_PERPETUAL,
+            CONTRACT_TYPE_TRADIFI_PERPETUAL
         );
     }
 
@@ -226,6 +243,8 @@ pub fn parse_usdm_instrument(
     let max_quantity = parse_filter_quantity(lot_filter, "maxQty").ok();
     let min_quantity = parse_filter_quantity(lot_filter, "minQty").ok();
 
+    let min_notional = parse_futures_min_notional(&symbol.filters, quote_currency);
+
     // Default margin (0.1 = 10x leverage)
     let default_margin = Decimal::new(1, 1);
 
@@ -245,19 +264,24 @@ pub fn parse_usdm_instrument(
         max_quantity,
         min_quantity,
         None, // max_notional
-        None, // min_notional
+        min_notional,
         max_price,
         min_price,
         Some(default_margin),
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // tick_scheme
         None, // info
         ts_event,
         ts_init,
     );
 
     Ok(InstrumentAny::CryptoPerpetual(instrument))
+}
+
+fn is_supported_usdm_perpetual_contract_type(contract_type: &str) -> bool {
+    contract_type == CONTRACT_TYPE_PERPETUAL || contract_type == CONTRACT_TYPE_TRADIFI_PERPETUAL
 }
 
 /// Parses a COIN-M Futures symbol definition into a Nautilus CryptoPerpetual instrument.
@@ -328,6 +352,8 @@ pub fn parse_coinm_instrument(
     // COIN-M has contract_size as the multiplier
     let multiplier = Quantity::new(symbol.contract_size as f64, 0);
 
+    let min_notional = parse_futures_min_notional(&symbol.filters, quote_currency);
+
     // Default margin (0.1 = 10x leverage)
     let default_margin = Decimal::new(1, 1);
 
@@ -347,13 +373,14 @@ pub fn parse_coinm_instrument(
         max_quantity,
         min_quantity,
         None, // max_notional
-        None, // min_notional
+        min_notional,
         max_price,
         min_price,
         Some(default_margin),
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // tick_scheme
         None, // info
         ts_event,
         ts_init,
@@ -528,6 +555,7 @@ pub fn parse_spot_instrument_sbe(
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // tick_scheme
         None, // info
         ts_event,
         ts_init,
@@ -1183,6 +1211,10 @@ mod tests {
                     "maxQty": "1000",
                     "minQty": "0.001"
                 }),
+                json!({
+                    "filterType": "MIN_NOTIONAL",
+                    "notional": "5"
+                }),
             ],
         }
     }
@@ -1223,6 +1255,10 @@ mod tests {
                     "stepSize": "1",
                     "maxQty": "1000",
                     "minQty": "1"
+                }),
+                json!({
+                    "filterType": "MIN_NOTIONAL",
+                    "notional": "1"
                 }),
             ],
         }
@@ -1292,6 +1328,34 @@ mod tests {
                 assert!(!perp.is_inverse);
                 assert_eq!(perp.price_increment, Price::from_str("0.10").unwrap());
                 assert_eq!(perp.size_increment, Quantity::from_str("0.001").unwrap());
+                assert_eq!(
+                    perp.min_notional,
+                    Some(Money::new(5.0, perp.quote_currency)),
+                );
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_parse_usdm_tradifi_perpetual() {
+        let mut symbol = sample_usdm_symbol();
+        symbol.symbol = "SPCXUSDT".to_string();
+        symbol.pair = "SPCXUSDT".to_string();
+        symbol.base_asset = "SPCX".to_string();
+        symbol.contract_type = CONTRACT_TYPE_TRADIFI_PERPETUAL.to_string();
+        let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
+
+        let result = parse_usdm_instrument(&symbol, ts, ts);
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let instrument = result.unwrap();
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.id.to_string(), "SPCXUSDT-PERP.BINANCE");
+                assert_eq!(perp.raw_symbol.to_string(), "SPCXUSDT");
+                assert_eq!(perp.quote_currency.code.as_str(), "USDT");
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDT");
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
         }
@@ -1351,6 +1415,10 @@ mod tests {
                 assert!(perp.is_inverse);
                 assert_eq!(perp.price_increment, Price::from_str("0.10").unwrap());
                 assert_eq!(perp.size_increment, Quantity::from_str("1").unwrap());
+                assert_eq!(
+                    perp.min_notional,
+                    Some(Money::new(1.0, perp.quote_currency)),
+                );
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
         }

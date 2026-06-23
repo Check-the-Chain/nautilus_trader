@@ -21,6 +21,7 @@ mod streams;
 use std::{
     collections::HashMap,
     fmt::Debug,
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -41,9 +42,10 @@ use nautilus_common::{
         data::{
             BarsResponse, InstrumentResponse, InstrumentsResponse, QuotesResponse, RequestBars,
             RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeIndexPrices, SubscribeOptionGreeks, SubscribeQuotes,
-            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-            UnsubscribeIndexPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+            SubscribeBookDeltas, SubscribeCustomData, SubscribeIndexPrices, SubscribeOptionGreeks,
+            SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            UnsubscribeBookDeltas, UnsubscribeCustomData, UnsubscribeIndexPrices,
+            UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -53,6 +55,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
+    data::DataType,
     enums::BookType,
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, any::InstrumentAny},
@@ -63,8 +66,8 @@ use tokio_util::sync::CancellationToken;
 use self::streams::{
     handle_historical_bars_subscription, handle_index_price_subscription,
     handle_market_depth_subscription, handle_option_greeks_subscription, handle_quote_subscription,
-    handle_realtime_bars_subscription, handle_tick_by_tick_quote_subscription,
-    handle_trade_subscription,
+    handle_realtime_bars_subscription, handle_short_availability_subscription,
+    handle_tick_by_tick_quote_subscription, handle_trade_subscription,
 };
 use super::{
     cache::{OptionGreeksCache, QuoteCache},
@@ -77,6 +80,10 @@ use super::{
 use crate::{
     common::{consts::IB_VENUE, shared_client::SharedClientHandle},
     config::InteractiveBrokersDataClientConfig,
+    data_types::{
+        IBKR_SHORT_AVAILABILITY_TYPE, INSTRUMENT_ID_METADATA_KEY,
+        register_interactive_brokers_custom_data,
+    },
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
 
@@ -108,6 +115,9 @@ pub struct InteractiveBrokersDataClient {
     subscriptions: Arc<tokio::sync::Mutex<AHashMap<InstrumentId, SubscriptionInfo>>>,
     /// Active option greeks subscriptions mapped by instrument ID.
     option_greeks_subscriptions: Arc<tokio::sync::Mutex<AHashMap<InstrumentId, CancellationToken>>>,
+    /// Active short availability subscriptions mapped by instrument ID.
+    short_availability_subscriptions:
+        Arc<tokio::sync::Mutex<AHashMap<InstrumentId, CancellationToken>>>,
     /// Quote cache for accumulating tick updates.
     quote_cache: Arc<tokio::sync::Mutex<QuoteCache>>,
     /// Option greeks cache for merging IB option-computation ticks.
@@ -295,6 +305,7 @@ impl InteractiveBrokersDataClient {
             data_sender,
             subscriptions: Arc::new(tokio::sync::Mutex::new(AHashMap::new())),
             option_greeks_subscriptions: Arc::new(tokio::sync::Mutex::new(AHashMap::new())),
+            short_availability_subscriptions: Arc::new(tokio::sync::Mutex::new(AHashMap::new())),
             quote_cache: Arc::new(tokio::sync::Mutex::new(QuoteCache::new())),
             option_greeks_cache: Arc::new(tokio::sync::Mutex::new(OptionGreeksCache::new())),
             clock,
@@ -329,8 +340,53 @@ impl InteractiveBrokersDataClient {
             }
             subscriptions.clear();
         }
+        {
+            let mut subscriptions = self
+                .short_availability_subscriptions
+                .try_lock()
+                .context("Failed to lock IB short availability subscriptions for cancellation")?;
+            for cancellation_token in subscriptions.values() {
+                cancellation_token.cancel();
+            }
+            subscriptions.clear();
+        }
 
         Ok(())
+    }
+
+    fn custom_instrument_id(data_type: &DataType) -> anyhow::Result<Option<InstrumentId>> {
+        let Some(raw_instrument_id) = data_type
+            .metadata()
+            .and_then(|m| m.get(INSTRUMENT_ID_METADATA_KEY))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let instrument_id = InstrumentId::from_str(raw_instrument_id)
+            .with_context(|| format!("invalid instrument_id metadata `{raw_instrument_id}`"))?;
+
+        Ok(Some(instrument_id))
+    }
+
+    fn required_custom_instrument_id(data_type: &DataType) -> anyhow::Result<InstrumentId> {
+        Self::custom_instrument_id(data_type)?.with_context(|| {
+            format!(
+                "IBKR custom data subscription requires metadata['{INSTRUMENT_ID_METADATA_KEY}']"
+            )
+        })
+    }
+
+    fn ensure_custom_instrument_loaded(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        if self.instrument_provider.find(&instrument_id).is_some() {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "IBKR custom data instrument {instrument_id} is not loaded in the instrument provider; configure the provider with the canonical Nautilus instrument id before subscribing"
+        )
     }
 
     /// Get a reference to the IB client if connected.
@@ -627,6 +683,7 @@ impl DataClient for InteractiveBrokersDataClient {
 
     async fn connect(&mut self) -> anyhow::Result<()> {
         tracing::debug!("Connecting Interactive Brokers data client...");
+        register_interactive_brokers_custom_data();
 
         let handle = crate::common::shared_client::get_or_connect(
             &self.config.host,
@@ -715,6 +772,76 @@ impl DataClient for InteractiveBrokersDataClient {
     }
 
     // Subscription handlers
+    fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
+        let data_type = cmd.data_type.type_name();
+        if data_type != IBKR_SHORT_AVAILABILITY_TYPE {
+            anyhow::bail!("unsupported IBKR custom data subscription: {data_type}");
+        }
+
+        let instrument_id = Self::required_custom_instrument_id(&cmd.data_type)?;
+        self.ensure_custom_instrument_loaded(instrument_id)?;
+        tracing::debug!("Subscribing to IBKR short availability for {instrument_id}");
+
+        let client = self
+            .ib_client
+            .as_ref()
+            .context("IB client not connected. Call connect() first")?;
+
+        let contract = self
+            .instrument_provider
+            .resolve_contract_for_instrument(instrument_id)
+            .context("Failed to convert instrument_id to IB contract")?;
+
+        if !matches!(contract.security_type, SecurityType::Stock) {
+            anyhow::bail!(
+                "IBKR short availability subscriptions require STK instruments, received {:?} for {instrument_id}",
+                contract.security_type
+            );
+        }
+
+        let mut subscriptions = self
+            .short_availability_subscriptions
+            .try_lock()
+            .context("Failed to lock IB short availability subscriptions")?;
+        if subscriptions.contains_key(&instrument_id) {
+            tracing::debug!(
+                "IBKR short availability subscription already active for {instrument_id}"
+            );
+            return Ok(());
+        }
+
+        let subscription_token = self.cancellation_token.child_token();
+        subscriptions.insert(instrument_id, subscription_token.clone());
+        drop(subscriptions);
+
+        let client_clone = client.as_arc().clone();
+        let data_sender = self.data_sender.clone();
+        let clock = self.clock;
+
+        let task = get_runtime().spawn(async move {
+            if let Err(e) = handle_short_availability_subscription(
+                client_clone,
+                contract,
+                instrument_id,
+                data_sender,
+                clock,
+                subscription_token,
+            )
+            .await
+            {
+                tracing::error!(
+                    "Short availability subscription error for {}: {:?}",
+                    instrument_id,
+                    e
+                );
+            }
+        });
+
+        self.tasks.push(task);
+        tracing::info!("IBKR short availability subscription started for {instrument_id}");
+        Ok(())
+    }
+
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         tracing::debug!("Subscribing to quotes for {}", cmd.instrument_id);
 
@@ -882,6 +1009,28 @@ impl DataClient for InteractiveBrokersDataClient {
                 "tick_by_tick_bid_ask"
             }
         );
+        Ok(())
+    }
+
+    fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
+        let data_type = cmd.data_type.type_name();
+        if data_type != IBKR_SHORT_AVAILABILITY_TYPE {
+            anyhow::bail!("unsupported IBKR custom data unsubscription: {data_type}");
+        }
+
+        let instrument_id = Self::required_custom_instrument_id(&cmd.data_type)?;
+        let mut subscriptions = self
+            .short_availability_subscriptions
+            .try_lock()
+            .context("Failed to lock IB short availability subscriptions")?;
+
+        if let Some(cancellation_token) = subscriptions.remove(&instrument_id) {
+            cancellation_token.cancel();
+            tracing::info!("IBKR short availability subscription cancelled for {instrument_id}");
+        } else {
+            tracing::debug!("No IBKR short availability subscription active for {instrument_id}");
+        }
+
         Ok(())
     }
 
@@ -2302,6 +2451,7 @@ mod tests {
 
     use super::*;
     use crate::common::consts::IB_CLIENT_ID;
+    use crate::data_types::IbkrShortAvailability;
 
     #[rstest]
     #[case(true, ibapi::market_data::TradingHours::Regular)]
@@ -2362,6 +2512,51 @@ mod tests {
         let dt = chrono::DateTime::from_timestamp(1, 2).unwrap();
 
         assert_eq!(datetime_to_unix_nanos(dt), UnixNanos::from(1_000_000_002));
+    }
+
+    #[rstest]
+    fn test_required_custom_instrument_id_reads_data_type_metadata() {
+        let instrument_id = InstrumentId::from("AAPL.XNAS");
+        let data_type = IbkrShortAvailability::data_type_for_instrument(instrument_id);
+
+        let parsed = InteractiveBrokersDataClient::required_custom_instrument_id(&data_type)
+            .expect("instrument metadata should parse");
+
+        assert_eq!(parsed, instrument_id);
+    }
+
+    #[rstest]
+    fn test_required_custom_instrument_id_rejects_missing_metadata() {
+        let data_type = DataType::new("IbkrShortAvailability", None, None);
+
+        let err = InteractiveBrokersDataClient::required_custom_instrument_id(&data_type)
+            .expect_err("missing instrument_id metadata should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "IBKR custom data subscription requires metadata['instrument_id']"
+        );
+    }
+
+    #[rstest]
+    fn test_custom_instrument_loaded_guard_rejects_missing_provider_instrument() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        nautilus_common::live::runner::replace_data_event_sender(sender);
+
+        let config = InteractiveBrokersDataClientConfig::default();
+        let provider = Arc::new(InteractiveBrokersInstrumentProvider::new(
+            config.instrument_provider.clone(),
+        ));
+        let client = InteractiveBrokersDataClient::new(*IB_CLIENT_ID, config, provider).unwrap();
+
+        let err = client
+            .ensure_custom_instrument_loaded(InstrumentId::from("AAPL.NASDAQ"))
+            .expect_err("missing provider instrument should fail");
+
+        assert!(
+            err.to_string()
+                .contains("is not loaded in the instrument provider")
+        );
     }
 
     #[rstest]

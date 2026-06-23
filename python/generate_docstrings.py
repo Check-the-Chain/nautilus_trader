@@ -77,7 +77,6 @@ ANNOTATED_ADAPTER_CRATES = [
     "polymarket",
     "sandbox",
     "tardis",
-    "variational",
 ]
 
 DROPPED_SECTIONS = {"Panics"}

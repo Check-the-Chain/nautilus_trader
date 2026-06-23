@@ -47,6 +47,7 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap, AtomicTime, UnixNanos, consts::NAUTILUS_USER_AGENT,
     datetime::NANOSECONDS_IN_MILLISECOND, env::get_or_env_var, string::secret::REDACTED,
@@ -1757,6 +1758,15 @@ impl OKXHttpClient {
             .ok_or_else(|| anyhow::anyhow!("Instrument {symbol} not in cache"))
     }
 
+    fn instrument_from_cache_by_id(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        self.instruments_cache
+            .get_cloned(&instrument_id.symbol.inner())
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id).into())
+    }
+
     /// Cancel all pending HTTP requests.
     pub fn cancel_all_requests(&self) {
         self.inner.cancel_all_requests();
@@ -2179,7 +2189,7 @@ impl OKXHttpClient {
 
         let raw_inst = resp
             .first()
-            .ok_or_else(|| anyhow::anyhow!("Instrument {symbol} not found"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         // Skip pre-open instruments which have incomplete/empty field values
         if raw_inst.state == OKXInstrumentStatus::Preopen {
@@ -2521,7 +2531,7 @@ impl OKXHttpClient {
         instrument_id: InstrumentId,
         depth: Option<u32>,
     ) -> anyhow::Result<OrderBook> {
-        let inst = self.instrument_from_cache(instrument_id.symbol.inner())?;
+        let inst = self.instrument_from_cache_by_id(instrument_id)?;
         let price_precision = inst.price_precision();
         let size_precision = inst.size_precision();
 
@@ -2579,7 +2589,7 @@ impl OKXHttpClient {
         instrument_id: InstrumentId,
         depth: Option<u32>,
     ) -> anyhow::Result<OrderBookDeltas> {
-        let inst = self.instrument_from_cache(instrument_id.symbol.inner())?;
+        let inst = self.instrument_from_cache_by_id(instrument_id)?;
         let price_precision = inst.price_precision();
         let size_precision = inst.size_precision();
 
@@ -2787,7 +2797,7 @@ impl OKXHttpClient {
         let end_ms = end.map(|e| e.timestamp_millis());
 
         let ts_init = self.generate_ts_init();
-        let inst = self.instrument_from_cache(instrument_id.symbol.inner())?;
+        let inst = self.instrument_from_cache_by_id(instrument_id)?;
 
         // Historical pagination walks backwards using trade IDs, OKX does not honour timestamps for
         // standalone `before` requests (type=2)
@@ -3193,8 +3203,9 @@ impl OKXHttpClient {
         });
         let now_ms = now.timestamp_millis();
 
-        let symbol = bar_type.instrument_id().symbol;
-        let inst = self.instrument_from_cache(symbol.inner())?;
+        let instrument_id = bar_type.instrument_id();
+        let symbol = instrument_id.symbol;
+        let inst = self.instrument_from_cache_by_id(instrument_id)?;
 
         let mut out: Vec<Bar> = Vec::new();
         let mut pages = 0usize;
@@ -5251,11 +5262,17 @@ impl OKXHttpClient {
         instrument_id: InstrumentId,
         algo_id: String,
         new_trigger_price: Option<Price>,
+        new_sl_trigger_price: Option<Price>,
         new_limit_price: Option<Price>,
         new_quantity: Option<Quantity>,
         new_callback_ratio: Option<String>,
         new_callback_spread: Option<String>,
         new_activation_price: Option<Price>,
+        new_tp_trigger_price: Option<Price>,
+        new_tp_order_price: Option<String>,
+        new_tp_trigger_px_type: Option<String>,
+        new_sl_order_price: Option<String>,
+        new_sl_trigger_px_type: Option<String>,
     ) -> Result<OKXAmendAlgoOrderResponse, OKXHttpError> {
         let request = OKXAmendAlgoOrderRequest {
             inst_id: instrument_id.symbol.as_str().to_string(),
@@ -5263,6 +5280,12 @@ impl OKXHttpClient {
             algo_cl_ord_id: None,
             new_sz: new_quantity.map(|q| q.to_string()),
             new_trigger_px: new_trigger_price.map(|p| p.to_string()),
+            new_tp_trigger_px: new_tp_trigger_price.map(|p| p.to_string()),
+            new_tp_ord_px: new_tp_order_price,
+            new_tp_trigger_px_type,
+            new_sl_trigger_px: new_sl_trigger_price.map(|p| p.to_string()),
+            new_sl_ord_px: new_sl_order_price,
+            new_sl_trigger_px_type,
             new_order_px: new_limit_price.map(|p| p.to_string()),
             new_callback_ratio,
             new_callback_spread,

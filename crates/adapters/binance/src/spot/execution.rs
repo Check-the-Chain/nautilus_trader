@@ -231,12 +231,7 @@ impl BinanceSpotExecutionClient {
     }
 
     fn submit_order_internal(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
         let event_emitter = self.emitter.clone();
         let trader_id = self.core.trader_id;
@@ -292,7 +287,7 @@ impl BinanceSpotExecutionClient {
                     .await
                 {
                     dispatch_state.pending_requests.remove(&request_id);
-                    log::error!(
+                    log::warn!(
                         "WS submit request failed for {client_order_id}, awaiting reconciliation: {e}"
                     );
                     anyhow::bail!("WS submit order failed: {e}");
@@ -341,7 +336,7 @@ impl BinanceSpotExecutionClient {
                     }
                     Err(e) => {
                         if is_ambiguous_submit_error(&e) {
-                            log::error!(
+                            log::warn!(
                                 "Ambiguous submit failure for {client_order_id}, awaiting reconciliation: {e}"
                             );
                         } else if is_structured_venue_rejection(&e)
@@ -366,7 +361,7 @@ impl BinanceSpotExecutionClient {
                             );
                             event_emitter.send_order_event(OrderEventAny::Rejected(rejected));
                         } else {
-                            log::error!(
+                            log::warn!(
                                 "Ambiguous submit failure for {client_order_id}, awaiting reconciliation: {e}"
                             );
                         }
@@ -409,7 +404,7 @@ impl BinanceSpotExecutionClient {
                     .await
                 {
                     dispatch_state.pending_requests.remove(&request_id);
-                    log::error!(
+                    log::warn!(
                         "WS cancel request failed for {}, awaiting reconciliation: {e}",
                         command.client_order_id
                     );
@@ -473,7 +468,7 @@ impl BinanceSpotExecutionClient {
                                 command.client_order_id
                             );
                         } else {
-                            log::error!(
+                            log::warn!(
                                 "Ambiguous cancel failure for {}, awaiting reconciliation: {e}",
                                 command.client_order_id
                             );
@@ -961,12 +956,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
         if order.is_closed() {
             let client_order_id = order.client_order_id();
@@ -1044,7 +1034,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                             .iter()
                             .find(|report| report.client_order_id == encoded_client_order_id)
                         else {
-                            log::error!(
+                            log::warn!(
                                 "OCO response missing leg for {}, awaiting reconciliation",
                                 order.client_order_id()
                             );
@@ -1155,7 +1145,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                     .await
                 {
                     dispatch_state.pending_requests.remove(&request_id);
-                    log::error!(
+                    log::warn!(
                         "WS modify request failed for {}, awaiting reconciliation: {e}",
                         command.client_order_id
                     );
@@ -1231,7 +1221,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                             event_emitter
                                 .send_order_event(OrderEventAny::ModifyRejected(rejected_event));
                         } else {
-                            log::error!(
+                            log::warn!(
                                 "Ambiguous modify failure for {}, awaiting reconciliation: {e}",
                                 command.client_order_id
                             );
@@ -1423,7 +1413,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                                 chunk.len()
                             );
                         } else {
-                            log::error!(
+                            log::warn!(
                                 "Ambiguous batch cancel failure for {} orders, awaiting reconciliation: {e}",
                                 chunk.len()
                             );
@@ -1519,7 +1509,7 @@ fn dispatch_ws_trading_message(
                     code_i64,
                     BINANCE_UNEXPECTED_RESPONSE_CODE | BINANCE_STATUS_UNKNOWN_CODE
                 ) {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous WS submit failure for {}, awaiting reconciliation: code={code}, msg={msg}",
                         pending.client_order_id,
                     );

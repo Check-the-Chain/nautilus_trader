@@ -59,7 +59,7 @@
 //! );
 //!
 //! // Write data to the catalog
-//! // catalog.write_to_parquet(data, None, None)?;
+//! // catalog.write_to_parquet(&data, None, None)?;
 //! ```
 
 use std::{
@@ -80,7 +80,6 @@ use datafusion::arrow::{
 };
 use futures::StreamExt;
 use indexmap::IndexSet;
-use itertools::Itertools;
 use nautilus_common::live::get_runtime;
 use nautilus_core::{
     UnixNanos,
@@ -120,7 +119,8 @@ use super::{
     session::{self, DataBackendSession, QueryResult, build_query},
 };
 use crate::parquet::{
-    is_remote_uri_scheme, read_parquet_from_object_store, remote_full_uri, remote_store_root_url,
+    append_path_to_file_uri, decode_object_store_segment, is_remote_uri_scheme,
+    read_parquet_from_object_store, remote_full_uri, remote_store_root_url,
     write_batches_to_object_store,
 };
 
@@ -395,8 +395,8 @@ impl ParquetDataCatalog {
         let mut mark_prices: Vec<MarkPriceUpdate> = Vec::new();
         let mut index_prices: Vec<IndexPriceUpdate> = Vec::new();
         let mut funding_rates: Vec<FundingRateUpdate> = Vec::new();
-        let mut statuses: Vec<InstrumentStatus> = Vec::new();
         let mut option_greeks: Vec<OptionGreeks> = Vec::new();
+        let mut statuses: Vec<InstrumentStatus> = Vec::new();
         let mut closes: Vec<InstrumentClose> = Vec::new();
         // Group custom data by full DataType identity (type_name + identifier + metadata)
         // so each batch is written to the correct path with consistent schema/metadata.
@@ -437,11 +437,11 @@ impl ParquetDataCatalog {
                 Data::FundingRateUpdate(p) => {
                     funding_rates.push(p);
                 }
-                Data::InstrumentStatus(s) => {
-                    statuses.push(s);
-                }
                 Data::OptionGreeks(g) => {
                     option_greeks.push(g);
+                }
+                Data::InstrumentStatus(s) => {
+                    statuses.push(s);
                 }
                 Data::InstrumentClose(c) => {
                     closes.push(c);
@@ -458,17 +458,17 @@ impl ParquetDataCatalog {
 
         // Instruments are handled separately via write_instruments method
 
-        self.write_to_parquet(deltas, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(depth10s, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(quotes, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(trades, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(bars, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(mark_prices, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(index_prices, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(funding_rates, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(statuses, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(option_greeks, start, end, skip_disjoint_check)?;
-        self.write_to_parquet(closes, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&deltas, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&depth10s, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&quotes, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&trades, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&bars, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&mark_prices, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&index_prices, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&funding_rates, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&option_greeks, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&statuses, start, end, skip_disjoint_check)?;
+        self.write_to_parquet(&closes, start, end, skip_disjoint_check)?;
 
         for (_, items) in custom_data {
             self.write_custom_data_batch(items, start, end, skip_disjoint_check)?;
@@ -489,7 +489,7 @@ impl ParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `data`: Vector of data records to write (must be in ascending timestamp order).
+    /// - `data`: Data records to write (must be in ascending timestamp order).
     /// - `start`: Optional start timestamp to override the natural data range.
     /// - `end`: Optional end timestamp to override the natural data range.
     ///
@@ -522,13 +522,13 @@ impl ParquetDataCatalog {
     /// let catalog = ParquetDataCatalog::new(/* ... */);
     /// let quotes: Vec<QuoteTick> = vec![/* quote data */];
     ///
-    /// let path = catalog.write_to_parquet(quotes, None, None)?;
+    /// let path = catalog.write_to_parquet(&quotes, None, None)?;
     /// println!("Data written to: {:?}", path);
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn write_to_parquet<T>(
         &self,
-        data: Vec<T>,
+        data: &[T],
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
         skip_disjoint_check: Option<bool>,
@@ -541,7 +541,7 @@ impl ParquetDataCatalog {
         }
 
         let type_name = to_snake_case(std::any::type_name::<T>());
-        Self::check_ascending_timestamps(&data, &type_name)?;
+        Self::check_ascending_timestamps(data, &type_name)?;
 
         let start_ts = start.unwrap_or(data.first().unwrap().ts_init());
         let end_ts = end.unwrap_or(data.last().unwrap().ts_init());
@@ -758,7 +758,7 @@ impl ParquetDataCatalog {
             };
             let start_ts = HasTsInit::ts_init(first_instrument);
             let end_ts = HasTsInit::ts_init(last_instrument);
-            let batches = self.data_to_record_batches(instrument_group)?;
+            let batches = self.data_to_record_batches(&instrument_group)?;
             if batches.is_empty() {
                 continue;
             }
@@ -907,13 +907,13 @@ impl ParquetDataCatalog {
                 continue;
             }
 
-            let instrument_id_dir = path_parts[path_parts.len() - 2];
+            let instrument_id_dir = decode_object_store_segment(path_parts[path_parts.len() - 2]);
 
             if let Some(ids) = instrument_ids
                 && !ids
                     .iter()
                     .map(|id| urisafe_instrument_id(id))
-                    .any(|x| x.as_str() == urisafe_instrument_id(instrument_id_dir))
+                    .any(|x| x.as_str() == urisafe_instrument_id(&instrument_id_dir))
             {
                 continue;
             }
@@ -1125,7 +1125,7 @@ impl ParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `data`: Vector of data records to convert.
+    /// - `data`: Data records to convert.
     ///
     /// # Returns
     ///
@@ -1134,16 +1134,15 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if record batch encoding fails for any chunk.
-    pub fn data_to_record_batches<T>(&self, data: Vec<T>) -> anyhow::Result<Vec<RecordBatch>>
+    pub fn data_to_record_batches<T>(&self, data: &[T]) -> anyhow::Result<Vec<RecordBatch>>
     where
         T: HasTsInit + EncodeToRecordBatch,
     {
         let mut batches = Vec::new();
 
-        for chunk in &data.into_iter().chunks(self.batch_size) {
-            let data = chunk.collect_vec();
-            let metadata = EncodeToRecordBatch::chunk_metadata(&data);
-            let record_batch = T::encode_batch(&metadata, &data)?;
+        for chunk in data.chunks(self.batch_size) {
+            let metadata = EncodeToRecordBatch::chunk_metadata(chunk);
+            let record_batch = T::encode_batch(&metadata, chunk)?;
             batches.push(record_batch);
         }
 
@@ -1457,9 +1456,7 @@ impl ParquetDataCatalog {
         }
 
         if self.original_uri.starts_with("file://") {
-            let base = self.original_uri.trim_end_matches('/');
-            let path_trimmed = path.trim_end_matches('/');
-            return format!("{base}/{path_trimmed}");
+            return append_path_to_file_uri(&self.original_uri, path);
         }
         self.reconstruct_full_uri(path)
     }
@@ -2078,8 +2075,9 @@ impl ParquetDataCatalog {
                     // Extract the directory name (second to last path component)
                     let path_parts: Vec<&str> = file_path.split('/').collect();
                     if path_parts.len() >= 2 {
-                        let dir_name = path_parts[path_parts.len() - 2];
-                        safe_identifiers.iter().any(|safe_id| safe_id == dir_name)
+                        let dir_name =
+                            decode_object_store_segment(path_parts[path_parts.len() - 2]);
+                        safe_identifiers.contains(&dir_name)
                     } else {
                         false
                     }
@@ -2091,8 +2089,10 @@ impl ParquetDataCatalog {
                 file_paths.retain(|file_path| {
                     let path_parts: Vec<&str> = file_path.split('/').collect();
                     if path_parts.len() >= 2 {
-                        let dir_name = path_parts[path_parts.len() - 2];
-                        if let Some(bar_instrument_id) = extract_bar_type_instrument_id(dir_name) {
+                        let dir_name =
+                            decode_object_store_segment(path_parts[path_parts.len() - 2]);
+
+                        if let Some(bar_instrument_id) = extract_bar_type_instrument_id(&dir_name) {
                             safe_identifiers.iter().any(|id| id == bar_instrument_id)
                         } else {
                             false
@@ -2200,20 +2200,6 @@ impl ParquetDataCatalog {
         self.query_typed::<FundingRateUpdate>(instrument_ids, start, end, None, None, true)
     }
 
-    /// Queries instrument close data for the specified instrument(s) and time range.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if file discovery, query execution, or decoding fails.
-    pub fn instrument_closes(
-        &mut self,
-        instrument_ids: Option<Vec<String>>,
-        start: Option<UnixNanos>,
-        end: Option<UnixNanos>,
-    ) -> anyhow::Result<Vec<InstrumentClose>> {
-        self.query_typed_data::<InstrumentClose>(instrument_ids, start, end, None, None, true)
-    }
-
     /// Queries option greeks data for the specified instrument(s) and time range.
     ///
     /// # Errors
@@ -2226,6 +2212,20 @@ impl ParquetDataCatalog {
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<OptionGreeks>> {
         self.query_typed_data::<OptionGreeks>(instrument_ids, start, end, None, None, true)
+    }
+
+    /// Queries instrument close data for the specified instrument(s) and time range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file discovery, query execution, or decoding fails.
+    pub fn instrument_closes(
+        &mut self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<Vec<InstrumentClose>> {
+        self.query_typed_data::<InstrumentClose>(instrument_ids, start, end, None, None, true)
     }
 
     /// Queries any instrument data for the specified instrument(s) and time range.
@@ -2372,7 +2372,7 @@ impl ParquetDataCatalog {
                 .map(|file_path| {
                     let path_parts: Vec<&str> = file_path.split('/').collect();
                     if path_parts.len() >= 2 {
-                        path_parts[path_parts.len() - 2].to_string()
+                        decode_object_store_segment(path_parts[path_parts.len() - 2])
                     } else {
                         String::new()
                     }
@@ -2398,7 +2398,8 @@ impl ParquetDataCatalog {
                 filtered_paths.retain(|file_path| {
                     let path_parts: Vec<&str> = file_path.split('/').collect();
                     if path_parts.len() >= 2 {
-                        let dir_name = path_parts[path_parts.len() - 2];
+                        let dir_name =
+                            decode_object_store_segment(path_parts[path_parts.len() - 2]);
                         safe_identifiers
                             .iter()
                             .any(|safe_id| dir_name.starts_with(&format!("{safe_id}-")))
@@ -4250,8 +4251,8 @@ impl_catalog_path_prefix!(Bar, "bars");
 impl_catalog_path_prefix!(IndexPriceUpdate, "index_prices");
 impl_catalog_path_prefix!(MarkPriceUpdate, "mark_prices");
 impl_catalog_path_prefix!(FundingRateUpdate, "funding_rate_update");
-impl_catalog_path_prefix!(InstrumentStatus, "instrument_status");
 impl_catalog_path_prefix!(OptionGreeks, "option_greeks");
+impl_catalog_path_prefix!(InstrumentStatus, "instrument_status");
 impl_catalog_path_prefix!(InstrumentClose, "instrument_closes");
 impl_catalog_path_prefix!(InstrumentAny, "instruments");
 impl_catalog_path_prefix!(AccountState, "account_state");

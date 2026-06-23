@@ -25,7 +25,7 @@ use nautilus_common::{
         ClientConfig, DataClientFactory, ExecutionClientFactory, SimulatedExecutionClientFactory,
     },
     logging::logger::LoggerConfig,
-    msgbus::database::MessageBusConfig,
+    msgbus::{BusMessage, MessageBusConfig, MessageBusExternalEgress, MessageBusExternalIngress},
 };
 use nautilus_core::UUID4;
 use nautilus_data::client::DataClientAdapter;
@@ -52,6 +52,15 @@ enum ExecutionClientFactoryEntry {
     Simulated(Box<dyn SimulatedExecutionClientFactory>),
 }
 
+pub(crate) struct ExternalMessageBusIngress(Box<dyn MessageBusExternalIngress>);
+
+impl Debug for ExternalMessageBusIngress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(ExternalMessageBusIngress))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Builder for constructing a [`LiveNode`] with a fluent API.
 ///
 /// Provides configuration options specific to live nodes, including client factory
@@ -69,6 +78,8 @@ pub struct LiveNodeBuilder {
     data_client_configs: HashMap<String, Box<dyn ClientConfig>>,
     exec_client_configs: HashMap<String, Box<dyn ClientConfig>>,
     event_store_factory: Option<EventStoreFactory>,
+    external_msgbus_egress: Option<Box<dyn MessageBusExternalEgress>>,
+    external_msgbus_ingress: Option<ExternalMessageBusIngress>,
 }
 
 impl Debug for LiveNodeBuilder {
@@ -81,6 +92,14 @@ impl Debug for LiveNodeBuilder {
             .field("data_client_configs", &self.data_client_configs.keys())
             .field("exec_client_configs", &self.exec_client_configs.keys())
             .field("event_store_factory", &self.event_store_factory.is_some())
+            .field(
+                "external_msgbus_egress",
+                &self.external_msgbus_egress.is_some(),
+            )
+            .field(
+                "external_msgbus_ingress",
+                &self.external_msgbus_ingress.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -113,6 +132,8 @@ impl LiveNodeBuilder {
             data_client_configs: HashMap::new(),
             exec_client_configs: HashMap::new(),
             event_store_factory: None,
+            external_msgbus_egress: None,
+            external_msgbus_ingress: None,
         })
     }
 
@@ -137,6 +158,8 @@ impl LiveNodeBuilder {
             data_client_configs: HashMap::new(),
             exec_client_configs: HashMap::new(),
             event_store_factory: None,
+            external_msgbus_egress: None,
+            external_msgbus_ingress: None,
         })
     }
 
@@ -239,8 +262,8 @@ impl LiveNodeBuilder {
 
     /// Set the message bus configuration.
     ///
-    /// The Rust live runtime does not support this setting yet.
-    /// `build()` returns an error when it is set.
+    /// External streams are consumed when an ingress implementation is injected with
+    /// [`Self::with_external_ingress`].
     #[must_use]
     pub fn with_msgbus_config(mut self, config: MessageBusConfig) -> Self {
         self.config.msgbus = Some(config);
@@ -309,6 +332,26 @@ impl LiveNodeBuilder {
             + 'static,
     {
         self.event_store_factory = Some(Box::new(factory));
+        self
+    }
+
+    /// Inject external message bus egress for serialized message bus publications.
+    #[must_use]
+    pub fn with_external_msgbus_egress(
+        mut self,
+        external_egress: Box<dyn MessageBusExternalEgress>,
+    ) -> Self {
+        self.external_msgbus_egress = Some(external_egress);
+        self
+    }
+
+    /// Inject external message bus ingress for serialized inbound publications.
+    #[must_use]
+    pub fn with_external_ingress(
+        mut self,
+        external_ingress: Box<dyn MessageBusExternalIngress>,
+    ) -> Self {
+        self.external_msgbus_ingress = Some(ExternalMessageBusIngress(external_ingress));
         self
     }
 
@@ -428,6 +471,13 @@ impl LiveNodeBuilder {
             self.event_store_factory.take(),
         )?;
 
+        if let Some(external_egress) = self.external_msgbus_egress {
+            let config = self.config.msgbus.clone().unwrap_or_default();
+            nautilus_common::msgbus::get_message_bus()
+                .borrow_mut()
+                .set_external_egress_config(external_egress, &config)?;
+        }
+
         for (name, factory) in self.data_client_factories {
             if let Some(config) = self.data_client_configs.remove(&name) {
                 log::debug!("Creating data client {name}");
@@ -497,16 +547,34 @@ impl LiveNodeBuilder {
             exec_manager_config,
         );
 
-        #[cfg_attr(
-            not(feature = "plugin"),
-            expect(unused_mut, reason = "plugin builds need mutable node state")
-        )]
-        let mut node =
-            LiveNode::new_from_builder(kernel, runner, self.config, exec_manager, exec_clients);
+        let node = LiveNode::new_from_builder(
+            kernel,
+            runner,
+            self.config,
+            exec_manager,
+            exec_clients,
+            self.external_msgbus_ingress,
+        );
         node.load_configured_plugins()?;
 
         log::info!("Built successfully");
 
         Ok(node)
+    }
+}
+
+impl ExternalMessageBusIngress {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+
+    pub(crate) fn take_receiver(
+        &mut self,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<BusMessage>> {
+        self.0.take_receiver()
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.0.close();
     }
 }

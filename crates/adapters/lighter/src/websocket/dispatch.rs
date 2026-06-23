@@ -93,7 +93,7 @@ pub(crate) struct OrderIdentity {
 /// responses without one fall back to FIFO-head attribution, so the queue
 /// order still matches the send order. The `kind` records whether the entry
 /// has an originating Nautilus order that should receive a typed
-/// `OrderRejected` on a venue rejection.
+/// order event on a venue rejection.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSendTx {
     pub(crate) kind: PendingSendTxKind,
@@ -113,9 +113,22 @@ pub(crate) enum PendingSendTxKind {
         order: Box<OrderAny>,
         client_order_index: i64,
     },
-    /// Cancel, modify, or update-leverage submit. Tracked for FIFO alignment
-    /// so the venue's ACK or rejection pops the correct head; the consumption
-    /// loop logs but does not emit a typed event for these yet.
+    /// Cancel-order submit. On rejection: emit `OrderCancelRejected`.
+    Cancel {
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+    },
+    /// Modify-order submit. On rejection: emit `OrderModifyRejected`.
+    Modify {
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+    },
+    /// Non-order sendTx, such as update-leverage. Tracked for FIFO alignment
+    /// so the venue's ACK or rejection pops the correct head.
     Other,
 }
 
@@ -646,6 +659,13 @@ impl WsDispatchState {
         self.seen_trade_ids.insert(trade_id)
     }
 
+    /// Roll back a [`Self::mark_trade_seen`] marker when the trade could not be
+    /// parsed, so a later replay of the same `trade_id` is retried instead of
+    /// being permanently suppressed by the dedup set.
+    pub(crate) fn unmark_trade_seen(&self, trade_id: &TradeId) {
+        self.seen_trade_ids.remove(trade_id);
+    }
+
     /// Record a market_index as having reported account activity.
     pub(crate) fn note_active_market(&self, market_index: i16) {
         self.active_markets.insert(market_index);
@@ -764,15 +784,26 @@ impl WsDispatchState {
     /// Instruments absent from `snapshot` are evicted; an empty input
     /// clears the cache entirely.
     pub(crate) fn replace_positions(&self, snapshot: &[PositionStatusReport]) -> Vec<InstrumentId> {
+        self.replace_positions_except(snapshot, &[])
+    }
+
+    /// Replace the cache from a snapshot while retaining instruments whose
+    /// venue rows were skipped and therefore cannot be treated as closed.
+    pub(crate) fn replace_positions_except(
+        &self,
+        snapshot: &[PositionStatusReport],
+        retained: &[InstrumentId],
+    ) -> Vec<InstrumentId> {
         let mut guard = self.last_positions.lock().expect(MUTEX_POISONED);
         let new_ids: ahash::AHashSet<InstrumentId> =
             snapshot.iter().map(|r| r.instrument_id).collect();
+        let retained_ids: ahash::AHashSet<InstrumentId> = retained.iter().copied().collect();
         let removed: Vec<InstrumentId> = guard
             .keys()
-            .filter(|id| !new_ids.contains(id))
+            .filter(|id| !new_ids.contains(id) && !retained_ids.contains(id))
             .copied()
             .collect();
-        guard.clear();
+        guard.retain(|id, _| retained_ids.contains(id));
         for report in snapshot {
             guard.insert(report.instrument_id, report.clone());
         }
@@ -1463,6 +1494,37 @@ mod tests {
         state.replace_positions(&[]);
 
         assert!(state.snapshot_positions(None).is_empty());
+    }
+
+    #[rstest]
+    fn replace_positions_except_keeps_only_retained_absent_positions() {
+        let state = WsDispatchState::new();
+        state.replace_positions(&[
+            stub_position_report("ETH-PERP.LIGHTER", "1.0"),
+            stub_position_report("BTC-PERP.LIGHTER", "2.0"),
+            stub_position_report("DOGE-PERP.LIGHTER", "4.0"),
+        ]);
+
+        let removed = state.replace_positions_except(
+            &[stub_position_report("ETH-PERP.LIGHTER", "3.0")],
+            &[InstrumentId::from("BTC-PERP.LIGHTER")],
+        );
+
+        let mut actual: Vec<(String, String)> = state
+            .snapshot_positions(None)
+            .into_iter()
+            .map(|r| (r.instrument_id.to_string(), r.quantity.to_string()))
+            .collect();
+        actual.sort();
+
+        assert_eq!(removed, vec![InstrumentId::from("DOGE-PERP.LIGHTER")]);
+        assert_eq!(
+            actual,
+            vec![
+                ("BTC-PERP.LIGHTER".to_string(), "2.0".to_string()),
+                ("ETH-PERP.LIGHTER".to_string(), "3.0".to_string()),
+            ],
+        );
     }
 
     #[rstest]
@@ -2328,6 +2390,12 @@ mod tests {
     fn pending_cloid(p: &PendingSendTx) -> Option<ClientOrderId> {
         match &p.kind {
             PendingSendTxKind::Create { order, .. } => Some(order.client_order_id()),
+            PendingSendTxKind::Cancel {
+                client_order_id, ..
+            }
+            | PendingSendTxKind::Modify {
+                client_order_id, ..
+            } => Some(*client_order_id),
             PendingSendTxKind::Other => None,
         }
     }

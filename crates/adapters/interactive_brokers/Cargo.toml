@@ -66,6 +66,7 @@ nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
+nautilus-persistence-macros = { workspace = true }
 
 nautilus-execution = { workspace = true, optional = true }
 nautilus-network = { workspace = true, optional = true }
@@ -106,6 +107,12 @@ tempfile = { workspace = true }
 [[example]]
 name = "ib-data-tester"
 path = "examples/node_data_tester.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "ib-short-availability-smoke"
+path = "examples/short_availability_smoke.rs"
 required-features = ["examples"]
 doc = false
 

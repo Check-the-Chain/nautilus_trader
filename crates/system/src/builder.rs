@@ -20,6 +20,7 @@ use nautilus_common::{
     clock::Clock,
     enums::Environment,
     logging::logger::LoggerConfig,
+    msgbus::MessageBusExternalEgress,
 };
 use nautilus_core::UUID4;
 use nautilus_data::engine::config::DataEngineConfig;
@@ -60,6 +61,7 @@ pub struct NautilusKernelBuilder {
     exec_engine: Option<ExecutionEngineConfig>,
     portfolio: Option<PortfolioConfig>,
     event_store_factory: Option<EventStoreFactory>,
+    external_msgbus_egress: Option<Box<dyn MessageBusExternalEgress>>,
 }
 
 impl Debug for NautilusKernelBuilder {
@@ -86,6 +88,10 @@ impl Debug for NautilusKernelBuilder {
             .field("exec_engine", &self.exec_engine)
             .field("portfolio", &self.portfolio)
             .field("event_store_factory", &self.event_store_factory.is_some())
+            .field(
+                "external_msgbus_egress",
+                &self.external_msgbus_egress.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -116,6 +122,7 @@ impl NautilusKernelBuilder {
             exec_engine: None,
             portfolio: None,
             event_store_factory: None,
+            external_msgbus_egress: None,
         }
     }
 
@@ -263,6 +270,16 @@ impl NautilusKernelBuilder {
         self
     }
 
+    /// Inject external message bus egress for serialized message bus publications.
+    #[must_use]
+    pub fn with_external_msgbus_egress(
+        mut self,
+        external_egress: Box<dyn MessageBusExternalEgress>,
+    ) -> Self {
+        self.external_msgbus_egress = Some(external_egress);
+        self
+    }
+
     /// Build the [`NautilusKernel`] with the configured settings.
     ///
     /// # Errors
@@ -292,12 +309,21 @@ impl NautilusKernelBuilder {
             streaming: None,
         };
 
-        NautilusKernel::new_with(
+        let kernel = NautilusKernel::new_with(
             self.name,
             config,
             self.cache_database,
             self.event_store_factory,
-        )
+        )?;
+
+        if let Some(external_egress) = self.external_msgbus_egress {
+            let config = kernel.config.msgbus().unwrap_or_default();
+            nautilus_common::msgbus::get_message_bus()
+                .borrow_mut()
+                .set_external_egress_config(external_egress, &config)?;
+        }
+
+        Ok(kernel)
     }
 }
 
@@ -314,6 +340,8 @@ impl Default for NautilusKernelBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use ahash::AHashMap;
     use bytes::Bytes;
     use nautilus_common::{
@@ -322,6 +350,7 @@ mod tests {
             database::{CacheDatabaseAdapter, CacheMap},
         },
         clock::Clock,
+        msgbus::BusMessage,
         signal::Signal,
     };
     use nautilus_core::UnixNanos;
@@ -408,6 +437,34 @@ mod tests {
         let builder = NautilusKernelBuilder::default().with_cache_database(Box::new(NoopAdapter));
 
         assert!(builder.cache_database.is_some());
+    }
+
+    #[rstest]
+    fn test_builder_with_external_msgbus_egress_forwards_published_quote() {
+        let (external_egress, publications, closed) = CapturingExternalEgress::new();
+        let kernel = NautilusKernelBuilder::default()
+            .with_external_msgbus_egress(Box::new(external_egress))
+            .build()
+            .expect("kernel builds with external message bus egress");
+        let quote = QuoteTick::default();
+
+        nautilus_common::msgbus::publish_quote("data.quotes.TEST".into(), &quote);
+
+        let publications = publications.borrow();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].topic, "data.quotes.TEST");
+        assert_eq!(
+            serde_json::from_slice::<QuoteTick>(&publications[0].payload)
+                .expect("JSON payload must decode as QuoteTick"),
+            quote
+        );
+        drop(publications);
+
+        nautilus_common::msgbus::get_message_bus()
+            .borrow_mut()
+            .dispose();
+        assert!(closed.get());
+        drop(kernel);
     }
 
     #[rstest]
@@ -505,6 +562,52 @@ mod tests {
         assert_eq!(builder.timeout_disconnection, Duration::from_secs(10));
         assert_eq!(builder.delay_post_stop, Duration::from_secs(10));
         assert_eq!(builder.timeout_shutdown, Duration::from_secs(5));
+    }
+
+    #[derive(Debug)]
+    struct CapturedEgressMessage {
+        topic: String,
+        payload: Bytes,
+    }
+
+    type CapturedEgressMessages = Rc<RefCell<Vec<CapturedEgressMessage>>>;
+    type SharedClosed = Rc<Cell<bool>>;
+
+    struct CapturingExternalEgress {
+        publications: CapturedEgressMessages,
+        closed: SharedClosed,
+    }
+
+    impl CapturingExternalEgress {
+        fn new() -> (Self, CapturedEgressMessages, SharedClosed) {
+            let publications = Rc::new(RefCell::new(Vec::new()));
+            let closed = Rc::new(Cell::new(false));
+            (
+                Self {
+                    publications: publications.clone(),
+                    closed: closed.clone(),
+                },
+                publications,
+                closed,
+            )
+        }
+    }
+
+    impl MessageBusExternalEgress for CapturingExternalEgress {
+        fn is_closed(&self) -> bool {
+            self.closed.get()
+        }
+
+        fn publish(&self, message: BusMessage) {
+            self.publications.borrow_mut().push(CapturedEgressMessage {
+                topic: message.topic.to_string(),
+                payload: message.payload,
+            });
+        }
+
+        fn close(&mut self) {
+            self.closed.set(true);
+        }
     }
 
     struct NoopAdapter;

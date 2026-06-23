@@ -19,6 +19,7 @@ use ibapi::{
             Bar as HistoricalBar, BarSize as HistoricalBarSize, HistoricalBarUpdate,
             WhatToShow as HistoricalWhatToShow,
         },
+        realtime::generic_tick,
         realtime::{
             Bar as RealtimeBar, MarketDepths, TickGeneric, TickPrice, TickPriceSize, TickSize,
             TickTypes, WhatToShow as RealtimeWhatToShow,
@@ -45,6 +46,7 @@ use crate::data::{
         parse_quote_tick, parse_trade_tick,
     },
 };
+use crate::data_types::{IbkrShortAvailability, SHORTABLE_SCORE_SCALE};
 
 enum StreamAction {
     Continue,
@@ -401,6 +403,62 @@ pub(super) async fn handle_option_greeks_subscription(
     }
 
     tracing::debug!("Option greeks subscription ended for {}", instrument_id);
+    Ok(())
+}
+
+pub(super) async fn handle_short_availability_subscription(
+    client: Arc<ibapi::Client>,
+    contract: ibapi::contracts::Contract,
+    instrument_id: InstrumentId,
+    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    clock: &'static AtomicTime,
+    cancellation_token: CancellationToken,
+) -> anyhow::Result<()> {
+    tracing::debug!(
+        "Starting short availability subscription for {}",
+        instrument_id
+    );
+
+    let mut subscription = client
+        .market_data(&contract)
+        .generic_ticks(&[generic_tick::SHORTABLE])
+        .streaming()
+        .subscribe()
+        .await
+        .context("Failed to create short availability market data subscription")?;
+
+    loop {
+        tokio::select! {
+            () = cancellation_token.cancelled() => {
+                tracing::debug!("Short availability subscription cancelled for {}", instrument_id);
+                subscription.cancel().await;
+                break;
+            }
+            tick_result = subscription.next() => {
+                let Some(tick_result) = tick_result else {
+                    tracing::debug!("Short availability subscription stream ended for {}", instrument_id);
+                    break;
+                };
+
+                if matches!(
+                    process_short_availability_tick_result(
+                        tick_result,
+                        instrument_id,
+                        &data_sender,
+                        clock,
+                    )?,
+                    StreamAction::Stop
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::debug!(
+        "Short availability subscription ended for {}",
+        instrument_id
+    );
     Ok(())
 }
 
@@ -1078,6 +1136,95 @@ where
     }
 }
 
+fn process_short_availability_tick_result<I, E>(
+    tick_result: Result<I, E>,
+    instrument_id: InstrumentId,
+    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    clock: &'static AtomicTime,
+) -> anyhow::Result<StreamAction>
+where
+    I: IntoSubscriptionTick,
+    E: Debug,
+{
+    match tick_result.map(IntoSubscriptionTick::into_subscription_item) {
+        Ok(SubscriptionItem::Data(TickTypes::Generic(TickGeneric { tick_type, value })))
+            if matches!(tick_type, TickType::Shortable) =>
+        {
+            let Some(shortable_score_e6) = scaled_shortable_score(value) else {
+                tracing::warn!(
+                    "Ignoring invalid IBKR shortability score for {}: {}",
+                    instrument_id,
+                    value
+                );
+                return Ok(StreamAction::Continue);
+            };
+            let ts_event = clock.get_time_ns();
+            let update = IbkrShortAvailability::from_score(
+                instrument_id,
+                shortable_score_e6,
+                ts_event,
+                ts_event,
+            );
+
+            send_short_availability(update, data_sender, instrument_id)
+        }
+        Ok(SubscriptionItem::Data(TickTypes::Size(TickSize { tick_type, size })))
+            if matches!(tick_type, TickType::ShortableShares) =>
+        {
+            let Some(shortable_shares) = shortable_shares_from_tick(size) else {
+                tracing::warn!(
+                    "Ignoring invalid IBKR shortable shares for {}: {}",
+                    instrument_id,
+                    size
+                );
+                return Ok(StreamAction::Continue);
+            };
+            let ts_event = clock.get_time_ns();
+            let update = IbkrShortAvailability::from_shares(
+                instrument_id,
+                shortable_shares,
+                ts_event,
+                ts_event,
+            );
+
+            send_short_availability(update, data_sender, instrument_id)
+        }
+        Ok(SubscriptionItem::Notice(notice)) => {
+            tracing::debug!(
+                "IB short availability notice for {}: {} - {}",
+                instrument_id,
+                notice.code,
+                notice.message
+            );
+
+            if notice.code == 162 {
+                tracing::info!(
+                    "Short availability subscription cancelled for {}",
+                    instrument_id
+                );
+                return Ok(StreamAction::Stop);
+            }
+            Ok(StreamAction::Continue)
+        }
+        Ok(SubscriptionItem::Data(TickTypes::SnapshotEnd)) => {
+            tracing::debug!(
+                "Short availability snapshot end received for {}",
+                instrument_id
+            );
+            Ok(StreamAction::Continue)
+        }
+        Ok(SubscriptionItem::Data(_)) => Ok(StreamAction::Continue),
+        Err(e) => {
+            tracing::error!(
+                "Short availability subscription error for {}: {:?}",
+                instrument_id,
+                e
+            );
+            anyhow::bail!("Subscription error: {e:?}");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_index_price_tick_result<I, E>(
     tick_result: Result<I, E>,
@@ -1146,6 +1293,24 @@ where
             anyhow::bail!("Subscription error: {e:?}");
         }
     }
+}
+
+fn scaled_shortable_score(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let scaled = value * SHORTABLE_SCORE_SCALE as f64;
+    if scaled < i64::MIN as f64 || scaled > i64::MAX as f64 {
+        return None;
+    }
+    Some(scaled.round() as i64)
+}
+
+fn shortable_shares_from_tick(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 || value > u64::MAX as f64 {
+        return None;
+    }
+    Some(value.round() as u64)
 }
 
 fn update_quote_from_price_tick(
@@ -1309,6 +1474,24 @@ fn send_option_greeks(
     StreamAction::Continue
 }
 
+fn send_short_availability(
+    update: IbkrShortAvailability,
+    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instrument_id: InstrumentId,
+) -> anyhow::Result<StreamAction> {
+    if data_sender
+        .send(DataEvent::Data(Data::Custom(update.into_custom_data())))
+        .is_err()
+    {
+        tracing::debug!(
+            "Short availability receiver dropped for {}; stopping stream",
+            instrument_id
+        );
+        return Ok(StreamAction::Stop);
+    }
+    Ok(StreamAction::Continue)
+}
+
 async fn process_option_open_interest_tick(
     instrument_id: InstrumentId,
     tick_type: TickType,
@@ -1357,9 +1540,10 @@ mod tests {
     use super::{
         OptionGreeksCache, QuoteCache, StreamAction, process_index_price_tick_result,
         process_market_depth_stream, process_option_greeks_tick_result, process_quote_tick_result,
-        process_realtime_bar_stream, process_trade_stream, send_quote_tick,
-        update_quote_from_price_tick, update_revised_bar_tracking,
+        process_realtime_bar_stream, process_short_availability_tick_result, process_trade_stream,
+        send_quote_tick, update_quote_from_price_tick, update_revised_bar_tracking,
     };
+    use crate::data_types::{IBKR_SHORT_AVAILABILITY_TYPE, IbkrShortAvailability};
 
     fn instrument_id() -> InstrumentId {
         InstrumentId::new(Symbol::from("SPX"), Venue::from("CBOE"))
@@ -1763,6 +1947,76 @@ mod tests {
 
         let error = result.err().unwrap();
         assert_eq!(error.to_string(), "Subscription error: \"boom\"");
+    }
+
+    #[tokio::test]
+    async fn test_process_short_availability_tick_result_emits_score_update() {
+        let instrument_id = instrument_id();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let clock = get_atomic_clock_realtime();
+
+        let action = process_short_availability_tick_result(
+            Ok::<_, &'static str>(TickTypes::Generic(TickGeneric {
+                tick_type: TickType::Shortable,
+                value: 2.5,
+            })),
+            instrument_id,
+            &sender,
+            clock,
+        )
+        .unwrap();
+
+        assert!(matches!(action, StreamAction::Continue));
+
+        match receiver.recv().await.unwrap() {
+            DataEvent::Data(Data::Custom(custom)) => {
+                assert_eq!(custom.data_type.type_name(), IBKR_SHORT_AVAILABILITY_TYPE);
+                let update = custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<IbkrShortAvailability>()
+                    .expect("custom payload should be IbkrShortAvailability");
+                assert_eq!(update.instrument_id, instrument_id);
+                assert_eq!(update.shortable_score_e6, Some(2_500_000));
+                assert_eq!(update.shortable_shares, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_short_availability_tick_result_emits_share_update() {
+        let instrument_id = instrument_id();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let clock = get_atomic_clock_realtime();
+
+        let action = process_short_availability_tick_result(
+            Ok::<_, &'static str>(TickTypes::Size(TickSize {
+                tick_type: TickType::ShortableShares,
+                size: 12_345.0,
+            })),
+            instrument_id,
+            &sender,
+            clock,
+        )
+        .unwrap();
+
+        assert!(matches!(action, StreamAction::Continue));
+
+        match receiver.recv().await.unwrap() {
+            DataEvent::Data(Data::Custom(custom)) => {
+                assert_eq!(custom.data_type.type_name(), IBKR_SHORT_AVAILABILITY_TYPE);
+                let update = custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<IbkrShortAvailability>()
+                    .expect("custom payload should be IbkrShortAvailability");
+                assert_eq!(update.instrument_id, instrument_id);
+                assert_eq!(update.shortable_score_e6, None);
+                assert_eq!(update.shortable_shares, Some(12_345));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[tokio::test]

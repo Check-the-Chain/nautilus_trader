@@ -26,10 +26,12 @@ use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     cache::Cache,
     clock::Clock,
-    messages::execution::{BatchCancelOrders, CancelAllOrders, CancelOrder, ModifyOrder},
+    messages::execution::{
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
+    },
     msgbus::{self, MessagingSwitchboard},
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{UUID4, UnixNanos, correctness::CorrectnessResult};
 use nautilus_model::{
     data::{
         Bar, BarType, InstrumentClose, OrderBookDelta, OrderBookDeltas, OrderBookDepth10,
@@ -66,8 +68,8 @@ use crate::{
     matching_core::{MatchAction, OrderMatchingCore, RestingOrder},
     matching_engine::{config::OrderMatchingEngineConfig, ids_generator::IdsGenerator},
     models::{
-        fee::{FeeModel, FeeModelAny},
-        fill::{FillModel, FillModelAny},
+        fee::{FeeModel, FeeModelHandle},
+        fill::{FillModel, FillModelHandle},
     },
     protection::protection_price_calculate,
     trailing::trailing_stop_calculate,
@@ -95,8 +97,8 @@ pub struct OrderMatchingEngine {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
     book: OrderBook,
-    fill_model: FillModelAny,
-    fee_model: FeeModelAny,
+    fill_model: FillModelHandle,
+    fee_model: FeeModelHandle,
     event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
     target_bid: Option<Price>,
     target_ask: Option<Price>,
@@ -145,8 +147,8 @@ impl OrderMatchingEngine {
     pub fn new(
         instrument: InstrumentAny,
         raw_id: u32,
-        fill_model: FillModelAny,
-        fee_model: FeeModelAny,
+        fill_model: FillModelHandle,
+        fee_model: FeeModelHandle,
         book_type: BookType,
         oms_type: OmsType,
         account_type: AccountType,
@@ -401,7 +403,7 @@ impl OrderMatchingEngine {
     }
 
     /// Sets the fill model for the matching engine.
-    pub fn set_fill_model(&mut self, fill_model: FillModelAny) {
+    pub fn set_fill_model(&mut self, fill_model: FillModelHandle) {
         self.core
             .set_fill_limit_inside_spread(fill_model.fill_limit_inside_spread());
         self.fill_model = fill_model;
@@ -3294,6 +3296,13 @@ impl OrderMatchingEngine {
         }
     }
 
+    /// Processes a batch modify orders command.
+    pub fn process_batch_modify(&mut self, command: &BatchModifyOrders, account_id: AccountId) {
+        for order in &command.modifies {
+            self.process_modify(order, account_id);
+        }
+    }
+
     fn process_market_order(&mut self, order: &OrderAny) {
         if order.time_in_force() == TimeInForce::AtTheOpen
             || order.time_in_force() == TimeInForce::AtTheClose
@@ -4651,6 +4660,16 @@ impl OrderMatchingEngine {
             .unwrap_or_else(|| order.filled_qty());
         let initial_total_filled = total_filled;
         let mut last_fill_px: Option<Price> = None;
+        let mut reduce_only_remaining_raw = None;
+        let mut reduce_only_filled_raw = None;
+
+        if self.config.use_reduce_only
+            && order.is_reduce_only()
+            && let Some(current_position) = position
+        {
+            reduce_only_remaining_raw = Some(current_position.quantity.raw);
+            reduce_only_filled_raw = Some(total_filled.raw);
+        }
 
         for &(fill_px, fill_qty) in fills {
             let Some(mut fill_px) = self.normalize_fill_price(fill_px, order.client_order_id())
@@ -4677,31 +4696,16 @@ impl OrderMatchingEngine {
                 }
             }
 
-            // Check reduce only order
-            // If the incoming simulated fill would exceed the position when reduce-only is honored,
-            // clamp the effective fill size to the adjusted (remaining position) quantity.
             let mut effective_fill_qty = fill_qty;
 
-            if self.config.use_reduce_only
-                && order.is_reduce_only()
-                && let Some(position) = &position
-                && fill_qty > position.quantity
-            {
-                if position.quantity == Quantity::zero(position.quantity.precision) {
-                    // Done
+            if let Some(remaining_raw) = reduce_only_remaining_raw {
+                if remaining_raw == 0 {
                     return;
                 }
 
-                // Adjusted target quantity equals the remaining position size
-                let adjusted_fill_qty =
-                    Quantity::from_raw(position.quantity.raw, fill_qty.precision);
-
-                // Determine the effective fill size for this iteration first
-                effective_fill_qty = min(effective_fill_qty, adjusted_fill_qty);
-
-                // Only emit an update if the order quantity actually changes
-                if order.quantity() != adjusted_fill_qty {
-                    self.generate_order_updated(order, adjusted_fill_qty, None, None, None);
+                if effective_fill_qty.raw > remaining_raw {
+                    effective_fill_qty =
+                        Quantity::from_raw(remaining_raw, effective_fill_qty.precision);
                 }
             }
 
@@ -4720,7 +4724,33 @@ impl OrderMatchingEngine {
                 effective_fill_qty,
                 order.quantity().saturating_sub(total_filled),
             );
+            let reduce_only_exhausts_position = reduce_only_remaining_raw
+                .is_some_and(|remaining_raw| capped_fill_qty.raw >= remaining_raw);
+
+            if reduce_only_exhausts_position {
+                let reduce_only_target_raw = reduce_only_filled_raw
+                    .unwrap_or(initial_total_filled.raw)
+                    .checked_add(capped_fill_qty.raw)
+                    .expect("Overflow occurred when adding reduce-only target quantity");
+                let reduce_only_target =
+                    Quantity::from_raw(reduce_only_target_raw, order.quantity().precision);
+
+                if order.quantity() != reduce_only_target {
+                    self.generate_order_updated(order, reduce_only_target, None, None, None);
+                }
+            }
+
             total_filled = total_filled.add(capped_fill_qty);
+
+            if let Some(remaining_raw) = reduce_only_remaining_raw.as_mut() {
+                *remaining_raw = remaining_raw.saturating_sub(capped_fill_qty.raw);
+            }
+
+            if let Some(filled_raw) = reduce_only_filled_raw.as_mut() {
+                *filled_raw = filled_raw
+                    .checked_add(capped_fill_qty.raw)
+                    .expect("Overflow occurred when adding reduce-only filled quantity");
+            }
 
             self.fill_order(
                 order,
@@ -4734,6 +4764,11 @@ impl OrderMatchingEngine {
 
             if order.order_type() == OrderType::MarketToLimit && initial_market_to_limit_fill {
                 // Filled initial level
+                return;
+            }
+
+            if reduce_only_exhausts_position {
+                self.purge_cached_filled_qty_if_closed(order.client_order_id());
                 return;
             }
         }
@@ -4781,7 +4816,34 @@ impl OrderMatchingEngine {
                 }
             }
 
-            let leaves_qty = order.quantity().saturating_sub(total_filled);
+            let mut leaves_qty = order.quantity().saturating_sub(total_filled);
+
+            if let Some(remaining_raw) = reduce_only_remaining_raw {
+                if remaining_raw == 0 {
+                    return;
+                }
+
+                if leaves_qty.raw > remaining_raw {
+                    leaves_qty = Quantity::from_raw(remaining_raw, leaves_qty.precision);
+                }
+
+                if leaves_qty.raw >= remaining_raw {
+                    let reduce_only_target_raw = reduce_only_filled_raw
+                        .unwrap_or(initial_total_filled.raw)
+                        .checked_add(leaves_qty.raw)
+                        .expect("Overflow occurred when adding reduce-only target quantity");
+                    let reduce_only_target =
+                        Quantity::from_raw(reduce_only_target_raw, order.quantity().precision);
+
+                    if order.quantity() != reduce_only_target {
+                        self.generate_order_updated(order, reduce_only_target, None, None, None);
+                    }
+                }
+            }
+
+            if leaves_qty.is_zero() {
+                return;
+            }
 
             self.fill_order(
                 order,
@@ -4791,6 +4853,7 @@ impl OrderMatchingEngine {
                 venue_position_id,
                 position,
             );
+            self.purge_cached_filled_qty_if_closed(order.client_order_id());
         }
     }
 
@@ -4870,7 +4933,13 @@ impl OrderMatchingEngine {
             &fee_order
         };
 
-        let underlying_px = self.fee_underlying_price();
+        let underlying_px = self.fee_underlying_price().unwrap_or_else(|e| {
+            panic!(
+                "Failed to compute commission for {}: {}",
+                order.client_order_id(),
+                e
+            );
+        });
         let commission = self
             .fee_model
             .get_commission_with_context(
@@ -5050,28 +5119,34 @@ impl OrderMatchingEngine {
         }
     }
 
-    fn fee_underlying_price(&self) -> Option<Price> {
+    fn fee_underlying_price(&self) -> CorrectnessResult<Option<Price>> {
         if !matches!(
             self.instrument,
             InstrumentAny::CryptoOption(_) | InstrumentAny::OptionContract(_)
         ) {
-            return None;
+            return Ok(None);
         }
 
-        let underlying = self.instrument.underlying()?;
+        let Some(underlying) = self.instrument.underlying() else {
+            return Ok(None);
+        };
+
         let underlying_id = InstrumentId::from(format!("{underlying}.{}", self.venue).as_str());
         let instrument_id = self.instrument.id();
         let cache = self.cache.borrow();
-        cache
+        if let Some(price) = cache
             .price(&underlying_id, PriceType::Last)
             .or_else(|| cache.price(&underlying_id, PriceType::Mark))
             .or_else(|| cache.price(&underlying_id, PriceType::Mid))
-            .or_else(|| {
-                cache
-                    .option_greeks(&instrument_id)
-                    .and_then(|greeks| greeks.underlying_price)
-                    .map(|price| Price::new(price, FIXED_PRECISION))
-            })
+        {
+            return Ok(Some(price));
+        }
+
+        cache
+            .option_greeks(&instrument_id)
+            .and_then(|greeks| greeks.underlying_price)
+            .map(|price| Price::new_checked(price, FIXED_PRECISION))
+            .transpose()
     }
 
     fn cached_order_is_closed(&self, client_order_id: ClientOrderId) -> bool {
@@ -6216,21 +6291,34 @@ impl BarTickSizes {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use nautilus_common::{cache::Cache, clock::TestClock};
+    use nautilus_core::{UnixNanos, correctness::CorrectnessError};
     use nautilus_model::{
+        data::{QuoteTick, option_chain::OptionGreeks},
         enums::{AccountType, BookType, LiquiditySide, OmsType, OrderSide, OrderType},
         events::OrderEventAny,
         identifiers::AccountId,
-        instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
-        orders::{Order, OrderTestBuilder},
-        types::{Price, Quantity, fixed::FIXED_PRECISION, quantity::QuantityRaw},
+        instruments::{
+            Instrument, InstrumentAny,
+            stubs::{crypto_option_btc_deribit, crypto_perpetual_ethusdt},
+        },
+        orderbook::OrderBook,
+        orders::{Order, OrderAny, OrderTestBuilder},
+        types::{Money, Price, Quantity, fixed::FIXED_PRECISION, quantity::QuantityRaw},
     };
     use rstest::rstest;
+    use rust_decimal::Decimal;
 
     use super::{BarTickSizes, OrderMatchingEngine};
-    use crate::models::{fee::FeeModelAny, fill::FillModelAny};
+    use crate::models::{
+        fee::{FeeModel, FeeModelAny, FeeModelHandle},
+        fill::{FillModel, FillModelHandle},
+    };
 
     fn assert_valid_bar_tick_sizes(volume: Quantity, size_increment: Quantity) {
         let sizes = BarTickSizes::from_volume(volume, size_increment);
@@ -6267,8 +6355,8 @@ mod tests {
         let mut engine = OrderMatchingEngine::new(
             instrument.clone(),
             1,
-            FillModelAny::default(),
-            FeeModelAny::default(),
+            FillModelHandle::default(),
+            FeeModelAny::default().into(),
             BookType::L1_MBP,
             OmsType::Netting,
             AccountType::Margin,
@@ -6315,6 +6403,230 @@ mod tests {
         assert_eq!(fill.liquidity_side, LiquiditySide::Taker);
         assert_eq!(commission.currency, instrument.quote_currency());
         assert_eq!(commission.as_decimal(), expected_commission);
+    }
+
+    #[rstest]
+    fn test_custom_fee_model_handle_is_called_by_fill_order() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let calls = Rc::new(Cell::new(0));
+        let expected_commission = Money::from("1.23 USDT");
+        let fee_model = FeeModelHandle::new(RecordingFeeModel {
+            calls: Rc::clone(&calls),
+            commission: expected_commission,
+        });
+        let cloned_fee_model = fee_model.clone();
+        drop(fee_model);
+        let mut engine = OrderMatchingEngine::new(
+            instrument.clone(),
+            1,
+            FillModelHandle::default(),
+            cloned_fee_model,
+            BookType::L1_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            clock,
+            cache,
+            Default::default(),
+        );
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_handler = Rc::clone(&events);
+        engine.set_event_handler(Rc::new(move |event| {
+            events_handler.borrow_mut().push(event);
+        }));
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .submit(true)
+            .build();
+        engine
+            .account_ids
+            .insert(order.trader_id(), AccountId::from("ACCOUNT-001"));
+
+        engine.fill_order(
+            &order,
+            Price::from("1500.00"),
+            Quantity::from("1.000"),
+            LiquiditySide::Taker,
+            None,
+            None,
+        );
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1);
+        let fill = match &events[0] {
+            OrderEventAny::Filled(fill) => fill,
+            event => panic!("Expected OrderFilled, was {event:?}"),
+        };
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fill.commission, Some(expected_commission));
+    }
+
+    struct RecordingFeeModel {
+        calls: Rc<Cell<u32>>,
+        commission: Money,
+    }
+
+    impl FeeModel for RecordingFeeModel {
+        fn get_commission(
+            &self,
+            _order: &OrderAny,
+            _fill_quantity: Quantity,
+            _fill_px: Price,
+            _instrument: &InstrumentAny,
+        ) -> anyhow::Result<Money> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.commission)
+        }
+    }
+
+    #[rstest]
+    fn test_custom_fill_model_handle_is_called_by_market_fill() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let calls = Rc::new(Cell::new(0));
+        let fill_model = FillModelHandle::new(RecordingFillModel {
+            calls: Rc::clone(&calls),
+        });
+        let mut engine = OrderMatchingEngine::new(
+            instrument.clone(),
+            1,
+            fill_model,
+            FeeModelAny::default().into(),
+            BookType::L1_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            clock,
+            cache,
+            Default::default(),
+        );
+        let quote = QuoteTick::new(
+            instrument.id(),
+            Price::from("1500.00"),
+            Price::from("1501.00"),
+            Quantity::from("10.000"),
+            Quantity::from("10.000"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        engine.process_quote_tick(&quote);
+
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .submit(true)
+            .build();
+        engine.process_order(&mut order, AccountId::from("ACCOUNT-001"));
+
+        assert_eq!(calls.get(), 1);
+    }
+
+    struct RecordingFillModel {
+        calls: Rc<Cell<u32>>,
+    }
+
+    impl FillModel for RecordingFillModel {
+        fn is_limit_filled(&mut self) -> bool {
+            true
+        }
+
+        fn is_slipped(&mut self) -> bool {
+            false
+        }
+
+        fn get_orderbook_for_fill_simulation(
+            &mut self,
+            _instrument: &InstrumentAny,
+            _order: &OrderAny,
+            _best_bid: Price,
+            _best_ask: Price,
+        ) -> Option<OrderBook> {
+            self.calls.set(self.calls.get() + 1);
+            None
+        }
+    }
+
+    #[rstest]
+    fn test_fee_underlying_price_uses_valid_cached_greeks_price() {
+        let instrument = InstrumentAny::CryptoOption(crypto_option_btc_deribit(
+            3,
+            1,
+            Price::from("0.001"),
+            Quantity::from("0.1"),
+        ));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache.borrow_mut().add_option_greeks(OptionGreeks {
+            instrument_id: instrument.id(),
+            underlying_price: Some(50_000.0),
+            ..Default::default()
+        });
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let engine = OrderMatchingEngine::new(
+            instrument,
+            1,
+            FillModelHandle::default(),
+            FeeModelAny::default().into(),
+            BookType::L1_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            clock,
+            cache,
+            Default::default(),
+        );
+
+        let price = engine
+            .fee_underlying_price()
+            .unwrap()
+            .expect("expected underlying price");
+
+        assert_eq!(price.precision, FIXED_PRECISION);
+        assert_eq!(price.as_decimal(), Decimal::from(50_000));
+    }
+
+    #[rstest]
+    fn test_fee_underlying_price_rejects_invalid_cached_greeks_price() {
+        let instrument = InstrumentAny::CryptoOption(crypto_option_btc_deribit(
+            3,
+            1,
+            Price::from("0.001"),
+            Quantity::from("0.1"),
+        ));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache.borrow_mut().add_option_greeks(OptionGreeks {
+            instrument_id: instrument.id(),
+            underlying_price: Some(f64::NAN),
+            ..Default::default()
+        });
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let engine = OrderMatchingEngine::new(
+            instrument,
+            1,
+            FillModelHandle::default(),
+            FeeModelAny::default().into(),
+            BookType::L1_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            clock,
+            cache,
+            Default::default(),
+        );
+
+        let error = engine.fee_underlying_price().unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::InvalidValue {
+                param: "value".to_string(),
+                value: "NaN".to_string(),
+                type_name: "f64",
+            }
+        );
     }
 
     #[rstest]

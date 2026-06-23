@@ -77,7 +77,6 @@ pub mod hex;
 #[cfg(feature = "latency-probe")]
 pub mod latency;
 pub mod math;
-pub mod message;
 pub mod nanos;
 pub mod params;
 pub mod paths;

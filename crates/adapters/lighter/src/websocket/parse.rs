@@ -44,8 +44,9 @@ use ustr::Ustr;
 use crate::{
     common::{
         enums::{
-            LighterCandleResolution, LighterOrderKind, LighterOrderSide, LighterOrderStatus,
-            LighterOrderTimeInForce, LighterTriggerStatus, order_side_from_is_ask,
+            LighterCandleResolution, LighterFundingResolution, LighterOrderKind, LighterOrderSide,
+            LighterOrderStatus, LighterOrderTimeInForce, LighterTriggerStatus,
+            order_side_from_is_ask,
         },
         parse::{parse_millis_to_nanos, price_from_decimal, quantity_from_decimal},
     },
@@ -349,6 +350,10 @@ fn build_price_update<T>(
 /// payment. The `funding_rate` field is the last completed payment, so it is
 /// not used for the streaming Nautilus update.
 ///
+/// The market-stats payload does not include a per-market funding interval.
+/// Lighter's current deployed markets fund hourly, matching the public
+/// `/api/v1/fundings` `1h` resolution used for historical requests.
+///
 /// # Errors
 ///
 /// Returns an error if the funding rate, event timestamp, or funding timestamp
@@ -369,7 +374,7 @@ pub fn parse_ws_funding_rate_update(
     Ok(FundingRateUpdate::new(
         instrument.id(),
         rate,
-        None,
+        Some(LighterFundingResolution::OneHour.interval_minutes()),
         next_funding_ns,
         ts_event,
         ts_init,
@@ -1266,6 +1271,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         ))
@@ -1573,6 +1579,7 @@ mod tests {
             update.next_funding_ns,
             Some(UnixNanos::from(1_774_886_400_000_000_000))
         );
+        assert_eq!(update.interval, Some(60));
         assert_eq!(update.ts_event, UnixNanos::from(1_774_883_844_933_000_000));
     }
 
@@ -1639,6 +1646,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(update.rate, sentinel);
+        assert_eq!(update.interval, Some(60));
     }
 
     #[rstest]

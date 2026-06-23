@@ -20,24 +20,23 @@ use std::collections::HashMap;
 use ahash::AHashMap;
 use nautilus_common::{
     actor::data_actor::ImportableActorConfig,
-    python::{actor::PyDataActor, cache::PyCache},
+    python::{actor::PyDataActor, cache::PyCache, config_error_to_pyvalue_err},
 };
 use nautilus_core::{
     UUID4, UnixNanos,
     python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err},
 };
-use nautilus_execution::models::{
-    fee::{
-        CappedOptionFeeModel, FeeModelAny, FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel,
-        TieredNotionalOptionFeeModel,
+use nautilus_execution::{
+    models::{
+        fill::{
+            BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FillModelAny,
+            LimitOrderPartialFillModel, MarketHoursFillModel, OneTickSlippageFillModel,
+            ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel,
+            VolumeSensitiveFillModel,
+        },
+        latency::{LatencyModelAny, StaticLatencyModel},
     },
-    fill::{
-        BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FillModelAny,
-        LimitOrderPartialFillModel, MarketHoursFillModel, OneTickSlippageFillModel,
-        ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel,
-        VolumeSensitiveFillModel,
-    },
-    latency::{LatencyModelAny, StaticLatencyModel},
+    python::fee::pyobject_to_fee_model_any,
 };
 #[cfg(feature = "defi")]
 use nautilus_model::defi::DefiData;
@@ -230,7 +229,7 @@ impl PyBacktestEngine {
             .transpose()?
             .unwrap_or_default();
         let fee_model = fee_model
-            .map(|obj| Python::attach(|py| pyobject_to_fee_model_any(py, obj.bind(py))))
+            .map(|obj| Python::attach(|py| pyobject_to_fee_model_any(obj.bind(py))))
             .transpose()?
             .unwrap_or_default();
         let latency_model = latency_model
@@ -286,7 +285,8 @@ impl PyBacktestEngine {
             .liquidation_enabled(liquidation_enabled)
             .liquidation_trigger_ratio(liquidation_trigger_ratio.unwrap_or(1.0))
             .liquidation_cancel_open_orders(liquidation_cancel_open_orders)
-            .build();
+            .build()
+            .map_err(config_error_to_pyvalue_err)?;
 
         self.0.add_venue(sim_config).map_err(to_pyruntime_err)?;
 
@@ -1107,36 +1107,6 @@ pub(crate) fn pyobject_to_fill_model_any(
     )))
 }
 
-pub(crate) fn pyobject_to_fee_model_any(
-    _py: Python,
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<FeeModelAny> {
-    if let Ok(m) = obj.extract::<FixedFeeModel>() {
-        return Ok(FeeModelAny::Fixed(m));
-    }
-
-    if let Ok(m) = obj.extract::<MakerTakerFeeModel>() {
-        return Ok(FeeModelAny::MakerTaker(m));
-    }
-
-    if let Ok(m) = obj.extract::<PerContractFeeModel>() {
-        return Ok(FeeModelAny::PerContract(m));
-    }
-
-    if let Ok(m) = obj.extract::<CappedOptionFeeModel>() {
-        return Ok(FeeModelAny::CappedOption(m));
-    }
-
-    if let Ok(m) = obj.extract::<TieredNotionalOptionFeeModel>() {
-        return Ok(FeeModelAny::TieredNotionalOption(m));
-    }
-
-    let type_name = obj.get_type().name()?;
-    Err(to_pytype_err(format!(
-        "Cannot convert {type_name} to FeeModel"
-    )))
-}
-
 pub(crate) fn pyobject_to_simulation_module_any(
     _py: Python,
     obj: &Bound<'_, PyAny>,
@@ -1221,12 +1191,12 @@ fn pyobject_to_data(_py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Data> {
         return Ok(Data::FundingRateUpdate(funding_rate));
     }
 
-    if let Ok(status) = obj.extract::<InstrumentStatus>() {
-        return Ok(Data::InstrumentStatus(status));
-    }
-
     if let Ok(greeks) = obj.extract::<OptionGreeks>() {
         return Ok(Data::OptionGreeks(greeks));
+    }
+
+    if let Ok(status) = obj.extract::<InstrumentStatus>() {
+        return Ok(Data::InstrumentStatus(status));
     }
 
     if let Ok(close) = obj.extract::<InstrumentClose>() {
@@ -1267,12 +1237,12 @@ fn pyobject_to_data(_py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Data> {
         return Ok(Data::FundingRateUpdate(funding_rate));
     }
 
-    if let Ok(status) = InstrumentStatus::from_pyobject(obj) {
-        return Ok(Data::InstrumentStatus(status));
-    }
-
     if let Ok(greeks) = OptionGreeks::from_pyobject(obj) {
         return Ok(Data::OptionGreeks(greeks));
+    }
+
+    if let Ok(status) = InstrumentStatus::from_pyobject(obj) {
+        return Ok(Data::InstrumentStatus(status));
     }
 
     if let Ok(close) = InstrumentClose::from_pyobject(obj) {

@@ -193,9 +193,7 @@ impl AxExecutionClient {
             limit_price,
         ) = {
             let cache = self.core.cache();
-            let order = cache.order(&cmd.client_order_id).ok_or_else(|| {
-                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
-            })?;
+            let order = cache.try_order(&cmd.client_order_id)?;
             (
                 order.client_order_id(),
                 order.strategy_id(),
@@ -291,7 +289,7 @@ impl AxExecutionClient {
             // The submit never demonstrably reached AX: leave the order in
             // flight for reconciliation to resolve.
             if let Err(e) = result {
-                log::error!(
+                log::warn!(
                     "Ambiguous AX submit failure for {client_order_id}, awaiting reconciliation: {e:?}"
                 );
             }
@@ -602,9 +600,7 @@ impl ExecutionClient for AxExecutionClient {
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         {
             let cache = self.core.cache();
-            let order = cache.order(&cmd.client_order_id).ok_or_else(|| {
-                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
-            })?;
+            let order = cache.try_order(&cmd.client_order_id)?;
 
             if order.is_closed() {
                 log::warn!("Cannot submit closed order {}", order.client_order_id());
