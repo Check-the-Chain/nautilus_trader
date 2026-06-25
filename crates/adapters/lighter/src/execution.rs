@@ -73,8 +73,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     common::{
         consts::{
-            LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX,
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_VENUE,
+            LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX, LIGHTER_VENUE,
         },
         credential::{Credential, scrub_auth},
         enums::{LighterAccountTier, LighterPositionMarginMode, LighterProductType, LighterTxType},
@@ -96,8 +95,8 @@ use crate::{
         auth_token::{build_auth_token_for, fresh_k},
         nonce::NonceError,
         tx::{
-            ApproveIntegratorTxInfo, CancelOrderTxInfo, CreateOrderTxInfo, L2TxAttributes,
-            ModifyOrderTxInfo, OrderInfo, TxContext, TxInfoJson, UpdateLeverageTxInfo, sign_tx,
+            CancelOrderTxInfo, CreateOrderTxInfo, L2TxAttributes, ModifyOrderTxInfo, OrderInfo,
+            TxContext, TxInfoJson, UpdateLeverageTxInfo, sign_tx,
         },
     },
     websocket::{
@@ -166,8 +165,6 @@ const ACCOUNT_TIER_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// this window we attribute and emit `OrderRejected`. Outside the window
 /// the existing submit-timeout drives expiry.
 const SENDTX_BARE_ERROR_WINDOW_MS: u64 = 1_000;
-const INTEGRATOR_AUTO_APPROVAL_MAX_TTL_MS: i64 = 5 * 365 * 24 * 60 * 60 * 1_000;
-const INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK: u32 = 0;
 
 #[derive(Debug)]
 pub struct LighterExecutionClient {
