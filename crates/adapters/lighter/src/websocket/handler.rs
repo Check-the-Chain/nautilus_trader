@@ -2571,7 +2571,7 @@ mod tests {
         match &messages[2] {
             NautilusWsMessage::FundingRate(update) => {
                 assert_eq!(update.instrument_id.to_string(), "ETH-PERP.LIGHTER");
-                assert_eq!(update.rate.to_string(), "0.000001");
+                assert_eq!(update.rate.to_string(), "0.00000001");
                 assert_eq!(update.interval, Some(60));
                 assert_eq!(
                     update.next_funding_ns,

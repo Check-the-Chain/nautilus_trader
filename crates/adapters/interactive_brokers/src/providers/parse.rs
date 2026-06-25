@@ -196,6 +196,32 @@ fn ib_contract_info(details: &ibapi::contracts::ContractDetails) -> nautilus_cor
         "priceMagnifier".to_string(),
         serde_json::Value::from(details.price_magnifier),
     );
+    info.insert(
+        "timeZoneId".to_string(),
+        serde_json::Value::String(details.time_zone_id.clone()),
+    );
+    info.insert(
+        "tradingHours".to_string(),
+        serde_json::Value::Array(
+            details
+                .trading_hours
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    info.insert(
+        "liquidHours".to_string(),
+        serde_json::Value::Array(
+            details
+                .liquid_hours
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
     info
 }
 
@@ -584,6 +610,42 @@ mod tests {
         assert_eq!(
             equity.info.unwrap().get("priceMagnifier"),
             Some(&serde_json::Value::from(100))
+        );
+    }
+
+    #[rstest]
+    fn test_parse_contract_preserves_trading_schedule_in_info() {
+        let details = ContractDetails {
+            contract: Contract {
+                symbol: Symbol::from("AAPL"),
+                security_type: SecurityType::Stock,
+                exchange: Exchange::from("SMART"),
+                primary_exchange: Exchange::from("NASDAQ"),
+                currency: Currency::from("USD"),
+                local_symbol: String::from("AAPL"),
+                ..Default::default()
+            },
+            min_tick: 0.01,
+            time_zone_id: "US/Eastern".to_string(),
+            trading_hours: vec!["20260625:0400-20260625:2000".to_string()],
+            liquid_hours: vec!["20260625:0930-20260625:1600".to_string()],
+            ..Default::default()
+        };
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("AAPL"), Venue::from("XNAS"));
+
+        let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+        let InstrumentAny::Equity(equity) = instrument else {
+            panic!("expected equity");
+        };
+        let info = equity.info.unwrap();
+
+        assert_eq!(
+            info.get("timeZoneId"),
+            Some(&serde_json::Value::String("US/Eastern".to_string()))
+        );
+        assert_eq!(
+            info.get("liquidHours"),
+            Some(&serde_json::json!(["20260625:0930-20260625:1600"]))
         );
     }
 

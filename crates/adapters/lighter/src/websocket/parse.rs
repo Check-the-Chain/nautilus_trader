@@ -48,7 +48,10 @@ use crate::{
             LighterOrderStatus, LighterOrderTimeInForce, LighterTriggerStatus,
             order_side_from_is_ask,
         },
-        parse::{parse_millis_to_nanos, price_from_decimal, quantity_from_decimal},
+        parse::{
+            funding_rate_decimal_from_percent, parse_millis_to_nanos, price_from_decimal,
+            quantity_from_decimal,
+        },
     },
     http::{
         models::{LighterOrder, LighterPriceLevel, LighterTrade},
@@ -346,9 +349,10 @@ fn build_price_update<T>(
 
 /// Parses a Lighter perpetual market-stat update into a funding-rate update.
 ///
-/// Lighter exposes `current_funding_rate` as the estimate for the upcoming
-/// payment. The `funding_rate` field is the last completed payment, so it is
-/// not used for the streaming Nautilus update.
+/// Lighter exposes `current_funding_rate` as the percent-unit estimate for the
+/// upcoming payment. The `funding_rate` field is the last completed payment, so
+/// it is not used for the streaming Nautilus update. Nautilus receives the
+/// normalized decimal rate.
 ///
 /// The market-stats payload does not include a per-market funding interval.
 /// Lighter's current deployed markets fund hourly, matching the public
@@ -364,7 +368,7 @@ pub fn parse_ws_funding_rate_update(
     timestamp_ms: u64,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FundingRateUpdate> {
-    let rate = stats.current_funding_rate;
+    let rate = funding_rate_decimal_from_percent(stats.current_funding_rate)?;
     let next_funding_ns = if stats.funding_timestamp == 0 {
         None
     } else {
@@ -1574,7 +1578,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(update.instrument_id, instrument.id());
-        assert_eq!(update.rate.to_string(), "0.000001");
+        assert_eq!(update.rate.to_string(), "0.00000001");
         assert_eq!(
             update.next_funding_ns,
             Some(UnixNanos::from(1_774_886_400_000_000_000))
@@ -1633,6 +1637,7 @@ mod tests {
         // `current_funding_rate` instead. Setting distinct sentinel values
         // catches a field-swap regression.
         let sentinel = Decimal::from_str("0.0000123").unwrap();
+        let expected = Decimal::from_str("0.000000123").unwrap();
         let other = Decimal::from_str("0.9999").unwrap();
         stats.current_funding_rate = sentinel;
         stats.funding_rate = other;
@@ -1645,7 +1650,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(update.rate, sentinel);
+        assert_eq!(update.rate, expected);
         assert_eq!(update.interval, Some(60));
     }
 

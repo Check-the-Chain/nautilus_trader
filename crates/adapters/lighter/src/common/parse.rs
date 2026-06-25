@@ -159,6 +159,21 @@ pub fn quantity_from_decimal(value: Decimal, precision: u8) -> anyhow::Result<Qu
         .map_err(|e| anyhow::anyhow!("invalid quantity `{value}` at precision {precision}: {e}"))
 }
 
+/// Converts a Lighter funding-rate payload value into Nautilus decimal-rate units.
+///
+/// Lighter publishes funding rates in percent units, e.g. `0.0012` means
+/// `0.0012%` for the funding interval. Nautilus [`FundingRateUpdate`] uses the
+/// conventional decimal rate, so the same value must be represented as
+/// `0.000012`.
+///
+/// # Errors
+///
+/// Returns an error if Decimal division fails.
+pub fn funding_rate_decimal_from_percent(rate: Decimal) -> anyhow::Result<Decimal> {
+    rate.checked_div(Decimal::from(100))
+        .ok_or_else(|| anyhow::anyhow!("invalid Lighter funding rate percent `{rate}`"))
+}
+
 /// Converts a Unix millisecond timestamp into [`UnixNanos`].
 ///
 /// # Errors
