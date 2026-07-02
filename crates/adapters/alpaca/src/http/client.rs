@@ -415,8 +415,12 @@ impl AlpacaRawHttpClient {
         params: &GetAccountActivitiesParams,
     ) -> AlpacaHttpResult<Vec<AlpacaAccountActivity>> {
         self.require_credentials()?;
-        self.send_get(&self.base_url_trading, ENDPOINT_ACCOUNT_ACTIVITIES, Some(params))
-            .await
+        self.send_get(
+            &self.base_url_trading,
+            ENDPOINT_ACCOUNT_ACTIVITIES,
+            Some(params),
+        )
+        .await
     }
 
     /// Calls `GET /v2/stocks/bars`.

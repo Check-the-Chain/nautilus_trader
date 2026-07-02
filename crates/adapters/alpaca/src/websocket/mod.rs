@@ -18,7 +18,8 @@
 //! Two streams are covered:
 //!
 //! - The equities market data stream (`wss://stream.data.alpaca.markets/v2/{feed}`)
-//!   carrying trades, quotes, and bars as `"T"`-tagged JSON arrays.
+//!   carrying trades, quotes, and bars as `"T"`-tagged arrays, framed as
+//!   MessagePack (default) or JSON per [`WsFormat`].
 //! - The account trade-updates stream (`wss://{paper-}api.alpaca.markets/stream`)
 //!   carrying order lifecycle events in `{"stream","data"}` envelopes.
 //!
@@ -36,5 +37,5 @@ pub use client::{AlpacaTradeUpdatesWebSocketClient, AlpacaWebSocketClient};
 pub use error::AlpacaWsError;
 pub use messages::{
     AlpacaInstrumentInfo, AlpacaSubscriptionAck, AlpacaTradeUpdateMsg, AlpacaWsChannel,
-    AlpacaWsOrder, NautilusWsMessage,
+    AlpacaWsOrder, NautilusWsMessage, WsFormat,
 };

@@ -15,11 +15,15 @@
 
 //! Parsing from Alpaca wire messages into Nautilus domain types.
 //!
-//! The market data hot path is a single typed [`serde_json::from_slice`] pass
-//! over the raw frame followed by direct construction of Nautilus values at
-//! instrument precision; timestamps borrow from the input buffer and symbols
-//! intern through [`Ustr`], so steady-state parsing performs no per-message
-//! string allocations beyond the trade-ID render.
+//! The market data hot path is a single typed deserialization pass over the
+//! raw frame ([`serde_json::from_slice`] or [`rmp_serde::from_slice`] per the
+//! negotiated [`WsFormat`]) followed by direct construction of Nautilus
+//! values at instrument precision; timestamps convert to [`UnixNanos`] during
+//! deserialization and symbols intern through [`Ustr`], so steady-state
+//! parsing performs no per-message string allocations beyond the trade-ID
+//! render.
+//!
+//! [`Ustr`]: ustr::Ustr
 
 use std::sync::LazyLock;
 
@@ -32,11 +36,11 @@ use nautilus_model::{
 
 use super::{
     error::AlpacaWsError,
-    messages::{AlpacaInstrumentInfo, AlpacaWsBar, AlpacaWsEvent, AlpacaWsQuote, AlpacaWsTrade},
+    messages::{
+        AlpacaInstrumentInfo, AlpacaWsBar, AlpacaWsEvent, AlpacaWsQuote, AlpacaWsTrade, WsFormat,
+    },
 };
-use crate::common::parse::{
-    parse_price_from_f64, parse_quantity_from_f64, parse_rfc3339_timestamp,
-};
+use crate::common::parse::{parse_price_from_f64, parse_quantity_from_f64};
 
 /// Nanoseconds in one minute, for deriving bar close times from the venue's
 /// bar-open timestamps.
@@ -48,16 +52,21 @@ pub static BAR_SPEC_1_MINUTE_LAST: LazyLock<BarSpecification> =
 
 /// Parses a raw market data frame into typed events in a single pass.
 ///
-/// Alpaca frames the market data stream as JSON arrays of `"T"`-tagged
-/// messages; control messages arrive alone while data messages may be
-/// batched. The returned events borrow their timestamps from `raw`.
+/// Alpaca frames the market data stream as arrays of `"T"`-tagged messages
+/// (JSON text or MessagePack binary per the negotiated `format`); control
+/// messages arrive alone while data messages may be batched.
 ///
 /// # Errors
 ///
-/// Returns an error if the payload is not a valid message array.
-pub fn parse_ws_events(raw: &[u8]) -> Result<Vec<AlpacaWsEvent<'_>>, AlpacaWsError> {
-    serde_json::from_slice::<Vec<AlpacaWsEvent<'_>>>(raw)
-        .map_err(|e| AlpacaWsError::Parse(format!("invalid market data frame: {e}")))
+/// Returns an error if the payload is not a valid message array in the given
+/// format.
+pub fn parse_ws_events(raw: &[u8], format: WsFormat) -> Result<Vec<AlpacaWsEvent>, AlpacaWsError> {
+    match format {
+        WsFormat::Json => serde_json::from_slice::<Vec<AlpacaWsEvent>>(raw)
+            .map_err(|e| AlpacaWsError::Parse(format!("invalid market data frame: {e}"))),
+        WsFormat::Msgpack => rmp_serde::from_slice::<Vec<AlpacaWsEvent>>(raw)
+            .map_err(|e| AlpacaWsError::Parse(format!("invalid market data frame: {e}"))),
+    }
 }
 
 /// Parses a trade message into a Nautilus [`TradeTick`].
@@ -69,13 +78,13 @@ pub fn parse_ws_events(raw: &[u8]) -> Result<Vec<AlpacaWsEvent<'_>>, AlpacaWsErr
 ///
 /// Returns an error if the price, size, or timestamp cannot be converted.
 pub fn parse_ws_trade_tick(
-    trade: &AlpacaWsTrade<'_>,
+    trade: &AlpacaWsTrade,
     info: &AlpacaInstrumentInfo,
     ts_init: UnixNanos,
 ) -> anyhow::Result<TradeTick> {
     let price = parse_price_from_f64(trade.price, info.price_precision)?;
     let size = parse_quantity_from_f64(trade.size as f64, info.size_precision)?;
-    let ts_event = parse_rfc3339_timestamp(trade.timestamp, "trade.t")?;
+    let ts_event = trade.timestamp.0;
 
     Ok(TradeTick::new(
         info.instrument_id,
@@ -94,7 +103,7 @@ pub fn parse_ws_trade_tick(
 ///
 /// Returns an error if any price, size, or the timestamp cannot be converted.
 pub fn parse_ws_quote_tick(
-    quote: &AlpacaWsQuote<'_>,
+    quote: &AlpacaWsQuote,
     info: &AlpacaInstrumentInfo,
     ts_init: UnixNanos,
 ) -> anyhow::Result<QuoteTick> {
@@ -102,7 +111,7 @@ pub fn parse_ws_quote_tick(
     let ask_price = parse_price_from_f64(quote.ask_price, info.price_precision)?;
     let bid_size = parse_quantity_from_f64(quote.bid_size as f64, info.size_precision)?;
     let ask_size = parse_quantity_from_f64(quote.ask_size as f64, info.size_precision)?;
-    let ts_event = parse_rfc3339_timestamp(quote.timestamp, "quote.t")?;
+    let ts_event = quote.timestamp.0;
 
     Ok(QuoteTick::new(
         info.instrument_id,
@@ -128,7 +137,7 @@ pub fn parse_ws_quote_tick(
 /// Returns an error if any price, the volume, or the timestamp cannot be
 /// converted.
 pub fn parse_ws_bar(
-    bar: &AlpacaWsBar<'_>,
+    bar: &AlpacaWsBar,
     info: &AlpacaInstrumentInfo,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
@@ -142,8 +151,7 @@ pub fn parse_ws_bar(
     let low = parse_price_from_f64(bar.low, info.price_precision)?;
     let close = parse_price_from_f64(bar.close, info.price_precision)?;
     let volume = parse_quantity_from_f64(bar.volume as f64, info.size_precision)?;
-    let ts_open = parse_rfc3339_timestamp(bar.timestamp, "bar.t")?;
-    let ts_event = UnixNanos::from(ts_open.as_u64() + NANOS_PER_MINUTE);
+    let ts_event = UnixNanos::from(bar.timestamp.0.as_u64() + NANOS_PER_MINUTE);
 
     Ok(Bar::new(
         bar_type, open, high, low, close, volume, ts_event, ts_init,
@@ -172,7 +180,7 @@ mod tests {
     #[rstest]
     fn test_parse_batched_market_data_fixture() {
         let json = load_test_json("ws_market_data_batch.json");
-        let events = parse_ws_events(json.as_bytes()).unwrap();
+        let events = parse_ws_events(json.as_bytes(), WsFormat::Json).unwrap();
         assert_eq!(events.len(), 5);
 
         let trades = events
@@ -195,7 +203,7 @@ mod tests {
     #[rstest]
     fn test_parse_trade_tick_values() {
         let json = load_test_json("ws_market_data_batch.json");
-        let events = parse_ws_events(json.as_bytes()).unwrap();
+        let events = parse_ws_events(json.as_bytes(), WsFormat::Json).unwrap();
         let info = instrument_info("AAPL");
         let ts_init = UnixNanos::from(1);
 
@@ -216,7 +224,7 @@ mod tests {
     #[rstest]
     fn test_parse_quote_tick_values() {
         let json = load_test_json("ws_market_data_batch.json");
-        let events = parse_ws_events(json.as_bytes()).unwrap();
+        let events = parse_ws_events(json.as_bytes(), WsFormat::Json).unwrap();
         let info = instrument_info("MSFT");
         let ts_init = UnixNanos::from(1);
 
@@ -238,7 +246,7 @@ mod tests {
     #[rstest]
     fn test_parse_bar_close_time_offset() {
         let json = load_test_json("ws_market_data_batch.json");
-        let events = parse_ws_events(json.as_bytes()).unwrap();
+        let events = parse_ws_events(json.as_bytes(), WsFormat::Json).unwrap();
         let info = instrument_info("AAPL");
 
         let bar = events
@@ -250,8 +258,10 @@ mod tests {
             .expect("fixture contains a minute bar");
         let parsed = parse_ws_bar(bar, &info, UnixNanos::from(1)).unwrap();
 
-        let ts_open = parse_rfc3339_timestamp(bar.timestamp, "t").unwrap();
-        assert_eq!(parsed.ts_event.as_u64(), ts_open.as_u64() + 60_000_000_000);
+        assert_eq!(
+            parsed.ts_event.as_u64(),
+            bar.timestamp.0.as_u64() + 60_000_000_000
+        );
         assert_eq!(parsed.open.to_string(), "189.01");
         assert_eq!(parsed.volume.to_string(), "49378");
         assert_eq!(parsed.bar_type.spec().aggregation, BarAggregation::Minute);
@@ -264,7 +274,7 @@ mod tests {
     #[rstest]
     fn test_parse_sub_penny_trade_rounds_to_precision() {
         let json = r#"[{"T":"t","S":"AAPL","i":1,"x":"V","p":189.0501,"s":10,"c":[],"z":"C","t":"2026-01-05T14:30:00Z"}]"#;
-        let events = parse_ws_events(json.as_bytes()).unwrap();
+        let events = parse_ws_events(json.as_bytes(), WsFormat::Json).unwrap();
         let AlpacaWsEvent::Trade(trade) = &events[0] else {
             panic!("expected trade");
         };
@@ -275,18 +285,51 @@ mod tests {
 
     #[rstest]
     fn test_parse_invalid_payload_errors() {
-        assert!(parse_ws_events(b"not-json").is_err());
-        assert!(parse_ws_events(b"{\"T\":\"t\"}").is_err()); // not an array
+        assert!(parse_ws_events(b"not-json", WsFormat::Json).is_err());
+        assert!(parse_ws_events(b"{\"T\":\"t\"}", WsFormat::Json).is_err()); // not an array
+        assert!(parse_ws_events(b"not-msgpack", WsFormat::Msgpack).is_err());
     }
 
     #[rstest]
     fn test_parse_invalid_timestamp_errors() {
+        // Timestamps convert during deserialization, so a garbage value fails
+        // the whole-frame parse.
         let json =
             r#"[{"T":"t","S":"AAPL","i":1,"x":"V","p":1.0,"s":1,"c":[],"z":"C","t":"garbage"}]"#;
-        let events = parse_ws_events(json.as_bytes()).unwrap();
-        let AlpacaWsEvent::Trade(trade) = &events[0] else {
-            panic!("expected trade");
-        };
-        assert!(parse_ws_trade_tick(trade, &instrument_info("AAPL"), UnixNanos::from(1)).is_err());
+        assert!(parse_ws_events(json.as_bytes(), WsFormat::Json).is_err());
+    }
+
+    #[rstest]
+    fn test_parse_msgpack_transcoded_fixture_matches_json() {
+        let json = load_test_json("ws_market_data_batch.json");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let msgpack = rmp_serde::to_vec_named(&value).unwrap();
+
+        let json_events = parse_ws_events(json.as_bytes(), WsFormat::Json).unwrap();
+        let msgpack_events = parse_ws_events(&msgpack, WsFormat::Msgpack).unwrap();
+
+        assert_eq!(json_events.len(), msgpack_events.len());
+        let info = instrument_info("AAPL");
+        let ts_init = UnixNanos::from(1);
+        for (json_event, msgpack_event) in json_events.iter().zip(msgpack_events.iter()) {
+            match (json_event, msgpack_event) {
+                (AlpacaWsEvent::Trade(a), AlpacaWsEvent::Trade(b)) => {
+                    let tick_a = parse_ws_trade_tick(a, &info, ts_init).unwrap();
+                    let tick_b = parse_ws_trade_tick(b, &info, ts_init).unwrap();
+                    assert_eq!(tick_a, tick_b);
+                }
+                (AlpacaWsEvent::Quote(a), AlpacaWsEvent::Quote(b)) => {
+                    let tick_a = parse_ws_quote_tick(a, &info, ts_init).unwrap();
+                    let tick_b = parse_ws_quote_tick(b, &info, ts_init).unwrap();
+                    assert_eq!(tick_a, tick_b);
+                }
+                (AlpacaWsEvent::MinuteBar(a), AlpacaWsEvent::MinuteBar(b)) => {
+                    let bar_a = parse_ws_bar(a, &info, ts_init).unwrap();
+                    let bar_b = parse_ws_bar(b, &info, ts_init).unwrap();
+                    assert_eq!(bar_a, bar_b);
+                }
+                (a, b) => panic!("event kind mismatch: {a:?} vs {b:?}"),
+            }
+        }
     }
 }

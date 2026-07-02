@@ -53,7 +53,7 @@ use crate::{
         handler::{FeedHandler, FeedKind, HandlerCommand},
         messages::{
             AlpacaInstrumentInfo, AlpacaSubscriptionAck, AlpacaWsAuth, AlpacaWsChannel,
-            AlpacaWsListen, NautilusWsMessage,
+            AlpacaWsListen, NautilusWsMessage, WsFormat, WsOutboundPayload, encode_outbound,
         },
     },
 };
@@ -76,6 +76,7 @@ const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct AlpacaWebSocketClient {
     url: String,
     credential: Credential,
+    format: WsFormat,
     auth_timeout_secs: u64,
     auth_tracker: AuthTracker,
     signal: Arc<AtomicBool>,
@@ -107,6 +108,7 @@ impl Clone for AlpacaWebSocketClient {
         Self {
             url: self.url.clone(),
             credential: self.credential.clone(),
+            format: self.format,
             auth_timeout_secs: self.auth_timeout_secs,
             auth_tracker: self.auth_tracker.clone(),
             signal: Arc::clone(&self.signal),
@@ -125,12 +127,16 @@ impl Clone for AlpacaWebSocketClient {
 impl AlpacaWebSocketClient {
     /// Creates a new client without connecting.
     ///
-    /// `url` overrides the resolved feed URL when supplied.
+    /// `url` overrides the resolved feed URL when supplied. `format` selects
+    /// the wire framing; [`WsFormat::Msgpack`] is negotiated via the
+    /// `Content-Type` header on the upgrade request and is the preferred data
+    /// plane.
     #[must_use]
     pub fn new(
         url: Option<String>,
         data_feed: AlpacaDataFeed,
         credential: Credential,
+        format: WsFormat,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
     ) -> Self {
@@ -140,6 +146,7 @@ impl AlpacaWebSocketClient {
         Self {
             url,
             credential,
+            format,
             auth_timeout_secs: AUTHENTICATION_TIMEOUT_SECS,
             auth_tracker: AuthTracker::new(),
             signal: Arc::new(AtomicBool::new(false)),
@@ -236,10 +243,20 @@ impl AlpacaWebSocketClient {
         let auth_payload = self.build_auth_payload()?;
         self.signal.store(false, Ordering::Release);
 
+        // MessagePack framing is negotiated with a Content-Type header on the
+        // WebSocket upgrade request; both directions then use binary frames.
+        let headers = match self.format {
+            WsFormat::Json => vec![],
+            WsFormat::Msgpack => vec![(
+                "Content-Type".to_string(),
+                "application/msgpack".to_string(),
+            )],
+        };
+
         let (message_handler, raw_rx) = channel_message_handler();
         let cfg = WebSocketConfig {
             url: self.url.clone(),
-            headers: vec![],
+            headers,
             heartbeat: Some(HEARTBEAT_INTERVAL.as_secs()),
             heartbeat_msg: None,
             reconnect_timeout_ms: Some(RECONNECT_TIMEOUT.as_millis() as u64),
@@ -276,10 +293,12 @@ impl AlpacaWebSocketClient {
         let instruments = Arc::clone(&self.instruments);
         let subscriptions = Arc::clone(&self.subscriptions);
         let cmd_tx_for_reconnect = cmd_tx.clone();
+        let format = self.format;
 
         let task = get_runtime().spawn(async move {
             let mut handler = FeedHandler::new(
                 FeedKind::MarketData,
+                format,
                 signal,
                 cmd_rx,
                 raw_rx,
@@ -533,9 +552,9 @@ impl AlpacaWebSocketClient {
         Ok(())
     }
 
-    fn build_auth_payload(&self) -> anyhow::Result<String> {
+    fn build_auth_payload(&self) -> anyhow::Result<WsOutboundPayload> {
         let auth = AlpacaWsAuth::new(self.credential.api_key(), self.credential.api_secret()?);
-        serde_json::to_string(&auth)
+        encode_outbound(&auth, self.format)
             .map_err(|e| anyhow::anyhow!("Failed to serialize auth message: {e}"))
     }
 
@@ -665,8 +684,14 @@ impl AlpacaTradeUpdatesWebSocketClient {
         }
 
         let auth_payload = self.build_auth_payload()?;
-        let listen_payload = serde_json::to_string(&AlpacaWsListen::trade_updates())
-            .expect("static listen payload serializes");
+        // The trade-updates stream stays on JSON framing: it is control-plane
+        // traffic (a handful of order events per second at most), so the
+        // MessagePack negotiation buys nothing and JSON keeps captures
+        // readable.
+        let listen_payload = WsOutboundPayload::Text(
+            serde_json::to_string(&AlpacaWsListen::trade_updates())
+                .expect("static listen payload serializes"),
+        );
         self.signal.store(false, Ordering::Release);
 
         let (message_handler, raw_rx) = channel_message_handler();
@@ -710,6 +735,7 @@ impl AlpacaTradeUpdatesWebSocketClient {
         let task = get_runtime().spawn(async move {
             let mut handler = FeedHandler::new(
                 FeedKind::TradeUpdates,
+                WsFormat::Json,
                 signal,
                 cmd_rx,
                 raw_rx,
@@ -837,9 +863,9 @@ impl AlpacaTradeUpdatesWebSocketClient {
         Ok(())
     }
 
-    fn build_auth_payload(&self) -> anyhow::Result<String> {
+    fn build_auth_payload(&self) -> anyhow::Result<WsOutboundPayload> {
         let auth = AlpacaWsAuth::new(self.credential.api_key(), self.credential.api_secret()?);
-        serde_json::to_string(&auth)
+        encode_outbound(&auth, WsFormat::Json)
             .map_err(|e| anyhow::anyhow!("Failed to serialize auth message: {e}"))
     }
 
@@ -909,6 +935,7 @@ mod tests {
             None,
             AlpacaDataFeed::Iex,
             test_credential(),
+            WsFormat::Json,
             TransportBackend::default(),
             None,
         );
@@ -923,6 +950,7 @@ mod tests {
             Some("ws://localhost:9000/v2/test".to_string()),
             AlpacaDataFeed::Sip,
             test_credential(),
+            WsFormat::Msgpack,
             TransportBackend::default(),
             None,
         );
@@ -984,6 +1012,7 @@ mod tests {
             None,
             AlpacaDataFeed::Iex,
             test_credential(),
+            WsFormat::Json,
             TransportBackend::default(),
             None,
         );

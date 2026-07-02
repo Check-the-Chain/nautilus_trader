@@ -28,15 +28,15 @@ use nautilus_common::{
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{
-        CancelAllOrders, CancelOrder, GenerateFillReports, GenerateOrderStatusReport,
-        GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
+        CancelAllOrders, CancelOrder, GenerateFillReports, GenerateFillReportsBuilder,
+        GenerateOrderStatusReport, GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
         GeneratePositionStatusReports, GeneratePositionStatusReportsBuilder, ModifyOrder,
         QueryAccount, SubmitOrder, SubmitOrderList,
     },
 };
 use nautilus_core::{
     MUTEX_POISONED, UnixNanos,
-    datetime::NANOSECONDS_IN_SECOND,
+    datetime::{NANOSECONDS_IN_SECOND, unix_nanos_to_iso8601},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
@@ -68,14 +68,23 @@ use crate::{
     config::AlpacaExecClientConfig,
     http::{
         client::AlpacaHttpClient,
-        models::{AlpacaAccount, AlpacaPosition},
-        query::{GetOrdersParamsBuilder, PatchOrderParamsBuilder, PostOrderParamsBuilder},
+        models::{AlpacaAccount, AlpacaAccountActivity, AlpacaPosition},
+        query::{
+            GetAccountActivitiesParamsBuilder, GetOrdersParamsBuilder, PatchOrderParamsBuilder,
+            PostOrderParamsBuilder,
+        },
     },
     websocket::{
         client::AlpacaTradeUpdatesWebSocketClient,
         messages::{AlpacaTradeUpdateMsg, AlpacaWsOrder, NautilusWsMessage},
     },
 };
+
+/// Maximum entries per `GET /v2/account/activities` page (venue limit 100).
+const ACTIVITIES_PAGE_SIZE: u32 = 100;
+
+/// Runaway guard for activities pagination during fill reconciliation.
+const MAX_ACTIVITY_PAGES: usize = 50;
 
 /// Alpaca live execution client.
 #[derive(Debug)]
@@ -263,6 +272,84 @@ impl AlpacaExecutionClient {
         self.emitter
             .emit_account_state(balances, vec![], true, ts_event);
         Ok(())
+    }
+
+    /// Builds a [`FillReport`] from a `FILL` account activity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required execution fields are missing or the
+    /// instrument is not cached.
+    fn parse_activity_fill_report(
+        &self,
+        activity: &AlpacaAccountActivity,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<FillReport> {
+        let symbol = activity
+            .symbol
+            .as_deref()
+            .context("FILL activity has no symbol")?;
+        let instrument = self
+            .http_client
+            .get_instrument(&Ustr::from(symbol))
+            .with_context(|| format!("no cached instrument for {symbol}"))?;
+        let instrument_id = InstrumentId::new(Symbol::from(symbol), *ALPACA_VENUE);
+
+        let price = activity
+            .price
+            .as_deref()
+            .context("FILL activity has no price")?;
+        let qty = activity
+            .qty
+            .as_deref()
+            .context("FILL activity has no qty")?;
+        let last_px = parse_price(price, instrument.price_precision())?;
+        let last_qty = parse_quantity(qty, instrument.size_precision())?;
+
+        let order_side = match activity.side.as_deref() {
+            Some("buy") => OrderSide::Buy,
+            Some("sell" | "sell_short") => OrderSide::Sell,
+            other => anyhow::bail!("unsupported FILL activity side: {other:?}"),
+        };
+
+        let venue_order_id = activity
+            .order_id
+            .as_deref()
+            .map(VenueOrderId::new)
+            .context("FILL activity has no order_id")?;
+
+        // Activity IDs are `{date}::{uuid}`; the UUID segment alone fits the
+        // Nautilus trade-ID capacity and is unique per execution.
+        let trade_id_value = activity
+            .id
+            .rsplit_once("::")
+            .map_or(activity.id.as_str(), |(_, uuid)| uuid);
+        let trade_id =
+            TradeId::new_checked(trade_id_value).context("invalid Alpaca activity trade ID")?;
+
+        let ts_event = match activity.transaction_time.as_deref() {
+            Some(value) => parse_rfc3339_timestamp(value, "activity.transaction_time")?,
+            None => ts_init,
+        };
+
+        Ok(FillReport::new(
+            self.core.account_id,
+            instrument_id,
+            venue_order_id,
+            trade_id,
+            order_side,
+            last_qty,
+            last_px,
+            // Alpaca is commission-free for US equities; regulatory fees are
+            // booked as separate end-of-day FEE activities.
+            Money::new(0.0, Currency::USD()),
+            LiquiditySide::NoLiquiditySide,
+            None,
+            None,
+            ts_event,
+            ts_init,
+            None,
+        ))
     }
 }
 
@@ -669,16 +756,69 @@ impl ExecutionClient for AlpacaExecutionClient {
         Ok(reports)
     }
 
-    /// Alpaca REST does not expose per-execution fills (they are delivered on
-    /// the trade-updates stream), so this returns an empty list.
+    /// Reconciles per-execution fills from `GET /v2/account/activities`
+    /// (`activity_types=FILL`).
+    ///
+    /// Live fills arrive on the trade-updates stream; this path recovers
+    /// executions missed while disconnected. The activities ledger is
+    /// eventually consistent, so fills from the last few seconds may lag.
     async fn generate_fill_reports(
         &self,
-        _cmd: GenerateFillReports,
+        cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        log::warn!(
-            "Alpaca REST has no fills endpoint; live fills arrive via the trade-updates stream"
+        let ts_init = self.clock.get_time_ns();
+
+        let mut params_builder = GetAccountActivitiesParamsBuilder::default();
+        params_builder
+            .activity_types("FILL")
+            .direction("asc")
+            .page_size(ACTIVITIES_PAGE_SIZE);
+        if let Some(start) = cmd.start {
+            params_builder.after(unix_nanos_to_iso8601(start));
+        }
+        if let Some(end) = cmd.end {
+            params_builder.until(unix_nanos_to_iso8601(end));
+        }
+        let mut params = params_builder.build().context("invalid activities query")?;
+
+        let mut reports = Vec::new();
+        for _ in 0..MAX_ACTIVITY_PAGES {
+            let activities = self.http_client.get_account_activities(&params).await?;
+            let page_len = activities.len();
+            let last_id = activities.last().map(|a| a.id.clone());
+
+            for activity in &activities {
+                if let Some(instrument_id) = cmd.instrument_id
+                    && activity.symbol.as_deref() != Some(instrument_id.symbol.as_str())
+                {
+                    continue;
+                }
+                if let Some(venue_order_id) = &cmd.venue_order_id
+                    && activity.order_id.as_deref() != Some(venue_order_id.as_str())
+                {
+                    continue;
+                }
+
+                match self.parse_activity_fill_report(activity, ts_init) {
+                    Ok(report) => reports.push(report),
+                    Err(e) => log::warn!("Skipping FILL activity {}: {e}", activity.id),
+                }
+            }
+
+            if page_len < ACTIVITIES_PAGE_SIZE as usize {
+                break;
+            }
+            match last_id {
+                Some(id) => params.page_token = Some(id),
+                None => break,
+            }
+        }
+
+        log::debug!(
+            "Generated {} fill report(s) from account activities",
+            reports.len()
         );
-        Ok(Vec::new())
+        Ok(reports)
     }
 
     async fn generate_position_status_reports(
@@ -744,13 +884,21 @@ impl ExecutionClient for AlpacaExecutionClient {
             .build()
             .context("Failed to build GeneratePositionStatusReports")?;
 
-        let (order_reports, position_reports) = tokio::try_join!(
+        let fill_cmd = GenerateFillReportsBuilder::default()
+            .ts_init(ts_now)
+            .start(start)
+            .build()
+            .context("Failed to build GenerateFillReports")?;
+
+        let (order_reports, position_reports, fill_reports) = tokio::try_join!(
             self.generate_order_status_reports(&order_cmd),
             self.generate_position_status_reports(&position_cmd),
+            self.generate_fill_reports(fill_cmd),
         )?;
 
         log::info!("Received {} OrderStatusReports", order_reports.len());
         log::info!("Received {} PositionReports", position_reports.len());
+        log::info!("Received {} FillReports", fill_reports.len());
 
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
@@ -761,6 +909,7 @@ impl ExecutionClient for AlpacaExecutionClient {
         );
 
         mass_status.add_order_reports(order_reports);
+        mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
         Ok(Some(mass_status))

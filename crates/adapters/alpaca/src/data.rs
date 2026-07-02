@@ -58,7 +58,7 @@ use crate::{
     http::client::{AlpacaHttpClient, AlpacaRawHttpClient},
     websocket::{
         client::AlpacaWebSocketClient,
-        messages::{AlpacaInstrumentInfo, NautilusWsMessage},
+        messages::{AlpacaInstrumentInfo, NautilusWsMessage, WsFormat},
     },
 };
 
@@ -176,10 +176,16 @@ impl AlpacaDataClient {
             .clone()
             .context("Alpaca credentials required for the market data stream")?;
 
+        let format = if self.config.use_msgpack {
+            WsFormat::Msgpack
+        } else {
+            WsFormat::Json
+        };
         let mut ws_client = AlpacaWebSocketClient::new(
             self.config.base_url_ws.clone(),
             self.config.data_feed,
             credential,
+            format,
             self.config.transport_backend,
             self.config.proxy_url.clone(),
         );

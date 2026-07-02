@@ -544,4 +544,33 @@ mod tests {
         assert_eq!(quotes[0].bp, 189.04);
         assert_eq!(quotes[0].ask_size, 300);
     }
+
+    #[rstest]
+    fn test_deserialize_account_activities() {
+        let json = load_test_json("http_get_account_activities.json");
+        let activities: Vec<AlpacaAccountActivity> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(activities.len(), 3);
+
+        let fill = &activities[0];
+        assert_eq!(fill.activity_type, "FILL");
+        assert_eq!(fill.fill_type.as_deref(), Some("fill"));
+        assert_eq!(fill.side.as_deref(), Some("buy"));
+        assert_eq!(fill.price.as_deref(), Some("295.2"));
+        assert_eq!(fill.qty.as_deref(), Some("50"));
+        assert_eq!(
+            fill.order_id.as_deref(),
+            Some("1cc0059d-d5ab-45fb-b82f-1e022e850e45")
+        );
+
+        let partial = &activities[1];
+        assert_eq!(partial.fill_type.as_deref(), Some("partial_fill"));
+        assert_eq!(partial.leaves_qty.as_deref(), Some("42"));
+
+        let fee = &activities[2];
+        assert_eq!(fee.activity_type, "FEE");
+        assert_eq!(fee.net_amount.as_deref(), Some("-0.41"));
+        assert_eq!(fee.date.as_deref(), Some("2026-07-02"));
+        assert!(fee.price.is_none());
+    }
 }

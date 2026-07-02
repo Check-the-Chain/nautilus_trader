@@ -31,7 +31,10 @@
 use std::time::{Duration, Instant};
 
 use nautilus_alpaca::{
-    common::{credential::Credential, enums::{AlpacaDataFeed, AlpacaEnvironment}},
+    common::{
+        credential::Credential,
+        enums::{AlpacaDataFeed, AlpacaEnvironment, AlpacaTradeUpdateEvent},
+    },
     http::{
         client::AlpacaHttpClient,
         query::{
@@ -41,7 +44,7 @@ use nautilus_alpaca::{
     },
     websocket::{
         client::{AlpacaTradeUpdatesWebSocketClient, AlpacaWebSocketClient},
-        messages::{AlpacaInstrumentInfo, NautilusWsMessage},
+        messages::{AlpacaInstrumentInfo, NautilusWsMessage, WsFormat},
     },
 };
 use nautilus_model::{identifiers::InstrumentId, instruments::Instrument};
@@ -71,7 +74,11 @@ async fn main() -> anyhow::Result<()> {
     let account = http.get_account().await?;
     println!(
         "account: id={:?} status={:?} currency={:?} cash={:?} equity={:?} buying_power={:?}",
-        account.id, account.status, account.currency, account.cash, account.equity,
+        account.id,
+        account.status,
+        account.currency,
+        account.cash,
+        account.equity,
         account.buying_power,
     );
 
@@ -113,7 +120,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
     let bar_count = bars.bars.get(SYMBOL).map_or(0, Vec::len);
-    println!("bars: {bar_count} (sample: {:?})", bars.bars.get(SYMBOL).and_then(|b| b.first()));
+    println!(
+        "bars: {bar_count} (sample: {:?})",
+        bars.bars.get(SYMBOL).and_then(|b| b.first())
+    );
 
     let trades = http
         .get_stock_trades_paginated(
@@ -140,11 +150,12 @@ async fn main() -> anyhow::Result<()> {
     println!("quotes: {quote_count}");
 
     // ------------------------------------------------- Market data stream
-    banner("3. Market data WebSocket (test feed, FAKEPACA)");
+    banner("3. Market data WebSocket (test feed, FAKEPACA, msgpack)");
     let mut ws = AlpacaWebSocketClient::new(
         None,
         AlpacaDataFeed::Test,
         credential.clone(),
+        WsFormat::Msgpack,
         TransportBackend::default(),
         None,
     );
@@ -219,7 +230,10 @@ async fn main() -> anyhow::Result<()> {
         None,
     );
     updates.connect().await?;
-    println!("trade-updates stream connected + listening: active={}", updates.is_active());
+    println!(
+        "trade-updates stream connected + listening: active={}",
+        updates.is_active()
+    );
 
     // Far-from-market limit buy: 1 share of AAPL at $1.00 (never fills).
     let submitted = http
@@ -259,12 +273,11 @@ async fn main() -> anyhow::Result<()> {
                     "trade update: event={:?} order_status={:?}",
                     update.event, update.order.status,
                 );
-                use nautilus_alpaca::common::enums::AlpacaTradeUpdateEvent;
                 match update.event {
                     AlpacaTradeUpdateEvent::New | AlpacaTradeUpdateEvent::PendingNew => {
                         saw_new = true;
                         if !cancel_sent {
-                            http.cancel_order(&order_id.to_string()).await?;
+                            http.cancel_order(&order_id.clone()).await?;
                             println!("cancel sent for {order_id}");
                             cancel_sent = true;
                         }
@@ -282,11 +295,11 @@ async fn main() -> anyhow::Result<()> {
     if !cancel_sent {
         // No stream event arrived in the window (e.g. venue latency); cancel
         // via REST regardless so the paper account is left clean.
-        http.cancel_order(&order_id.to_string()).await?;
+        http.cancel_order(&order_id.clone()).await?;
         println!("cancel sent for {order_id} (no stream event within {EVENT_WAIT_SECS}s)");
     }
 
-    let final_order = http.get_order(&order_id.to_string()).await?;
+    let final_order = http.get_order(&order_id.clone()).await?;
     println!("final order status: {:?}", final_order.status);
 
     updates.disconnect().await?;

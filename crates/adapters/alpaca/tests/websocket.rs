@@ -49,7 +49,7 @@ use nautilus_alpaca::{
     },
     websocket::{
         AlpacaInstrumentInfo, AlpacaTradeUpdatesWebSocketClient, AlpacaWebSocketClient,
-        NautilusWsMessage,
+        NautilusWsMessage, WsFormat,
     },
 };
 use nautilus_common::testing::wait_until_async;
@@ -92,6 +92,8 @@ struct TestServerState {
     push_after_ack: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// When set, the server closes the socket after the next subscribe ack.
     drop_after_next_subscribe: Arc<AtomicBool>,
+    /// Count of upgrade requests carrying `Content-Type: application/msgpack`.
+    msgpack_upgrades: Arc<AtomicUsize>,
 }
 
 impl TestServerState {
@@ -346,10 +348,18 @@ fn trade_updates_handler(
 }
 
 async fn connect_market_data_client(addr: SocketAddr) -> AlpacaWebSocketClient {
+    connect_market_data_client_with_format(addr, WsFormat::Json).await
+}
+
+async fn connect_market_data_client_with_format(
+    addr: SocketAddr,
+    format: WsFormat,
+) -> AlpacaWebSocketClient {
     let mut client = AlpacaWebSocketClient::new(
         Some(format!("ws://{addr}/stream")),
         AlpacaDataFeed::Iex,
         test_credential(),
+        format,
         TransportBackend::default(),
         None,
     );
@@ -565,6 +575,169 @@ async fn test_trade_updates_connect_listen_and_fill() {
     assert_eq!(msg.order.client_order_id, "O-20260105-001");
 
     assert_eq!(state.listens.lock().await.len(), 1);
+
+    client.disconnect().await.expect("disconnect");
+}
+
+// ================================================================================================
+// MessagePack framing
+// ================================================================================================
+
+/// MessagePack-mode market data server: decodes client binary frames as
+/// msgpack maps, replies with msgpack-encoded control frames, and records
+/// whether the upgrade request negotiated msgpack via `Content-Type`.
+async fn handle_msgpack_upgrade(
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<TestServerState>>,
+) -> Response {
+    if headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        == Some("application/msgpack")
+    {
+        state.msgpack_upgrades.fetch_add(1, Ordering::SeqCst);
+    }
+    ws.on_upgrade(move |socket| handle_msgpack_market_data_socket(socket, state))
+}
+
+fn to_msgpack_frame(value: &Value) -> Message {
+    Message::Binary(
+        rmp_serde::to_vec_named(value)
+            .expect("encode msgpack")
+            .into(),
+    )
+}
+
+async fn handle_msgpack_market_data_socket(socket: WebSocket, state: Arc<TestServerState>) {
+    state.connection_count.fetch_add(1, Ordering::SeqCst);
+    let (mut sink, mut stream) = socket.split();
+
+    let _ = sink
+        .send(to_msgpack_frame(
+            &json!([{"T":"success","msg":"connected"}]),
+        ))
+        .await;
+
+    let mut trades: Vec<String> = Vec::new();
+
+    while let Some(Ok(message)) = stream.next().await {
+        let Message::Binary(bytes) = message else {
+            continue;
+        };
+        let Ok(value) = rmp_serde::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let action = value.get("action").and_then(Value::as_str).unwrap_or("");
+        match action {
+            "auth" => {
+                state.auths.lock().await.push(value);
+                let ack = json!([{"T":"success","msg":"authenticated"}]);
+                if sink.send(to_msgpack_frame(&ack)).await.is_err() {
+                    break;
+                }
+            }
+            "subscribe" => {
+                state.subscribes.lock().await.push(value.clone());
+                if let Some(symbols) = value.get("trades").and_then(Value::as_array) {
+                    for symbol in symbols {
+                        let symbol = symbol.as_str().unwrap_or_default().to_string();
+                        if !trades.contains(&symbol) {
+                            trades.push(symbol);
+                        }
+                    }
+                }
+                let ack = json!([{
+                    "T": "subscription",
+                    "trades": trades,
+                    "quotes": [],
+                    "bars": [],
+                    "dailyBars": [],
+                    "updatedBars": [],
+                }]);
+                if sink.send(to_msgpack_frame(&ack)).await.is_err() {
+                    break;
+                }
+                while let Some(frame) = state.pop_push().await {
+                    let value: Value = serde_json::from_str(&frame).expect("push fixture json");
+                    if sink.send(to_msgpack_frame(&value)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    state.connection_count.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn msgpack_market_data_handler(
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+    state: State<Arc<TestServerState>>,
+) -> std::pin::Pin<Box<dyn Future<Output = Response> + Send>> {
+    Box::pin(handle_msgpack_upgrade(headers, ws, state))
+}
+
+async fn start_msgpack_server(state: Arc<TestServerState>) -> SocketAddr {
+    let router = Router::new()
+        .route("/stream", get(msgpack_market_data_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ws listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("ws server");
+    });
+    wait_until_async(
+        || async move { tokio::net::TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(2),
+    )
+    .await;
+    addr
+}
+
+#[tokio::test]
+async fn test_msgpack_framing_end_to_end() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_msgpack_server(Arc::clone(&state)).await;
+
+    let mut client = connect_market_data_client_with_format(addr, WsFormat::Msgpack).await;
+    assert!(client.is_active());
+    // Upgrade negotiated msgpack and the auth frame arrived as valid msgpack.
+    assert_eq!(state.msgpack_upgrades.load(Ordering::SeqCst), 1);
+    assert_eq!(state.auths.lock().await.len(), 1);
+    let auth = &state.auths.lock().await[0];
+    assert_eq!(auth.get("key").and_then(Value::as_str), Some("test-key"));
+
+    state
+        .enqueue_push(load_json_text("ws_market_data_batch.json"))
+        .await;
+    client
+        .subscribe_trades(instrument_info("AAPL").instrument_id)
+        .await
+        .expect("subscribe");
+
+    // The subscribe frame itself arrived as msgpack with named fields.
+    let msg = wait_for_message(&mut client, |msg| {
+        matches!(msg, NautilusWsMessage::Trades(_))
+    })
+    .await;
+    let NautilusWsMessage::Trades(trades) = msg else {
+        unreachable!()
+    };
+    assert_eq!(trades.len(), 2);
+    assert_eq!(trades[0].price.to_string(), "189.05");
+
+    let subscribes = state.subscribes.lock().await;
+    assert_eq!(subscribes.len(), 1);
+    assert_eq!(
+        subscribes[0].get("action").and_then(Value::as_str),
+        Some("subscribe")
+    );
 
     client.disconnect().await.expect("disconnect");
 }

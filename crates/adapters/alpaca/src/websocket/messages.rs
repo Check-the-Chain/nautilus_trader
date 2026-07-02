@@ -15,22 +15,240 @@
 
 //! Wire frames and handler-output message types for Alpaca streams.
 //!
-//! Market data arrives as JSON arrays of messages tagged by a `"T"` field;
-//! the inbound types here deserialize in a single typed pass with borrowed
-//! timestamps so the hot path performs no DOM traversal or re-serialization.
-//! The trade-updates stream wraps events in a `{"stream", "data"}` envelope.
+//! Market data arrives as arrays of messages tagged by a `"T"` field, in
+//! either JSON or MessagePack framing (negotiated via the `Content-Type`
+//! header on the WebSocket upgrade). The inbound types here deserialize in a
+//! single typed pass; timestamps convert straight to [`UnixNanos`] during
+//! deserialization from both the RFC 3339 strings JSON carries and the
+//! MessagePack timestamp extension (ext `-1`), so the hot path performs no
+//! DOM traversal, re-serialization, or second timestamp pass. The
+//! trade-updates stream wraps events in a `{"stream", "data"}` envelope.
 
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     identifiers::InstrumentId,
 };
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{Error as DeError, SeqAccess, Visitor},
+};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 use ustr::Ustr;
 
+use super::error::AlpacaWsError;
 use crate::common::enums::AlpacaTradeUpdateEvent;
+
+/// Wire format negotiated for a stream connection.
+///
+/// MessagePack is the default data plane: frames are smaller and decode
+/// faster than JSON at equivalent structure. JSON remains available for
+/// debugging and for the trade-updates stream, whose control-plane volume
+/// makes the framing irrelevant.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WsFormat {
+    /// JSON text frames.
+    Json,
+    /// MessagePack binary frames (`Content-Type: application/msgpack`).
+    #[default]
+    Msgpack,
+}
+
+/// An outbound frame encoded for a specific [`WsFormat`].
+#[derive(Clone)]
+pub enum WsOutboundPayload {
+    /// JSON text frame.
+    Text(String),
+    /// MessagePack binary frame.
+    Binary(Vec<u8>),
+}
+
+impl Debug for WsOutboundPayload {
+    /// Custom `Debug` that omits payload contents, which may embed the API
+    /// secret (e.g. auth frames).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => write!(f, "Text(<{} chars>)", text.len()),
+            Self::Binary(bytes) => write!(f, "Binary(<{} bytes>)", bytes.len()),
+        }
+    }
+}
+
+/// Encodes an outbound message for the given wire format.
+///
+/// MessagePack encoding uses named (map) struct representation, which is what
+/// the venue expects; positional tuples are not accepted.
+///
+/// # Errors
+///
+/// Returns an error if serialization fails.
+pub fn encode_outbound<T: Serialize>(
+    msg: &T,
+    format: WsFormat,
+) -> Result<WsOutboundPayload, AlpacaWsError> {
+    match format {
+        WsFormat::Json => serde_json::to_string(msg)
+            .map(WsOutboundPayload::Text)
+            .map_err(|e| AlpacaWsError::Client(format!("failed to serialize message: {e}"))),
+        WsFormat::Msgpack => rmp_serde::to_vec_named(msg)
+            .map(WsOutboundPayload::Binary)
+            .map_err(|e| AlpacaWsError::Client(format!("failed to serialize message: {e}"))),
+    }
+}
+
+/// Wire timestamp converted to [`UnixNanos`] during deserialization.
+///
+/// Accepts the RFC 3339 nanosecond strings the JSON framing carries and the
+/// MessagePack timestamp extension (ext `-1`, 32/64/96-bit forms) the binary
+/// framing carries.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlpacaWsTimestamp(pub UnixNanos);
+
+impl<'de> Deserialize<'de> for AlpacaWsTimestamp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(WsTimestampVisitor).map(Self)
+    }
+}
+
+struct WsTimestampVisitor;
+
+impl<'de> Visitor<'de> for WsTimestampVisitor {
+    type Value = UnixNanos;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an RFC 3339 timestamp string or MessagePack timestamp extension")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        value.parse::<UnixNanos>().map_err(E::custom)
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let MsgpackExt((tag, bytes)) = MsgpackExt::deserialize(deserializer)?;
+        msgpack_timestamp_ext_to_unix_nanos(tag, &bytes.0).map_err(D::Error::custom)
+    }
+}
+
+/// MessagePack extension value as `rmp-serde` presents it under
+/// `deserialize_any`: a newtype struct named `_ExtStruct` wrapping
+/// `(type_tag, payload_bytes)`.
+#[derive(Deserialize)]
+#[serde(rename = "_ExtStruct")]
+struct MsgpackExt((i8, MsgpackBytes));
+
+#[derive(Deserialize)]
+struct MsgpackBytes(#[serde(deserialize_with = "deserialize_msgpack_bytes")] Vec<u8>);
+
+fn deserialize_msgpack_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a MessagePack byte array")
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut value = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                value.push(byte);
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_any(BytesVisitor)
+}
+
+/// Decodes a MessagePack timestamp extension payload into [`UnixNanos`].
+///
+/// Implements the three encodings from the MessagePack spec: 32-bit seconds,
+/// 64-bit packed (30-bit nanos / 34-bit seconds), and 96-bit (nanos +
+/// seconds).
+fn msgpack_timestamp_ext_to_unix_nanos(tag: i8, bytes: &[u8]) -> Result<UnixNanos, String> {
+    if tag != -1 {
+        return Err(format!("unsupported MessagePack extension tag {tag}"));
+    }
+
+    let (seconds, nanos) = match bytes.len() {
+        4 => {
+            let seconds = u32::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| "invalid 32-bit timestamp payload".to_string())?,
+            );
+            (i64::from(seconds), 0u32)
+        }
+        8 => {
+            let value = u64::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| "invalid 64-bit timestamp payload".to_string())?,
+            );
+            let nanos = (value >> 34) as u32;
+            let seconds = value & ((1_u64 << 34) - 1);
+            (i64::try_from(seconds).map_err(|e| e.to_string())?, nanos)
+        }
+        12 => {
+            let nanos = u32::from_be_bytes(
+                bytes[..4]
+                    .try_into()
+                    .map_err(|_| "invalid 96-bit timestamp nanos".to_string())?,
+            );
+            let seconds = i64::from_be_bytes(
+                bytes[4..]
+                    .try_into()
+                    .map_err(|_| "invalid 96-bit timestamp seconds".to_string())?,
+            );
+            (seconds, nanos)
+        }
+        len => {
+            return Err(format!(
+                "invalid MessagePack timestamp payload length {len}"
+            ));
+        }
+    };
+
+    let seconds =
+        u64::try_from(seconds).map_err(|_| format!("negative timestamp seconds {seconds}"))?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|ns| ns.checked_add(u64::from(nanos)))
+        .map(UnixNanos::from)
+        .ok_or_else(|| format!("timestamp overflow: seconds={seconds} nanos={nanos}"))
+}
 
 /// Instrument metadata required to build Nautilus values from wire messages.
 #[derive(Copy, Clone, Debug)]
@@ -218,27 +436,27 @@ impl AlpacaWsListen {
 
 /// A single message on the market data stream, tagged by the `"T"` field.
 ///
-/// Payloads always arrive as JSON arrays of these messages; control messages
-/// (`success`, `error`, `subscription`) arrive alone while data messages may
-/// be batched.
+/// Payloads always arrive as arrays of these messages (JSON or MessagePack
+/// framing); control messages (`success`, `error`, `subscription`) arrive
+/// alone while data messages may be batched.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "T", bound(deserialize = "'de: 'a"))]
-pub enum AlpacaWsEvent<'a> {
+#[serde(tag = "T")]
+pub enum AlpacaWsEvent {
     /// Trade print.
     #[serde(rename = "t")]
-    Trade(AlpacaWsTrade<'a>),
+    Trade(AlpacaWsTrade),
     /// NBBO quote.
     #[serde(rename = "q")]
-    Quote(AlpacaWsQuote<'a>),
+    Quote(AlpacaWsQuote),
     /// Completed minute bar.
     #[serde(rename = "b")]
-    MinuteBar(AlpacaWsBar<'a>),
+    MinuteBar(AlpacaWsBar),
     /// Cumulative daily bar (emitted each minute after market open).
     #[serde(rename = "d")]
-    DailyBar(AlpacaWsBar<'a>),
+    DailyBar(AlpacaWsBar),
     /// Corrected minute bar issued when late trades arrive.
     #[serde(rename = "u")]
-    UpdatedBar(AlpacaWsBar<'a>),
+    UpdatedBar(AlpacaWsBar),
     /// Subscription acknowledgement carrying the full current set.
     #[serde(rename = "subscription")]
     Subscription(AlpacaSubscriptionAck),
@@ -255,7 +473,7 @@ pub enum AlpacaWsEvent<'a> {
 
 /// Trade message (`"T":"t"`).
 #[derive(Clone, Debug, Deserialize)]
-pub struct AlpacaWsTrade<'a> {
+pub struct AlpacaWsTrade {
     /// Symbol.
     #[serde(rename = "S")]
     pub symbol: Ustr,
@@ -277,14 +495,14 @@ pub struct AlpacaWsTrade<'a> {
     /// Tape (`A`/`B`/`C`).
     #[serde(rename = "z", default)]
     pub tape: Option<Ustr>,
-    /// RFC 3339 timestamp with nanosecond precision.
-    #[serde(rename = "t", borrow)]
-    pub timestamp: &'a str,
+    /// Event timestamp (nanosecond precision).
+    #[serde(rename = "t")]
+    pub timestamp: AlpacaWsTimestamp,
 }
 
 /// Quote message (`"T":"q"`).
 #[derive(Clone, Debug, Deserialize)]
-pub struct AlpacaWsQuote<'a> {
+pub struct AlpacaWsQuote {
     /// Symbol.
     #[serde(rename = "S")]
     pub symbol: Ustr,
@@ -312,14 +530,14 @@ pub struct AlpacaWsQuote<'a> {
     /// Tape (`A`/`B`/`C`).
     #[serde(rename = "z", default)]
     pub tape: Option<Ustr>,
-    /// RFC 3339 timestamp with nanosecond precision.
-    #[serde(rename = "t", borrow)]
-    pub timestamp: &'a str,
+    /// Event timestamp (nanosecond precision).
+    #[serde(rename = "t")]
+    pub timestamp: AlpacaWsTimestamp,
 }
 
 /// Bar message (`"T":"b"` / `"d"` / `"u"`).
 #[derive(Clone, Debug, Deserialize)]
-pub struct AlpacaWsBar<'a> {
+pub struct AlpacaWsBar {
     /// Symbol.
     #[serde(rename = "S")]
     pub symbol: Ustr,
@@ -344,9 +562,9 @@ pub struct AlpacaWsBar<'a> {
     /// Volume-weighted average price.
     #[serde(rename = "vw", default)]
     pub vwap: Option<f64>,
-    /// RFC 3339 bar-open timestamp.
-    #[serde(rename = "t", borrow)]
-    pub timestamp: &'a str,
+    /// Bar-open timestamp (nanosecond precision).
+    #[serde(rename = "t")]
+    pub timestamp: AlpacaWsTimestamp,
 }
 
 /// Subscription acknowledgement (`"T":"subscription"`).
@@ -627,7 +845,11 @@ mod tests {
                 assert_eq!(trade.trade_id, 96921);
                 assert_eq!(trade.price, 189.05);
                 assert_eq!(trade.size, 100);
-                assert_eq!(trade.timestamp, "2026-01-05T14:30:00.123456789Z");
+                assert_eq!(
+                    trade.timestamp.0.as_u64() % 1_000_000_000,
+                    123_456_789,
+                    "timestamp converts to UnixNanos during deserialization",
+                );
             }
             other => panic!("expected trade, got {other:?}"),
         }
@@ -698,6 +920,102 @@ mod tests {
         let json = r#"[{"T":"x","S":"AAPL","i":1,"x":"V","p":1.0,"s":1,"a":"C","t":"2026-01-05T14:30:00Z","z":"C"}]"#;
         let events: Vec<AlpacaWsEvent> = serde_json::from_str(json).unwrap();
         assert!(matches!(events[0], AlpacaWsEvent::Unknown));
+    }
+
+    #[rstest]
+    #[case::ts32(&2_000_000_000u32.to_be_bytes()[..], 2_000_000_000_000_000_000)]
+    #[case::ts64(&((123_456_789u64 << 34) | 1_700_000_000).to_be_bytes()[..], 1_700_000_000_123_456_789)]
+    #[case::ts96(
+        &[&500_000_000u32.to_be_bytes()[..], &1_700_000_000i64.to_be_bytes()[..]].concat(),
+        1_700_000_000_500_000_000,
+    )]
+    fn test_msgpack_ext_timestamp_forms(#[case] payload: &[u8], #[case] expected: u64) {
+        let nanos = msgpack_timestamp_ext_to_unix_nanos(-1, payload).unwrap();
+        assert_eq!(nanos.as_u64(), expected);
+    }
+
+    #[rstest]
+    fn test_msgpack_ext_timestamp_rejects_bad_input() {
+        assert!(msgpack_timestamp_ext_to_unix_nanos(3, &[0u8; 8]).is_err()); // wrong tag
+        assert!(msgpack_timestamp_ext_to_unix_nanos(-1, &[0u8; 5]).is_err()); // bad length
+    }
+
+    /// Hand-crafted MessagePack frame: `[{"T":"t","S":"AAPL","i":1,"x":"V",
+    /// "p":1.5,"s":10,"c":[],"z":"C","t":<fixext8 timestamp>}]` — exactly the
+    /// shape the venue sends, with the timestamp as an ext `-1` value rather
+    /// than a string.
+    #[rstest]
+    fn test_deserialize_msgpack_trade_with_ext_timestamp() {
+        let seconds = 1_700_000_000u64;
+        let nanos = 123_456_789u64;
+        let packed = (nanos << 34) | seconds;
+
+        let mut frame: Vec<u8> = vec![0x91, 0x89]; // 1-element array, 9-pair map
+        let put_key = |frame: &mut Vec<u8>, key: u8| frame.extend([0xa1, key]);
+        put_key(&mut frame, b'T');
+        frame.extend([0xa1, b't']);
+        put_key(&mut frame, b'S');
+        frame.push(0xa4);
+        frame.extend(b"AAPL");
+        put_key(&mut frame, b'i');
+        frame.push(0x01);
+        put_key(&mut frame, b'x');
+        frame.extend([0xa1, b'V']);
+        put_key(&mut frame, b'p');
+        frame.push(0xcb);
+        frame.extend(1.5f64.to_be_bytes());
+        put_key(&mut frame, b's');
+        frame.push(0x0a);
+        put_key(&mut frame, b'c');
+        frame.push(0x90); // empty array
+        put_key(&mut frame, b'z');
+        frame.extend([0xa1, b'C']);
+        put_key(&mut frame, b't');
+        frame.extend([0xd7, 0xff]); // fixext8, type -1
+        frame.extend(packed.to_be_bytes());
+
+        let events: Vec<AlpacaWsEvent> = rmp_serde::from_slice(&frame).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AlpacaWsEvent::Trade(trade) => {
+                assert_eq!(trade.symbol, Ustr::from("AAPL"));
+                assert_eq!(trade.price, 1.5);
+                assert_eq!(trade.size, 10);
+                assert_eq!(trade.timestamp.0.as_u64(), seconds * 1_000_000_000 + nanos,);
+            }
+            other => panic!("expected trade, got {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_encode_outbound_msgpack_named_maps() {
+        let request = AlpacaWsSubscription::subscribe(
+            AlpacaWsChannel::Trades,
+            vec![Ustr::from("AAPL"), Ustr::from("MSFT")],
+        );
+        let WsOutboundPayload::Binary(bytes) =
+            encode_outbound(&request, WsFormat::Msgpack).unwrap()
+        else {
+            panic!("expected binary payload");
+        };
+
+        // Decode back through a generic JSON value: field names must survive
+        // (the venue rejects positional tuples).
+        let value: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value.get("action").and_then(|v| v.as_str()),
+            Some("subscribe")
+        );
+        assert_eq!(
+            value.get("trades").and_then(|v| v.as_array()).map(Vec::len),
+            Some(2)
+        );
+
+        let WsOutboundPayload::Text(text) = encode_outbound(&request, WsFormat::Json).unwrap()
+        else {
+            panic!("expected text payload");
+        };
+        assert_eq!(text, r#"{"action":"subscribe","trades":["AAPL","MSFT"]}"#);
     }
 
     #[rstest]

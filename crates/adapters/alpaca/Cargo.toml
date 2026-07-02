@@ -64,6 +64,7 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 log = { workspace = true }
+rmp-serde = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

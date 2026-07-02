@@ -60,6 +60,12 @@ pub struct AlpacaDataClientConfig {
     /// Refresh interval for instrument metadata in minutes.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
+    /// Use MessagePack framing on the market data stream (default `true`).
+    ///
+    /// MessagePack frames are smaller and decode faster than JSON; disable
+    /// only for debugging against JSON captures.
+    #[builder(default = true)]
+    pub use_msgpack: bool,
     /// WebSocket transport backend.
     #[builder(default)]
     pub transport_backend: TransportBackend,
@@ -129,6 +135,7 @@ impl Debug for AlpacaDataClientConfig {
                 "update_instruments_interval_mins",
                 &self.update_instruments_interval_mins,
             )
+            .field("use_msgpack", &self.use_msgpack)
             .field("transport_backend", &self.transport_backend)
             .finish()
     }

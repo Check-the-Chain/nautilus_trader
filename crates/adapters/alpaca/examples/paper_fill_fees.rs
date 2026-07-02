@@ -33,8 +33,8 @@ use nautilus_alpaca::{
     common::{
         credential::Credential,
         enums::{
-            AlpacaDataFeed, AlpacaEnvironment, AlpacaOrderSide, AlpacaOrderType,
-            AlpacaTimeInForce, AlpacaTradeUpdateEvent,
+            AlpacaDataFeed, AlpacaEnvironment, AlpacaOrderSide, AlpacaOrderType, AlpacaTimeInForce,
+            AlpacaTradeUpdateEvent,
         },
     },
     http::{
@@ -129,7 +129,10 @@ async fn submit_and_await_fill(
             Ok(Some(NautilusWsMessage::TradeUpdate(update))) => {
                 println!(
                     "  event={:?} status={:?} price={:?} qty={:?} position_qty={:?}",
-                    update.event, update.order.status, update.price, update.qty,
+                    update.event,
+                    update.order.status,
+                    update.price,
+                    update.qty,
                     update.position_qty,
                 );
                 match update.event {
@@ -140,8 +143,7 @@ async fn submit_and_await_fill(
                             .unwrap_or("0")
                             .parse()
                             .unwrap_or(0.0);
-                        let qty: f64 =
-                            update.qty.as_deref().unwrap_or("0").parse().unwrap_or(0.0);
+                        let qty: f64 = update.qty.as_deref().unwrap_or("0").parse().unwrap_or(0.0);
                         weighted_px += px * qty;
                         filled_qty += qty;
                         execution_id = update.execution_id.clone().or(execution_id);
@@ -270,9 +272,7 @@ async fn main() -> anyhow::Result<()> {
     banner("6. Fee reconciliation");
     let expected_taf = booked_sell_shares * TAF_PER_SHARE;
     println!("sell leg: {booked_sell_shares} shares, notional ${booked_sell_notional:.2}");
-    println!(
-        "expected FINRA TAF: ${expected_taf:.6} ({booked_sell_shares} x {TAF_PER_SHARE})",
-    );
+    println!("expected FINRA TAF: ${expected_taf:.6} ({booked_sell_shares} x {TAF_PER_SHARE})",);
     println!(
         "expected SEC fee: notional x rate (rate changes periodically; ~$27.80/$1M => ${:.6})",
         booked_sell_notional * 27.80 / 1_000_000.0,
@@ -333,12 +333,18 @@ async fn main() -> anyhow::Result<()> {
     updates.disconnect().await?;
 
     banner("SUMMARY");
-    println!("buy: {} @ {:.4} | sell: {} @ {:.4}", buy.qty, buy.price, sell.qty, sell.price);
+    println!(
+        "buy: {} @ {:.4} | sell: {} @ {:.4}",
+        buy.qty, buy.price, sell.qty, sell.price
+    );
     println!(
         "round-trip PnL before fees: ${:.2}",
         (sell.price - buy.price) * sell.qty,
     );
-    println!("stream fills matched venue FILL activities: {}", fills.len() >= 2);
+    println!(
+        "stream fills matched venue FILL activities: {}",
+        fills.len() >= 2
+    );
     println!("FEE activities observed: {}", fee_entries.len());
 
     Ok(())

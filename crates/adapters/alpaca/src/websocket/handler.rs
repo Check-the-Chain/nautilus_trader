@@ -40,7 +40,8 @@ use super::{
     error::{AlpacaWsError, create_alpaca_ws_timeout_error, should_retry_alpaca_ws_error},
     messages::{
         AlpacaInstrumentInfo, AlpacaStreamError, AlpacaStreamMessage, AlpacaWsChannel,
-        AlpacaWsEvent, AlpacaWsSubscription, NautilusWsMessage,
+        AlpacaWsEvent, AlpacaWsSubscription, NautilusWsMessage, WsFormat, WsOutboundPayload,
+        encode_outbound,
     },
     parse::{parse_ws_bar, parse_ws_events, parse_ws_quote_tick, parse_ws_trade_tick},
 };
@@ -77,7 +78,7 @@ pub enum HandlerCommand {
     /// Send an authentication payload.
     Authenticate {
         /// Serialized auth message (contains the API secret).
-        payload: String,
+        payload: WsOutboundPayload,
     },
     /// Subscribe `symbols` on a market data `channel`.
     Subscribe {
@@ -92,7 +93,7 @@ pub enum HandlerCommand {
     /// Send a pre-serialized payload (e.g. the trade-updates listen frame).
     Send {
         /// Serialized message.
-        payload: String,
+        payload: WsOutboundPayload,
     },
 }
 
@@ -130,6 +131,7 @@ impl Debug for HandlerCommand {
 pub(super) struct FeedHandler {
     clock: &'static AtomicTime,
     kind: FeedKind,
+    format: WsFormat,
     signal: Arc<AtomicBool>,
     inner: Option<WebSocketClient>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
@@ -142,8 +144,10 @@ pub(super) struct FeedHandler {
 }
 
 impl FeedHandler {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         kind: FeedKind,
+        format: WsFormat,
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
         raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
@@ -154,6 +158,7 @@ impl FeedHandler {
         Self {
             clock: get_atomic_clock_realtime(),
             kind,
+            format,
             signal,
             inner: None,
             cmd_rx,
@@ -274,7 +279,7 @@ impl FeedHandler {
         let messages = match self.kind {
             FeedKind::MarketData => {
                 let ts_init = self.clock.get_time_ns();
-                match parse_ws_events(raw) {
+                match parse_ws_events(raw, self.format) {
                     Ok(events) => self.handle_market_events(&events, ts_init),
                     Err(e) => {
                         log::warn!("Failed to parse Alpaca market data frame: {e}");
@@ -309,7 +314,7 @@ impl FeedHandler {
     /// consumers that only care about prints.
     fn handle_market_events(
         &self,
-        events: &[AlpacaWsEvent<'_>],
+        events: &[AlpacaWsEvent],
         ts_init: UnixNanos,
     ) -> Vec<NautilusWsMessage> {
         let mut messages: Vec<NautilusWsMessage> = Vec::new();
@@ -439,9 +444,9 @@ impl FeedHandler {
     }
 
     async fn dispatch_subscription(&self, request: AlpacaWsSubscription) {
-        match serde_json::to_string(&request) {
+        match encode_outbound(&request, self.format) {
             Ok(payload) => {
-                log::debug!("Sending Alpaca subscription request: {payload}");
+                log::debug!("Sending Alpaca subscription request: {request:?}");
                 if let Err(e) = self.send_with_retry(payload).await {
                     log::error!("Error sending Alpaca subscription request: {e}");
                 }
@@ -450,7 +455,7 @@ impl FeedHandler {
         }
     }
 
-    async fn send_with_retry(&self, payload: String) -> Result<(), AlpacaWsError> {
+    async fn send_with_retry(&self, payload: WsOutboundPayload) -> Result<(), AlpacaWsError> {
         if let Some(client) = &self.inner {
             self.retry_manager
                 .execute_with_retry(
@@ -458,10 +463,13 @@ impl FeedHandler {
                     || {
                         let payload = payload.clone();
                         async move {
-                            client
-                                .send_text(payload, None)
-                                .await
-                                .map_err(AlpacaWsError::Transport)
+                            match payload {
+                                WsOutboundPayload::Text(text) => client.send_text(text, None).await,
+                                WsOutboundPayload::Binary(bytes) => {
+                                    client.send_bytes(bytes, None).await
+                                }
+                            }
+                            .map_err(AlpacaWsError::Transport)
                         }
                     },
                     should_retry_alpaca_ws_error,
@@ -506,6 +514,7 @@ mod tests {
 
         FeedHandler::new(
             kind,
+            WsFormat::Json,
             Arc::new(AtomicBool::new(false)),
             cmd_rx,
             raw_rx,
@@ -513,6 +522,12 @@ mod tests {
             AuthTracker::new(),
             instruments,
         )
+    }
+
+    fn msgpack_handler() -> FeedHandler {
+        let mut handler = test_handler(FeedKind::MarketData);
+        handler.format = WsFormat::Msgpack;
+        handler
     }
 
     #[rstest]
@@ -634,6 +649,22 @@ mod tests {
             }
             other => panic!("expected trade update, got {other:?}"),
         }
+    }
+
+    #[rstest]
+    fn test_route_msgpack_market_data_batch() {
+        let mut handler = msgpack_handler();
+        let json = load_test_json("ws_market_data_batch.json");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let msgpack = rmp_serde::to_vec_named(&value).unwrap();
+
+        let first = handler.route_payload(&msgpack).expect("messages");
+
+        match first {
+            NautilusWsMessage::Trades(trades) => assert_eq!(trades.len(), 2),
+            other => panic!("expected batched trades first, got {other:?}"),
+        }
+        assert_eq!(handler.pending_messages.len(), 3);
     }
 
     #[rstest]
