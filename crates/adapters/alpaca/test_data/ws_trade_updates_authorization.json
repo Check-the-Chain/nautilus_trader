@@ -1,0 +1,7 @@
+{
+  "stream": "authorization",
+  "data": {
+    "status": "authorized",
+    "action": "authenticate"
+  }
+}

@@ -1,0 +1,14 @@
+[
+  {
+    "T": "subscription",
+    "trades": ["AAPL"],
+    "quotes": ["AMD", "CLDR"],
+    "bars": ["*"],
+    "updatedBars": [],
+    "dailyBars": ["SPY"],
+    "statuses": [],
+    "lulds": [],
+    "corrections": ["AAPL"],
+    "cancelErrors": ["AAPL"]
+  }
+]
