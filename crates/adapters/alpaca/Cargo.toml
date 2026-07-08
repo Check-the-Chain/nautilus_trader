@@ -100,3 +100,9 @@ doc = false
 name = "alpaca-paper-fill-fees"
 path = "examples/paper_fill_fees.rs"
 doc = false
+
+# Run with `cargo run --example alpaca-paper-soak -p nautilus-alpaca`.
+[[example]]
+name = "alpaca-paper-soak"
+path = "examples/paper_soak.rs"
+doc = false

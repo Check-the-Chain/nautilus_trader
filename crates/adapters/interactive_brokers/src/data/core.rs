@@ -924,22 +924,23 @@ impl DataClient for InteractiveBrokersDataClient {
                     tracing::error!("Quote subscription error for {}: {:?}", instrument_id, e);
                 }
             } else {
-                // Try tick_by_tick_bid_ask first for regular contracts (better performance)
-                // Fallback to market_data if it fails (e.g., for BAG contracts not detected upfront)
+                // Use tick_by_tick_bid_ask for regular contracts when batch quotes are disabled.
+                // reqMktData is local-stamped in this adapter, so do not silently downgrade a
+                // timestamp-sensitive subscription to that path.
                 tracing::debug!(
                     "Attempting tick_by_tick_bid_ask subscription for {}",
                     instrument_id
                 );
 
                 match handle_tick_by_tick_quote_subscription(
-                    client_clone.clone(),
-                    contract.clone(),
+                    client_clone,
+                    contract,
                     instrument_id,
                     price_precision,
                     size_precision,
-                    data_sender.clone(),
+                    data_sender,
                     clock,
-                    subscription_token_clone.clone(),
+                    subscription_token_clone,
                     price_magnifier,
                 )
                 .await
@@ -948,37 +949,11 @@ impl DataClient for InteractiveBrokersDataClient {
                         // Success - subscription is active
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "tick_by_tick_bid_ask failed for {} (may be BAG contract), falling back to market_data: {:?}",
+                        tracing::error!(
+                            "tick_by_tick_bid_ask subscription failed for {}: {:?}",
                             instrument_id,
                             e
                         );
-                        // Fallback to market_data (reqMktData) - works for BAG contracts
-                        if let Err(fallback_err) = handle_quote_subscription(
-                            client_clone,
-                            contract,
-                            instrument_id,
-                            price_precision,
-                            size_precision,
-                            data_sender,
-                            quote_cache,
-                            clock,
-                            subscription_token_clone,
-                            ignore_size_updates,
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                "Quote subscription fallback also failed for {}: {:?}",
-                                instrument_id,
-                                fallback_err
-                            );
-                        } else {
-                            tracing::info!(
-                                "Successfully subscribed to {} using market_data fallback",
-                                instrument_id
-                            );
-                        }
                     }
                 }
             }

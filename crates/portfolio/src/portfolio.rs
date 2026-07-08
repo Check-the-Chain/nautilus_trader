@@ -627,7 +627,7 @@ impl Portfolio {
             return Some(pnl);
         }
 
-        let pnl = self.calculate_unrealized_pnl(instrument_id, None)?;
+        let pnl = self.calculate_unrealized_pnl_for_instrument(instrument_id)?;
         self.inner
             .borrow_mut()
             .unrealized_pnls
@@ -660,7 +660,7 @@ impl Portfolio {
             return Some(pnl);
         }
 
-        let pnl = self.calculate_realized_pnl(instrument_id, None)?;
+        let pnl = self.calculate_realized_pnl_for_instrument(instrument_id)?;
         self.inner
             .borrow_mut()
             .realized_pnls
@@ -1347,7 +1347,7 @@ impl Portfolio {
             self.update_net_position(&instrument_id, &position_refs);
 
             if let Some(calculated_unrealized_pnl) =
-                self.calculate_unrealized_pnl(&instrument_id, None)
+                self.calculate_unrealized_pnl_for_instrument(&instrument_id)
             {
                 self.inner
                     .borrow_mut()
@@ -1360,7 +1360,8 @@ impl Portfolio {
                 self.inner.borrow_mut().pending_calcs.insert(instrument_id);
             }
 
-            if let Some(calculated_realized_pnl) = self.calculate_realized_pnl(&instrument_id, None)
+            if let Some(calculated_realized_pnl) =
+                self.calculate_realized_pnl_for_instrument(&instrument_id)
             {
                 self.inner
                     .borrow_mut()
@@ -1373,51 +1374,60 @@ impl Portfolio {
                 self.inner.borrow_mut().pending_calcs.insert(instrument_id);
             }
 
-            let cache = self.cache.borrow();
-            let Some(account) = cache.account_for_venue_owned(&instrument_id.venue) else {
-                log::error!(
-                    "Cannot update maintenance (position) margin: no account registered for {}",
-                    instrument_id.venue
-                );
-                initialized = false;
-                break;
-            };
-
-            let account = match account {
-                AccountAny::Cash(_) | AccountAny::Betting(_) => continue,
-                AccountAny::Margin(margin_account) => margin_account,
-            };
-
-            let Some(instrument) = cache.instrument(&instrument_id).cloned() else {
-                log::error!(
-                    "Cannot update maintenance (position) margin: no instrument found for {instrument_id}"
-                );
-                initialized = false;
-                break;
-            };
-            let positions: Vec<Position> = cache
-                .positions_open(None, Some(&instrument_id), None, None, None)
-                .into_iter()
-                .map(|p| p.cloned())
+            let account_ids: IndexSet<AccountId> = positions_open
+                .iter()
+                .map(|position| position.account_id)
                 .collect();
-            drop(cache);
 
-            let result = self.inner.borrow_mut().accounts.update_positions(
-                &account,
-                &instrument,
-                positions.iter().collect(),
-                self.clock.borrow().timestamp_ns(),
-            );
+            for account_id in account_ids {
+                let (account, instrument, account_positions) = {
+                    let cache = self.cache.borrow();
+                    let Some(account) = cache.account_owned(&account_id) else {
+                        log::error!(
+                            "Cannot update maintenance (position) margin: no account registered for {account_id}",
+                        );
+                        initialized = false;
+                        break;
+                    };
 
-            match result {
-                Some((updated_account, _)) => {
-                    self.cache
-                        .borrow_mut()
-                        .update_account(&AccountAny::Margin(updated_account))
-                        .unwrap();
-                }
-                None => {
-                    initialized = false;
+                    let account = match account {
+                        AccountAny::Cash(_) | AccountAny::Betting(_) => continue,
+                        AccountAny::Margin(margin_account) => margin_account,
+                    };
+
+                    let Some(instrument) = cache.instrument(&instrument_id).cloned() else {
+                        log::error!(
+                            "Cannot update maintenance (position) margin: no instrument found for {instrument_id}"
+                        );
+                        initialized = false;
+                        break;
+                    };
+                    let account_positions: Vec<Position> = cache
+                        .positions_open(None, Some(&instrument_id), None, Some(&account_id), None)
+                        .into_iter()
+                        .map(|p| p.cloned())
+                        .collect();
+
+                    (account, instrument, account_positions)
+                };
+
+                let result = self.inner.borrow_mut().accounts.update_positions(
+                    &account,
+                    &instrument,
+                    account_positions.iter().collect(),
+                    self.clock.borrow().timestamp_ns(),
+                );
+
+                match result {
+                    Some((updated_account, _)) => {
+                        self.cache
+                            .borrow_mut()
+                            .update_account(&AccountAny::Margin(updated_account))
+                            .unwrap();
+                    }
+                    None => {
+                        initialized = false;
+                    }
                 }
             }
         }
@@ -1600,6 +1610,34 @@ impl Portfolio {
                 None
             }
         }
+    }
+
+    fn calculate_unrealized_pnl_for_instrument(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> Option<Money> {
+        let account_ids: IndexSet<AccountId> = {
+            let cache = self.cache.borrow();
+            cache
+                .positions_open(None, Some(instrument_id), None, None, None)
+                .iter()
+                .map(|position| position.account_id)
+                .collect()
+        };
+
+        if account_ids.is_empty() {
+            return self.calculate_unrealized_pnl(instrument_id, None);
+        }
+
+        let mut total = None;
+        for account_id in account_ids {
+            let pnl = self.calculate_unrealized_pnl(instrument_id, Some(&account_id))?;
+            if !accumulate_money(&mut total, pnl, "unrealized PnL", instrument_id) {
+                return None;
+            }
+        }
+
+        total
     }
 
     fn ensure_snapshot_pnls_cached_for(&self, instrument_id: &InstrumentId) {
@@ -2016,6 +2054,31 @@ impl Portfolio {
         }
     }
 
+    fn calculate_realized_pnl_for_instrument(&self, instrument_id: &InstrumentId) -> Option<Money> {
+        let account_ids: IndexSet<AccountId> = {
+            let cache = self.cache.borrow();
+            cache
+                .positions(None, Some(instrument_id), None, None, None)
+                .iter()
+                .map(|position| position.account_id)
+                .collect()
+        };
+
+        if account_ids.is_empty() {
+            return self.calculate_realized_pnl(instrument_id, None);
+        }
+
+        let mut total = None;
+        for account_id in account_ids {
+            let pnl = self.calculate_realized_pnl(instrument_id, Some(&account_id))?;
+            if !accumulate_money(&mut total, pnl, "realized PnL", instrument_id) {
+                return None;
+            }
+        }
+
+        total
+    }
+
     fn get_price(&self, position: &Position) -> Option<Price> {
         let cache = self.cache.borrow();
         let instrument_id = &position.instrument_id;
@@ -2095,6 +2158,38 @@ fn decimal_map_to_money(map: IndexMap<Currency, Decimal>) -> IndexMap<Currency, 
         .collect()
 }
 
+fn accumulate_money(
+    total: &mut Option<Money>,
+    value: Money,
+    label: &'static str,
+    instrument_id: &InstrumentId,
+) -> bool {
+    let Some(current) = total else {
+        *total = Some(value);
+        return true;
+    };
+
+    if current.currency != value.currency {
+        log::error!(
+            "Cannot aggregate {label} for {instrument_id}: currency mismatch {} vs {}",
+            current.currency,
+            value.currency
+        );
+        return false;
+    }
+
+    match current.checked_add(value) {
+        Some(sum) => {
+            *current = sum;
+            true
+        }
+        None => {
+            log::error!("Cannot aggregate {label} for {instrument_id}: money addition overflow");
+            false
+        }
+    }
+}
+
 fn update_quote_tick(
     cache: &Rc<RefCell<Cache>>,
     clock: &Rc<RefCell<dyn Clock>>,
@@ -2136,20 +2231,9 @@ fn update_instrument_id(
         return;
     }
 
-    let mut result_maint = None;
-
     // Scoped borrow: must drop before calling AccountsManager (which borrows cache internally)
-    let (account, instrument, orders_open, positions_open) = {
+    let (instrument, orders_open, positions_open, account_ids) = {
         let cache_ref = cache.borrow();
-        let account = if let Some(account) = cache_ref.account_for_venue(&instrument_id.venue) {
-            account.clone()
-        } else {
-            log::error!(
-                "Cannot update tick: no account registered for {}",
-                instrument_id.venue
-            );
-            return;
-        };
         let instrument = if let Some(instrument) = cache_ref.instrument(instrument_id) {
             instrument.clone()
         } else {
@@ -2166,29 +2250,85 @@ fn update_instrument_id(
             .iter()
             .map(|p| (*p).clone())
             .collect();
-        (account, instrument, orders_open, positions_open)
+
+        let mut account_ids: IndexSet<AccountId> = positions_open
+            .iter()
+            .map(|position| position.account_id)
+            .collect();
+        account_ids.extend(orders_open.iter().filter_map(Order::account_id));
+
+        if account_ids.is_empty() {
+            if let Some(account) = cache_ref.account_for_venue(&instrument_id.venue) {
+                account_ids.insert(account.id());
+            } else {
+                log::error!(
+                    "Cannot update tick: no account registered for {}",
+                    instrument_id.venue
+                );
+                return;
+            }
+        }
+
+        (instrument, orders_open, positions_open, account_ids)
     };
 
-    // No cache borrow held: AccountsManager borrows cache internally for xrate lookups
-    let orders_open_refs: Vec<&OrderAny> = orders_open.iter().collect();
-    let result_init = inner.borrow().accounts.update_orders(
-        &account,
-        &instrument,
-        &orders_open_refs,
-        clock.borrow().timestamp_ns(),
-    );
+    let mut updated_orders = false;
+    let mut updated_margin_positions = true;
+    let mut has_margin_account = false;
+    let mut has_cash_or_betting_account = false;
 
-    if let AccountAny::Margin(ref margin_account) = account {
-        result_maint = inner.borrow().accounts.update_positions(
-            margin_account,
+    for account_id in account_ids {
+        let Some(account) = cache.borrow().account_owned(&account_id) else {
+            log::error!("Cannot update tick: no account registered for {account_id}");
+            return;
+        };
+
+        let orders_for_account: Vec<&OrderAny> = orders_open
+            .iter()
+            .filter(|order| match order.account_id() {
+                Some(order_account_id) => order_account_id == account_id,
+                None => true,
+            })
+            .collect();
+
+        let result_init = inner.borrow().accounts.update_orders(
+            &account,
             &instrument,
-            positions_open.iter().collect(),
+            &orders_for_account,
             clock.borrow().timestamp_ns(),
         );
-    }
 
-    if let Some((ref updated_account, _)) = result_init {
-        cache.borrow_mut().update_account(updated_account).unwrap();
+        if let Some((ref updated_account, _)) = result_init {
+            cache.borrow_mut().update_account(updated_account).unwrap();
+            updated_orders = true;
+        }
+
+        match account {
+            AccountAny::Margin(margin_account) => {
+                has_margin_account = true;
+                let positions_for_account: Vec<&Position> = positions_open
+                    .iter()
+                    .filter(|position| position.account_id == account_id)
+                    .collect();
+                let result_maint = inner.borrow().accounts.update_positions(
+                    &margin_account,
+                    &instrument,
+                    positions_for_account,
+                    clock.borrow().timestamp_ns(),
+                );
+                if let Some((updated_account, _)) = result_maint {
+                    cache
+                        .borrow_mut()
+                        .update_account(&AccountAny::Margin(updated_account))
+                        .unwrap();
+                } else {
+                    updated_margin_positions = false;
+                }
+            }
+            AccountAny::Cash(_) | AccountAny::Betting(_) => {
+                has_cash_or_betting_account = true;
+            }
+        }
     }
 
     let portfolio_clone = Portfolio {
@@ -2199,11 +2339,11 @@ fn update_instrument_id(
     };
 
     let result_unrealized_pnl: Option<Money> =
-        portfolio_clone.calculate_unrealized_pnl(instrument_id, None);
+        portfolio_clone.calculate_unrealized_pnl_for_instrument(instrument_id);
 
-    if result_init.is_some()
-        && (matches!(account, AccountAny::Cash(_) | AccountAny::Betting(_))
-            || (result_maint.is_some() && result_unrealized_pnl.is_some()))
+    if updated_orders
+        && ((has_cash_or_betting_account && !has_margin_account)
+            || (updated_margin_positions && result_unrealized_pnl.is_some()))
     {
         inner.borrow_mut().pending_calcs.remove(instrument_id);
         if inner.borrow().pending_calcs.is_empty() {
@@ -2359,7 +2499,7 @@ fn update_order(
             config,
         };
 
-        match portfolio_clone.calculate_unrealized_pnl(&order_filled.instrument_id, None) {
+        match portfolio_clone.calculate_unrealized_pnl_for_instrument(&order_filled.instrument_id) {
             Some(unrealized_pnl) => {
                 inner
                     .borrow_mut()
@@ -2502,7 +2642,7 @@ fn update_position(
     record_closed_position_pnl(cache, inner, config, event);
 
     if let Some(calculated_unrealized_pnl) =
-        portfolio_clone.calculate_unrealized_pnl(&instrument_id, None)
+        portfolio_clone.calculate_unrealized_pnl_for_instrument(&instrument_id)
     {
         inner
             .borrow_mut()
@@ -2520,7 +2660,7 @@ fn update_position(
     }
 
     if let Some(calculated_realized_pnl) =
-        portfolio_clone.calculate_realized_pnl(&instrument_id, None)
+        portfolio_clone.calculate_realized_pnl_for_instrument(&instrument_id)
     {
         inner
             .borrow_mut()

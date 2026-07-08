@@ -42,9 +42,10 @@ use nautilus_model::{
         stubs::{account_id, uuid4},
     },
     instruments::{
-        CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny,
+        CryptoPerpetual, CurrencyPair, Equity, Instrument, InstrumentAny,
         stubs::{
-            audusd_sim, currency_pair_btcusdt, default_fx_ccy, ethusdt_bitmex, futures_spread_es,
+            audusd_sim, currency_pair_btcusdt, default_fx_ccy, equity_aapl, ethusdt_bitmex,
+            futures_spread_es,
         },
     },
     orders::{Order, OrderAny, OrderTestBuilder},
@@ -4435,6 +4436,54 @@ fn test_equity_margin_account_with_unrealized_pnl(
         equity.get(&Currency::USD()).unwrap().as_decimal(),
         dec!(20.0)
     );
+}
+
+#[rstest]
+fn test_update_position_uses_position_account_for_broker_listed_instrument(
+    mut simple_cache: Cache,
+    clock: TestClock,
+    equity_aapl: Equity,
+) {
+    let account_id = AccountId::new("IB-001");
+    let instrument = InstrumentAny::Equity(equity_aapl);
+    let instrument_id = instrument.id();
+
+    simple_cache.add_instrument(instrument.clone()).unwrap();
+    let mut account = AccountAny::from(get_margin_account(Some(account_id.as_str())));
+    account.set_calculate_account_state(true);
+    simple_cache.add_account(account).unwrap();
+    assert!(
+        simple_cache
+            .account_for_venue(&instrument_id.venue)
+            .is_none(),
+        "test requires a broker account whose issuer differs from the listing venue"
+    );
+
+    let last = get_quote_tick(&instrument, 100.0, 101.0, 1.0, 1.0);
+    simple_cache.add_quote(last).unwrap();
+
+    let fill = make_fill_for_account(
+        &instrument,
+        account_id,
+        OrderSide::Buy,
+        Quantity::from("1"),
+        Price::new(90.0, instrument.price_precision()),
+        PositionId::new("P-IB-AAPL"),
+    );
+    let position = Position::new(&instrument, fill);
+    simple_cache
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+
+    let cache = Rc::new(RefCell::new(simple_cache));
+    let mut portfolio = Portfolio::new(cache, Rc::new(RefCell::new(clock)), None);
+    portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+
+    let pnl = portfolio
+        .unrealized_pnl(&instrument_id)
+        .expect("broker-listed position should calculate PnL from position account");
+    assert_eq!(pnl.currency, Currency::USD());
+    assert_eq!(pnl.as_decimal(), dec!(10.0));
 }
 
 #[rstest]

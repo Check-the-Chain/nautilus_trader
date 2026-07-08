@@ -72,9 +72,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        consts::{
-            LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX, LIGHTER_VENUE,
-        },
+        consts::{LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX, LIGHTER_VENUE},
         credential::{Credential, scrub_auth},
         enums::{LighterAccountTier, LighterPositionMarginMode, LighterProductType, LighterTxType},
         rate_limit::{LighterTxRateLimiter, await_tx_quota, build_tx_rate_limiter, resolve_quota},
@@ -85,7 +83,7 @@ use crate::{
     http::{
         client::{LIGHTER_REST_PAGE_SIZE, LighterHttpClient, LighterRawHttpClient},
         error::LighterHttpError,
-        models::{LighterSendTxBatchRequest, LighterSendTxRequest},
+        models::LighterSendTxBatchRequest,
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
             LighterSortDirection, LighterTradeSortBy, LighterTradesQuery,
@@ -102,12 +100,12 @@ use crate::{
     websocket::{
         client::LighterWebSocketClient,
         dispatch::{
-            LIGHTER_INSTRUMENT_CACHE, OrderIdentity, PendingSendTx, PendingSendTxKind,
-            WsDispatchState, cache_instruments_for_reports, derive_market_order_price_ticks,
-            evict_terminal_mappings, lookup_order_status_report, nautilus_to_lighter_order_type,
-            nautilus_to_lighter_tif, order_expiry_for, parse_http_order_to_report, price_to_ticks,
-            quantity_to_ticks, resolve_cloid, translate_fill_cloid, translate_order_cloid,
-            unwrap_reports_or_warn,
+            HttpOrderReportContext, LIGHTER_INSTRUMENT_CACHE, OrderIdentity, PendingSendTx,
+            PendingSendTxKind, WsDispatchState, cache_instruments_for_reports,
+            derive_market_order_price_ticks, evict_terminal_mappings, lookup_order_status_report,
+            nautilus_to_lighter_order_type, nautilus_to_lighter_tif, order_expiry_for,
+            parse_http_order_to_report, price_to_ticks, quantity_to_ticks, resolve_cloid,
+            translate_fill_cloid, translate_order_cloid, unwrap_reports_or_warn,
         },
         messages::{
             AccountStream, ExecutionReport, LighterWsChannel, NautilusWsMessage,
@@ -449,125 +447,6 @@ impl LighterExecutionClient {
             }
             None => {}
         }
-    }
-
-    /// Returns `Ok(true)` if this credential's `api_key_index` is maker-only.
-    /// Maker-only keys cannot submit `ApproveIntegrator`, so the caller skips
-    /// the integrator auto-approval when `true`.
-    async fn is_maker_only_api_key(&self, credential: &Credential) -> anyhow::Result<bool> {
-        let auth_token = build_auth_token_for(credential)
-            .context("failed to mint Lighter auth token for maker-only check")?;
-        let response = self
-            .http_client
-            .get_maker_only_api_keys(credential.account_index(), auth_token)
-            .await
-            .context("failed to query getMakerOnlyApiKeys")?;
-        let api_key_index = i64::from(credential.api_key_index());
-        Ok(response.api_key_indexes.contains(&api_key_index))
-    }
-
-    async fn submit_integrator_auto_approval(&self) -> anyhow::Result<()> {
-        let Some(credential) = &self.credential else {
-            return Ok(());
-        };
-
-        let mut maker_only_check_failed = false;
-
-        match self.is_maker_only_api_key(credential).await {
-            Ok(true) => {
-                log::warn!(
-                    "Skipping Lighter integrator auto-approval: api_key_index={} is maker-only; \
-                     ensure the account has been approved by a non-maker-only key",
-                    credential.api_key_index(),
-                );
-                return Ok(());
-            }
-            Ok(false) => {}
-            Err(e) => {
-                maker_only_check_failed = true;
-                log::debug!(
-                    "Lighter maker-only api key check failed; attempting integrator approval \
-                     anyway: {e:?}"
-                );
-            }
-        }
-
-        let mut approval = self.prepare_integrator_auto_approval(credential)?;
-
-        let request = LighterSendTxRequest::new(
-            LighterTxType::ApproveIntegrator as u8,
-            approval.tx_info.clone(),
-        );
-
-        approval.send_reservation.wait_for_turn().await;
-
-        let response = self.http_client.send_tx(&request).await.with_context(|| {
-            let hint = if maker_only_check_failed {
-                " (maker-only pre-flight check failed earlier; venue may reject with 62007 \
-                 if this key is maker-only)"
-            } else {
-                ""
-            };
-            format!(
-                "failed to submit Lighter integrator approval nonce={} api_key_index={}{hint}",
-                approval.nonce, approval.api_key_index,
-            )
-        })?;
-
-        approval.send_reservation.release();
-
-        log::debug!(
-            "Submitted Lighter integrator approval: integrator={}, nonce={}, \
-             api_key_index={}, approval_expiry={}, tx_hash={}",
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
-            approval.nonce,
-            approval.api_key_index,
-            approval.approval_expiry,
-            response.tx_hash,
-        );
-        Ok(())
-    }
-
-    fn prepare_integrator_auto_approval(
-        &self,
-        credential: &Credential,
-    ) -> anyhow::Result<PreparedIntegratorApproval> {
-        let ReservedTxContext {
-            context,
-            send_reservation,
-        } = self.build_tx_context(credential)?;
-
-        let now_ms = (self.clock.get_time_ns().as_u64() as i64) / 1_000_000;
-        let approval_expiry = now_ms.saturating_add(INTEGRATOR_AUTO_APPROVAL_MAX_TTL_MS);
-        let nonce = context.nonce;
-        let api_key_index = context.api_key_index;
-
-        let tx = ApproveIntegratorTxInfo {
-            context,
-            integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX as i64,
-            max_perps_taker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
-            max_perps_maker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
-            max_spot_taker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
-            max_spot_maker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
-            approval_expiry,
-            skip_nonce: 0,
-        };
-
-        let signed = sign_tx(
-            &tx,
-            lighter_chain_id(self.config.environment),
-            &credential.private_key()?,
-            fresh_k(),
-        );
-        let tx_info = TxInfoJson::approve_integrator(&tx, &signed, "");
-
-        Ok(PreparedIntegratorApproval {
-            tx_info,
-            nonce,
-            api_key_index,
-            approval_expiry,
-            send_reservation,
-        })
     }
 
     async fn spawn_ws_consumer(&mut self) -> anyhow::Result<()> {
@@ -1373,7 +1252,7 @@ impl LighterExecutionClient {
                 trigger_price: trigger_price_ticks,
                 order_expiry,
             },
-            attributes: integrator_attributes(),
+            attributes: order_tx_attributes(),
         };
 
         let signed = sign_tx(
@@ -1722,7 +1601,7 @@ impl LighterExecutionClient {
             base_amount,
             price: price_ticks,
             trigger_price: trigger_price_ticks,
-            attributes: integrator_attributes(),
+            attributes: order_tx_attributes(),
         };
 
         let signed = sign_tx(
@@ -2184,14 +2063,6 @@ struct PreparedModifyOrder {
     nonce: i64,
     api_key_index: u8,
     tx_hash: String,
-    send_reservation: TxSendReservation,
-}
-
-struct PreparedIntegratorApproval {
-    tx_info: String,
-    nonce: i64,
-    api_key_index: u8,
-    approval_expiry: i64,
     send_reservation: TxSendReservation,
 }
 
@@ -2788,33 +2659,8 @@ fn rollback_tx_dispatch_indices(
     }
 }
 
-fn integrator_attributes() -> L2TxAttributes {
-    L2TxAttributes {
-        integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
-        integrator_taker_fee: 0,
-        integrator_maker_fee: 0,
-        skip_nonce: 0,
-    }
-}
-
-/// Format a `start_ms,end_ms` window for Lighter's `between_timestamps`
-/// query parameter. Returns `None` when neither bound is set; an unset end
-/// defaults to the current time so the venue scopes pagination to the
-/// half-open window.
-fn format_between_timestamps(
-    start: Option<UnixNanos>,
-    end: Option<UnixNanos>,
-    ts_now: UnixNanos,
-) -> Option<String> {
-    let (start, end) = match (start, end) {
-        (None, None) => return None,
-        (Some(s), Some(e)) => (s, e),
-        (Some(s), None) => (s, ts_now),
-        (None, Some(e)) => (UnixNanos::from(0), e),
-    };
-    let start_ms = start.as_u64() / 1_000_000;
-    let end_ms = end.as_u64() / 1_000_000;
-    Some(format!("{start_ms},{end_ms}"))
+fn order_tx_attributes() -> L2TxAttributes {
+    L2TxAttributes::default()
 }
 
 #[async_trait(?Send)]
@@ -2936,33 +2782,6 @@ impl ExecutionClient for LighterExecutionClient {
         self.ensure_instruments_initialized_async().await?;
         self.refresh_nonce().await?;
         self.detect_account_tier().await;
-
-        if let Err(e) = self.submit_integrator_auto_approval().await {
-            // Bail on venue 21149 ("integrator is not approved") so the
-            // operator catches it at startup rather than at first order.
-            // Other failures are tolerated: approval is account-scoped and
-            // may already be in place, or a reconnect can retry.
-            let is_unapproved = e.chain().any(|cause| {
-                matches!(
-                    cause.downcast_ref::<LighterHttpError>(),
-                    Some(LighterHttpError::Venue { code: 21149, .. }),
-                )
-            });
-
-            if is_unapproved {
-                return Err(e.context(
-                    "Lighter account is not integrator-approved (venue 21149); \
-                     orders cannot be placed",
-                ));
-            }
-            log::error!("Lighter integrator approval failed; continuing startup: {e:?}");
-        }
-
-        if let Err(e) = self.refresh_nonce().await {
-            log::debug!(
-                "Failed to refresh Lighter nonce after integrator approval; continuing startup: {e:?}"
-            );
-        }
         self.spawn_ws_consumer().await?;
 
         if let Err(e) = self.await_account_streams_ready(30.0).await {
@@ -3523,7 +3342,6 @@ impl ExecutionClient for LighterExecutionClient {
                 &self.dispatch,
                 credential,
                 &auth,
-                format_between_timestamps(cmd.start, cmd.end, ts_init),
             )
             .await;
         }
@@ -3585,6 +3403,7 @@ impl ExecutionClient for LighterExecutionClient {
                     self.core.account_id,
                     ts_init,
                     &self.dispatch.cloid_map,
+                    HttpOrderReportContext::Active,
                 ) {
                     active_reports.push(report);
                 }
@@ -3595,9 +3414,8 @@ impl ExecutionClient for LighterExecutionClient {
         // asks for non-`open_only` reports during a wider reconciliation.
         // Pagination is followed because a single market can hold more than
         // 200 historical inactive orders for a long-running account. The
-        // venue-side `between_timestamps` window is set when `cmd.start`
-        // / `cmd.end` are present so the venue, not the client, scopes the
-        // pagination: important under the 60 req/min REST quota.
+        // Lighter endpoint currently rejects its optional timestamp filter for
+        // this call, so time scoping is applied below after reports are parsed.
         if !cmd.open_only {
             let inactive_markets: Vec<i16> = match cmd.instrument_id {
                 Some(id) => self
@@ -3607,8 +3425,6 @@ impl ExecutionClient for LighterExecutionClient {
                     .unwrap_or_default(),
                 None => self.dispatch.active_markets_snapshot(),
             };
-
-            let between_timestamps = format_between_timestamps(cmd.start, cmd.end, ts_init);
 
             for market_id in inactive_markets {
                 let mut cursor: Option<String> = None;
@@ -3622,7 +3438,7 @@ impl ExecutionClient for LighterExecutionClient {
                             account_index: credential.account_index(),
                             market_id: Some(market_id),
                             ask_filter: None,
-                            between_timestamps: between_timestamps.clone(),
+                            between_timestamps: None,
                             cursor: cursor.clone(),
                             limit: LIGHTER_REST_PAGE_SIZE,
                         })
@@ -3637,6 +3453,7 @@ impl ExecutionClient for LighterExecutionClient {
                                     self.core.account_id,
                                     ts_init,
                                     &self.dispatch.cloid_map,
+                                    HttpOrderReportContext::Inactive,
                                 ) {
                                     inactive_reports.push(report);
                                 }
@@ -3852,6 +3669,16 @@ impl ExecutionClient for LighterExecutionClient {
         let position_cmd =
             GeneratePositionStatusReports::new(UUID4::new(), ts_init, None, None, None, None, None);
 
+        // Capture the WS-backed position snapshot before the slower REST
+        // fan-out. Lighter has no REST position source, so startup
+        // reconciliation should package the account_all_positions state seen
+        // at the start of mass-status generation, not whatever remains after
+        // order/fill history pagination completes.
+        let position_reports = unwrap_reports_or_warn(
+            "position",
+            self.generate_position_status_reports(&position_cmd).await,
+        );
+
         // Each sub-call degrades independently; see `unwrap_reports_or_warn`.
         let order_reports = unwrap_reports_or_warn(
             "order",
@@ -3859,10 +3686,6 @@ impl ExecutionClient for LighterExecutionClient {
         );
         let fill_reports =
             unwrap_reports_or_warn("fill", self.generate_fill_reports(fill_cmd).await);
-        let position_reports = unwrap_reports_or_warn(
-            "position",
-            self.generate_position_status_reports(&position_cmd).await,
-        );
 
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
@@ -3975,7 +3798,6 @@ async fn seed_active_markets_from_inactive_orders(
     dispatch: &WsDispatchState,
     credential: &Credential,
     auth: &str,
-    between_timestamps: Option<String>,
 ) {
     let mut cursor: Option<String> = None;
     let mut orders_seen = 0_usize;
@@ -3988,7 +3810,7 @@ async fn seed_active_markets_from_inactive_orders(
                 account_index: credential.account_index(),
                 market_id: None,
                 ask_filter: None,
-                between_timestamps: between_timestamps.clone(),
+                between_timestamps: None,
                 cursor: cursor.clone(),
                 limit: LIGHTER_REST_PAGE_SIZE,
             })
@@ -7273,15 +7095,13 @@ mod tests {
     }
 
     #[rstest]
-    fn integrator_attributes_tags_nautilus_account_at_zero_fees() {
-        let attrs = integrator_attributes();
-        assert_eq!(
-            attrs.integrator_account_index,
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
-        );
+    fn order_tx_attributes_do_not_require_integrator_approval() {
+        let attrs = order_tx_attributes();
+        assert_eq!(attrs.integrator_account_index, 0);
         assert_eq!(attrs.integrator_taker_fee, 0);
         assert_eq!(attrs.integrator_maker_fee, 0);
         assert_eq!(attrs.skip_nonce, 0);
+        assert!(attrs.is_empty());
     }
 
     use std::str::FromStr;

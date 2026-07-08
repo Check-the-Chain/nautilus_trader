@@ -600,6 +600,42 @@ impl OrderMatchingEngine {
         }
     }
 
+    /// Re-caps every tracked queue position against the current book state:
+    /// after a full snapshot (Depth10) replaces the book, the displayed size
+    /// at an order's level is a fresh upper bound on the volume ahead —
+    /// queue position can only improve (fills/cancels ahead), never reset.
+    /// Zeroing on snapshots instead would make every resting order
+    /// front-of-queue one snapshot later, destroying maker-fill realism on
+    /// snapshot-driven feeds.
+    fn cap_queue_positions_to_book(&mut self) {
+        let size_prec = self.instrument.size_precision();
+        let price_prec = self.instrument.price_precision();
+        let keys: Vec<ClientOrderId> = self.queue_ahead.keys().copied().collect();
+        for client_order_id in keys {
+            let Some(&(price_raw, ahead_raw)) = self.queue_ahead.get(&client_order_id) else {
+                continue;
+            };
+            let Some(side) = self
+                .cache
+                .borrow()
+                .order(&client_order_id)
+                .map(|order| order.order_side())
+            else {
+                continue;
+            };
+            let price = Price::from_raw(price_raw, price_prec);
+            // Opposite side because get_quantity_at_level flips internally
+            // (BUY reads asks, SELL reads bids); we want the resting side.
+            let displayed = self.book.get_quantity_at_level(
+                price,
+                OrderCore::opposite_side(side),
+                size_prec,
+            );
+            self.queue_ahead
+                .insert(client_order_id, (price_raw, ahead_raw.min(displayed.raw)));
+        }
+    }
+
     fn clear_queue_on_delete(&mut self, deleted_price_raw: PriceRaw, deleted_side: OrderSide) {
         let keys: Vec<ClientOrderId> = self.queue_ahead.keys().copied().collect();
         for client_order_id in keys {
@@ -1306,7 +1342,7 @@ impl OrderMatchingEngine {
 
         // Depth10 always replaces the full book via apply_depth regardless of flags
         if self.config.queue_position {
-            self.clear_all_queue_positions();
+            self.cap_queue_positions_to_book();
             let bid_price_raw = depth.bids[0].price.raw;
             let bid_size_raw = depth.bids[0].size.raw;
             let ask_price_raw = depth.asks[0].price.raw;

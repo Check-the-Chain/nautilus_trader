@@ -395,6 +395,34 @@ impl ExecutionEngine {
         Ok(())
     }
 
+    /// Registers an execution client for lifecycle and state events without routing orders to it.
+    ///
+    /// State clients are started, connected, disconnected, and reconciled like normal execution
+    /// clients, so adapter-emitted account state and position reports still flow through the
+    /// Nautilus cache/portfolio path. They are deliberately omitted from the venue routing map and
+    /// marked as external so a command explicitly addressed to the client ID is not submitted to
+    /// the live venue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a client with the same ID is already registered.
+    pub fn register_state_client(
+        &mut self,
+        client: Box<dyn ExecutionClient>,
+    ) -> anyhow::Result<()> {
+        let client_id = client.client_id();
+
+        if self.clients.contains_key(&client_id) {
+            anyhow::bail!("Client already registered with ID {client_id}");
+        }
+
+        let adapter = ExecutionClientAdapter::new(client);
+        self.external_clients.insert(client_id);
+        log::debug!("Registered state-only client {client_id}");
+        self.clients.insert(client_id, adapter);
+        Ok(())
+    }
+
     /// Registers a default execution client for fallback routing.
     pub fn register_default_client(&mut self, client: Box<dyn ExecutionClient>) {
         let client_id = client.client_id();

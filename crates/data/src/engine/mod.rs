@@ -3888,19 +3888,34 @@ impl DataEngine {
     }
 
     fn handle_instrument_response(&self, instrument: InstrumentAny) {
-        let mut cache = self.cache.as_ref().borrow_mut();
-        if let Err(e) = cache.add_instrument(instrument) {
-            log_error_on_cache_insert(&e);
+        {
+            let mut cache = self.cache.as_ref().borrow_mut();
+            if let Err(e) = cache.add_instrument(instrument.clone()) {
+                log_error_on_cache_insert(&e);
+            }
         }
+
+        // Publish like the streamed definition path so instrument-topic
+        // subscribers observe request-driven refreshes too; the cache borrow
+        // is released first because subscribers may read the cache.
+        let topic = switchboard::get_instrument_topic(instrument.id());
+        msgbus::publish_instrument(topic, &instrument);
     }
 
     fn handle_instruments(&self, instruments: &[InstrumentAny]) {
         // TODO: Improve by adding bulk update methods to cache and database
-        let mut cache = self.cache.as_ref().borrow_mut();
-        for instrument in instruments {
-            if let Err(e) = cache.add_instrument(instrument.clone()) {
-                log_error_on_cache_insert(&e);
+        {
+            let mut cache = self.cache.as_ref().borrow_mut();
+            for instrument in instruments {
+                if let Err(e) = cache.add_instrument(instrument.clone()) {
+                    log_error_on_cache_insert(&e);
+                }
             }
+        }
+
+        for instrument in instruments {
+            let topic = switchboard::get_instrument_topic(instrument.id());
+            msgbus::publish_instrument(topic, instrument);
         }
     }
 

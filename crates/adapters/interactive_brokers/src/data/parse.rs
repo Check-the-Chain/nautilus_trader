@@ -61,6 +61,24 @@ pub fn parse_quote_tick(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<QuoteTick> {
+    if let Some(bid) = bid_price
+        && (!bid.is_finite() || bid <= 0.0)
+    {
+        anyhow::bail!("invalid bid price={bid}");
+    }
+
+    if let Some(ask) = ask_price
+        && (!ask.is_finite() || ask <= 0.0)
+    {
+        anyhow::bail!("invalid ask price={ask}");
+    }
+
+    if let (Some(bid), Some(ask)) = (bid_price, ask_price)
+        && ask <= bid
+    {
+        anyhow::bail!("crossed quote bid_price={bid} ask_price={ask}");
+    }
+
     let bid = bid_price.map(|p| Price::new(p, price_precision));
     let ask = ask_price.map(|p| Price::new(p, price_precision));
     let bid_qty = bid_size
@@ -380,6 +398,42 @@ mod tests {
             Some(150.25),
             Some(150.30),
             Some(0.5),
+            Some(200.0),
+            2,
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_rejects_crossed_quote() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_quote_tick(
+            instrument_id,
+            Some(150.30),
+            Some(150.25),
+            Some(100.0),
+            Some(200.0),
+            2,
+            0,
+            UnixNanos::new(0),
+            UnixNanos::new(0),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_parse_quote_tick_rejects_non_finite_price() {
+        let instrument_id = create_test_instrument_id();
+        let result = parse_quote_tick(
+            instrument_id,
+            Some(f64::NAN),
+            Some(150.30),
+            Some(100.0),
             Some(200.0),
             2,
             0,

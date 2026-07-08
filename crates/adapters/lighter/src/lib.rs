@@ -42,18 +42,12 @@
 //!
 //! [High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
 //!
-//! # Integrator attribution
+//! # L2 transaction attributes
 //!
-//! Submitted create and modify order transactions carry the NautilusTrader integrator account index
-//! in Lighter's `L2TxAttributes`. This helps us gauge real usage of the integration and prioritize
-//! ongoing maintenance. Maker and taker integrator fees are set to zero, so attribution adds no
-//! trading cost.
-//!
-//! Lighter requires an `ApproveIntegrator` approval before these attributes can be attached to
-//! orders. During startup, the execution client submits the required zero-fee approval for the
-//! configured L2 account. See the
-//! [Lighter integration guide](https://nautilustrader.io/docs/nightly/integrations/lighter.html#integrator-attribution)
-//! for approval and revocation details.
+//! Submitted create and modify order transactions do not attach NautilusTrader
+//! integrator attribution by default. This keeps execution-client startup free
+//! of implicit venue-side approval transactions; operators who want integrator
+//! attribution can approve and attach it through an explicit workflow.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]

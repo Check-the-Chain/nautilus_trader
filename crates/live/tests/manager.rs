@@ -1344,6 +1344,51 @@ async fn test_reconcile_mass_status_uses_claimed_strategy() {
 }
 
 #[tokio::test]
+async fn test_reconcile_mass_status_claimed_external_bypasses_unclaimed_filter() {
+    let config = ExecutionManagerConfig {
+        filter_unclaimed_external: true,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument_id = test_instrument_id();
+    let strategy_id = StrategyId::from("MY-STRATEGY");
+
+    ctx.add_instrument(test_instrument());
+    ctx.manager
+        .claim_external_orders(instrument_id, strategy_id)
+        .unwrap();
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+
+    let report = create_order_status_report(
+        None,
+        VenueOrderId::from("V-EXT-CLAIMED-001"),
+        instrument_id,
+        OrderStatus::Accepted,
+        Quantity::from("1.0"),
+        Quantity::from("0"),
+    );
+    mass_status.add_order_reports(vec![report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert_eq!(result.events.len(), 1);
+
+    let client_order_id = ClientOrderId::from("V-EXT-CLAIMED-001");
+    let order = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(order.strategy_id(), strategy_id);
+}
+
+#[tokio::test]
 async fn test_claim_external_orders_duplicate_fails_without_overwriting() {
     let mut ctx = TestContext::new();
     let instrument_id = test_instrument_id();

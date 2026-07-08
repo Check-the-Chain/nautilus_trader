@@ -152,7 +152,12 @@ impl LighterDataClient {
         )
         .context("failed to construct Lighter raw HTTP client")?;
         let http_client =
-            LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry));
+            LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry))
+                .with_account_fee_overrides(
+                    config
+                        .account_fee_overrides()
+                        .context("failed to resolve Lighter account fee overrides")?,
+                );
 
         let ws_client = Self::create_ws_client(&config, Arc::clone(&registry));
 

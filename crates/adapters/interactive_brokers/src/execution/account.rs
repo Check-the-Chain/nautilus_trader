@@ -40,6 +40,9 @@ use nautilus_model::{
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 
+const CASH_BALANCE_TAG: &str = "CashBalance";
+const TOTAL_CASH_BALANCE_TAG: &str = "TotalCashBalance";
+
 pub(crate) fn raw_ib_account_code(account_id: &AccountId) -> String {
     account_id
         .to_string()
@@ -70,6 +73,7 @@ pub async fn subscribe_account_summary(
         AccountSummaryTags::INIT_MARGIN_REQ,
         AccountSummaryTags::MAINT_MARGIN_REQ,
         AccountSummaryTags::CUSHION,
+        AccountSummaryTags::LEDGER_ALL,
     ];
 
     let group = AccountGroup("All".to_string());
@@ -96,7 +100,7 @@ pub async fn subscribe_account_summary(
                 }
 
                 match parse_account_summary_to_balance(&summary) {
-                    Ok(balance) => {
+                    Ok(Some(balance)) => {
                         // Check if balance already exists for this currency
                         if let Some(existing) = balances
                             .iter_mut()
@@ -114,6 +118,7 @@ pub async fn subscribe_account_summary(
                             balances.push(balance);
                         }
                     }
+                    Ok(None) => {}
                     Err(e) => {
                         tracing::warn!("Failed to parse account summary: {}", e);
                     }
@@ -144,6 +149,13 @@ pub async fn subscribe_account_summary(
 }
 
 fn merge_account_summary_margin(margins: &mut Vec<MarginBalance>, summary: &AccountSummary) {
+    if !matches!(
+        summary.tag.as_str(),
+        AccountSummaryTags::INIT_MARGIN_REQ | AccountSummaryTags::MAINT_MARGIN_REQ
+    ) {
+        return;
+    }
+
     let currency = match parse_currency(&summary.currency) {
         Ok(currency) => currency,
         Err(e) => {
@@ -500,31 +512,39 @@ pub async fn subscribe_positions(
 }
 
 /// Parse IB account summary to Nautilus AccountBalance.
-fn parse_account_summary_to_balance(summary: &AccountSummary) -> anyhow::Result<AccountBalance> {
-    let currency = parse_currency(&summary.currency)?;
-    let balance = parse_balance_decimal(&summary.value)?;
-
+fn parse_account_summary_to_balance(
+    summary: &AccountSummary,
+) -> anyhow::Result<Option<AccountBalance>> {
     match summary.tag.as_str() {
-        AccountSummaryTags::SETTLED_CASH | AccountSummaryTags::TOTAL_CASH_VALUE => {
+        AccountSummaryTags::SETTLED_CASH
+        | AccountSummaryTags::TOTAL_CASH_VALUE
+        | CASH_BALANCE_TAG
+        | TOTAL_CASH_BALANCE_TAG => {
+            let currency = parse_currency(&summary.currency)?;
+            let balance = parse_balance_decimal(&summary.value)?;
             // Cash balance - free equals total for settled cash
             AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
+                .map(Some)
                 .map_err(Into::into)
         }
         AccountSummaryTags::NET_LIQUIDATION => {
+            let currency = parse_currency(&summary.currency)?;
+            let balance = parse_balance_decimal(&summary.value)?;
             // Net liquidation - represents total equity
             // Free would be calculated from available funds
             AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
+                .map(Some)
                 .map_err(Into::into)
         }
         AccountSummaryTags::BUYING_POWER | AccountSummaryTags::AVAILABLE_FUNDS => {
+            let currency = parse_currency(&summary.currency)?;
+            let balance = parse_balance_decimal(&summary.value)?;
             // Available funds - this is the free amount
-            AccountBalance::from_total_and_free(balance, balance, currency).map_err(Into::into)
-        }
-        _ => {
-            // Default: treat as total balance
-            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
+            AccountBalance::from_total_and_free(balance, balance, currency)
+                .map(Some)
                 .map_err(Into::into)
         }
+        _ => Ok(None),
     }
 }
 
@@ -547,8 +567,9 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        AccountSummaryTags, check_external_position_change, create_position_tracker,
-        merge_account_summary_balance, merge_account_summary_margin, parse_currency,
+        AccountSummaryTags, CASH_BALANCE_TAG, check_external_position_change,
+        create_position_tracker, merge_account_summary_balance, merge_account_summary_margin,
+        parse_account_summary_to_balance, parse_currency,
     };
 
     fn margin_summary(tag: &str, value: &str, currency: &str) -> AccountSummary {
@@ -585,6 +606,26 @@ mod tests {
             result.unwrap_err().to_string(),
             "Account summary currency was empty",
         );
+    }
+
+    #[rstest]
+    fn test_parse_account_summary_uses_usd_ledger_cash_balance() {
+        let balance =
+            parse_account_summary_to_balance(&margin_summary(CASH_BALANCE_TAG, "13163.00", "USD"))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(balance.total.as_decimal(), "13163.00".parse().unwrap());
+        assert_eq!(balance.free.as_decimal(), "13163.00".parse().unwrap());
+        assert_eq!(balance.total.currency, Currency::USD());
+    }
+
+    #[rstest]
+    fn test_parse_account_summary_ignores_ledger_metadata() {
+        let balance =
+            parse_account_summary_to_balance(&margin_summary("Currency", "USD", "USD")).unwrap();
+
+        assert!(balance.is_none());
     }
 
     #[rstest]

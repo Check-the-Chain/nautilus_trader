@@ -49,7 +49,7 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 use crate::{
     common::{
         credential::{Credential, scrub_auth},
-        enums::{LighterOrderType, LighterTimeInForce},
+        enums::{LighterOrderKind, LighterOrderType, LighterTimeInForce},
         symbol::MarketRegistry,
     },
     http::{
@@ -936,6 +936,12 @@ pub(crate) fn evict_terminal_mappings(
 pub(crate) static LIGHTER_INSTRUMENT_CACHE: LazyLock<DashMap<InstrumentId, InstrumentAny>> =
     LazyLock::new(DashMap::new);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HttpOrderReportContext {
+    Active,
+    Inactive,
+}
+
 /// Populate [`LIGHTER_INSTRUMENT_CACHE`] for downstream report parsers.
 pub(crate) fn cache_instruments_for_reports(instruments: &[InstrumentAny]) {
     for instrument in instruments {
@@ -956,6 +962,7 @@ pub(crate) fn parse_http_order_to_report(
     account_id: AccountId,
     ts_init: UnixNanos,
     cloid_map: &Arc<DashMap<i64, ClientOrderId>>,
+    context: HttpOrderReportContext,
 ) -> Option<OrderStatusReport> {
     let instrument_id = registry.instrument_id(order.market_index)?;
     let instrument = match LIGHTER_INSTRUMENT_CACHE.get(&instrument_id) {
@@ -969,13 +976,25 @@ pub(crate) fn parse_http_order_to_report(
     match parse_ws_order_status_report(order, &instrument, account_id, ts_init) {
         Ok(report) => Some(translate_order_cloid(report, cloid_map)),
         Err(e) => {
-            log::warn!(
-                "parse_http_order_to_report: parse failed for order_index={}: {e}",
-                order.order_index,
-            );
+            if context == HttpOrderReportContext::Inactive && is_twap_order_kind(order.order_type) {
+                log::debug!(
+                    "parse_http_order_to_report: skipping inactive Lighter {:?} order_index={} with no Nautilus order-type equivalent",
+                    order.order_type,
+                    order.order_index,
+                );
+            } else {
+                log::warn!(
+                    "parse_http_order_to_report: parse failed for order_index={}: {e}",
+                    order.order_index,
+                );
+            }
             None
         }
     }
+}
+
+fn is_twap_order_kind(kind: LighterOrderKind) -> bool {
+    matches!(kind, LighterOrderKind::Twap | LighterOrderKind::TwapSub)
 }
 
 /// Look up a single order via the active+inactive HTTP endpoints, returning
@@ -1049,8 +1068,14 @@ pub(crate) async fn lookup_order_status_report(
     let supplied_cloid = client_order_id.copied();
 
     let finalize = |order: &LighterOrder| -> Option<OrderStatusReport> {
-        let mut report =
-            parse_http_order_to_report(order, registry, account_id, ts_init, &dispatch.cloid_map)?;
+        let mut report = parse_http_order_to_report(
+            order,
+            registry,
+            account_id,
+            ts_init,
+            &dispatch.cloid_map,
+            HttpOrderReportContext::Active,
+        )?;
         // Substitute the caller-supplied cloid whenever it positively
         // identifies this order: when the order's
         // `client_order_index` equals the deterministic derivation from
@@ -1388,6 +1413,20 @@ mod tests {
         let mut r = stub_open_order_status_report(client_order_id_str);
         r.order_status = OrderStatus::Canceled;
         r
+    }
+
+    #[rstest]
+    #[case::twap(LighterOrderKind::Twap)]
+    #[case::twap_sub(LighterOrderKind::TwapSub)]
+    fn twap_order_kinds_are_skippable_in_inactive_reconciliation(#[case] kind: LighterOrderKind) {
+        assert!(is_twap_order_kind(kind));
+    }
+
+    #[rstest]
+    fn non_twap_order_kinds_are_not_skippable_in_inactive_reconciliation() {
+        assert!(!is_twap_order_kind(LighterOrderKind::Limit));
+        assert!(!is_twap_order_kind(LighterOrderKind::Market));
+        assert!(!is_twap_order_kind(LighterOrderKind::Liquidation));
     }
 
     fn stub_position_report(instrument: &str, qty: &str) -> PositionStatusReport {

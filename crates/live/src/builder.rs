@@ -49,6 +49,7 @@ use crate::{
 #[derive(Debug)]
 enum ExecutionClientFactoryEntry {
     Adapter(Box<dyn ExecutionClientFactory>),
+    StateOnly(Box<dyn ExecutionClientFactory>),
     Simulated(Box<dyn SimulatedExecutionClientFactory>),
 }
 
@@ -407,6 +408,36 @@ impl LiveNodeBuilder {
         Ok(self)
     }
 
+    /// Add a live execution client factory as a state-only source.
+    ///
+    /// State-only clients run through the normal live adapter lifecycle and publish account /
+    /// position state into Nautilus, but they are not inserted into venue order routing. This is
+    /// useful when a live account should be observed while another execution client, such as the
+    /// sandbox matching engine, owns order submission for the same venue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a client with the same name is already registered.
+    pub fn add_state_exec_client(
+        mut self,
+        name: Option<String>,
+        factory: Box<dyn ExecutionClientFactory>,
+        config: Box<dyn ClientConfig>,
+    ) -> anyhow::Result<Self> {
+        let name = name.unwrap_or_else(|| factory.name().to_string());
+
+        if self.exec_client_factories.contains_key(&name) {
+            anyhow::bail!("Execution client '{name}' is already registered");
+        }
+
+        self.exec_client_factories.insert(
+            name.clone(),
+            ExecutionClientFactoryEntry::StateOnly(factory),
+        );
+        self.exec_client_configs.insert(name, config);
+        Ok(self)
+    }
+
     /// Add a simulated execution client factory.
     ///
     /// This path is for sync-core clients such as the sandbox matching engine, which owns cache
@@ -514,22 +545,35 @@ impl LiveNodeBuilder {
             if let Some(config) = self.exec_client_configs.remove(&name) {
                 log::debug!("Creating execution client {name}");
 
-                let client = match factory {
-                    ExecutionClientFactoryEntry::Adapter(factory) => {
-                        factory.create(&name, config.as_ref(), kernel.cache().into())?
-                    }
-                    ExecutionClientFactoryEntry::Simulated(factory) => {
-                        factory.create(&name, config.as_ref(), kernel.cache())?
-                    }
+                let (client, state_only) = match factory {
+                    ExecutionClientFactoryEntry::Adapter(factory) => (
+                        factory.create(&name, config.as_ref(), kernel.cache().into())?,
+                        false,
+                    ),
+                    ExecutionClientFactoryEntry::StateOnly(factory) => (
+                        factory.create(&name, config.as_ref(), kernel.cache().into())?,
+                        true,
+                    ),
+                    ExecutionClientFactoryEntry::Simulated(factory) => (
+                        factory.create(&name, config.as_ref(), kernel.cache())?,
+                        false,
+                    ),
                 };
                 let client = LiveExecutionClient::new(client);
                 let client_id = client.client_id();
                 let venue = client.venue();
 
-                kernel
-                    .exec_engine
-                    .borrow_mut()
-                    .register_client(Box::new(client.clone()))?;
+                if state_only {
+                    kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .register_state_client(Box::new(client.clone()))?;
+                } else {
+                    kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .register_client(Box::new(client.clone()))?;
+                }
                 ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
                 exec_clients.push(client);
 

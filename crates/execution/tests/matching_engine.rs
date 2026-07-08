@@ -38,8 +38,8 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     data::{
-        Bar, BarType, BookOrder, InstrumentClose, OptionGreeks, QuoteTick, TradeTick,
-        stubs::OrderBookDeltaTestBuilder,
+        Bar, BarType, BookOrder, InstrumentClose, OptionGreeks, OrderBookDepth10, QuoteTick,
+        TradeTick, stubs::OrderBookDeltaTestBuilder,
     },
     enums::{
         AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
@@ -13196,4 +13196,165 @@ fn test_l1_stop_market_order_slips_remainder_after_trigger(
     assert_eq!(fills[0].last_qty, Quantity::from("0.500"));
     assert_eq!(fills[1].last_px, Price::from("1010.01"));
     assert_eq!(fills[1].last_qty, Quantity::from("1.000"));
+}
+
+fn get_l2_queue_position_engine(
+    instrument: InstrumentAny,
+) -> (
+    OrderMatchingEngine,
+    Rc<RefCell<Cache>>,
+    TypedIntoMessageSavingHandler<OrderEventAny>,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let handler = order_event_handler_with_cache(Rc::clone(&cache));
+    let config = OrderMatchingEngineConfig {
+        trade_execution: true,
+        queue_position: true,
+        ..Default::default()
+    };
+    let engine = OrderMatchingEngine::new(
+        instrument,
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Netting,
+        AccountType::Margin,
+        clock,
+        Rc::clone(&cache),
+        config,
+    );
+    (engine, cache, handler)
+}
+
+fn depth10_bid_ask(
+    instrument_id: InstrumentId,
+    bid_price: &str,
+    bid_size: &str,
+    ask_price: &str,
+    ask_size: &str,
+    ts: u64,
+) -> OrderBookDepth10 {
+    let empty_bid = BookOrder::new(OrderSide::Buy, Price::from("0.01"), Quantity::from("0"), 0);
+    let empty_ask = BookOrder::new(
+        OrderSide::Sell,
+        Price::from("99999.99"),
+        Quantity::from("0"),
+        0,
+    );
+    let mut bids = [empty_bid; 10];
+    let mut asks = [empty_ask; 10];
+    bids[0] = BookOrder::new(
+        OrderSide::Buy,
+        Price::from(bid_price),
+        Quantity::from(bid_size),
+        1,
+    );
+    asks[0] = BookOrder::new(
+        OrderSide::Sell,
+        Price::from(ask_price),
+        Quantity::from(ask_size),
+        2,
+    );
+    let mut bid_counts = [0u32; 10];
+    let mut ask_counts = [0u32; 10];
+    bid_counts[0] = 1;
+    ask_counts[0] = 1;
+    OrderBookDepth10::new(
+        instrument_id,
+        bids,
+        asks,
+        bid_counts,
+        ask_counts,
+        0,
+        ts,
+        UnixNanos::from(ts),
+        UnixNanos::from(ts),
+    )
+}
+
+// Regression: Depth10 snapshots must CAP tracked queue positions to the
+// displayed level size, never reset them to zero. The old behavior
+// (clear_all_queue_positions on every depth event) made any resting order
+// front-of-queue within one snapshot, so snapshot-driven feeds had no maker
+// queue realism at all.
+#[rstest]
+fn test_l2_depth10_snapshot_caps_queue_instead_of_clearing(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let (mut engine, _cache, handler) = get_l2_queue_position_engine(instrument_eth_usdt.clone());
+
+    // Book: bid 54.59 @ 600.
+    let depth0 = depth10_bid_ask(instrument_eth_usdt.id(), "54.59", "600.000", "54.62", "500.000", 1);
+    engine.process_order_book_depth10(&depth0);
+
+    // BUY LIMIT joins the bid: 600 ahead.
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("54.59"))
+        .quantity(Quantity::from("100.000"))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-9"))
+        .submit(true)
+        .build();
+    engine.process_order(&mut order, account_id);
+    clear_order_event_handler_messages(&handler);
+
+    // Fresh snapshot, level grew to 700 (someone joined behind us): our
+    // queue position must remain 600, not reset to 0.
+    let depth1 = depth10_bid_ask(instrument_eth_usdt.id(), "54.59", "700.000", "54.62", "500.000", 2);
+    engine.process_order_book_depth10(&depth1);
+
+    // A 100 print at our level consumes queue ahead (600 -> 500). With the
+    // old clearing behavior the order would fill here.
+    let trade1 = TradeTick::new(
+        instrument_eth_usdt.id(),
+        Price::from("54.59"),
+        Quantity::from("100.000"),
+        AggressorSide::Seller,
+        TradeId::new("11"),
+        UnixNanos::from(3),
+        UnixNanos::from(3),
+    );
+    engine.process_trade_tick(&trade1);
+    assert!(
+        get_order_event_handler_messages(&handler)
+            .iter()
+            .all(|e| !matches!(e, OrderEventAny::Filled(_))),
+        "must not fill with 500 still displayed ahead"
+    );
+
+    // Snapshot shows the level down to 80: cap 500 -> 80.
+    let depth2 = depth10_bid_ask(instrument_eth_usdt.id(), "54.59", "80.000", "54.62", "500.000", 4);
+    engine.process_order_book_depth10(&depth2);
+
+    // 80 drains the remaining queue; the next print fills us.
+    let trade2 = TradeTick::new(
+        instrument_eth_usdt.id(),
+        Price::from("54.59"),
+        Quantity::from("80.000"),
+        AggressorSide::Seller,
+        TradeId::new("12"),
+        UnixNanos::from(5),
+        UnixNanos::from(5),
+    );
+    engine.process_trade_tick(&trade2);
+    let trade3 = TradeTick::new(
+        instrument_eth_usdt.id(),
+        Price::from("54.59"),
+        Quantity::from("50.000"),
+        AggressorSide::Seller,
+        TradeId::new("13"),
+        UnixNanos::from(6),
+        UnixNanos::from(6),
+    );
+    engine.process_trade_tick(&trade3);
+    assert!(
+        get_order_event_handler_messages(&handler)
+            .iter()
+            .any(|e| matches!(e, OrderEventAny::Filled(_))),
+        "must fill once displayed queue ahead is consumed"
+    );
 }

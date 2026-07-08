@@ -31,6 +31,7 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     retry::{RetryManager, create_http_retry_manager},
 };
+use rust_decimal::Decimal;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -637,12 +638,43 @@ fn multipart_form_bytes(fields: &[(&str, String)]) -> Vec<u8> {
 
 /// Domain HTTP client for Lighter REST operations.
 ///
+/// Account-tier fee overrides stamped onto parsed instrument definitions.
+///
+/// Lighter's market metadata carries the venue-wide standard-account fees
+/// (zero); premium and market-maker tiers pay per-tier fees only the account
+/// operator knows. Instrument definitions are the single fee source for
+/// downstream cost models and fills, so the override belongs here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountFeeOverrides {
+    pub maker_fee: Option<Decimal>,
+    pub taker_fee: Option<Decimal>,
+}
+
+impl AccountFeeOverrides {
+    /// Applies the overrides to an instrument definition, leaving unset
+    /// sides at the venue metadata value.
+    pub fn apply(&self, instrument: &mut InstrumentAny) {
+        let (maker, taker) = match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => (&mut perp.maker_fee, &mut perp.taker_fee),
+            InstrumentAny::CurrencyPair(pair) => (&mut pair.maker_fee, &mut pair.taker_fee),
+            _ => return,
+        };
+        if let Some(fee) = self.maker_fee {
+            *maker = fee;
+        }
+        if let Some(fee) = self.taker_fee {
+            *taker = fee;
+        }
+    }
+}
+
 /// This client wraps [`LighterRawHttpClient`] and converts selected endpoint responses into
 /// Nautilus domain data. Market metadata calls also populate the shared [`MarketRegistry`].
 #[derive(Clone, Debug)]
 pub struct LighterHttpClient {
     pub(crate) inner: Arc<LighterRawHttpClient>,
     market_registry: Arc<MarketRegistry>,
+    account_fees: AccountFeeOverrides,
     clock: &'static AtomicTime,
 }
 
@@ -684,8 +716,17 @@ impl LighterHttpClient {
         Self {
             inner: Arc::new(raw_client),
             market_registry,
+            account_fees: AccountFeeOverrides::default(),
             clock: get_atomic_clock_realtime(),
         }
+    }
+
+    /// Returns a client that stamps account-tier fee overrides onto every
+    /// instrument definition it parses.
+    #[must_use]
+    pub fn with_account_fee_overrides(mut self, account_fees: AccountFeeOverrides) -> Self {
+        self.account_fees = account_fees;
+        self
     }
 
     /// Returns the configured REST base URL.
@@ -1339,13 +1380,17 @@ impl LighterHttpClient {
     ) -> LighterHttpResult<Vec<(InstrumentAny, LighterMarketStatus)>> {
         let response = self.get_order_book_details(query).await?;
         let ts_init = self.generate_ts_init();
-        parse_order_book_details_instruments_with_status(
+        let mut instruments = parse_order_book_details_instruments_with_status(
             &self.market_registry,
             &response.order_book_details,
             &response.spot_order_book_details,
             ts_init,
         )
-        .map_err(LighterHttpError::from)
+        .map_err(LighterHttpError::from)?;
+        for (instrument, _) in &mut instruments {
+            self.account_fees.apply(instrument);
+        }
+        Ok(instruments)
     }
 
     fn parse_trade_ticks(

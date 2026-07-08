@@ -20,12 +20,16 @@ use std::fmt::Debug;
 use nautilus_core::string::secret::REDACTED;
 use nautilus_model::identifiers::{AccountId, TraderId};
 use nautilus_network::websocket::TransportBackend;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::common::{
-    credential::credential_env_vars,
-    enums::LighterEnvironment,
-    urls::{lighter_http_base_url, lighter_ws_url},
+use crate::{
+    common::{
+        credential::credential_env_vars,
+        enums::LighterEnvironment,
+        urls::{lighter_http_base_url, lighter_ws_url},
+    },
+    http::client::AccountFeeOverrides,
 };
 
 /// Configuration for the Lighter data client.
@@ -70,6 +74,14 @@ pub struct LighterDataClientConfig {
     /// Optional REST read-bucket quota override in requests per minute; unset keeps
     /// the conservative 60 req/min default (raising it requires venue IP registration).
     pub rest_quota_per_min: Option<u32>,
+    /// Optional account-tier maker fee override in basis points. Lighter's
+    /// market metadata carries the standard-account fees (zero); premium and
+    /// market-maker tiers pay per-tier fees only the operator knows. When
+    /// set, published instrument definitions carry this fee instead — the
+    /// definition is the single fee source for cost models and fills.
+    pub maker_fee_bps: Option<f64>,
+    /// Optional account-tier taker fee override in basis points.
+    pub taker_fee_bps: Option<f64>,
     /// WebSocket transport backend.
     #[builder(default)]
     pub transport_backend: TransportBackend,
@@ -107,6 +119,29 @@ impl LighterDataClientConfig {
         ensure_readonly_ws_url(url)
     }
 
+    /// Returns the account-tier fee overrides parsed from the bps fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a bps value is not a finite number.
+    pub fn account_fee_overrides(&self) -> anyhow::Result<AccountFeeOverrides> {
+        let to_rate = |bps: f64, side: &str| -> anyhow::Result<Decimal> {
+            let bps = Decimal::try_from(bps)
+                .map_err(|e| anyhow::anyhow!("[lighter] {side}_fee_bps: {e}"))?;
+            Ok(bps / Decimal::from(10_000))
+        };
+        Ok(AccountFeeOverrides {
+            maker_fee: self
+                .maker_fee_bps
+                .map(|bps| to_rate(bps, "maker"))
+                .transpose()?,
+            taker_fee: self
+                .taker_fee_bps
+                .map(|bps| to_rate(bps, "taker"))
+                .transpose()?,
+        })
+    }
+
     /// Returns `true` when all REST auth credential fields are available.
     #[must_use]
     pub fn has_credentials(&self) -> bool {
@@ -140,6 +175,8 @@ impl Debug for LighterDataClientConfig {
                 &self.update_instruments_interval_mins,
             )
             .field("rest_quota_per_min", &self.rest_quota_per_min)
+            .field("maker_fee_bps", &self.maker_fee_bps)
+            .field("taker_fee_bps", &self.taker_fee_bps)
             .field("transport_backend", &self.transport_backend)
             .finish()
     }
@@ -339,6 +376,29 @@ mod tests {
         let dbg_out = format!("{config:?}");
 
         assert!(dbg_out.contains("private_key: None"));
+    }
+
+    #[rstest]
+    fn data_config_account_fee_overrides_convert_bps_to_rates() {
+        let config = LighterDataClientConfig {
+            maker_fee_bps: Some(0.4),
+            taker_fee_bps: Some(2.8),
+            ..Default::default()
+        };
+
+        let fees = config.account_fee_overrides().unwrap();
+
+        assert_eq!(fees.maker_fee, Some(Decimal::new(4, 5))); // 0.00004
+        assert_eq!(fees.taker_fee, Some(Decimal::new(28, 5))); // 0.00028
+    }
+
+    #[rstest]
+    fn data_config_account_fee_overrides_default_to_none() {
+        let fees = LighterDataClientConfig::default()
+            .account_fee_overrides()
+            .unwrap();
+
+        assert_eq!(fees, AccountFeeOverrides::default());
     }
 
     #[rstest]

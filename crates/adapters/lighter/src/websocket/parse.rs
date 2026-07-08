@@ -1150,9 +1150,13 @@ fn nautilus_order_type(kind: LighterOrderKind) -> anyhow::Result<OrderType> {
         LighterOrderKind::StopLossLimit => Ok(OrderType::StopLimit),
         LighterOrderKind::TakeProfit => Ok(OrderType::MarketIfTouched),
         LighterOrderKind::TakeProfitLimit => Ok(OrderType::LimitIfTouched),
-        LighterOrderKind::Twap | LighterOrderKind::TwapSub | LighterOrderKind::Liquidation => Err(
-            anyhow::anyhow!("Lighter `{kind:?}` has no Nautilus order-type equivalent",),
-        ),
+        // A liquidation is venue-forced execution, not a user-submitted order.
+        // During reconciliation the useful native Nautilus shape is an external
+        // market order so fills and resulting position state can be reconciled.
+        LighterOrderKind::Liquidation => Ok(OrderType::Market),
+        LighterOrderKind::Twap | LighterOrderKind::TwapSub => Err(anyhow::anyhow!(
+            "Lighter `{kind:?}` has no Nautilus order-type equivalent",
+        )),
     }
 }
 
@@ -2002,6 +2006,23 @@ mod tests {
             err.to_string()
                 .contains("no Nautilus order-type equivalent")
         );
+    }
+
+    #[rstest]
+    fn test_parse_ws_order_status_report_maps_liquidation_to_market() {
+        let instrument = create_test_instrument();
+        let mut order = stub_order(LighterOrderStatus::Filled);
+        order.order_type = LighterOrderKind::Liquidation;
+        order.filled_base_amount = order.initial_base_amount;
+        order.remaining_base_amount = Decimal::ZERO;
+
+        let report =
+            parse_ws_order_status_report(&order, &instrument, account_id(), UnixNanos::from(1))
+                .unwrap();
+
+        assert_eq!(report.order_type, OrderType::Market);
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.filled_qty, report.quantity);
     }
 
     // Liquidity side is decided by `user_is_asker == trade.is_maker_ask`:

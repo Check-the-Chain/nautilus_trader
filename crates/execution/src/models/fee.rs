@@ -16,7 +16,7 @@
 use std::{fmt::Debug, rc::Rc};
 
 use nautilus_model::{
-    enums::LiquiditySide,
+    enums::{LiquiditySide, OrderSideSpecified},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     types::{Currency, Money, Price, Quantity},
@@ -126,6 +126,7 @@ pub enum FeeModelAny {
     Fixed(FixedFeeModel),
     MakerTaker(MakerTakerFeeModel),
     PerContract(PerContractFeeModel),
+    CommissionSchedule(CommissionScheduleFeeModel),
     ProbabilityPrice(ProbabilityPriceFeeModel),
     CappedOption(CappedOptionFeeModel),
     TieredNotionalOption(TieredNotionalOptionFeeModel),
@@ -145,6 +146,9 @@ impl FeeModel for FeeModelAny {
                 model.get_commission(order, fill_quantity, fill_px, instrument)
             }
             Self::PerContract(model) => {
+                model.get_commission(order, fill_quantity, fill_px, instrument)
+            }
+            Self::CommissionSchedule(model) => {
                 model.get_commission(order, fill_quantity, fill_px, instrument)
             }
             Self::ProbabilityPrice(model) => {
@@ -183,6 +187,13 @@ impl FeeModel for FeeModelAny {
                 underlying_px,
             ),
             Self::PerContract(model) => model.get_commission_with_context(
+                order,
+                fill_quantity,
+                fill_px,
+                instrument,
+                underlying_px,
+            ),
+            Self::CommissionSchedule(model) => model.get_commission_with_context(
                 order,
                 fill_quantity,
                 fill_px,
@@ -313,6 +324,110 @@ impl FeeModel for PerContractFeeModel {
     ) -> anyhow::Result<Money> {
         let total = self.commission.as_decimal() * fill_quantity.as_decimal();
         Money::from_decimal(total, self.commission.currency).map_err(Into::into)
+    }
+}
+
+/// A per-unit commission clamped by a per-order minimum and a maximum
+/// fraction of fill notional — the shape of fixed-rate US equity brokerage
+/// pricing (e.g. IBKR Fixed: $0.005/share, min $1.00 per order, max 1% of
+/// trade value).
+///
+/// The minimum applies to an order's first fill only (mirroring per-order
+/// minimums); subsequent partial fills pay the unclamped per-unit rate.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.execution",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")
+)]
+pub struct CommissionScheduleFeeModel {
+    /// Commission as a fraction of fill notional.
+    rate: Decimal,
+    /// Commission per base unit filled.
+    per_unit: Money,
+    /// Commission floor, applied to an order's first fill only (brokers
+    /// charge per-order minimums; partial fills are one order).
+    minimum: Money,
+    /// Commission cap as a fraction of fill notional.
+    maximum_rate: Decimal,
+    /// Transaction tax on buys as a fraction of notional, outside the
+    /// commission min/max clamp (taxes are never subject to broker minimums).
+    buy_tax_rate: Decimal,
+    /// Transaction tax on sells as a fraction of notional, outside the
+    /// clamp (e.g. the Korean securities transaction tax).
+    sell_tax_rate: Decimal,
+}
+
+impl CommissionScheduleFeeModel {
+    /// Creates a new [`CommissionScheduleFeeModel`] instance.
+    ///
+    /// All money parameters share the fee currency (normally the
+    /// instrument's quote currency). `commission = clamp(rate x notional +
+    /// per_unit x qty, minimum..=maximum_rate x notional) + side_tax x
+    /// notional`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any parameter is negative or the currencies of
+    /// `per_unit` and `minimum` differ.
+    pub fn new(
+        rate: Decimal,
+        per_unit: Money,
+        minimum: Money,
+        maximum_rate: Decimal,
+        buy_tax_rate: Decimal,
+        sell_tax_rate: Decimal,
+    ) -> anyhow::Result<Self> {
+        if rate < Decimal::ZERO
+            || per_unit.raw < 0
+            || minimum.raw < 0
+            || maximum_rate < Decimal::ZERO
+            || buy_tax_rate < Decimal::ZERO
+            || sell_tax_rate < Decimal::ZERO
+        {
+            anyhow::bail!("Fee parameters must be greater than or equal to zero")
+        }
+        if per_unit.currency != minimum.currency {
+            anyhow::bail!("Per-unit rate and minimum must share a currency")
+        }
+        Ok(Self {
+            rate,
+            per_unit,
+            minimum,
+            maximum_rate,
+            buy_tax_rate,
+            sell_tax_rate,
+        })
+    }
+}
+
+impl FeeModel for CommissionScheduleFeeModel {
+    fn get_commission(
+        &self,
+        order: &OrderAny,
+        fill_quantity: Quantity,
+        fill_px: Price,
+        _instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        let notional = fill_px.as_decimal() * fill_quantity.as_decimal();
+        let mut commission =
+            self.rate * notional + self.per_unit.as_decimal() * fill_quantity.as_decimal();
+        if order.filled_qty().is_zero() {
+            commission = commission.max(self.minimum.as_decimal());
+        }
+        commission = commission.min(self.maximum_rate * notional);
+        let tax_rate = match order.order_side_specified() {
+            OrderSideSpecified::Buy => self.buy_tax_rate,
+            OrderSideSpecified::Sell => self.sell_tax_rate,
+        };
+        Money::from_decimal(commission + tax_rate * notional, self.per_unit.currency)
+            .map_err(Into::into)
     }
 }
 
@@ -621,8 +736,8 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::{
-        CappedOptionFeeModel, FeeModel, FeeModelAny, FeeModelHandle, FixedFeeModel,
-        MakerTakerFeeModel, PerContractFeeModel, ProbabilityPriceFeeModel,
+        CappedOptionFeeModel, CommissionScheduleFeeModel, FeeModel, FeeModelAny, FeeModelHandle,
+        FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel, ProbabilityPriceFeeModel,
         TieredNotionalOptionFeeModel,
     };
 
@@ -699,6 +814,132 @@ mod tests {
             .unwrap();
         assert_eq!(commission_first_fill, expected_first_fill);
         assert_eq!(commission_next_fill, expected_next_fill);
+    }
+
+    fn schedule_order(order_side: OrderSide) -> (InstrumentAny, OrderAny) {
+        let aud_usd = InstrumentAny::CurrencyPair(audusd_sim());
+        let market_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(aud_usd.id())
+            .side(order_side)
+            .quantity(Quantity::from(100_000))
+            .build();
+        let accepted = TestOrderStubs::make_accepted_order(&market_order);
+        (aud_usd, accepted)
+    }
+
+    #[rstest]
+    // Rate on notional: 0.06% x (10_000 x 1.0) = 6 USD, above the 2 USD min.
+    #[case(OrderSide::Buy, dec!(0.0006), dec!(0), Money::from("6.00 USD"))]
+    // Sell tax (0.20%) stacks OUTSIDE the commission: 6 + 20 = 26 USD.
+    #[case(OrderSide::Sell, dec!(0.0006), dec!(0.002), Money::from("26.00 USD"))]
+    // Buys never pay the sell tax.
+    #[case(OrderSide::Buy, dec!(0.0006), dec!(0.002), Money::from("6.00 USD"))]
+    fn test_commission_schedule_rate_and_sided_tax(
+        #[case] order_side: OrderSide,
+        #[case] rate: Decimal,
+        #[case] sell_tax_rate: Decimal,
+        #[case] expected: Money,
+    ) {
+        let (aud_usd, order) = schedule_order(order_side);
+        let fee_model = CommissionScheduleFeeModel::new(
+            rate,
+            Money::from("0 USD"),
+            Money::from("2 USD"),
+            Decimal::ONE,
+            Decimal::ZERO,
+            sell_tax_rate,
+        )
+        .unwrap();
+        let commission = fee_model
+            .get_commission(&order, Quantity::from(10_000), Price::from("1.0"), &aud_usd)
+            .unwrap();
+        assert_eq!(commission, expected);
+    }
+
+    #[rstest]
+    fn test_commission_schedule_minimum_first_fill_only_and_tax_survives() {
+        let (aud_usd, mut order) = schedule_order(OrderSide::Sell);
+        // Tiny fills: commission 0.06% x 100 = 0.06 -> clamped up to the 2
+        // USD minimum on the FIRST fill only; the 0.20% tax applies to every
+        // fill and is never absorbed by the minimum.
+        let fee_model = CommissionScheduleFeeModel::new(
+            dec!(0.0006),
+            Money::from("0 USD"),
+            Money::from("2 USD"),
+            Decimal::ONE,
+            Decimal::ZERO,
+            dec!(0.002),
+        )
+        .unwrap();
+        let first = fee_model
+            .get_commission(&order, Quantity::from(100), Price::from("1.0"), &aud_usd)
+            .unwrap();
+        assert_eq!(first, Money::from("2.20 USD")); // 2 min + 0.20 tax
+
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &aud_usd,
+            None,
+            None,
+            None,
+            Some(Quantity::from(100)),
+            None,
+            None,
+            None,
+            None,
+        );
+        order.apply(fill).unwrap();
+        let next = fee_model
+            .get_commission(&order, Quantity::from(100), Price::from("1.0"), &aud_usd)
+            .unwrap();
+        assert_eq!(next, Money::from("0.26 USD")); // 0.06 commission + 0.20 tax
+    }
+
+    #[rstest]
+    fn test_commission_schedule_per_unit_with_max_rate_cap() {
+        let (aud_usd, order) = schedule_order(OrderSide::Buy);
+        // US shape: $0.005/share, $1 min, capped at 1% of notional. 10_000
+        // shares at 0.004: per-unit = 50 USD but 1% x 40 = 0.40 USD cap wins.
+        let fee_model = CommissionScheduleFeeModel::new(
+            Decimal::ZERO,
+            Money::from("0.005 USD"),
+            Money::from("1 USD"),
+            dec!(0.01),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        )
+        .unwrap();
+        let commission = fee_model
+            .get_commission(
+                &order,
+                Quantity::from(10_000),
+                Price::from("0.004"),
+                &aud_usd,
+            )
+            .unwrap();
+        assert_eq!(commission, Money::from("0.40 USD"));
+    }
+
+    #[rstest]
+    fn test_commission_schedule_rejects_invalid_parameters() {
+        assert!(CommissionScheduleFeeModel::new(
+            dec!(-0.1),
+            Money::from("0 USD"),
+            Money::from("0 USD"),
+            Decimal::ONE,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        )
+        .is_err());
+        assert!(CommissionScheduleFeeModel::new(
+            Decimal::ZERO,
+            Money::from("0.005 USD"),
+            Money::from("1 AUD"),
+            Decimal::ONE,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        )
+        .is_err());
     }
 
     #[rstest]

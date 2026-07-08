@@ -2619,6 +2619,9 @@ impl ExecutionManager {
         fills: &[&FillReport],
         is_synthetic: bool,
     ) -> (Vec<OrderEventAny>, Option<ExternalOrderMetadata>) {
+        let is_claimed = self
+            .external_order_claims
+            .contains_key(&report.instrument_id);
         let (strategy_id, tags) =
             if let Some(claimed_strategy) = self.external_order_claims.get(&report.instrument_id) {
                 let order_id = report
@@ -2642,8 +2645,9 @@ impl ExecutionManager {
                 (StrategyId::from("EXTERNAL"), Some(vec![tag]))
             };
 
-        // Filter unclaimed venue orders (but not synthetic reconciliation orders)
-        if self.config.filter_unclaimed_external && !is_synthetic {
+        // Filter unclaimed venue orders (but not synthetic reconciliation orders
+        // or orders explicitly claimed through StrategyConfig::external_order_claims).
+        if self.config.filter_unclaimed_external && !is_synthetic && !is_claimed {
             return (Vec::new(), None);
         }
 

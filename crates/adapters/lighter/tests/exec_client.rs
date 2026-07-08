@@ -42,7 +42,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use axum::{
@@ -72,10 +72,7 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_lighter::{
-    common::{
-        consts::{LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_VENUE},
-        enums::LighterEnvironment,
-    },
+    common::{consts::LIGHTER_VENUE, enums::LighterEnvironment},
     config::LighterExecClientConfig,
     execution::LighterExecutionClient,
 };
@@ -109,7 +106,6 @@ const ETH_PERP_SYMBOL: &str = "ETH-PERP";
 const ETH_SPOT_SYMBOL: &str = "ETH/USDC-SPOT";
 const TEST_MARKET_INDEX: i16 = 0;
 const TEST_NEXT_NONCE: i64 = 9_999;
-const INTEGRATOR_APPROVAL_MAX_TTL_MS: i64 = 5 * 365 * 24 * 60 * 60 * 1_000;
 
 fn data_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
@@ -176,6 +172,8 @@ struct TestServerState {
     trades_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     next_rest_send_tx_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     next_send_tx_ack: Arc<tokio::sync::Mutex<Option<Value>>>,
+    block_next_active_orders_response: Arc<AtomicBool>,
+    active_orders_response_gate: Arc<tokio::sync::Notify>,
     block_next_send_tx_batch_response: Arc<AtomicBool>,
     send_tx_batch_response_gate: Arc<tokio::sync::Notify>,
     inbox_tx: tokio::sync::broadcast::Sender<String>,
@@ -208,6 +206,8 @@ impl Default for TestServerState {
             trades_response: Arc::new(tokio::sync::Mutex::new(None)),
             next_rest_send_tx_response: Arc::new(tokio::sync::Mutex::new(None)),
             next_send_tx_ack: Arc::new(tokio::sync::Mutex::new(None)),
+            block_next_active_orders_response: Arc::new(AtomicBool::new(false)),
+            active_orders_response_gate: Arc::new(tokio::sync::Notify::new()),
             block_next_send_tx_batch_response: Arc::new(AtomicBool::new(false)),
             send_tx_batch_response_gate: Arc::new(tokio::sync::Notify::new()),
             inbox_tx,
@@ -246,6 +246,15 @@ impl TestServerState {
 
     fn release_send_tx_batch_response(&self) {
         self.send_tx_batch_response_gate.notify_one();
+    }
+
+    fn block_next_active_orders_response(&self) {
+        self.block_next_active_orders_response
+            .store(true, Ordering::Release);
+    }
+
+    fn release_active_orders_response(&self) {
+        self.active_orders_response_gate.notify_one();
     }
 }
 
@@ -315,6 +324,12 @@ async fn account_active_orders(
     Query(_query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     state.active_orders_calls.fetch_add(1, Ordering::Relaxed);
+    if state
+        .block_next_active_orders_response
+        .swap(false, Ordering::AcqRel)
+    {
+        state.active_orders_response_gate.notified().await;
+    }
     if let Some(body) = state.active_orders_response.lock().await.clone() {
         return (StatusCode::OK, body.to_string()).into_response();
     }
@@ -1455,87 +1470,17 @@ async fn test_connect_disconnect_lifecycle() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn connect_submits_l2_only_integrator_auto_approval() {
+async fn connect_does_not_submit_integrator_auto_approval() {
     let (addr, state) = start_server().await;
     let (mut client, _rx, _cache) = build_client(addr);
 
     client.connect().await.expect("connect");
 
-    let approvals = state.rest_send_txs().await;
-    assert_eq!(approvals.len(), 1);
-    assert_eq!(approvals[0]["tx_type"], 45);
-
-    let tx_info = &approvals[0]["tx_info"];
-    assert_eq!(tx_info["AccountIndex"], TEST_ACCOUNT_INDEX);
-    assert_eq!(tx_info["ApiKeyIndex"], TEST_API_KEY_INDEX);
-    assert_eq!(
-        tx_info["IntegratorAccountIndex"],
-        LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
-    );
-    assert_eq!(tx_info["MaxPerpsTakerFee"], 0);
-    assert_eq!(tx_info["MaxPerpsMakerFee"], 0);
-    assert_eq!(tx_info["MaxSpotTakerFee"], 0);
-    assert_eq!(tx_info["MaxSpotMakerFee"], 0);
-    assert_eq!(tx_info["L1Sig"], "");
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time must be after UNIX epoch")
-        .as_millis() as i64;
-    let approval_expiry = tx_info["ApprovalExpiry"]
-        .as_i64()
-        .expect("ApprovalExpiry must be an i64");
-    assert!(
-        (now_ms + INTEGRATOR_APPROVAL_MAX_TTL_MS - 60_000
-            ..=now_ms + INTEGRATOR_APPROVAL_MAX_TTL_MS)
-            .contains(&approval_expiry),
-        "ApprovalExpiry must use the maximum five-year TTL",
-    );
-
-    client.disconnect().await.expect("disconnect");
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn connect_skips_integrator_auto_approval_for_maker_only_api_key() {
-    let (addr, state) = start_server().await;
-    state
-        .maker_only_api_key_indexes
-        .lock()
-        .await
-        .push(i64::from(TEST_API_KEY_INDEX));
-    let (mut client, _rx, _cache) = build_client(addr);
-
-    client.connect().await.expect("connect");
-
-    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(state.maker_only_authorizations().await.len(), 1);
+    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(state.maker_only_authorizations().await.len(), 0);
     assert_eq!(state.rest_send_txs().await.len(), 0);
 
     client.disconnect().await.expect("disconnect");
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn connect_bails_when_integrator_auto_approval_reports_unapproved() {
-    let (addr, state) = start_server().await;
-    *state.next_rest_send_tx_response.lock().await = Some(json!({
-        "code": 21149,
-        "message": "integrator is not approved",
-    }));
-    let (mut client, _rx, _cache) = build_client(addr);
-
-    let err = client.connect().await.unwrap_err();
-    let msg = format!("{err:#}");
-
-    assert!(
-        msg.contains("Lighter account is not integrator-approved (venue 21149)"),
-        "unexpected error: {msg}",
-    );
-    assert!(msg.contains("orders cannot be placed"));
-    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(state.rest_send_txs().await.len(), 1);
-    assert!(!client.is_connected());
-    assert_eq!(*state.connection_count.lock().await, 0);
 }
 
 /// Pins the per-stream marker dispatch in the execution consumption loop.
@@ -3188,6 +3133,112 @@ async fn test_generate_mass_status_fans_out_active_inactive_position_and_trades(
     let positions = mass.position_reports();
     assert_eq!(positions.len(), 1);
     assert!(positions.contains_key(&eth_perp_id()));
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_snapshots_positions_before_rest_fanout() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, _cache) = build_client(addr);
+    client.connect().await.expect("connect");
+    await_subscribe_count(&state, 4).await;
+
+    state.push_frame(&load_json("ws_account_all_positions_update.json"));
+
+    wait_until_async(
+        || {
+            let client_ptr = std::ptr::addr_of!(client);
+            async move {
+                let client = unsafe { &*client_ptr };
+                !client
+                    .generate_position_status_reports(&GeneratePositionStatusReports::new(
+                        UUID4::new(),
+                        UnixNanos::default(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    state.block_next_active_orders_response();
+
+    let mass_status = client.generate_mass_status(None);
+    let perturb_position_cache = {
+        let state = state.clone();
+        async move {
+            wait_until_async(
+                || {
+                    let state = state.clone();
+                    async move { state.active_orders_calls.load(Ordering::Relaxed) > 0 }
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+
+            state.push_frame(&json!({
+                "type": "update/account_all_positions",
+                "channel": format!("account_all_positions:{TEST_ACCOUNT_INDEX}"),
+                "positions": {},
+                "shares": [],
+                "last_funding_round": null,
+                "last_funding_discount": null,
+            }));
+
+            next_event_matching(&mut rx, Duration::from_secs(2), |e| {
+                matches!(
+                    e,
+                    ExecutionEvent::Report(ExecutionReport::Position(report))
+                        if report.instrument_id == eth_perp_id()
+                            && report.position_side == PositionSideSpecified::Flat
+                )
+            })
+            .await
+            .expect("flat position report");
+
+            state.release_active_orders_response();
+        }
+    };
+
+    let (mass, ()) = tokio::join!(mass_status, perturb_position_cache);
+    let mass = mass
+        .expect("mass status")
+        .expect("execution client returns mass status");
+
+    let positions = mass.position_reports();
+    assert_eq!(
+        positions.len(),
+        1,
+        "mass status should retain the position snapshot captured before REST fan-out: {positions:?}",
+    );
+    assert!(positions.contains_key(&eth_perp_id()));
+
+    let latest_positions = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect("latest position reports");
+    assert!(
+        latest_positions.is_empty(),
+        "test should prove the live WS cache was cleared after mass-status captured it",
+    );
 
     client.disconnect().await.expect("disconnect");
 }
