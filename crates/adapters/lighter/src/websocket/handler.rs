@@ -763,9 +763,19 @@ impl FeedHandler {
                     return raw_message(&frame);
                 }
                 let mut msgs = self.handle_account_orders(orders, ts_init);
-                msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
-                    AccountStream::Orders,
-                ));
+                let complete = orders
+                    .values()
+                    .flatten()
+                    .all(|order| self.instruments.contains_key(&order.market_index));
+                if complete {
+                    msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
+                        AccountStream::Orders,
+                    ));
+                } else {
+                    log::error!(
+                        "Lighter account order frame was incomplete; startup readiness withheld"
+                    );
+                }
                 msgs
             }
             // Lighter publishes the historical fill replay as `subscribed/`
@@ -803,9 +813,24 @@ impl FeedHandler {
                     return raw_message(&frame);
                 }
                 let mut msgs = self.handle_account_positions(positions, ts_init);
-                msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
-                    AccountStream::Positions,
-                ));
+                let complete = msgs.iter().all(|msg| {
+                    !matches!(
+                        msg,
+                        NautilusWsMessage::PositionSnapshot {
+                            skipped_market_ids,
+                            ..
+                        } if !skipped_market_ids.is_empty()
+                    )
+                });
+                if complete {
+                    msgs.push(NautilusWsMessage::AccountStreamFirstFrame(
+                        AccountStream::Positions,
+                    ));
+                } else {
+                    log::error!(
+                        "Lighter position snapshot was incomplete; startup readiness withheld"
+                    );
+                }
                 msgs
             }
             LighterWsFrame::AccountAllAssets {
@@ -1886,9 +1911,13 @@ mod tests {
         frame_json["positions"]["0"]["market_id"] = json!(999);
         let frame: super::LighterWsFrame = serde_json::from_value(frame_json).unwrap();
 
-        let messages = strip_account_marker(handler.handle_frame(frame, UnixNanos::from(11)));
+        let messages = handler.handle_frame(frame, UnixNanos::from(11));
 
         assert_eq!(messages.len(), 1);
+        assert!(!messages.iter().any(|msg| matches!(
+            msg,
+            NautilusWsMessage::AccountStreamFirstFrame(AccountStream::Positions)
+        )));
         match &messages[0] {
             NautilusWsMessage::PositionSnapshot {
                 reports,
@@ -1909,9 +1938,13 @@ mod tests {
         frame_json["positions"]["0"]["position"] = json!("-1.5000");
         let frame: super::LighterWsFrame = serde_json::from_value(frame_json).unwrap();
 
-        let messages = strip_account_marker(handler.handle_frame(frame, UnixNanos::from(11)));
+        let messages = handler.handle_frame(frame, UnixNanos::from(11));
 
         assert_eq!(messages.len(), 1);
+        assert!(!messages.iter().any(|msg| matches!(
+            msg,
+            NautilusWsMessage::AccountStreamFirstFrame(AccountStream::Positions)
+        )));
         match &messages[0] {
             NautilusWsMessage::PositionSnapshot {
                 reports,
@@ -2354,9 +2387,8 @@ mod tests {
     fn handle_frame_account_orders_skips_unknown_market() {
         // Build a handler with the execution context but no instrument
         // cached for the order's market_index; the handler should log and
-        // emit no execution reports (the trailing readiness marker still
-        // fires so `connect()` does not stall when the venue resubscribes
-        // before instrument bootstrap completes).
+        // emit no execution reports or readiness marker. Startup must wait
+        // for a complete authoritative frame instead of assuming no orders.
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
         let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -2367,7 +2399,7 @@ mod tests {
         // No instrument inserted for market_index=0.
 
         let frame: super::LighterWsFrame = serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
-        let messages = strip_account_marker(handler.handle_frame(frame, UnixNanos::from(11)));
+        let messages = handler.handle_frame(frame, UnixNanos::from(11));
 
         assert!(messages.is_empty());
     }

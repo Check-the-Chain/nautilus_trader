@@ -48,7 +48,7 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 
 use crate::{
     common::{
-        credential::{Credential, scrub_auth},
+        credential::Credential,
         enums::{LighterOrderKind, LighterOrderType, LighterTimeInForce},
         symbol::MarketRegistry,
     },
@@ -1347,23 +1347,6 @@ pub(crate) fn derive_market_order_price_ticks(
     })
 }
 
-/// Degrade an `Err` sub-report to an empty `Vec` after logging the full
-/// chain at WARN. Deliberate: a transient REST failure on one category
-/// must not blank out the others. Visibility comes from the `{e:#}` log,
-/// not from the returned `ExecutionMassStatus`.
-pub(crate) fn unwrap_reports_or_warn<T>(label: &str, result: anyhow::Result<Vec<T>>) -> Vec<T> {
-    match result {
-        Ok(reports) => reports,
-        Err(e) => {
-            log::warn!(
-                "Lighter mass-status: {label} reports failed: {}",
-                scrub_auth(&format!("{e:#}")),
-            );
-            Vec::new()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -1564,19 +1547,6 @@ mod tests {
                 ("ETH-PERP.LIGHTER".to_string(), "3.0".to_string()),
             ],
         );
-    }
-
-    #[rstest]
-    fn unwrap_reports_or_warn_returns_inner_on_ok() {
-        let result: anyhow::Result<Vec<i32>> = Ok(vec![1, 2, 3]);
-        assert_eq!(unwrap_reports_or_warn("orders", result), vec![1, 2, 3]);
-    }
-
-    #[rstest]
-    fn unwrap_reports_or_warn_returns_empty_on_err() {
-        let result: anyhow::Result<Vec<i32>> = Err(anyhow::anyhow!("boom"));
-        let out: Vec<i32> = unwrap_reports_or_warn("orders", result);
-        assert!(out.is_empty());
     }
 
     #[rstest]

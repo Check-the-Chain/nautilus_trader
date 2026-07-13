@@ -626,11 +626,9 @@ impl OrderMatchingEngine {
             let price = Price::from_raw(price_raw, price_prec);
             // Opposite side because get_quantity_at_level flips internally
             // (BUY reads asks, SELL reads bids); we want the resting side.
-            let displayed = self.book.get_quantity_at_level(
-                price,
-                OrderCore::opposite_side(side),
-                size_prec,
-            );
+            let displayed =
+                self.book
+                    .get_quantity_at_level(price, OrderCore::opposite_side(side), size_prec);
             self.queue_ahead
                 .insert(client_order_id, (price_raw, ahead_raw.min(displayed.raw)));
         }

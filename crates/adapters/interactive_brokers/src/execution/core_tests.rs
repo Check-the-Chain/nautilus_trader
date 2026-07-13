@@ -1637,3 +1637,22 @@ fn test_get_leg_position_three_leg_spread() {
     let result = InteractiveBrokersExecutionClient::get_leg_position(&spread_id, &leg_id3);
     assert_eq!(result, 2);
 }
+
+#[rstest]
+fn reconciliation_notice_allows_only_known_informational_codes() {
+    let healthy = ibapi::Notice {
+        code: 2104,
+        message: "Market data farm connection is OK".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+    let request_error = ibapi::Notice {
+        code: 200,
+        message: "No security definition found".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+
+    assert!(require_informational_reconciliation_notice(&healthy).is_ok());
+    assert!(require_informational_reconciliation_notice(&request_error).is_err());
+}

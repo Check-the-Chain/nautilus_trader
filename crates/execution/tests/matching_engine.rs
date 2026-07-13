@@ -13287,7 +13287,14 @@ fn test_l2_depth10_snapshot_caps_queue_instead_of_clearing(
     let (mut engine, _cache, handler) = get_l2_queue_position_engine(instrument_eth_usdt.clone());
 
     // Book: bid 54.59 @ 600.
-    let depth0 = depth10_bid_ask(instrument_eth_usdt.id(), "54.59", "600.000", "54.62", "500.000", 1);
+    let depth0 = depth10_bid_ask(
+        instrument_eth_usdt.id(),
+        "54.59",
+        "600.000",
+        "54.62",
+        "500.000",
+        1,
+    );
     engine.process_order_book_depth10(&depth0);
 
     // BUY LIMIT joins the bid: 600 ahead.
@@ -13304,7 +13311,14 @@ fn test_l2_depth10_snapshot_caps_queue_instead_of_clearing(
 
     // Fresh snapshot, level grew to 700 (someone joined behind us): our
     // queue position must remain 600, not reset to 0.
-    let depth1 = depth10_bid_ask(instrument_eth_usdt.id(), "54.59", "700.000", "54.62", "500.000", 2);
+    let depth1 = depth10_bid_ask(
+        instrument_eth_usdt.id(),
+        "54.59",
+        "700.000",
+        "54.62",
+        "500.000",
+        2,
+    );
     engine.process_order_book_depth10(&depth1);
 
     // A 100 print at our level consumes queue ahead (600 -> 500). With the
@@ -13327,7 +13341,14 @@ fn test_l2_depth10_snapshot_caps_queue_instead_of_clearing(
     );
 
     // Snapshot shows the level down to 80: cap 500 -> 80.
-    let depth2 = depth10_bid_ask(instrument_eth_usdt.id(), "54.59", "80.000", "54.62", "500.000", 4);
+    let depth2 = depth10_bid_ask(
+        instrument_eth_usdt.id(),
+        "54.59",
+        "80.000",
+        "54.62",
+        "500.000",
+        4,
+    );
     engine.process_order_book_depth10(&depth2);
 
     // 80 drains the remaining queue; the next print fills us.

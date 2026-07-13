@@ -38,8 +38,8 @@ use nautilus_alpaca::{
     common::{
         credential::Credential,
         enums::{
-            AlpacaDataFeed, AlpacaEnvironment, AlpacaOrderSide, AlpacaOrderType,
-            AlpacaTimeInForce, AlpacaTradeUpdateEvent,
+            AlpacaDataFeed, AlpacaEnvironment, AlpacaOrderSide, AlpacaOrderType, AlpacaTimeInForce,
+            AlpacaTradeUpdateEvent,
         },
     },
     http::{
@@ -181,7 +181,10 @@ async fn main() -> anyhow::Result<()> {
         ws.subscribe_quotes(instrument_id(symbol)).await?;
         ws.subscribe_bars(instrument_id(symbol)).await?;
     }
-    println!("market data connected (msgpack, IEX): {} symbols x trades/quotes/bars", SYMBOLS.len());
+    println!(
+        "market data connected (msgpack, IEX): {} symbols x trades/quotes/bars",
+        SYMBOLS.len()
+    );
 
     // The original client owns the event receiver and moves into the
     // collector task; the clone shares the command channel for churn and
@@ -374,7 +377,10 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = await_terminal_event(
         &mut updates,
         &[AlpacaTradeUpdateEvent::Canceled],
-        &[AlpacaTradeUpdateEvent::Fill, AlpacaTradeUpdateEvent::Rejected],
+        &[
+            AlpacaTradeUpdateEvent::Fill,
+            AlpacaTradeUpdateEvent::Rejected,
+        ],
         30,
     )
     .await
@@ -414,8 +420,7 @@ async fn main() -> anyhow::Result<()> {
             .await
             {
                 Ok((_, _, qty)) => {
-                    stream_fill_qty +=
-                        qty.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+                    stream_fill_qty += qty.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
                 }
                 Err(e) => failures.push(format!("sell fill: {e}")),
             },
@@ -426,9 +431,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let positions = http.get_positions().await?;
-    let flat = !positions
-        .iter()
-        .any(|p| p.symbol.as_str() == ORDER_SYMBOL);
+    let flat = !positions.iter().any(|p| p.symbol.as_str() == ORDER_SYMBOL);
     if !flat {
         failures.push(format!("{ORDER_SYMBOL} position not flat after round trip"));
     }
@@ -437,9 +440,15 @@ async fn main() -> anyhow::Result<()> {
     // -------------------------------------------------- mid-soak churn
     banner("SUBSCRIPTION CHURN (mid-soak)");
     tokio::time::sleep(Duration::from_secs(10)).await;
-    churn_handle.unsubscribe_trades(instrument_id(CHURN_UNSUB)).await?;
-    churn_handle.subscribe_trades(instrument_id(CHURN_SUB)).await?;
-    churn_handle.subscribe_quotes(instrument_id(CHURN_SUB)).await?;
+    churn_handle
+        .unsubscribe_trades(instrument_id(CHURN_UNSUB))
+        .await?;
+    churn_handle
+        .subscribe_trades(instrument_id(CHURN_SUB))
+        .await?;
+    churn_handle
+        .subscribe_quotes(instrument_id(CHURN_SUB))
+        .await?;
     println!("unsubscribed {CHURN_UNSUB} trades; subscribed {CHURN_SUB} trades+quotes");
 
     // ------------------------------------------------------- wait for soak

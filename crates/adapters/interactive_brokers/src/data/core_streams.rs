@@ -1147,9 +1147,10 @@ where
     E: Debug,
 {
     match tick_result.map(IntoSubscriptionTick::into_subscription_item) {
-        Ok(SubscriptionItem::Data(TickTypes::Generic(TickGeneric { tick_type, value })))
-            if matches!(tick_type, TickType::Shortable) =>
-        {
+        Ok(SubscriptionItem::Data(TickTypes::Generic(TickGeneric {
+            tick_type: TickType::Shortable,
+            value,
+        }))) => {
             let Some(shortable_score_e6) = scaled_shortable_score(value) else {
                 tracing::warn!(
                     "Ignoring invalid IBKR shortability score for {}: {}",
@@ -1166,11 +1167,12 @@ where
                 ts_event,
             );
 
-            send_short_availability(update, data_sender, instrument_id)
+            Ok(send_short_availability(update, data_sender, instrument_id))
         }
-        Ok(SubscriptionItem::Data(TickTypes::Size(TickSize { tick_type, size })))
-            if matches!(tick_type, TickType::ShortableShares) =>
-        {
+        Ok(SubscriptionItem::Data(TickTypes::Size(TickSize {
+            tick_type: TickType::ShortableShares,
+            size,
+        }))) => {
             let Some(shortable_shares) = shortable_shares_from_tick(size) else {
                 tracing::warn!(
                     "Ignoring invalid IBKR shortable shares for {}: {}",
@@ -1187,7 +1189,7 @@ where
                 ts_event,
             );
 
-            send_short_availability(update, data_sender, instrument_id)
+            Ok(send_short_availability(update, data_sender, instrument_id))
         }
         Ok(SubscriptionItem::Notice(notice)) => {
             tracing::debug!(
@@ -1478,7 +1480,7 @@ fn send_short_availability(
     update: IbkrShortAvailability,
     data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instrument_id: InstrumentId,
-) -> anyhow::Result<StreamAction> {
+) -> StreamAction {
     if data_sender
         .send(DataEvent::Data(Data::Custom(update.into_custom_data())))
         .is_err()
@@ -1487,9 +1489,9 @@ fn send_short_availability(
             "Short availability receiver dropped for {}; stopping stream",
             instrument_id
         );
-        return Ok(StreamAction::Stop);
+        return StreamAction::Stop;
     }
-    Ok(StreamAction::Continue)
+    StreamAction::Continue
 }
 
 async fn process_option_open_interest_tick(

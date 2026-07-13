@@ -105,7 +105,7 @@ use crate::{
             derive_market_order_price_ticks, evict_terminal_mappings, lookup_order_status_report,
             nautilus_to_lighter_order_type, nautilus_to_lighter_tif, order_expiry_for,
             parse_http_order_to_report, price_to_ticks, quantity_to_ticks, resolve_cloid,
-            translate_fill_cloid, translate_order_cloid, unwrap_reports_or_warn,
+            translate_fill_cloid, translate_order_cloid,
         },
         messages::{
             AccountStream, ExecutionReport, LighterWsChannel, NautilusWsMessage,
@@ -537,6 +537,7 @@ impl LighterExecutionClient {
 
         let task = get_runtime().spawn(async move {
             log::debug!("Lighter execution WebSocket consumption loop started");
+            let mut order_frame_complete = true;
 
             loop {
                 tokio::select! {
@@ -558,7 +559,7 @@ impl LighterExecutionClient {
                                     match report {
                                         ExecutionReport::Order(order) => {
                                             order_count += 1;
-                                            dispatch_lighter_order(
+                                            if !dispatch_lighter_order(
                                                 &order,
                                                 &dispatch,
                                                 &emitter,
@@ -566,7 +567,9 @@ impl LighterExecutionClient {
                                                 account_id_for_loop,
                                                 trader_id,
                                                 clock_for_loop.get_time_ns(),
-                                            );
+                                            ) {
+                                                order_frame_complete = false;
+                                            }
                                         }
                                         ExecutionReport::Fill(trade) => {
                                             fill_count += 1;
@@ -833,7 +836,14 @@ impl LighterExecutionClient {
                                 // here is safe to unblock `await_all`.
                                 match stream {
                                     AccountStream::Orders => {
-                                        dispatch.account_streams_ready.mark_orders();
+                                        if order_frame_complete {
+                                            dispatch.account_streams_ready.mark_orders();
+                                        } else {
+                                            log::error!(
+                                                "Lighter order frame could not be applied completely; startup readiness withheld"
+                                            );
+                                        }
+                                        order_frame_complete = true;
                                     }
                                     AccountStream::Trades => {
                                         dispatch.account_streams_ready.mark_trades();
@@ -3320,8 +3330,7 @@ impl ExecutionClient for LighterExecutionClient {
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         let Some(credential) = &self.credential else {
-            log::warn!("Lighter generate_order_status_reports: no credentials");
-            return Ok(Vec::new());
+            anyhow::bail!("Lighter order reports require credentials");
         };
 
         let auth = build_auth_token_for(credential)
@@ -3343,7 +3352,7 @@ impl ExecutionClient for LighterExecutionClient {
                 credential,
                 &auth,
             )
-            .await;
+            .await?;
         }
 
         let market_indices = match cmd.instrument_id {
@@ -3375,7 +3384,7 @@ impl ExecutionClient for LighterExecutionClient {
         // the fact that the order is currently live and reconciliation
         // needs to know about it.
         for market_index in market_indices {
-            let active = match self
+            let active = self
                 .http_client
                 .get_account_active_orders(&LighterAccountActiveOrdersQuery {
                     authorization: None,
@@ -3384,29 +3393,32 @@ impl ExecutionClient for LighterExecutionClient {
                     market_id: market_index,
                 })
                 .await
-            {
-                Ok(response) => response,
-                Err(e) => {
-                    log::warn!(
+                .map_err(|e| {
+                    anyhow::anyhow!(
                         "Lighter active orders fetch failed for market_index={market_index}: {}",
                         scrub_auth(&format!("{e:#}")),
-                    );
-                    continue;
-                }
-            };
+                    )
+                })?;
 
             for order in &active.orders {
                 self.dispatch.note_active_market(order.market_index);
-                if let Some(report) = parse_http_order_to_report(
+                let report = parse_http_order_to_report(
                     order,
                     &self.registry,
                     self.core.account_id,
                     ts_init,
                     &self.dispatch.cloid_map,
                     HttpOrderReportContext::Active,
-                ) {
-                    active_reports.push(report);
-                }
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot reconcile active Lighter order_index={} market_index={} kind={:?}",
+                        order.order_index,
+                        order.market_index,
+                        order.order_type,
+                    )
+                })?;
+                active_reports.push(report);
             }
         }
 
@@ -3430,7 +3442,7 @@ impl ExecutionClient for LighterExecutionClient {
                 let mut cursor: Option<String> = None;
 
                 loop {
-                    match self
+                    let inactive = self
                         .http_client
                         .get_account_inactive_orders(&LighterAccountInactiveOrdersQuery {
                             authorization: None,
@@ -3443,34 +3455,30 @@ impl ExecutionClient for LighterExecutionClient {
                             limit: LIGHTER_REST_PAGE_SIZE,
                         })
                         .await
-                    {
-                        Ok(inactive) => {
-                            for order in &inactive.orders {
-                                self.dispatch.note_active_market(order.market_index);
-                                if let Some(report) = parse_http_order_to_report(
-                                    order,
-                                    &self.registry,
-                                    self.core.account_id,
-                                    ts_init,
-                                    &self.dispatch.cloid_map,
-                                    HttpOrderReportContext::Inactive,
-                                ) {
-                                    inactive_reports.push(report);
-                                }
-                            }
-
-                            match inactive.next_cursor {
-                                Some(next) if !next.is_empty() => cursor = Some(next),
-                                _ => break,
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
+                        .map_err(|e| {
+                            anyhow::anyhow!(
                                 "Lighter inactive orders fetch failed for market_index={market_id}: {}",
                                 scrub_auth(&format!("{e:#}")),
-                            );
-                            break;
+                            )
+                        })?;
+
+                    for order in &inactive.orders {
+                        self.dispatch.note_active_market(order.market_index);
+                        if let Some(report) = parse_http_order_to_report(
+                            order,
+                            &self.registry,
+                            self.core.account_id,
+                            ts_init,
+                            &self.dispatch.cloid_map,
+                            HttpOrderReportContext::Inactive,
+                        ) {
+                            inactive_reports.push(report);
                         }
+                    }
+
+                    match inactive.next_cursor {
+                        Some(next) if !next.is_empty() => cursor = Some(next),
+                        _ => break,
                     }
                 }
             }
@@ -3510,8 +3518,7 @@ impl ExecutionClient for LighterExecutionClient {
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
         let Some(credential) = &self.credential else {
-            log::warn!("Lighter generate_fill_reports: no credentials");
-            return Ok(Vec::new());
+            anyhow::bail!("Lighter fill reports require credentials");
         };
 
         let market_id = cmd
@@ -3674,18 +3681,30 @@ impl ExecutionClient for LighterExecutionClient {
         // reconciliation should package the account_all_positions state seen
         // at the start of mass-status generation, not whatever remains after
         // order/fill history pagination completes.
-        let position_reports = unwrap_reports_or_warn(
-            "position",
-            self.generate_position_status_reports(&position_cmd).await,
-        );
-
-        // Each sub-call degrades independently; see `unwrap_reports_or_warn`.
-        let order_reports = unwrap_reports_or_warn(
-            "order",
-            self.generate_order_status_reports(&order_cmd).await,
-        );
-        let fill_reports =
-            unwrap_reports_or_warn("fill", self.generate_fill_reports(fill_cmd).await);
+        let position_reports = self
+            .generate_position_status_reports(&position_cmd)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Lighter mass-status position reports failed: {}",
+                    scrub_auth(&format!("{e:#}")),
+                )
+            })?;
+        let order_reports = self
+            .generate_order_status_reports(&order_cmd)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Lighter mass-status order reports failed: {}",
+                    scrub_auth(&format!("{e:#}")),
+                )
+            })?;
+        let fill_reports = self.generate_fill_reports(fill_cmd).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Lighter mass-status fill reports failed: {}",
+                scrub_auth(&format!("{e:#}")),
+            )
+        })?;
 
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
@@ -3798,12 +3817,12 @@ async fn seed_active_markets_from_inactive_orders(
     dispatch: &WsDispatchState,
     credential: &Credential,
     auth: &str,
-) {
+) -> anyhow::Result<()> {
     let mut cursor: Option<String> = None;
     let mut orders_seen = 0_usize;
 
     loop {
-        let response = match http_client
+        let response = http_client
             .get_account_inactive_orders(&LighterAccountInactiveOrdersQuery {
                 authorization: None,
                 auth: Some(auth.to_string()),
@@ -3815,16 +3834,12 @@ async fn seed_active_markets_from_inactive_orders(
                 limit: LIGHTER_REST_PAGE_SIZE,
             })
             .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                log::warn!(
+            .map_err(|e| {
+                anyhow::anyhow!(
                     "Lighter active markets seed failed from inactive orders: {}",
                     scrub_auth(&format!("{e:#}")),
-                );
-                break;
-            }
-        };
+                )
+            })?;
 
         for order in &response.orders {
             dispatch.note_active_market(order.market_index);
@@ -3840,6 +3855,8 @@ async fn seed_active_markets_from_inactive_orders(
     if orders_seen > 0 {
         log::debug!("Seeded Lighter active markets from {orders_seen} inactive order report(s)");
     }
+
+    Ok(())
 }
 
 fn cancel_order_from_cancel_all(
@@ -3904,7 +3921,7 @@ fn dispatch_lighter_order(
     account_id: AccountId,
     trader_id: TraderId,
     ts_init: UnixNanos,
-) {
+) -> bool {
     let instrument_id = match registry.instrument_id(order.market_index) {
         Some(id) => id,
         None => {
@@ -3912,7 +3929,7 @@ fn dispatch_lighter_order(
                 "Lighter order frame dropped: no instrument for market_index={}",
                 order.market_index,
             );
-            return;
+            return false;
         }
     };
 
@@ -3924,7 +3941,7 @@ fn dispatch_lighter_order(
         Some(inst) => inst.value().clone(),
         None => {
             log::debug!("Lighter order frame dropped: instrument {instrument_id} not in cache",);
-            return;
+            return false;
         }
     };
 
@@ -3953,7 +3970,7 @@ fn dispatch_lighter_order(
                 log::error!(
                     "Failed to compute Lighter order shape: error={e}, voi={venue_order_id}, cloid={cloid}",
                 );
-                return;
+                return false;
             }
         };
         let prior_shape = dispatch.snapshot_for(&cloid);
@@ -4008,6 +4025,7 @@ fn dispatch_lighter_order(
                 log::error!(
                     "Failed to parse Lighter order event: error={e}, voi={venue_order_id}, cloid={cloid}",
                 );
+                return false;
             }
         }
     } else {
@@ -4036,9 +4054,12 @@ fn dispatch_lighter_order(
                     "Failed to parse Lighter order status report: error={e}, order_id={}",
                     order.order_id,
                 );
+                return false;
             }
         }
     }
+
+    true
 }
 
 /// Route a venue `account_trades` payload through the tracked-event path
@@ -7817,7 +7838,7 @@ mod tests {
         };
         order.client_order_id = "1".to_string();
 
-        dispatch_lighter_order(
+        let applied = dispatch_lighter_order(
             &order,
             &dispatch,
             &emitter,
@@ -7828,6 +7849,7 @@ mod tests {
         );
 
         let events = drain_events(&mut rx);
+        assert!(!applied, "incomplete order frames must withhold readiness");
         assert!(
             events.is_empty(),
             "no event for uncached instrument, was {events:?}"

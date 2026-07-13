@@ -101,6 +101,10 @@ pub struct ReconciliationResult {
     pub events: Vec<OrderEventAny>,
     /// External orders that need to be registered with execution clients.
     pub external_orders: Vec<ExternalOrderMetadata>,
+    /// Venue orders that could not be reconciled because their instrument was unavailable.
+    pub unresolved_orders: usize,
+    /// Venue positions that could not be reconciled because their instrument was unavailable.
+    pub unresolved_positions: usize,
 }
 
 /// Result of inflight order checks containing terminal events and intermediate queries.
@@ -462,6 +466,11 @@ impl ExecutionManager {
                 continue;
             }
 
+            if self.get_instrument(&report.instrument_id).is_none() {
+                orders_skipped_no_instrument += 1;
+                continue;
+            }
+
             if let Some(client_order_id) = &report.client_order_id {
                 if let Some(cached_order) = self.get_order(*client_order_id)
                     && Self::is_exact_order_match(&cached_order, report)
@@ -768,6 +777,7 @@ impl ExecutionManager {
         }
 
         let mut positions_created = 0usize;
+        let mut positions_skipped_no_instrument = 0usize;
 
         if !self.config.filter_position_reports {
             // Collect instruments with fills that lack venue_position_id (can't attribute to
@@ -810,6 +820,10 @@ impl ExecutionManager {
                 }
 
                 for report in reports {
+                    if self.get_instrument(&report.instrument_id).is_none() {
+                        positions_skipped_no_instrument += 1;
+                        continue;
+                    }
                     if let Some(position_events) = self.reconcile_position_report(
                         &report,
                         mass_status.account_id,
@@ -830,6 +844,12 @@ impl ExecutionManager {
             log::warn!("{orders_skipped_no_instrument} orders skipped (instrument not in cache)");
         }
 
+        if positions_skipped_no_instrument > 0 {
+            log::warn!(
+                "{positions_skipped_no_instrument} positions skipped (instrument not in cache)"
+            );
+        }
+
         if orders_skipped_duplicate > 0 {
             log::debug!("{orders_skipped_duplicate} orders skipped (already in sync)");
         }
@@ -846,6 +866,8 @@ impl ExecutionManager {
         ReconciliationResult {
             events,
             external_orders,
+            unresolved_orders: orders_skipped_no_instrument,
+            unresolved_positions: positions_skipped_no_instrument,
         }
     }
 

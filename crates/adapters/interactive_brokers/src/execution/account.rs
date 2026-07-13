@@ -40,9 +40,6 @@ use nautilus_model::{
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 
-const CASH_BALANCE_TAG: &str = "CashBalance";
-const TOTAL_CASH_BALANCE_TAG: &str = "TotalCashBalance";
-
 pub(crate) fn raw_ib_account_code(account_id: &AccountId) -> String {
     account_id
         .to_string()
@@ -61,19 +58,12 @@ pub async fn subscribe_account_summary(
     account_id: AccountId,
 ) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
     let raw_account_id = raw_ib_account_code(&account_id);
-    // Request key account summary tags (includes TotalCashValue to match Python account summary info dict).
+    // Request only the facts represented by Nautilus balances/margins.
     let tags = &[
         AccountSummaryTags::NET_LIQUIDATION,
-        AccountSummaryTags::TOTAL_CASH_VALUE,
-        AccountSummaryTags::SETTLED_CASH,
-        AccountSummaryTags::BUYING_POWER,
-        AccountSummaryTags::EQUITY_WITH_LOAN_VALUE,
         AccountSummaryTags::AVAILABLE_FUNDS,
-        AccountSummaryTags::EXCESS_LIQUIDITY,
         AccountSummaryTags::INIT_MARGIN_REQ,
         AccountSummaryTags::MAINT_MARGIN_REQ,
-        AccountSummaryTags::CUSHION,
-        AccountSummaryTags::LEDGER_ALL,
     ];
 
     let group = AccountGroup("All".to_string());
@@ -199,19 +189,19 @@ fn merge_account_summary_balance(
     let currency = parse_currency(currency_code)?;
 
     match tag {
-        AccountSummaryTags::SETTLED_CASH => {
-            let settled_cash = parse_balance_decimal(value)?;
-            Ok(Some(AccountBalance::from_total_and_locked(
-                settled_cash,
-                Decimal::ZERO,
-                currency,
-            )?))
-        }
         AccountSummaryTags::NET_LIQUIDATION => {
             let net_liq = parse_balance_decimal(value)?;
             Ok(Some(AccountBalance::from_total_and_free(
                 net_liq,
                 existing.free.as_decimal(),
+                currency,
+            )?))
+        }
+        AccountSummaryTags::AVAILABLE_FUNDS => {
+            let available = parse_balance_decimal(value)?;
+            Ok(Some(AccountBalance::from_total_and_free(
+                existing.total.as_decimal(),
+                available,
                 currency,
             )?))
         }
@@ -516,17 +506,6 @@ fn parse_account_summary_to_balance(
     summary: &AccountSummary,
 ) -> anyhow::Result<Option<AccountBalance>> {
     match summary.tag.as_str() {
-        AccountSummaryTags::SETTLED_CASH
-        | AccountSummaryTags::TOTAL_CASH_VALUE
-        | CASH_BALANCE_TAG
-        | TOTAL_CASH_BALANCE_TAG => {
-            let currency = parse_currency(&summary.currency)?;
-            let balance = parse_balance_decimal(&summary.value)?;
-            // Cash balance - free equals total for settled cash
-            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
-                .map(Some)
-                .map_err(Into::into)
-        }
         AccountSummaryTags::NET_LIQUIDATION => {
             let currency = parse_currency(&summary.currency)?;
             let balance = parse_balance_decimal(&summary.value)?;
@@ -536,7 +515,7 @@ fn parse_account_summary_to_balance(
                 .map(Some)
                 .map_err(Into::into)
         }
-        AccountSummaryTags::BUYING_POWER | AccountSummaryTags::AVAILABLE_FUNDS => {
+        AccountSummaryTags::AVAILABLE_FUNDS => {
             let currency = parse_currency(&summary.currency)?;
             let balance = parse_balance_decimal(&summary.value)?;
             // Available funds - this is the free amount
@@ -567,8 +546,8 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        AccountSummaryTags, CASH_BALANCE_TAG, check_external_position_change,
-        create_position_tracker, merge_account_summary_balance, merge_account_summary_margin,
+        AccountSummaryTags, check_external_position_change, create_position_tracker,
+        merge_account_summary_balance, merge_account_summary_margin,
         parse_account_summary_to_balance, parse_currency,
     };
 
@@ -609,15 +588,12 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_account_summary_uses_usd_ledger_cash_balance() {
+    fn test_parse_account_summary_ignores_cash_balance_as_equity() {
         let balance =
-            parse_account_summary_to_balance(&margin_summary(CASH_BALANCE_TAG, "13163.00", "USD"))
-                .unwrap()
+            parse_account_summary_to_balance(&margin_summary("CashBalance", "13163.00", "USD"))
                 .unwrap();
 
-        assert_eq!(balance.total.as_decimal(), "13163.00".parse().unwrap());
-        assert_eq!(balance.free.as_decimal(), "13163.00".parse().unwrap());
-        assert_eq!(balance.total.currency, Currency::USD());
+        assert!(balance.is_none());
     }
 
     #[rstest]
@@ -664,6 +640,38 @@ mod tests {
         assert_eq!(merged.total.as_decimal(), "100.00".parse().unwrap());
         assert_eq!(merged.locked.as_decimal(), "0.00".parse().unwrap());
         assert_eq!(merged.free.as_decimal(), "100.00".parse().unwrap());
+    }
+
+    #[rstest]
+    fn test_equity_and_available_funds_merge_is_order_independent() {
+        let permutations = [
+            [
+                (AccountSummaryTags::NET_LIQUIDATION, "150000.00"),
+                (AccountSummaryTags::AVAILABLE_FUNDS, "100000.00"),
+            ],
+            [
+                (AccountSummaryTags::AVAILABLE_FUNDS, "100000.00"),
+                (AccountSummaryTags::NET_LIQUIDATION, "150000.00"),
+            ],
+        ];
+
+        for summaries in permutations {
+            let mut balance = None;
+            for (tag, value) in summaries {
+                let summary = margin_summary(tag, value, "USD");
+                let parsed = parse_account_summary_to_balance(&summary).unwrap().unwrap();
+                balance = match balance {
+                    None => Some(parsed),
+                    Some(existing) => merge_account_summary_balance(&existing, tag, value, "USD")
+                        .unwrap()
+                        .or(Some(existing)),
+                };
+            }
+            let balance = balance.unwrap();
+            assert_eq!(balance.total.as_decimal(), Decimal::from(150_000));
+            assert_eq!(balance.free.as_decimal(), Decimal::from(100_000));
+            assert_eq!(balance.total.currency, Currency::USD());
+        }
     }
 
     #[rstest]

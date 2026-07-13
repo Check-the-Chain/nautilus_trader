@@ -456,6 +456,8 @@ async fn test_reconcile_mass_status_with_empty_reports() {
         .await;
 
     assert!(result.events.is_empty());
+    assert_eq!(result.unresolved_orders, 0);
+    assert_eq!(result.unresolved_positions, 0);
 }
 
 #[tokio::test]
@@ -1564,6 +1566,40 @@ async fn test_reconcile_mass_status_skips_order_without_instrument() {
         .await;
 
     assert!(result.events.is_empty());
+    assert_eq!(result.unresolved_orders, 1);
+    assert_eq!(result.unresolved_positions, 0);
+}
+
+#[tokio::test]
+async fn test_reconcile_mass_status_reports_position_without_instrument_as_unresolved() {
+    let mut ctx = TestContext::new();
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    mass_status.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        test_instrument_id(),
+        PositionSideSpecified::Long,
+        Quantity::from("1.0"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+        None,
+        Some(dec!(3000.0)),
+    )]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert!(result.events.is_empty());
+    assert_eq!(result.unresolved_orders, 0);
+    assert_eq!(result.unresolved_positions, 1);
 }
 
 #[tokio::test]
@@ -3205,10 +3241,13 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
     );
     mass_status.add_order_reports(vec![report]);
 
-    let _events = ctx
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert_eq!(result.unresolved_orders, 0);
+    assert_eq!(result.unresolved_positions, 0);
 
     assert_eq!(
         ctx.cache.borrow().client_order_id(&venue_order_id),
@@ -3377,10 +3416,13 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
     );
     mass_status.add_order_reports(vec![loaded_report, unloaded_report]);
 
-    let _events = ctx
+    let result = ctx
         .manager
         .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
         .await;
+
+    assert_eq!(result.unresolved_orders, 1);
+    assert_eq!(result.unresolved_positions, 0);
 
     let cache_borrow = ctx.cache.borrow();
     let loaded_client_id = cache_borrow.client_order_id(&loaded_venue_order_id);

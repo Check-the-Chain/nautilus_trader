@@ -922,24 +922,28 @@ mod tests {
 
     #[rstest]
     fn test_commission_schedule_rejects_invalid_parameters() {
-        assert!(CommissionScheduleFeeModel::new(
-            dec!(-0.1),
-            Money::from("0 USD"),
-            Money::from("0 USD"),
-            Decimal::ONE,
-            Decimal::ZERO,
-            Decimal::ZERO,
-        )
-        .is_err());
-        assert!(CommissionScheduleFeeModel::new(
-            Decimal::ZERO,
-            Money::from("0.005 USD"),
-            Money::from("1 AUD"),
-            Decimal::ONE,
-            Decimal::ZERO,
-            Decimal::ZERO,
-        )
-        .is_err());
+        assert!(
+            CommissionScheduleFeeModel::new(
+                dec!(-0.1),
+                Money::from("0 USD"),
+                Money::from("0 USD"),
+                Decimal::ONE,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            )
+            .is_err()
+        );
+        assert!(
+            CommissionScheduleFeeModel::new(
+                Decimal::ZERO,
+                Money::from("0.005 USD"),
+                Money::from("1 AUD"),
+                Decimal::ONE,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            )
+            .is_err()
+        );
     }
 
     #[rstest]

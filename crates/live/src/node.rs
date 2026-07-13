@@ -722,10 +722,9 @@ impl LiveNode {
         let client_ids = self.kernel.exec_engine.borrow().client_ids();
 
         for client_id in client_ids {
-            if start.elapsed() > timeout {
-                log::warn!("Reconciliation timeout reached, stopping early");
-                break;
-            }
+            let remaining = timeout.checked_sub(start.elapsed()).ok_or_else(|| {
+                anyhow::anyhow!("startup reconciliation timed out before client {client_id}")
+            })?;
 
             log_info!(
                 "Requesting mass status from {}...",
@@ -733,12 +732,17 @@ impl LiveNode {
                 color = LogColor::Blue
             );
 
-            let mass_status_result = self
-                .kernel
-                .exec_engine
-                .borrow_mut()
-                .generate_mass_status(&client_id, lookback_mins)
-                .await;
+            let mass_status_result = dst::time::timeout(remaining, async {
+                self.kernel
+                    .exec_engine
+                    .borrow_mut()
+                    .generate_mass_status(&client_id, lookback_mins)
+                    .await
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("startup reconciliation timed out for client {client_id}")
+            })?;
 
             match mass_status_result {
                 Ok(Some(mass_status)) => {
@@ -754,6 +758,14 @@ impl LiveNode {
                         .exec_manager
                         .reconcile_execution_mass_status(mass_status, exec_engine_rc)
                         .await;
+
+                    if result.unresolved_orders > 0 || result.unresolved_positions > 0 {
+                        anyhow::bail!(
+                            "startup reconciliation for {client_id} left {} order(s) and {} position(s) unresolved",
+                            result.unresolved_orders,
+                            result.unresolved_positions,
+                        );
+                    }
 
                     if result.events.is_empty() {
                         log_info!(
@@ -785,13 +797,12 @@ impl LiveNode {
                     }
                 }
                 Ok(None) => {
-                    log::warn!(
-                        "No mass status available from {client_id} \
-                         (likely adapter error when generating reports)"
-                    );
+                    anyhow::bail!("startup reconciliation returned no mass status for {client_id}");
                 }
                 Err(e) => {
-                    log::warn!("Failed to get mass status from {client_id}: {e}");
+                    return Err(anyhow::anyhow!(
+                        "startup reconciliation failed for client {client_id}: {e}"
+                    ));
                 }
             }
         }

@@ -35,7 +35,7 @@ use nautilus_interactive_brokers::{
         InteractiveBrokersDataClientConfig, InteractiveBrokersInstrumentProviderConfig,
         MarketDataType,
     },
-    factories::{InteractiveBrokersDataClientFactory, InteractiveBrokersDataFactoryConfig},
+    factories::InteractiveBrokersDataClientFactory,
 };
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
@@ -77,16 +77,17 @@ async fn main() -> anyhow::Result<()> {
         matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
     });
 
+    let provider_config = InteractiveBrokersInstrumentProviderConfig {
+        load_ids: HashSet::from([instrument_id]),
+        ..Default::default()
+    };
     let data_config = InteractiveBrokersDataClientConfig {
         host,
         port,
         client_id,
         market_data_type,
         batch_quotes,
-        ..Default::default()
-    };
-    let provider_config = InteractiveBrokersInstrumentProviderConfig {
-        load_ids: HashSet::from([instrument_id]),
+        instrument_provider: provider_config,
         ..Default::default()
     };
 
@@ -96,10 +97,7 @@ async fn main() -> anyhow::Result<()> {
         .add_data_client(
             None,
             Box::new(InteractiveBrokersDataClientFactory::new()),
-            Box::new(InteractiveBrokersDataFactoryConfig {
-                config: data_config,
-                instrument_provider: provider_config,
-            }),
+            Box::new(data_config),
         )?
         .build()?;
 
@@ -113,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         .manage_book(false)
         .log_latency(true)
         .stats_interval_secs(0)
-        .build();
+        .build()?;
     node.add_actor(DataTester::new(tester_config))?;
 
     let handle = node.handle();

@@ -47,6 +47,7 @@ use ibapi::{
         Orders,
     },
     prelude::{StreamExt, SubscriptionItemStreamExt},
+    subscriptions::SubscriptionItem,
 };
 use nautilus_common::{
     cache::Cache,
@@ -110,6 +111,26 @@ use crate::{
     config::InteractiveBrokersExecClientConfig,
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
+
+fn require_informational_reconciliation_notice(notice: &ibapi::Notice) -> anyhow::Result<()> {
+    // These codes only describe healthy or idle IBKR data-farm state. Any
+    // other notice can mean the requested snapshot is incomplete and must
+    // fail startup reconciliation.
+    if matches!(notice.code, 1102 | 2104 | 2106 | 2107 | 2108 | 2158) {
+        tracing::debug!(
+            code = notice.code,
+            message = notice.message,
+            "Ignoring informational IBKR notice during reconciliation",
+        );
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "IBKR reconciliation notice {}: {}",
+            notice.code,
+            notice.message,
+        )
+    }
+}
 
 /// Interactive Brokers execution client.
 ///
@@ -817,7 +838,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let subscription = tokio::time::timeout(timeout_dur, client.all_open_orders())
             .await
             .context("Timeout requesting open orders")??;
-        let mut subscription = subscription.filter_data();
+        let mut subscription = subscription;
         let mut reports = Vec::new();
         let mut open_order_fills: AHashMap<InstrumentId, Decimal> = AHashMap::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
@@ -825,27 +846,21 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
         while let Some(order_result) = subscription.next().await {
             match order_result {
-                Ok(Orders::OrderData(data)) => {
+                Ok(SubscriptionItem::Data(Orders::OrderData(data))) => {
                     if !data.order.account.is_empty() && data.order.account != raw_account_id {
                         continue;
                     }
 
                     // Convert IB contract to instrument ID
-                    let instrument_id =
-                        match self.resolve_report_contract_instrument_id(&data.contract) {
-                            Ok(instrument_id) => instrument_id,
-                            Err(e) => {
-                                tracing::warn!(
-                                    order_id = data.order_id,
-                                    sec_type = ?data.contract.security_type,
-                                    symbol = data.contract.symbol.as_str(),
-                                    con_id = data.contract.contract_id,
-                                    error = %e,
-                                    "Failed to resolve IBKR order status report instrument ID",
-                                );
-                                continue;
-                            }
-                        };
+                    let instrument_id = self
+                        .resolve_report_contract_instrument_id(&data.contract)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to resolve IBKR open order {} (con_id={}): {e}",
+                                data.order_id,
+                                data.contract.contract_id,
+                            )
+                        })?;
 
                     // Filter by instrument_id if specified
                     if let Some(filter_id) = cmd.instrument_id {
@@ -856,7 +871,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
                     // Parse to order status report using minimal OrderStatus
                     // Note: OrderState doesn't have filled/average_fill_price, so we use defaults
-                    match parse_order_status_to_report(
+                    let report = parse_order_status_to_report(
                         &IBOrderStatus {
                             order_id: data.order_id,
                             status: data.order_state.status,
@@ -876,31 +891,34 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         self.core.account_id,
                         &self.instrument_provider,
                         ts_init,
-                    ) {
-                        Ok(report) => {
-                            if !cmd.open_only && report.filled_qty.as_decimal() > Decimal::ZERO {
-                                let signed_filled = if report.order_side == OrderSide::Buy {
-                                    report.filled_qty.as_decimal()
-                                } else {
-                                    -report.filled_qty.as_decimal()
-                                };
-                                open_order_fills
-                                    .entry(report.instrument_id)
-                                    .and_modify(|qty| *qty += signed_filled)
-                                    .or_insert(signed_filled);
-                            }
-                            reports.push(report);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse order status report: {e}");
-                        }
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to parse IBKR open order {} status report: {e}",
+                            data.order_id,
+                        )
+                    })?;
+                    if !cmd.open_only && report.filled_qty.as_decimal() > Decimal::ZERO {
+                        let signed_filled = if report.order_side == OrderSide::Buy {
+                            report.filled_qty.as_decimal()
+                        } else {
+                            -report.filled_qty.as_decimal()
+                        };
+                        open_order_fills
+                            .entry(report.instrument_id)
+                            .and_modify(|qty| *qty += signed_filled)
+                            .or_insert(signed_filled);
                     }
+                    reports.push(report);
                 }
-                Ok(_) => {
+                Ok(SubscriptionItem::Data(_)) => {
                     // Ignore other order types
                 }
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    require_informational_reconciliation_notice(&notice)?;
+                }
                 Err(e) => {
-                    tracing::warn!("Error receiving order data: {e}");
+                    return Err(anyhow::anyhow!("error receiving IBKR open order data: {e}"));
                 }
             }
         }
@@ -909,39 +927,32 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             let positions = tokio::time::timeout(timeout_dur, client.positions())
                 .await
                 .context("Timeout requesting positions for synthetic order reports")??;
-            let mut positions = positions.filter_data();
+            let mut positions = positions;
+            let mut position_end = false;
 
             while let Some(position_result) = positions.next().await {
                 match position_result {
-                    Ok(PositionUpdate::Position(position)) => {
+                    Ok(SubscriptionItem::Data(PositionUpdate::Position(position))) => {
                         if position.account != raw_account_id {
                             continue;
                         }
 
-                        let instrument = match self
+                        let instrument = self
                             .instrument_provider
                             .get_instrument(client.as_arc().as_ref(), &position.contract)
                             .await
-                        {
-                            Ok(Some(instrument)) => instrument,
-                            Ok(None) => {
-                                tracing::warn!(
-                                    con_id = position.contract.contract_id,
-                                    sec_type = ?position.contract.security_type,
-                                    "Cannot generate synthetic order report: instrument not found",
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    con_id = position.contract.contract_id,
-                                    sec_type = ?position.contract.security_type,
-                                    error = %e,
-                                    "Failed to resolve instrument for synthetic order report",
-                                );
-                                continue;
-                            }
-                        };
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "failed to resolve IBKR position instrument con_id={}: {e}",
+                                    position.contract.contract_id,
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "IBKR position instrument not found for con_id={}",
+                                    position.contract.contract_id,
+                                )
+                            })?;
 
                         let instrument_id = instrument.id();
                         if let Some(filter_id) = cmd.instrument_id
@@ -994,12 +1005,24 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         );
                         reports.push(report);
                     }
-                    Ok(PositionUpdate::PositionEnd) => break,
-                    Err(e) => tracing::warn!(
-                        "Error receiving position data for synthetic order report: {e}"
-                    ),
+                    Ok(SubscriptionItem::Data(PositionUpdate::PositionEnd)) => {
+                        position_end = true;
+                        break;
+                    }
+                    Ok(SubscriptionItem::Notice(notice)) => {
+                        require_informational_reconciliation_notice(&notice)?;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "error receiving IBKR position data for synthetic order reports: {e}"
+                        ));
+                    }
                 }
             }
+            anyhow::ensure!(
+                position_end,
+                "IBKR position stream ended before PositionEnd while building synthetic order reports"
+            );
         }
 
         Ok(reports)
@@ -1038,7 +1061,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let subscription = tokio::time::timeout(timeout_dur, client.executions(filter))
             .await
             .context("Timeout requesting executions")??;
-        let mut subscription = subscription.filter_data();
+        let mut subscription = subscription;
         let mut reports = Vec::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let mut pending_exec_data: AHashMap<String, ExecutionData> = AHashMap::new();
@@ -1046,7 +1069,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
         while let Some(exec_result) = subscription.next().await {
             match exec_result {
-                Ok(Executions::ExecutionData(exec_data)) => {
+                Ok(SubscriptionItem::Data(Executions::ExecutionData(exec_data))) => {
                     let execution_id = exec_data.execution.execution_id.clone();
                     if let Some((commission, commission_currency)) =
                         pending_commissions.remove(&execution_id)
@@ -1064,7 +1087,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         pending_exec_data.insert(execution_id, exec_data);
                     }
                 }
-                Ok(Executions::CommissionReport(commission)) => {
+                Ok(SubscriptionItem::Data(Executions::CommissionReport(commission))) => {
                     if let Some(exec_data) = pending_exec_data.remove(&commission.execution_id) {
                         if let Some(report) = self.parse_historical_fill_report(
                             &cmd,
@@ -1082,16 +1105,19 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         );
                     }
                 }
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    require_informational_reconciliation_notice(&notice)?;
+                }
                 Err(e) => {
-                    tracing::warn!("Error receiving execution data: {e}");
+                    return Err(anyhow::anyhow!("error receiving IBKR execution data: {e}"));
                 }
             }
         }
 
         if !pending_exec_data.is_empty() {
-            tracing::warn!(
-                "Skipped {} historical fill reports because IB did not provide matching commission reports",
-                pending_exec_data.len()
+            anyhow::bail!(
+                "IBKR omitted commission reports for {} historical executions",
+                pending_exec_data.len(),
             );
         }
 
@@ -1108,8 +1134,9 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let subscription = tokio::time::timeout(timeout_dur, client.positions())
             .await
             .context("Timeout requesting positions")??;
-        let mut subscription = subscription.filter_data();
+        let mut subscription = subscription;
         let mut reports = Vec::new();
+        let mut position_end = false;
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let raw_account_id = raw_ib_account_code(&self.core.account_id);
 
@@ -1117,36 +1144,28 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         // never return None/missing for "no positions").
         while let Some(position_result) = subscription.next().await {
             match position_result {
-                Ok(PositionUpdate::Position(position)) => {
+                Ok(SubscriptionItem::Data(PositionUpdate::Position(position))) => {
                     // Filter for the specific account
                     if position.account != raw_account_id {
                         continue;
                     }
 
-                    let instrument = match self
+                    let instrument = self
                         .instrument_provider
                         .get_instrument(client.as_arc().as_ref(), &position.contract)
                         .await
-                    {
-                        Ok(Some(instrument)) => instrument,
-                        Ok(None) => {
-                            tracing::warn!(
-                                con_id = position.contract.contract_id,
-                                sec_type = ?position.contract.security_type,
-                                "Cannot generate position status report: instrument not found",
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                con_id = position.contract.contract_id,
-                                sec_type = ?position.contract.security_type,
-                                error = %e,
-                                "Failed to resolve position instrument",
-                            );
-                            continue;
-                        }
-                    };
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to resolve IBKR position instrument con_id={}: {e}",
+                                position.contract.contract_id,
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "IBKR position instrument not found for con_id={}",
+                                position.contract.contract_id,
+                            )
+                        })?;
                     let instrument_id = instrument.id();
 
                     // Filter by instrument_id if specified
@@ -1190,15 +1209,23 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
                     reports.push(report);
                 }
-                Ok(PositionUpdate::PositionEnd) => {
+                Ok(SubscriptionItem::Data(PositionUpdate::PositionEnd)) => {
                     // End of position list
+                    position_end = true;
                     break;
                 }
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    require_informational_reconciliation_notice(&notice)?;
+                }
                 Err(e) => {
-                    tracing::warn!("Error receiving position data: {e}");
+                    return Err(anyhow::anyhow!("error receiving IBKR position data: {e}"));
                 }
             }
         }
+        anyhow::ensure!(
+            position_end,
+            "IBKR position stream ended before PositionEnd"
+        );
 
         if reports.is_empty()
             && let Some(instrument_id) = cmd.instrument_id
