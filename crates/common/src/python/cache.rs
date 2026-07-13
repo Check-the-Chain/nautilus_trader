@@ -854,23 +854,18 @@ impl PyCache {
     }
 
     #[pyo3(name = "order_list")]
-    fn py_order_list(&self, py: Python, order_list_id: OrderListId) -> PyResult<Option<Py<PyAny>>> {
-        let cache = self.0.borrow();
-        match cache.order_list(&order_list_id) {
-            Some(order_list) => Ok(Some(order_list.clone().into_pyobject(py)?.into())),
-            None => Ok(None),
-        }
+    fn py_order_list(&self, order_list_id: OrderListId) -> Option<OrderList> {
+        self.0.borrow().order_list(&order_list_id).cloned()
     }
 
     #[pyo3(name = "order_lists", signature = (venue=None, instrument_id=None, strategy_id=None, account_id=None))]
     fn py_order_lists(
         &self,
-        py: Python,
         venue: Option<Venue>,
         instrument_id: Option<InstrumentId>,
         strategy_id: Option<StrategyId>,
         account_id: Option<AccountId>,
-    ) -> PyResult<Vec<Py<PyAny>>> {
+    ) -> Vec<OrderList> {
         let cache = self.0.borrow();
         cache
             .order_lists(
@@ -880,7 +875,7 @@ impl PyCache {
                 account_id.as_ref(),
             )
             .into_iter()
-            .map(|ol| Ok(ol.clone().into_pyobject(py)?.into()))
+            .cloned()
             .collect()
     }
 
@@ -1179,6 +1174,45 @@ impl PyCache {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use nautilus_core::UnixNanos;
+    use rstest::rstest;
+
+    use super::*;
+
+    fn create_order_list() -> OrderList {
+        OrderList::new(
+            OrderListId::from("OL-001"),
+            InstrumentId::from("AUD/USD.SIM"),
+            StrategyId::from("S-001"),
+            vec![ClientOrderId::from("O-001")],
+            UnixNanos::from(42_u64),
+        )
+    }
+
+    #[rstest]
+    fn test_order_list_queries_preserve_concrete_type() {
+        let order_list = create_order_list();
+        let order_list_id = order_list.id;
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_order_list(order_list.clone())
+            .unwrap();
+        let py_cache = PyCache::from_rc(cache);
+
+        assert_eq!(
+            py_cache.py_order_list(order_list_id),
+            Some(order_list.clone()),
+        );
+        assert_eq!(
+            py_cache.py_order_lists(None, None, None, None),
+            vec![order_list],
+        );
+    }
+}
+
 #[cfg(feature = "defi")]
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -1473,6 +1507,10 @@ impl Cache {
     /// `override_existing`: If the added order should 'override' any existing order and replace
     /// it in the cache. This is currently used for emulated orders which are
     /// being released and transformed into another type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if not `replace_existing` and the `order.client_order_id` is already contained in the cache.
     #[pyo3(name = "add_order")]
     fn py_add_order(
         &mut self,
@@ -1635,6 +1673,10 @@ impl Cache {
     }
 
     /// Adds the `position` to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the position to the backing database fails.
     #[pyo3(name = "add_position")]
     #[expect(clippy::needless_pass_by_value)]
     fn py_add_position(

@@ -287,7 +287,7 @@ async fn raw_client_get_account_orders_sends_auth_queries_and_parses_response() 
         .account_index(712_440)
         .market_id(0)
         .ask_filter(1)
-        .between_timestamps("1700000000000,1700000001000")
+        .between_timestamps("1700000000-1700003600")
         .cursor("cursor-1")
         .limit(50)
         .build()
@@ -908,13 +908,13 @@ async fn domain_client_request_funding_rates_parses_signed_rates() {
 
     assert_eq!(funding_rates.len(), 2);
     assert_eq!(funding_rates[0].instrument_id, instrument.id());
-    assert_eq!(funding_rates[0].rate, Decimal::new(12, 6));
+    assert_eq!(funding_rates[0].rate, Decimal::new(12, 4));
     assert_eq!(funding_rates[0].interval, Some(60));
     assert_eq!(
         funding_rates[0].ts_event,
         UnixNanos::from(1_778_702_400_000_000_000),
     );
-    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 6));
+    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 4));
 }
 
 #[tokio::test]
@@ -957,11 +957,11 @@ async fn domain_client_request_funding_rates_paginates_range() {
         funding_rates[0].ts_event,
         millis_to_unix_nanos(state.start_ms)
     );
-    assert_eq!(funding_rates[0].rate, Decimal::new(12, 6));
+    assert_eq!(funding_rates[0].rate, Decimal::new(12, 4));
     assert_eq!(funding_rates[1].ts_event, millis_to_unix_nanos(boundary_ms));
-    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 6));
+    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 4));
     assert_eq!(funding_rates[2].ts_event, millis_to_unix_nanos(end_ms));
-    assert_eq!(funding_rates[2].rate, Decimal::new(1, 6));
+    assert_eq!(funding_rates[2].rate, Decimal::new(1, 4));
 }
 
 #[tokio::test]
@@ -1004,12 +1004,12 @@ async fn domain_client_request_funding_rates_caps_to_limit_across_pages() {
         funding_rates[0].ts_event,
         millis_to_unix_nanos(state.start_ms)
     );
-    assert_eq!(funding_rates[0].rate, Decimal::new(12, 6));
+    assert_eq!(funding_rates[0].rate, Decimal::new(12, 4));
     assert_eq!(
         funding_rates[1].ts_event,
         millis_to_unix_nanos(state.start_ms + interval_ms)
     );
-    assert_eq!(funding_rates[1].rate, Decimal::new(3, 6));
+    assert_eq!(funding_rates[1].rate, Decimal::new(3, 4));
 }
 
 #[tokio::test]
@@ -1045,12 +1045,12 @@ async fn domain_client_request_funding_rates_without_start_returns_latest_limit(
         funding_rates[0].ts_event,
         millis_to_unix_nanos(state.end_ms - interval_ms)
     );
-    assert_eq!(funding_rates[0].rate, Decimal::new(7, 6));
+    assert_eq!(funding_rates[0].rate, Decimal::new(7, 4));
     assert_eq!(
         funding_rates[1].ts_event,
         millis_to_unix_nanos(state.end_ms)
     );
-    assert_eq!(funding_rates[1].rate, Decimal::new(-8, 6));
+    assert_eq!(funding_rates[1].rate, Decimal::new(-8, 4));
 }
 
 #[tokio::test]
@@ -1640,7 +1640,7 @@ async fn handle_account_inactive_orders(
     assert_eq!(query.ask_filter, Some(1));
     assert_eq!(
         query.between_timestamps.as_deref(),
-        Some("1700000000000,1700000001000"),
+        Some("1700000000-1700003600"),
     );
     assert_eq!(query.cursor.as_deref(), Some("cursor-1"));
     assert_eq!(query.limit, 50);

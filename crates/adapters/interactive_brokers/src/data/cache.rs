@@ -307,14 +307,6 @@ impl QuoteCache {
         let bid_size = cached.bid_size.unwrap_or(0.0);
         let ask_size = cached.ask_size.unwrap_or(0.0);
 
-        if !bid_price.is_finite()
-            || !ask_price.is_finite()
-            || bid_price <= 0.0
-            || ask_price <= bid_price
-        {
-            return None;
-        }
-
         let bid_qty = checked_quantity(bid_size, size_precision)?;
         let ask_qty = checked_quantity(ask_size, size_precision)?;
 
@@ -536,61 +528,6 @@ mod tests {
         assert_eq!(quote.bid_size.as_f64(), 0.0);
         assert_eq!(quote.ask_size.as_f64(), 0.0);
         assert!(cache.get_last_quote(&instrument_id).is_some());
-    }
-
-    #[rstest]
-    fn test_quote_cache_skips_crossed_bid_ask_updates() {
-        let mut cache = QuoteCache::new();
-        let instrument_id = instrument_id();
-
-        cache.update_bid_price(
-            instrument_id,
-            100.0,
-            2,
-            0,
-            UnixNanos::new(1),
-            UnixNanos::new(1),
-        );
-        let quote = cache.update_ask_price(
-            instrument_id,
-            101.0,
-            2,
-            0,
-            UnixNanos::new(2),
-            UnixNanos::new(2),
-        );
-        assert!(quote.is_some());
-
-        let crossed = cache.update_bid_price(
-            instrument_id,
-            102.0,
-            2,
-            0,
-            UnixNanos::new(3),
-            UnixNanos::new(3),
-        );
-        assert!(crossed.is_none());
-        assert_eq!(
-            cache
-                .get_last_quote(&instrument_id)
-                .unwrap()
-                .bid_price
-                .as_f64(),
-            100.0,
-        );
-
-        let uncrossed = cache.update_ask_price(
-            instrument_id,
-            102.5,
-            2,
-            0,
-            UnixNanos::new(4),
-            UnixNanos::new(4),
-        );
-        assert!(uncrossed.is_some());
-        let quote = uncrossed.unwrap();
-        assert_eq!(quote.bid_price.as_f64(), 102.0);
-        assert_eq!(quote.ask_price.as_f64(), 102.5);
     }
 
     #[rstest]

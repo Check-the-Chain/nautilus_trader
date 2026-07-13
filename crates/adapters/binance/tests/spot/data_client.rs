@@ -512,7 +512,7 @@ async fn handle_ws_connection(mut socket: WebSocket, config: DataTestServerConfi
 
                                     if config
                                         .reconnect_signals_remaining
-                                        .fetch_update(
+                                        .try_update(
                                             Ordering::Relaxed,
                                             Ordering::Relaxed,
                                             |remaining| remaining.checked_sub(1),

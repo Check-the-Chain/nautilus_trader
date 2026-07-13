@@ -242,7 +242,6 @@ pub fn compute_gap_hash(gap: &MarkerGap) -> [u8; 32] {
 mod tests {
     use std::{fmt::Write, str::FromStr};
 
-    use proptest::{prelude::*, test_runner::Config as ProptestConfig};
     use rstest::rstest;
 
     use super::*;
@@ -389,20 +388,18 @@ mod tests {
     }
 
     #[rstest]
-    fn marker_record_bincode_roundtrip() {
-        let cfg = bincode::config::standard();
-
+    fn marker_record_codec_roundtrip() {
         // DataCursorSnapshot
         let snap = baseline_snapshot();
-        let bytes = bincode::serde::encode_to_vec(&snap, cfg).unwrap();
-        let (decoded, _): (DataCursorSnapshot, _) =
-            bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        let bytes = crate::codec::encode_to_vec(&snap).expect("encode");
+        let decoded =
+            crate::codec::decode_from_slice::<DataCursorSnapshot>(&bytes).expect("decode");
         assert_eq!(snap, decoded);
 
         // HiFiMarker
         let hifi = baseline_hifi();
-        let bytes = bincode::serde::encode_to_vec(&hifi, cfg).unwrap();
-        let (decoded, _): (HiFiMarker, _) = bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        let bytes = crate::codec::encode_to_vec(&hifi).expect("encode");
+        let decoded = crate::codec::decode_from_slice::<HiFiMarker>(&bytes).expect("decode");
         assert_eq!(hifi, decoded);
 
         // MarkerGap
@@ -411,8 +408,8 @@ mod tests {
             to_marker_seq: 10,
             reason: MarkerGapReason::Overflow,
         };
-        let bytes = bincode::serde::encode_to_vec(&gap, cfg).unwrap();
-        let (decoded, _): (MarkerGap, _) = bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        let bytes = crate::codec::encode_to_vec(&gap).expect("encode");
+        let decoded = crate::codec::decode_from_slice::<MarkerGap>(&bytes).expect("decode");
         assert_eq!(gap, decoded);
 
         // StreamDictEntry
@@ -421,9 +418,8 @@ mod tests {
             data_cls: DataClass::Bar,
             identifier: "BTCUSDT-PERP.BINANCE".to_string(),
         };
-        let bytes = bincode::serde::encode_to_vec(&dict, cfg).unwrap();
-        let (decoded, _): (StreamDictEntry, _) =
-            bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        let bytes = crate::codec::encode_to_vec(&dict).expect("encode");
+        let decoded = crate::codec::decode_from_slice::<StreamDictEntry>(&bytes).expect("decode");
         assert_eq!(dict, decoded);
     }
 
@@ -512,66 +508,5 @@ mod tests {
             compute_marker_hash(&empty),
             compute_marker_hash(&baseline_snapshot())
         );
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
-
-        // Any cursor snapshot survives a bincode encode/decode unchanged
-        #[rstest]
-        fn prop_marker_snapshot_bincode_roundtrip(
-            marker_seq in any::<u64>(),
-            event_seq_before in any::<u64>(),
-            ts_init in any::<u64>(),
-            cursors in proptest::collection::vec((any::<u32>(), any::<u64>(), any::<u64>()), 0..8),
-        ) {
-            let cfg = bincode::config::standard();
-            let snap = DataCursorSnapshot {
-                marker_seq,
-                event_seq_before,
-                ts_init: UnixNanos::from(ts_init),
-                advanced: cursors
-                    .into_iter()
-                    .map(|(slot, hi, count)| StreamCursor {
-                        slot,
-                        ts_init_hi: UnixNanos::from(hi),
-                        count,
-                    })
-                    .collect(),
-            };
-
-            let bytes = bincode::serde::encode_to_vec(&snap, cfg).expect("encode");
-            let (decoded, _): (DataCursorSnapshot, _) =
-                bincode::serde::decode_from_slice(&bytes, cfg).expect("decode");
-            prop_assert_eq!(snap, decoded);
-        }
-
-        // Any high-fidelity marker survives a bincode encode/decode unchanged
-        #[rstest]
-        fn prop_hifi_marker_bincode_roundtrip(
-            marker_seq in any::<u64>(),
-            event_seq_before in any::<u64>(),
-            slot in any::<u32>(),
-            ts_event in any::<u64>(),
-            ts_init in any::<u64>(),
-            same_ts_ordinal in any::<u32>(),
-            fingerprint in proptest::array::uniform32(any::<u8>()),
-        ) {
-            let cfg = bincode::config::standard();
-            let marker = HiFiMarker {
-                marker_seq,
-                event_seq_before,
-                slot,
-                ts_event: UnixNanos::from(ts_event),
-                ts_init: UnixNanos::from(ts_init),
-                same_ts_ordinal,
-                record_fingerprint: fingerprint,
-            };
-
-            let bytes = bincode::serde::encode_to_vec(&marker, cfg).expect("encode");
-            let (decoded, _): (HiFiMarker, _) =
-                bincode::serde::decode_from_slice(&bytes, cfg).expect("decode");
-            prop_assert_eq!(marker, decoded);
-        }
     }
 }

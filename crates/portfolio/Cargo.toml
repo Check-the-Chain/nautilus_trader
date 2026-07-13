@@ -24,6 +24,7 @@ crate-type = ["rlib"]
 default = []
 extension-module = ["python", "pyo3/extension-module"]
 python = [
+  "nautilus-analysis/python",
   "nautilus-common/python",
   "nautilus-model/python",
   "pyo3",
@@ -31,7 +32,7 @@ python = [
 ]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]

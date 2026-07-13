@@ -197,6 +197,10 @@ pub fn normalize_symbol_str(
             append_suffix(symbol, "-PERP")
         }
 
+        TardisExchange::MexcFutures if instrument_type == &TardisInstrumentType::Perpetual => {
+            append_suffix(symbol, "-PERP")
+        }
+
         _ => symbol,
     }
 }
@@ -417,6 +421,7 @@ mod tests {
     #[case(TardisExchange::Bybit, "BTCUSDT", "BTCUSDT.BYBIT")]
     #[case(TardisExchange::OkexFutures, "BTC-USD-200313", "BTC-USD-200313.OKEX")]
     #[case(TardisExchange::HuobiDmLinearSwap, "FOO-BAR", "FOO-BAR.HUOBI")]
+    #[case(TardisExchange::Mexc, "BTCUSDT", "BTCUSDT.MEXC")]
     fn test_parse_instrument_id(
         #[case] exchange: TardisExchange,
         #[case] symbol: Ustr,
@@ -469,6 +474,13 @@ mod tests {
         TardisInstrumentType::Perpetual,
         None,
         "BTC-USD-PERP.DYDX"
+    )]
+    #[case(
+        TardisExchange::MexcFutures,
+        "BTC_USDT",
+        TardisInstrumentType::Perpetual,
+        None,
+        "BTC_USDT-PERP.MEXC"
     )]
     fn test_normalize_instrument_id(
         #[case] exchange: TardisExchange,

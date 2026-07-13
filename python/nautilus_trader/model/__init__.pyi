@@ -3614,6 +3614,7 @@ class OrderFilled:
         reconciliation: bool,
         position_id: PositionId | None = None,
         commission: Money | None = None,
+        info: typing.Mapping[str, str] | None = None,
     ) -> None: ...
     @property
     def is_buy(self) -> bool: ...
@@ -3656,6 +3657,8 @@ class OrderFilled:
     @property
     def commission(self) -> Money | None: ...
     @property
+    def info(self) -> dict[str, str] | None: ...
+    @property
     def order_type(self) -> OrderType: ...
     @staticmethod
     def from_dict(values: dict) -> OrderFilled: ...
@@ -3681,6 +3684,7 @@ class OrderInitialized:
         ts_event: int,
         ts_init: int,
         price: Price | None = None,
+        activation_price: Price | None = None,
         trigger_price: Price | None = None,
         trigger_type: TriggerType | None = None,
         limit_offset: decimal.Decimal | None = None,
@@ -3704,6 +3708,20 @@ class OrderInitialized:
     @staticmethod
     def from_dict(values: dict) -> OrderInitialized: ...
     def to_dict(self) -> typing.Any: ...
+
+@typing.final
+class OrderList:
+    def __hash__(self) -> int: ...
+    def __len__(self) -> int: ...
+    @property
+    def id(self) -> OrderListId: ...
+    @property
+    def instrument_id(self) -> InstrumentId: ...
+    @property
+    def strategy_id(self) -> StrategyId: ...
+    def client_order_ids(self) -> list[ClientOrderId]: ...
+    @property
+    def ts_init(self) -> int: ...
 
 @typing.final
 class OrderListId:
@@ -3767,7 +3785,7 @@ class OrderPendingCancel:
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
-        account_id: AccountId,
+        account_id: AccountId | None,
         event_id: core.UUID4,
         ts_event: int,
         ts_init: int,
@@ -3787,7 +3805,7 @@ class OrderPendingCancel:
     @property
     def venue_order_id(self) -> VenueOrderId | None: ...
     @property
-    def account_id(self) -> AccountId: ...
+    def account_id(self) -> AccountId | None: ...
     @property
     def event_id(self) -> core.UUID4: ...
     @property
@@ -3806,7 +3824,7 @@ class OrderPendingUpdate:
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
-        account_id: AccountId,
+        account_id: AccountId | None,
         event_id: core.UUID4,
         ts_event: int,
         ts_init: int,
@@ -3826,7 +3844,7 @@ class OrderPendingUpdate:
     @property
     def venue_order_id(self) -> VenueOrderId | None: ...
     @property
-    def account_id(self) -> AccountId: ...
+    def account_id(self) -> AccountId | None: ...
     @property
     def event_id(self) -> core.UUID4: ...
     @property
@@ -3941,6 +3959,7 @@ class OrderStatusReport:
         contingency_type: ContingencyType | None = None,
         expire_time: int | None = None,
         price: Price | None = None,
+        activation_price: Price | None = None,
         trigger_price: Price | None = None,
         trigger_type: TriggerType | None = None,
         limit_offset: decimal.Decimal | None = None,
@@ -3995,6 +4014,8 @@ class OrderStatusReport:
     def expire_time(self) -> int | None: ...
     @property
     def price(self) -> Price | None: ...
+    @property
+    def activation_price(self) -> Price | None: ...
     @property
     def trigger_price(self) -> Price | None: ...
     @property
@@ -4669,6 +4690,10 @@ class PoolProfiler:
     def protocol_fees_token1(self) -> str: ...
     @property
     def fee_protocol(self) -> int: ...
+    @property
+    def fee_protocol0_basis_points(self) -> int | None: ...
+    @property
+    def fee_protocol1_basis_points(self) -> int | None: ...
     def get_active_liquidity(self) -> int: ...
     def get_active_tick_count(self) -> int: ...
     def get_total_tick_count(self) -> int: ...
@@ -5897,8 +5922,8 @@ class TrailingStopLimitOrder:
         client_order_id: ClientOrderId,
         order_side: OrderSide,
         quantity: Quantity,
-        price: Price,
-        trigger_price: Price,
+        price: Price | None,
+        trigger_price: Price | None,
         trigger_type: TriggerType,
         limit_offset: decimal.Decimal,
         trailing_offset: decimal.Decimal,
@@ -5909,6 +5934,7 @@ class TrailingStopLimitOrder:
         quote_quantity: bool,
         init_id: core.UUID4,
         ts_init: int,
+        activation_price: Price | None = None,
         expire_time: int | None = None,
         display_qty: Quantity | None = None,
         emulation_trigger: TriggerType | None = None,
@@ -5943,9 +5969,9 @@ class TrailingStopLimitOrder:
     @property
     def quantity(self) -> Quantity: ...
     @property
-    def price(self) -> Price: ...
+    def price(self) -> Price | None: ...
     @property
-    def trigger_price(self) -> Price: ...
+    def trigger_price(self) -> Price | None: ...
     @property
     def trigger_type(self) -> TriggerType: ...
     @property
@@ -6030,7 +6056,7 @@ class TrailingStopMarketOrder:
         client_order_id: ClientOrderId,
         order_side: OrderSide,
         quantity: Quantity,
-        trigger_price: Price,
+        trigger_price: Price | None,
         trigger_type: TriggerType,
         trailing_offset: decimal.Decimal,
         trailing_offset_type: TrailingOffsetType,
@@ -6039,6 +6065,7 @@ class TrailingStopMarketOrder:
         quote_quantity: bool,
         init_id: core.UUID4,
         ts_init: int,
+        activation_price: Price | None = None,
         expire_time: int | None = None,
         display_qty: Quantity | None = None,
         emulation_trigger: TriggerType | None = None,
@@ -6073,7 +6100,7 @@ class TrailingStopMarketOrder:
     @property
     def quantity(self) -> Quantity: ...
     @property
-    def trigger_price(self) -> Price: ...
+    def trigger_price(self) -> Price | None: ...
     @property
     def trigger_type(self) -> TriggerType: ...
     @property

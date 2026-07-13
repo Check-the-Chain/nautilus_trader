@@ -48,6 +48,7 @@ python = [
   "nautilus-system/python",
   "pyo3",
   "pyo3-async-runtimes",
+  "pyo3-stub-gen",
 ]
 gateway = ["bollard"]
 
@@ -58,7 +59,8 @@ ignored = [
 ]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["examples", "execution", "gateway"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -66,7 +68,6 @@ nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
-nautilus-persistence-macros = { workspace = true }
 
 nautilus-execution = { workspace = true, optional = true }
 nautilus-network = { workspace = true, optional = true }
@@ -77,6 +78,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 ibapi = { workspace = true }
@@ -94,6 +96,7 @@ ustr = { workspace = true }
 bollard = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-testkit = { workspace = true }
@@ -107,12 +110,6 @@ tempfile = { workspace = true }
 [[example]]
 name = "ib-data-tester"
 path = "examples/node_data_tester.rs"
-required-features = ["examples"]
-doc = false
-
-[[example]]
-name = "ib-short-availability-smoke"
-path = "examples/short_availability_smoke.rs"
 required-features = ["examples"]
 doc = false
 

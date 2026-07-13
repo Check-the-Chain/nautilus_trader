@@ -42,7 +42,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -72,7 +72,10 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_lighter::{
-    common::{consts::LIGHTER_VENUE, enums::LighterEnvironment},
+    common::{
+        consts::{LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_VENUE},
+        enums::LighterEnvironment,
+    },
     config::LighterExecClientConfig,
     execution::LighterExecutionClient,
 };
@@ -89,10 +92,7 @@ use nautilus_model::{
         TraderId, VenueOrderId,
     },
     instruments::{CryptoPerpetual, CurrencyPair, InstrumentAny},
-    orders::{
-        LimitIfTouchedOrder, LimitOrder, MarketIfTouchedOrder, MarketOrder, Order, OrderAny,
-        OrderList, StopLimitOrder, StopMarketOrder,
-    },
+    orders::{Order, OrderAny, OrderList, OrderTestBuilder},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rstest::rstest;
@@ -106,6 +106,7 @@ const ETH_PERP_SYMBOL: &str = "ETH-PERP";
 const ETH_SPOT_SYMBOL: &str = "ETH/USDC-SPOT";
 const TEST_MARKET_INDEX: i16 = 0;
 const TEST_NEXT_NONCE: i64 = 9_999;
+const INTEGRATOR_APPROVAL_MAX_TTL_MS: i64 = 5 * 365 * 24 * 60 * 60 * 1_000;
 
 fn data_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
@@ -172,8 +173,6 @@ struct TestServerState {
     trades_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     next_rest_send_tx_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     next_send_tx_ack: Arc<tokio::sync::Mutex<Option<Value>>>,
-    block_next_active_orders_response: Arc<AtomicBool>,
-    active_orders_response_gate: Arc<tokio::sync::Notify>,
     block_next_send_tx_batch_response: Arc<AtomicBool>,
     send_tx_batch_response_gate: Arc<tokio::sync::Notify>,
     inbox_tx: tokio::sync::broadcast::Sender<String>,
@@ -206,8 +205,6 @@ impl Default for TestServerState {
             trades_response: Arc::new(tokio::sync::Mutex::new(None)),
             next_rest_send_tx_response: Arc::new(tokio::sync::Mutex::new(None)),
             next_send_tx_ack: Arc::new(tokio::sync::Mutex::new(None)),
-            block_next_active_orders_response: Arc::new(AtomicBool::new(false)),
-            active_orders_response_gate: Arc::new(tokio::sync::Notify::new()),
             block_next_send_tx_batch_response: Arc::new(AtomicBool::new(false)),
             send_tx_batch_response_gate: Arc::new(tokio::sync::Notify::new()),
             inbox_tx,
@@ -246,15 +243,6 @@ impl TestServerState {
 
     fn release_send_tx_batch_response(&self) {
         self.send_tx_batch_response_gate.notify_one();
-    }
-
-    fn block_next_active_orders_response(&self) {
-        self.block_next_active_orders_response
-            .store(true, Ordering::Release);
-    }
-
-    fn release_active_orders_response(&self) {
-        self.active_orders_response_gate.notify_one();
     }
 }
 
@@ -324,12 +312,6 @@ async fn account_active_orders(
     Query(_query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     state.active_orders_calls.fetch_add(1, Ordering::Relaxed);
-    if state
-        .block_next_active_orders_response
-        .swap(false, Ordering::AcqRel)
-    {
-        state.active_orders_response_gate.notified().await;
-    }
     if let Some(body) = state.active_orders_response.lock().await.clone() {
         return (StatusCode::OK, body.to_string()).into_response();
     }
@@ -705,7 +687,6 @@ fn build_config(addr: SocketAddr) -> LighterExecClientConfig {
         environment: LighterEnvironment::Testnet,
         http_timeout_secs: 5,
         ws_timeout_secs: 5,
-        active_markets: Vec::new(),
         market_order_slippage_bps: 50,
         rest_quota_per_min: None,
         sendtx_quota_per_min: None,
@@ -956,33 +937,18 @@ fn make_limit_order(
     post_only: bool,
     reduce_only: bool,
 ) -> OrderAny {
-    OrderAny::Limit(LimitOrder::new(
-        trader_id(),
-        strategy_id(),
-        eth_perp_id(),
-        ClientOrderId::from(id),
-        side,
-        qty,
-        price,
-        tif,
-        None,
-        post_only,
-        reduce_only,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        UUID4::new(),
-        UnixNanos::default(),
-    ))
+    OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(trader_id())
+        .strategy_id(strategy_id())
+        .instrument_id(eth_perp_id())
+        .client_order_id(ClientOrderId::from(id))
+        .side(side)
+        .quantity(qty)
+        .price(price)
+        .time_in_force(tif)
+        .post_only(post_only)
+        .reduce_only(reduce_only)
+        .build()
 }
 
 fn make_limit_order_with_quantity_options(
@@ -990,57 +956,34 @@ fn make_limit_order_with_quantity_options(
     quote_quantity: bool,
     display_qty: Option<Quantity>,
 ) -> OrderAny {
-    OrderAny::Limit(LimitOrder::new(
-        trader_id(),
-        strategy_id(),
-        eth_perp_id(),
-        ClientOrderId::from(id),
-        OrderSide::Buy,
-        Quantity::from("0.0050"),
-        Price::from("2361.31"),
-        TimeInForce::Gtc,
-        None,
-        false,
-        false,
-        quote_quantity,
-        display_qty,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        UUID4::new(),
-        UnixNanos::default(),
-    ))
+    let mut builder = OrderTestBuilder::new(OrderType::Limit);
+    builder
+        .trader_id(trader_id())
+        .strategy_id(strategy_id())
+        .instrument_id(eth_perp_id())
+        .client_order_id(ClientOrderId::from(id))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.0050"))
+        .price(Price::from("2361.31"))
+        .quote_quantity(quote_quantity);
+
+    if let Some(display_qty) = display_qty {
+        builder.display_qty(display_qty);
+    }
+
+    builder.build()
 }
 
 fn make_market_order(id: &str, side: OrderSide, qty: Quantity) -> OrderAny {
-    OrderAny::Market(MarketOrder::new(
-        trader_id(),
-        strategy_id(),
-        eth_perp_id(),
-        ClientOrderId::from(id),
-        side,
-        qty,
-        TimeInForce::Ioc,
-        UUID4::new(),
-        UnixNanos::default(),
-        false,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ))
+    OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id())
+        .strategy_id(strategy_id())
+        .instrument_id(eth_perp_id())
+        .client_order_id(ClientOrderId::from(id))
+        .side(side)
+        .quantity(qty)
+        .time_in_force(TimeInForce::Ioc)
+        .build()
 }
 
 fn make_stop_market_order(id: &str, side: OrderSide, qty: Quantity, trigger: Price) -> OrderAny {
@@ -1064,122 +1007,29 @@ fn make_conditional_order_for(
     trigger: Price,
     tif: TimeInForce,
 ) -> OrderAny {
-    let price = Price::from("2401.00");
+    assert!(
+        matches!(
+            order_type,
+            OrderType::StopMarket
+                | OrderType::StopLimit
+                | OrderType::MarketIfTouched
+                | OrderType::LimitIfTouched
+        ),
+        "expected conditional order type, was {order_type:?}",
+    );
 
-    match order_type {
-        OrderType::StopMarket => OrderAny::StopMarket(StopMarketOrder::new(
-            trader_id(),
-            strategy_id(),
-            instrument_id,
-            ClientOrderId::from(id),
-            side,
-            qty,
-            trigger,
-            TriggerType::Default,
-            tif,
-            None,
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UUID4::new(),
-            UnixNanos::default(),
-        )),
-        OrderType::StopLimit => OrderAny::StopLimit(StopLimitOrder::new(
-            trader_id(),
-            strategy_id(),
-            instrument_id,
-            ClientOrderId::from(id),
-            side,
-            qty,
-            price,
-            trigger,
-            TriggerType::Default,
-            tif,
-            None,
-            false,
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UUID4::new(),
-            UnixNanos::default(),
-        )),
-        OrderType::MarketIfTouched => OrderAny::MarketIfTouched(MarketIfTouchedOrder::new(
-            trader_id(),
-            strategy_id(),
-            instrument_id,
-            ClientOrderId::from(id),
-            side,
-            qty,
-            trigger,
-            TriggerType::Default,
-            tif,
-            None,
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UUID4::new(),
-            UnixNanos::default(),
-        )),
-        OrderType::LimitIfTouched => OrderAny::LimitIfTouched(LimitIfTouchedOrder::new(
-            trader_id(),
-            strategy_id(),
-            instrument_id,
-            ClientOrderId::from(id),
-            side,
-            qty,
-            price,
-            trigger,
-            TriggerType::Default,
-            tif,
-            None,
-            false,
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UUID4::new(),
-            UnixNanos::default(),
-        )),
-        other => panic!("expected conditional order type, was {other:?}"),
-    }
+    OrderTestBuilder::new(order_type)
+        .trader_id(trader_id())
+        .strategy_id(strategy_id())
+        .instrument_id(instrument_id)
+        .client_order_id(ClientOrderId::from(id))
+        .side(side)
+        .quantity(qty)
+        .price(Price::from("2401.00"))
+        .trigger_price(trigger)
+        .trigger_type(TriggerType::Default)
+        .time_in_force(tif)
+        .build()
 }
 
 fn make_stop_market_order_with_tif(
@@ -1238,7 +1088,7 @@ fn cache_pending_cancel_order(
         strategy_id(),
         instrument_id,
         client_order_id,
-        account_id(),
+        Some(account_id()),
         UUID4::new(),
         UnixNanos::default(),
         UnixNanos::default(),
@@ -1470,17 +1320,87 @@ async fn test_connect_disconnect_lifecycle() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn connect_does_not_submit_integrator_auto_approval() {
+async fn connect_submits_l2_only_integrator_auto_approval() {
     let (addr, state) = start_server().await;
     let (mut client, _rx, _cache) = build_client(addr);
 
     client.connect().await.expect("connect");
 
-    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(state.maker_only_authorizations().await.len(), 0);
+    let approvals = state.rest_send_txs().await;
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0]["tx_type"], 45);
+
+    let tx_info = &approvals[0]["tx_info"];
+    assert_eq!(tx_info["AccountIndex"], TEST_ACCOUNT_INDEX);
+    assert_eq!(tx_info["ApiKeyIndex"], TEST_API_KEY_INDEX);
+    assert_eq!(
+        tx_info["IntegratorAccountIndex"],
+        LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+    );
+    assert_eq!(tx_info["MaxPerpsTakerFee"], 0);
+    assert_eq!(tx_info["MaxPerpsMakerFee"], 0);
+    assert_eq!(tx_info["MaxSpotTakerFee"], 0);
+    assert_eq!(tx_info["MaxSpotMakerFee"], 0);
+    assert_eq!(tx_info["L1Sig"], "");
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must be after UNIX epoch")
+        .as_millis() as i64;
+    let approval_expiry = tx_info["ApprovalExpiry"]
+        .as_i64()
+        .expect("ApprovalExpiry must be an i64");
+    assert!(
+        (now_ms + INTEGRATOR_APPROVAL_MAX_TTL_MS - 60_000
+            ..=now_ms + INTEGRATOR_APPROVAL_MAX_TTL_MS)
+            .contains(&approval_expiry),
+        "ApprovalExpiry must use the maximum five-year TTL",
+    );
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_skips_integrator_auto_approval_for_maker_only_api_key() {
+    let (addr, state) = start_server().await;
+    state
+        .maker_only_api_key_indexes
+        .lock()
+        .await
+        .push(i64::from(TEST_API_KEY_INDEX));
+    let (mut client, _rx, _cache) = build_client(addr);
+
+    client.connect().await.expect("connect");
+
+    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.maker_only_authorizations().await.len(), 1);
     assert_eq!(state.rest_send_txs().await.len(), 0);
 
     client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_bails_when_integrator_auto_approval_reports_unapproved() {
+    let (addr, state) = start_server().await;
+    *state.next_rest_send_tx_response.lock().await = Some(json!({
+        "code": 21149,
+        "message": "integrator is not approved",
+    }));
+    let (mut client, _rx, _cache) = build_client(addr);
+
+    let err = client.connect().await.unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("Lighter account is not integrator-approved (venue 21149)"),
+        "unexpected error: {msg}",
+    );
+    assert!(msg.contains("orders cannot be placed"));
+    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.rest_send_txs().await.len(), 1);
+    assert!(!client.is_connected());
+    assert_eq!(*state.connection_count.lock().await, 0);
 }
 
 /// Pins the per-stream marker dispatch in the execution consumption loop.
@@ -3042,9 +2962,9 @@ async fn test_generate_mass_status_fans_out_active_inactive_position_and_trades(
     client.connect().await.expect("connect");
     await_subscribe_count(&state, 4).await;
 
-    // Drive `active_markets` so the fan-out actually hits the active /
-    // inactive endpoints. The consumption loop notes a market whenever an
-    // account_all_* frame mentions it; the position fixture exists in
+    // Drive the account-active market set so the fan-out actually hits the
+    // active / inactive endpoints. The consumption loop notes a market whenever
+    // an account_all_* frame mentions it; the position fixture exists in
     // test_data and carries market_id=0, matching our test instrument.
     state.push_frame(&load_json("ws_account_all_positions_update.json"));
 
@@ -3139,162 +3059,7 @@ async fn test_generate_mass_status_fans_out_active_inactive_position_and_trades(
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_generate_mass_status_snapshots_positions_before_rest_fanout() {
-    let (addr, state) = start_server().await;
-    let (mut client, mut rx, _cache) = build_client(addr);
-    client.connect().await.expect("connect");
-    await_subscribe_count(&state, 4).await;
-
-    state.push_frame(&load_json("ws_account_all_positions_update.json"));
-
-    wait_until_async(
-        || {
-            let client_ptr = std::ptr::addr_of!(client);
-            async move {
-                let client = unsafe { &*client_ptr };
-                !client
-                    .generate_position_status_reports(&GeneratePositionStatusReports::new(
-                        UUID4::new(),
-                        UnixNanos::default(),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    ))
-                    .await
-                    .unwrap_or_default()
-                    .is_empty()
-            }
-        },
-        Duration::from_secs(5),
-    )
-    .await;
-
-    state.block_next_active_orders_response();
-
-    let mass_status = client.generate_mass_status(None);
-    let perturb_position_cache = {
-        let state = state.clone();
-        async move {
-            wait_until_async(
-                || {
-                    let state = state.clone();
-                    async move { state.active_orders_calls.load(Ordering::Relaxed) > 0 }
-                },
-                Duration::from_secs(5),
-            )
-            .await;
-
-            state.push_frame(&json!({
-                "type": "update/account_all_positions",
-                "channel": format!("account_all_positions:{TEST_ACCOUNT_INDEX}"),
-                "positions": {},
-                "shares": [],
-                "last_funding_round": null,
-                "last_funding_discount": null,
-            }));
-
-            next_event_matching(&mut rx, Duration::from_secs(2), |e| {
-                matches!(
-                    e,
-                    ExecutionEvent::Report(ExecutionReport::Position(report))
-                        if report.instrument_id == eth_perp_id()
-                            && report.position_side == PositionSideSpecified::Flat
-                )
-            })
-            .await
-            .expect("flat position report");
-
-            state.release_active_orders_response();
-        }
-    };
-
-    let (mass, ()) = tokio::join!(mass_status, perturb_position_cache);
-    let mass = mass
-        .expect("mass status")
-        .expect("execution client returns mass status");
-
-    let positions = mass.position_reports();
-    assert_eq!(
-        positions.len(),
-        1,
-        "mass status should retain the position snapshot captured before REST fan-out: {positions:?}",
-    );
-    assert!(positions.contains_key(&eth_perp_id()));
-
-    let latest_positions = client
-        .generate_position_status_reports(&GeneratePositionStatusReports::new(
-            UUID4::new(),
-            UnixNanos::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ))
-        .await
-        .expect("latest position reports");
-    assert!(
-        latest_positions.is_empty(),
-        "test should prove the live WS cache was cleared after mass-status captured it",
-    );
-
-    client.disconnect().await.expect("disconnect");
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_generate_mass_status_uses_configured_active_markets_on_cold_start() {
-    let (addr, state) = start_server().await;
-    let mut config = build_config(addr);
-    config.active_markets = vec![TEST_MARKET_INDEX];
-    let (mut client, _rx, _cache) = build_client_with(config);
-    client.connect().await.expect("connect");
-    await_subscribe_count(&state, 4).await;
-
-    *state.active_orders_response.lock().await = Some(http_orders_payload(
-        &[http_order_fixture(
-            "281476929510200",
-            "1001",
-            "open",
-            "0.0000",
-        )],
-        None,
-    ));
-    *state.trades_response.lock().await = Some(json!({"code":200,"trades":[]}));
-
-    let mass = client
-        .generate_mass_status(None)
-        .await
-        .expect("mass status")
-        .expect("Some(mass_status)");
-
-    assert_eq!(
-        state.active_orders_calls.load(Ordering::Relaxed),
-        1,
-        "configured active market should drive one active-orders fetch",
-    );
-    assert_eq!(
-        state.inactive_orders_calls.load(Ordering::Relaxed),
-        1,
-        "configured active market should skip inactive seeding and run one per-market fetch",
-    );
-
-    let order_reports = mass.order_reports();
-    assert!(
-        order_reports
-            .values()
-            .any(|r| r.order_status == OrderStatus::Accepted),
-        "configured active market should surface open orders in mass status: {order_reports:?}",
-    );
-
-    client.disconnect().await.expect("disconnect");
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_generate_mass_status_seeds_active_markets_from_inactive_orders() {
+async fn test_generate_mass_status_seeds_market_fanout_from_inactive_orders() {
     let (addr, state) = start_server().await;
     let (mut client, _rx, _cache) = build_client(addr);
     client.connect().await.expect("connect");

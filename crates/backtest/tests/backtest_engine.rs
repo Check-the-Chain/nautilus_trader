@@ -19,6 +19,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use indexmap::IndexMap;
 use nautilus_backtest::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
@@ -33,7 +34,7 @@ use nautilus_common::{
     msgbus, nautilus_actor,
     timer::TimeEvent,
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_execution::models::latency::StaticLatencyModel;
 use nautilus_indicators::{
     average::ema::ExponentialMovingAverage,
@@ -66,7 +67,8 @@ use nautilus_model::{
 use nautilus_system::trader::Trader;
 use nautilus_trading::{
     ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore, Strategy, StrategyConfig,
-    StrategyCore, nautilus_execution_algorithm, nautilus_strategy,
+    StrategyCore, TwapAlgorithm, TwapAlgorithmConfig, nautilus_execution_algorithm,
+    nautilus_strategy,
 };
 use rstest::*;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -219,8 +221,8 @@ impl DataActor for EmaCross {
     }
 
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
-        self.ema_fast.handle_quote(quote);
-        self.ema_slow.handle_quote(quote);
+        self.ema_fast.handle_quote(quote)?;
+        self.ema_slow.handle_quote(quote)?;
 
         if !self.ema_fast.initialized() || !self.ema_slow.initialized() {
             return Ok(());
@@ -239,6 +241,68 @@ impl DataActor for EmaCross {
         }
 
         self.prev_fast_above = Some(fast_above);
+        Ok(())
+    }
+}
+
+struct TwapOrderStrategy {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    exec_algorithm_id: ExecAlgorithmId,
+    submitted: bool,
+}
+
+impl TwapOrderStrategy {
+    fn new(instrument_id: InstrumentId, exec_algorithm_id: ExecAlgorithmId) -> Self {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("TWAP-ORDER-001")),
+            order_id_tag: Some("001".to_string()),
+            ..Default::default()
+        };
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+            exec_algorithm_id,
+            submitted: false,
+        }
+    }
+}
+
+nautilus_strategy!(TwapOrderStrategy);
+
+impl Debug for TwapOrderStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(TwapOrderStrategy)).finish()
+    }
+}
+
+impl DataActor for TwapOrderStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes(self.instrument_id, None, None);
+        Ok(())
+    }
+
+    fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        if !self.submitted {
+            self.submitted = true;
+            let mut params = IndexMap::new();
+            params.insert(Ustr::from("horizon_secs"), Ustr::from("4.0"));
+            params.insert(Ustr::from("interval_secs"), Ustr::from("1.0"));
+
+            let order = self.order().market(
+                self.instrument_id,
+                OrderSide::Buy,
+                Quantity::from("0.100"),
+                None,
+                None,
+                None,
+                Some(self.exec_algorithm_id),
+                Some(params),
+                None,
+                None,
+            );
+            self.submit_order(order, None, None, None)?;
+        }
         Ok(())
     }
 }
@@ -1517,7 +1581,7 @@ fn expiration_fill_price(
             OrderEventAny::Filled(fill)
                 if fill.client_order_id.as_str().starts_with("EXPIRATION-") =>
             {
-                Some(*fill)
+                Some(fill.clone())
             }
             _ => None,
         })
@@ -1561,12 +1625,12 @@ fn test_get_result_includes_snapshot_position_history(crypto_perpetual_ethusdt: 
         let cache = cache_rc.borrow();
         let positions = cache.positions(None, None, None, None, None);
 
-        let mut expected_pnls: Vec<(PositionId, Currency, f64)> = positions
+        let mut expected_pnls: Vec<(PositionId, UnixNanos, Currency, f64)> = positions
             .iter()
             .filter_map(|p| {
                 p.realized_pnl
                     .as_ref()
-                    .map(|m| (p.id, m.currency, m.as_f64()))
+                    .map(|m| (p.id, p.ts_last, m.currency, m.as_f64()))
             })
             .collect();
 
@@ -1578,7 +1642,7 @@ fn test_get_result_includes_snapshot_position_history(crypto_perpetual_ethusdt: 
         expected_pnls.extend(snapshot_positions.iter().filter_map(|p| {
             p.realized_pnl
                 .as_ref()
-                .map(|m| (p.id, m.currency, m.as_f64()))
+                .map(|m| (p.id, p.ts_last, m.currency, m.as_f64()))
         }));
         let snapshots_realized: f64 = snapshot_positions
             .iter()
@@ -1596,12 +1660,12 @@ fn test_get_result_includes_snapshot_position_history(crypto_perpetual_ethusdt: 
 
         let expected_currency = expected_pnls
             .first()
-            .map(|(_, currency, _)| *currency)
+            .map(|(_, _, currency, _)| *currency)
             .expect("expected realized PnL history");
         let expected_pnls = expected_pnls
             .into_iter()
-            .filter_map(|(position_id, currency, pnl)| {
-                (currency == expected_currency).then_some((position_id, pnl))
+            .filter_map(|(position_id, ts_event, currency, pnl)| {
+                (currency == expected_currency).then_some((position_id, ts_event, pnl))
             })
             .collect::<Vec<_>>();
 
@@ -1621,16 +1685,26 @@ fn test_get_result_includes_snapshot_position_history(crypto_perpetual_ethusdt: 
         .recorded_realized_pnls()
         .get(&expected_currency)
     {
-        expected_pnls.retain(|(position_id, _)| {
+        expected_pnls.retain(|(position_id, ts_event, _)| {
+            let key = (canonical_position_id(*position_id), *ts_event);
             !recorded_pnls
                 .iter()
-                .any(|(recorded_position_id, _, _)| recorded_position_id == position_id)
+                .any(|(recorded_position_id, recorded_ts_event, _)| {
+                    (
+                        canonical_position_id(*recorded_position_id),
+                        *recorded_ts_event,
+                    ) == key
+                })
         });
-        expected_pnls.extend(recorded_pnls.iter().map(|(id, _, pnl)| (*id, *pnl)));
+        expected_pnls.extend(
+            recorded_pnls
+                .iter()
+                .map(|(id, ts_event, pnl)| (*id, *ts_event, *pnl)),
+        );
     }
 
     let expected_expectancy =
-        expected_pnls.iter().map(|(_, pnl)| pnl).sum::<f64>() / expected_pnls.len() as f64;
+        expected_pnls.iter().map(|(_, _, pnl)| pnl).sum::<f64>() / expected_pnls.len() as f64;
 
     let bt_result = engine.get_result();
     assert_eq!(
@@ -1660,6 +1734,26 @@ fn test_get_result_includes_snapshot_position_history(crypto_perpetual_ethusdt: 
         (expectancy - expected_expectancy).abs() < 1e-9,
         "expected Expectancy={expected_expectancy} to include snapshot history {snapshots_realized}, found {expectancy}"
     );
+}
+
+fn canonical_position_id(position_id: PositionId) -> PositionId {
+    const UUID4_STRING_LEN: usize = 36;
+
+    let value = position_id.as_str();
+    let Some(separator_index) = value.len().checked_sub(UUID4_STRING_LEN + 1) else {
+        return position_id;
+    };
+
+    if separator_index == 0 || value.as_bytes()[separator_index] != b'-' {
+        return position_id;
+    }
+
+    let suffix = &value[separator_index + 1..];
+    if suffix.parse::<UUID4>().is_ok() {
+        PositionId::new(&value[..separator_index])
+    } else {
+        position_id
+    }
 }
 
 #[rstest]
@@ -1894,6 +1988,127 @@ fn test_ema_cross_strategy_generates_orders(crypto_perpetual_ethusdt: CryptoPerp
     assert!(
         bt_result.total_positions > 0,
         "Expected positions from filled orders"
+    );
+}
+
+#[rstest]
+fn test_twap_exec_algorithm_routes_and_slices_order(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    let exec_algorithm_id = ExecAlgorithmId::from("TWAP-001");
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_exec_algorithm(TwapAlgorithm::new(TwapAlgorithmConfig {
+            exec_algorithm_id: Some(exec_algorithm_id),
+            ..Default::default()
+        }))
+        .unwrap();
+    engine
+        .add_strategy(TwapOrderStrategy::new(instrument_id, exec_algorithm_id))
+        .unwrap();
+
+    let quotes = vec![
+        quote(instrument_id, "1000.00", "1000.00", 1_000_000_000),
+        quote(instrument_id, "1000.00", "1000.00", 2_000_000_000),
+        quote(instrument_id, "1000.00", "1000.00", 3_000_000_000),
+        quote(instrument_id, "1000.00", "1000.00", 4_000_000_000),
+        quote(instrument_id, "1000.00", "1000.00", 5_000_000_000),
+    ];
+    engine.add_data(quotes, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    let result = engine.get_result();
+    assert_eq!(result.iterations, 5);
+    assert_eq!(result.total_orders, 4);
+    assert_eq!(result.total_positions, 1);
+    assert_eq!(result.elapsed_time_secs, 4.0);
+    assert_eq!(result.backtest_start, Some(UnixNanos::from(1_000_000_000)));
+    assert_eq!(result.backtest_end, Some(UnixNanos::from(5_000_000_000)));
+
+    let cache = engine.kernel().cache.borrow();
+    let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+    let primary_orders: Vec<_> = orders
+        .iter()
+        .filter(|order| order.exec_spawn_id() == Some(order.client_order_id()))
+        .collect();
+    let spawned_orders: Vec<_> = orders
+        .iter()
+        .filter(|order| order.exec_spawn_id() != Some(order.client_order_id()))
+        .collect();
+
+    assert_eq!(primary_orders.len(), 1);
+    assert_eq!(spawned_orders.len(), 3);
+    assert!(
+        orders
+            .iter()
+            .all(|order| order.quantity() == Quantity::from("0.025"))
+    );
+    assert!(
+        orders
+            .iter()
+            .all(|order| order.status() == OrderStatus::Filled)
+    );
+    assert!(
+        orders
+            .iter()
+            .all(|order| order.exec_algorithm_id() == Some(exec_algorithm_id))
+    );
+    assert_eq!(
+        orders
+            .iter()
+            .flat_map(|order| order.events())
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count(),
+        4
+    );
+
+    let primary = primary_orders[0];
+    assert_eq!(primary.exec_spawn_id(), Some(primary.client_order_id()));
+    assert!(
+        spawned_orders
+            .iter()
+            .all(|order| order.exec_spawn_id() == Some(primary.client_order_id()))
+    );
+    assert_eq!(
+        primary.quantity().as_decimal()
+            + spawned_orders
+                .iter()
+                .map(|order| order.quantity().as_decimal())
+                .sum::<Decimal>(),
+        Decimal::new(1, 1)
+    );
+
+    let mut fill_times: Vec<_> = orders.iter().map(|order| order.ts_last()).collect();
+    fill_times.sort_unstable();
+    assert_eq!(
+        fill_times,
+        vec![
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            UnixNanos::from(4_000_000_000),
+        ]
+    );
+    assert!(
+        cache
+            .orders_open(None, Some(&instrument_id), None, None, None)
+            .is_empty()
+    );
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, Quantity::from("0.100"));
+    assert_eq!(positions[0].event_count(), 4);
+    assert_eq!(
+        positions[0]
+            .unrealized_pnl(Price::from("1000.00"))
+            .as_decimal(),
+        Decimal::ZERO
+    );
+    assert!(
+        cache
+            .positions_closed(None, Some(&instrument_id), None, None, None)
+            .is_empty()
     );
 }
 
@@ -2676,7 +2891,36 @@ impl CascadingStopStrategy {
     }
 }
 
-nautilus_strategy!(CascadingStopStrategy);
+nautilus_strategy!(CascadingStopStrategy, {
+    fn on_order_filled(&mut self, _event: &OrderFilled) {
+        // Submit stop-loss in response to fill (cascading command)
+        if !self.stop_submitted.get() {
+            self.stop_submitted.set(true);
+            let instrument_id = self.instrument_id;
+            let trade_size = self.trade_size;
+            let order = self.order().stop_market(
+                instrument_id,
+                OrderSide::Sell,
+                trade_size,
+                Price::from("900.00"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            self.submit_order(order, None, None, None)
+                .expect("failed to submit cascading stop loss");
+        }
+    }
+});
 
 impl Debug for CascadingStopStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2699,35 +2943,6 @@ impl DataActor for CascadingStopStrategy {
                 instrument_id,
                 OrderSide::Buy,
                 trade_size,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            );
-            self.submit_order(order, None, None, None)?;
-        }
-        Ok(())
-    }
-
-    fn on_order_filled(&mut self, _event: &OrderFilled) -> anyhow::Result<()> {
-        // Submit stop-loss in response to fill (cascading command)
-        if !self.stop_submitted.get() {
-            self.stop_submitted.set(true);
-            let instrument_id = self.instrument_id;
-            let trade_size = self.trade_size;
-            let order = self.order().stop_market(
-                instrument_id,
-                OrderSide::Sell,
-                trade_size,
-                Price::from("900.00"),
-                None,
-                None,
-                None,
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -3763,6 +3978,94 @@ fn test_option_expiry_timer_runs_when_end_equals_expiration() {
     );
 }
 
+#[rstest]
+fn test_instruments_with_same_expiration_share_expiry_timer() {
+    let venue = Venue::from("OPRA");
+    let expiration_ns = UnixNanos::from(2_000_000_000u64);
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("1_000_000 USD")])
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+    let option = option_contract(venue, expiration_ns);
+    let mut other_option = option_contract(venue, expiration_ns);
+    if let InstrumentAny::OptionContract(option) = &mut other_option {
+        option.id = InstrumentId::from(format!("AAPL240315C00155000.{venue}").as_str());
+        option.raw_symbol = Symbol::from("AAPL240315C00155000");
+        option.strike_price = Price::from("155.00");
+    }
+
+    engine.add_instrument(&option).unwrap();
+    engine.add_instrument(&other_option).unwrap();
+
+    let expiry_timer_names: Vec<String> = engine
+        .kernel()
+        .clock
+        .borrow()
+        .timer_names()
+        .into_iter()
+        .filter(|name| name.starts_with("INSTRUMENT-EXPIRATION:"))
+        .map(ToString::to_string)
+        .collect();
+
+    assert_eq!(
+        expiry_timer_names,
+        vec![format!("INSTRUMENT-EXPIRATION:{venue}:{expiration_ns}")],
+    );
+}
+
+#[rstest]
+fn test_instrument_update_cancels_previous_expiry_timer() {
+    let venue = Venue::from("OPRA");
+    let original_expiration_ns = UnixNanos::from(2_000_000_000u64);
+    let updated_expiration_ns = UnixNanos::from(3_000_000_000u64);
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("1_000_000 USD")])
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+    let option = option_contract(venue, original_expiration_ns);
+    let updated_option = option_contract(venue, updated_expiration_ns);
+
+    engine.add_instrument(&option).unwrap();
+    engine.add_instrument(&updated_option).unwrap();
+
+    let expiry_timer_names: Vec<String> = engine
+        .kernel()
+        .clock
+        .borrow()
+        .timer_names()
+        .into_iter()
+        .filter(|name| name.starts_with("INSTRUMENT-EXPIRATION:"))
+        .map(ToString::to_string)
+        .collect();
+
+    assert_eq!(
+        expiry_timer_names,
+        vec![format!(
+            "INSTRUMENT-EXPIRATION:{venue}:{updated_expiration_ns}"
+        )],
+    );
+}
+
 fn run_call_option_expiry_timer(
     underlying_price: &str,
     end_ns: UnixNanos,
@@ -3888,7 +4191,7 @@ impl DataActor for CloseOnStop {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        self.close_all_positions(self.instrument_id, None, None, None, None, None, None)
+        self.close_all_positions(self.instrument_id, None, None, None, None, None, None, None)
     }
 
     fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
@@ -4542,7 +4845,7 @@ impl DataActor for MultiInstrumentCloseOnStop {
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
         for instrument_id in self.instrument_ids.clone() {
-            self.close_all_positions(instrument_id, None, None, None, None, None, None)?;
+            self.close_all_positions(instrument_id, None, None, None, None, None, None, None)?;
         }
         Ok(())
     }

@@ -79,7 +79,16 @@ ignored = [
 ] # Optional dep activated only via the streaming feature
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = [
+  "defi",
+  "examples",
+  "ffi",
+  "node",
+  "plugin",
+  "simulation",
+  "streaming",
+]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -118,6 +127,7 @@ criterion = { workspace = true }
 madsim = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 toml = { workspace = true }
 ustr = { workspace = true }
 

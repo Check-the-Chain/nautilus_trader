@@ -258,6 +258,7 @@ impl OrderStatus {
             (Self::PendingCancel, OrderEventAny::Canceled(_)) => Self::Canceled,
             (Self::PendingCancel, OrderEventAny::Expired(_)) => Self::Expired,
             (Self::PendingCancel, OrderEventAny::Accepted(_)) => Self::Accepted,  // Allow failed cancel requests
+            (Self::PendingCancel, OrderEventAny::Updated(_)) => Self::PendingCancel,  // Handled by updated to restore previous_status
             (Self::PendingCancel, OrderEventAny::Filled(_)) => Self::Filled,
             (Self::Triggered, OrderEventAny::Rejected(_)) => Self::Rejected,
             (Self::Triggered, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,
@@ -299,10 +300,10 @@ pub trait Order: 'static + Send {
     fn time_in_force(&self) -> TimeInForce;
     fn expire_time(&self) -> Option<UnixNanos>;
     fn price(&self) -> Option<Price>;
-    fn trigger_price(&self) -> Option<Price>;
     fn activation_price(&self) -> Option<Price> {
         None
     }
+    fn trigger_price(&self) -> Option<Price>;
     fn trigger_type(&self) -> Option<TriggerType>;
     fn liquidity_side(&self) -> Option<LiquiditySide>;
     fn is_post_only(&self) -> bool;
@@ -506,8 +507,8 @@ pub trait Order: 'static + Send {
             self.client_order_id(),
             self.venue_order_id(),
             self.order_side().as_specified(),
-            self.price().expect("`OwnBookOrder` must have a price"), // TBD
-            self.quantity(),
+            self.price().expect("`OwnBookOrder` must have a price"),
+            self.leaves_qty(),
             self.order_type(),
             self.time_in_force(),
             self.status(),
@@ -548,6 +549,10 @@ pub trait Order: 'static + Send {
 
         if let Some(price) = self.price() {
             report = report.with_price(price);
+        }
+
+        if let Some(activation_price) = self.activation_price() {
+            report = report.with_activation_price(activation_price);
         }
 
         if let Some(trigger_price) = self.trigger_price() {
@@ -656,6 +661,7 @@ where
             order_type: order.order_type(),
             quantity: order.quantity(),
             price: order.price(),
+            activation_price: order.activation_price(),
             trigger_price: order.trigger_price(),
             trigger_type: order.trigger_type(),
             time_in_force: order.time_in_force(),
@@ -925,10 +931,17 @@ impl OrderCore {
     }
 
     fn updated(&mut self, event: &OrderUpdated) {
-        if self.status == OrderStatus::PendingUpdate
-            && let Some(previous) = self.previous_status
+        if matches!(
+            self.status,
+            OrderStatus::PendingUpdate | OrderStatus::PendingCancel,
+        ) && let Some(previous) = self.previous_status
         {
             self.status = previous;
+        }
+
+        if event.reconciliation && !self.filled_qty.is_zero() && event.quantity == self.filled_qty {
+            self.status = OrderStatus::Filled;
+            self.ts_closed = Some(event.ts_event);
         }
 
         if let Some(venue_order_id) = &event.venue_order_id
@@ -1127,8 +1140,8 @@ mod tests {
         enums::{LiquiditySide, OrderSide, OrderStatus, PositionSide, TriggerType},
         events::order::spec::{
             OrderAcceptedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderFilledSpec,
-            OrderInitializedSpec, OrderPendingUpdateSpec, OrderRejectedSpec, OrderSubmittedSpec,
-            OrderTriggeredSpec, OrderUpdatedSpec,
+            OrderInitializedSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec,
+            OrderRejectedSpec, OrderSubmittedSpec, OrderTriggeredSpec, OrderUpdatedSpec,
         },
         identifiers::InstrumentId,
         instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::audusd_sim},
@@ -1444,6 +1457,34 @@ mod tests {
         assert_eq!(own_book_order.ts_submitted, UnixNanos::from(1_000_000));
         assert_eq!(own_book_order.ts_accepted, UnixNanos::from(2_000_000));
         assert_eq!(own_book_order.ts_last, UnixNanos::from(2_000_000));
+    }
+
+    #[rstest]
+    fn test_to_own_book_order_partial_fill_uses_leaves_qty() {
+        use crate::orders::limit::LimitOrder;
+
+        let init = OrderInitializedSpec::builder()
+            .price(Price::from("100.00"))
+            .quantity(Quantity::from(100_000))
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let filled = OrderFilledSpec::builder()
+            .order_type(OrderType::Limit)
+            .last_qty(Quantity::from(40_000))
+            .last_px(Price::from("100.00"))
+            .build();
+
+        let mut order: LimitOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(filled)).unwrap();
+
+        let own_book_order = order.to_own_book_order();
+
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.leaves_qty(), Quantity::from(60_000));
+        assert_eq!(own_book_order.size, Quantity::from(60_000));
     }
 
     #[rstest]
@@ -1975,6 +2016,39 @@ mod tests {
     }
 
     #[rstest]
+    fn test_updated_restores_status_before_pending_cancel() {
+        let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let pending_cancel = OrderPendingCancelSpec::builder().build();
+        let updated = OrderUpdatedSpec::builder()
+            .quantity(Quantity::from(150_000))
+            .build();
+
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        let ts_accepted = order.ts_accepted();
+        let venue_order_ids: Vec<VenueOrderId> =
+            order.venue_order_ids().into_iter().copied().collect();
+        order
+            .apply(OrderEventAny::PendingCancel(pending_cancel))
+            .unwrap();
+        order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.quantity(), Quantity::from(150_000));
+        assert_eq!(order.ts_accepted(), ts_accepted);
+        assert_eq!(
+            order
+                .venue_order_ids()
+                .into_iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            venue_order_ids,
+        );
+    }
+
+    #[rstest]
     fn test_apply_triggered_to_stop_market_order_returns_error() {
         let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
         let submitted = OrderSubmittedSpec::builder().build();
@@ -2222,6 +2296,7 @@ mod tests {
             .side(OrderSide::Sell)
             .quantity(Quantity::from(100_000))
             .price(Price::from("0.99500"))
+            .activation_price(Price::from("1.00500"))
             .trigger_price(Price::from("1.00000"))
             .trigger_type(TriggerType::LastPrice)
             .limit_offset(dec!(0.0001))
@@ -2232,6 +2307,7 @@ mod tests {
 
         let report = accepted.to_order_status_report(None).unwrap();
 
+        assert_eq!(report.activation_price, Some(Price::from("1.00500")));
         assert_eq!(report.limit_offset, Some(dec!(0.0001)));
         assert_eq!(report.trailing_offset, Some(dec!(0.0002)));
         assert_eq!(report.trailing_offset_type, TrailingOffsetType::Price);

@@ -37,20 +37,27 @@ use nautilus_model::defi::{
 use nautilus_model::{
     data::{
         Bar, BarType, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDeltas, QuoteTick, TradeTick,
+        MarkPriceUpdate, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         close::InstrumentClose,
         option_chain::{OptionChainSlice, OptionGreeks},
     },
     enums::BookType,
-    identifiers::{ActorId, ClientId, InstrumentId, OptionSeriesId, TraderId, Venue},
+    identifiers::{
+        ActorId, ClientId, ExecAlgorithmId, InstrumentId, OptionSeriesId, TraderId, Venue,
+    },
     instruments::{InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
-    python::{data::option_chain::PyStrikeRange, instruments::instrument_any_to_pyobject},
+    orders::{OrderAny, OrderList},
+    python::{
+        data::option_chain::PyStrikeRange, instruments::instrument_any_to_pyobject,
+        orders::order_any_to_pyobject,
+    },
 };
 use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict, PyList},
 };
+use ustr::Ustr;
 
 use crate::{
     actor::{
@@ -62,6 +69,9 @@ use crate::{
     clock::Clock,
     component::{Component, with_component_registry},
     enums::ComponentState,
+    logging::{CMD, RECV},
+    messages::execution::TradingCommand,
+    msgbus::{self, ShareableMessageHandler},
     python::{
         cache::PyCache,
         clock::PyClock,
@@ -89,6 +99,36 @@ impl DataActorConfig {
             log_events,
             log_commands,
         }
+    }
+
+    #[getter]
+    fn actor_id(&self) -> Option<ActorId> {
+        self.actor_id
+    }
+
+    #[setter]
+    fn set_actor_id(&mut self, actor_id: Option<ActorId>) {
+        self.actor_id = actor_id;
+    }
+
+    #[getter]
+    fn log_events(&self) -> bool {
+        self.log_events
+    }
+
+    #[setter]
+    fn set_log_events(&mut self, log_events: bool) {
+        self.log_events = log_events;
+    }
+
+    #[getter]
+    fn log_commands(&self) -> bool {
+        self.log_commands
+    }
+
+    #[setter]
+    fn set_log_commands(&mut self, log_commands: bool) {
+        self.log_commands = log_commands;
     }
 }
 
@@ -156,6 +196,7 @@ impl ImportableActorConfig {
 pub struct PyDataActorInner {
     core: DataActorCore,
     py_self: Option<Py<PyAny>>,
+    config: Option<Py<PyAny>>,
     clock: PyClock,
     logger: PyLogger,
 }
@@ -165,6 +206,7 @@ impl Debug for PyDataActorInner {
         f.debug_struct(stringify!(PyDataActorInner))
             .field("core", &self.core)
             .field("py_self", &self.py_self.as_ref().map(|_| "<Py<PyAny>>"))
+            .field("config", &self.config.as_ref().map(|_| "<Py<PyAny>>"))
             .field("clock", &self.clock)
             .field("logger", &self.logger)
             .finish()
@@ -197,6 +239,84 @@ impl DataActorNative for PyDataActorInner {
 
 #[expect(clippy::needless_pass_by_ref_mut)]
 impl PyDataActorInner {
+    fn execute_exec_algorithm_command(&mut self, command: &TradingCommand) -> anyhow::Result<()> {
+        if self.core.config.log_commands {
+            let id = self.core.actor_id;
+            log::info!("{id} {RECV}{CMD} {command:?}");
+        }
+
+        if self.core.state() != ComponentState::Running {
+            return Ok(());
+        }
+
+        match command {
+            TradingCommand::SubmitOrder(cmd) => {
+                let order = DataActor::cache(self).try_order(&cmd.client_order_id)?;
+                self.dispatch_on_order(order)
+                    .map_err(|e| anyhow::anyhow!("Python on_order failed: {e}"))
+            }
+            TradingCommand::SubmitOrderList(cmd) => {
+                let orders = self.orders_for_list(&cmd.order_list)?;
+                self.dispatch_on_order_list(cmd.order_list.clone(), orders)
+                    .map_err(|e| anyhow::anyhow!("Python on_order_list failed: {e}"))
+            }
+            _ => {
+                log::warn!("Unhandled command type: {command:?}");
+                Ok(())
+            }
+        }
+    }
+
+    fn orders_for_list(&self, order_list: &OrderList) -> anyhow::Result<Vec<OrderAny>> {
+        let cache = DataActor::cache(self);
+        let mut orders = Vec::with_capacity(order_list.client_order_ids.len());
+
+        for client_order_id in &order_list.client_order_ids {
+            orders.push(cache.try_order(client_order_id)?);
+        }
+
+        Ok(orders)
+    }
+
+    fn dispatch_on_order(&mut self, order: OrderAny) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| -> PyResult<()> {
+                let py_order = order_any_to_pyobject(py, order)?;
+                py_self.call_method1(py, "on_order", (py_order,))?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_order_list(
+        &mut self,
+        order_list: OrderList,
+        orders: Vec<OrderAny>,
+    ) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| -> PyResult<()> {
+                if py_self.bind(py).hasattr("on_order_list")? {
+                    let py_order_list = order_list.into_py_any_unwrap(py);
+                    let py_orders = orders
+                        .into_iter()
+                        .map(|order| order_any_to_pyobject(py, order))
+                        .collect::<PyResult<Vec<_>>>()?;
+                    let py_orders = PyList::new(py, py_orders)?;
+
+                    py_self.call_method1(py, "on_order_list", (py_order_list, py_orders))?;
+                } else {
+                    for order in orders {
+                        let py_order = order_any_to_pyobject(py, order)?;
+                        py_self.call_method1(py, "on_order", (py_order,))?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     fn dispatch_on_start(&self) -> PyResult<()> {
         if let Some(ref py_self) = self.py_self {
             Python::attach(|py| py_self.call_method0(py, "on_start"))?;
@@ -330,6 +450,15 @@ impl PyDataActorInner {
         if let Some(ref py_self) = self.py_self {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_book_deltas", (deltas.into_py_any_unwrap(py),))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_book_depth(&mut self, depth: &OrderBookDepth10) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_book_depth", ((*depth).into_py_any_unwrap(py),))
             })?;
         }
         Ok(())
@@ -669,6 +798,7 @@ impl PyDataActor {
         let inner = PyDataActorInner {
             core,
             py_self: None,
+            config: None,
             clock,
             logger,
         };
@@ -686,6 +816,15 @@ impl PyDataActor {
     /// `DataActor` methods and have them called by the Rust system.
     pub fn set_python_instance(&mut self, py_obj: Py<PyAny>) {
         self.inner_mut().py_self = Some(py_obj);
+    }
+
+    /// Stores the original Python config object passed at construction.
+    ///
+    /// Retained so the constructed instance exposes `.config` (matching v1) and so
+    /// instance-based registration can source the actor ID and logging flags from the
+    /// same single config object.
+    pub fn set_config(&mut self, config: Option<Py<PyAny>>) {
+        self.inner_mut().config = config;
     }
 
     /// Updates the `actor_id` in both the core config and the `actor_id` field.
@@ -770,6 +909,21 @@ impl PyDataActor {
         let actor_trait_ref: Rc<UnsafeCell<dyn Actor>> = inner_ref;
         with_actor_registry(|registry| registry.insert(actor_id, actor_trait_ref));
     }
+}
+
+pub fn register_python_exec_algorithm_endpoint(exec_algorithm_id: ExecAlgorithmId) {
+    let actor_id = Ustr::from(exec_algorithm_id.inner().as_str());
+    let endpoint: Ustr = format!("{exec_algorithm_id}.execute").into();
+    let handler = ShareableMessageHandler::from_typed(move |command: &TradingCommand| {
+        if let Some(mut algo) = try_get_actor_unchecked::<PyDataActorInner>(&actor_id) {
+            if let Err(e) = algo.execute_exec_algorithm_command(command) {
+                log::error!("Error executing command on Python algorithm {actor_id}: {e}");
+            }
+        } else {
+            log::error!("Python execution algorithm {actor_id} not found in registry");
+        }
+    });
+    msgbus::register_any(endpoint.into(), handler);
 }
 
 impl DataActor for PyDataActorInner {
@@ -864,6 +1018,11 @@ impl DataActor for PyDataActorInner {
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         self.dispatch_on_book_deltas(deltas.clone())
             .map_err(|e| anyhow::anyhow!("Python on_book_deltas failed: {e}"))
+    }
+
+    fn on_book_depth(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
+        self.dispatch_on_book_depth(depth)
+            .map_err(|e| anyhow::anyhow!("Python on_book_depth failed: {e}"))
     }
 
     fn on_book(&mut self, order_book: &OrderBook) -> anyhow::Result<()> {
@@ -994,17 +1153,37 @@ impl DataActor for PyDataActorInner {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyDataActor {
+    /// Creates a new [`PyDataActor`] instance.
+    ///
+    /// Accepts `None` or any Python object. If the object is a [`DataActorConfig`]
+    /// (or can be extracted as one via `from_py_object`), its values are used;
+    /// otherwise the actor falls back to [`DataActorConfig::default()`].
+    ///
+    /// This permissive signature is required so that Python subclasses can pass a
+    /// **custom** config dataclass to their `__init__`. The original object is retained
+    /// here in `__new__`, which always receives the constructor arguments, so `.config`
+    /// and registration see the config even when a subclass omits forwarding it to
+    /// `super().__init__()`.
     #[new]
     #[pyo3(signature = (config=None))]
-    fn py_new(config: Option<DataActorConfig>) -> Self {
-        Self::new(config)
+    fn py_new(config: Option<Py<PyAny>>) -> Self {
+        let actor_config = config
+            .as_ref()
+            .and_then(|obj| Python::attach(|py| obj.extract::<DataActorConfig>(py).ok()));
+        let mut actor = Self::new(actor_config);
+        actor.set_config(config);
+        actor
     }
 
     #[pyo3(signature = (config=None))]
-    #[allow(unused_variables, clippy::needless_pass_by_value)]
-    fn __init__(slf: &Bound<'_, Self>, config: Option<DataActorConfig>) {
+    fn __init__(slf: &Bound<'_, Self>, config: Option<Py<PyAny>>) {
         let py_self: Py<PyAny> = slf.clone().unbind().into_any();
-        slf.borrow_mut().set_python_instance(py_self);
+        let mut borrowed = slf.borrow_mut();
+        borrowed.set_python_instance(py_self);
+        // `__new__` retained the config; only a forwarded config overrides it
+        if config.is_some() {
+            borrowed.set_config(config);
+        }
     }
 
     #[getter]
@@ -1043,6 +1222,15 @@ impl PyDataActor {
     #[pyo3(name = "actor_id")]
     fn py_actor_id(&self) -> ActorId {
         self.inner().core.actor_id
+    }
+
+    #[getter]
+    #[pyo3(name = "config")]
+    fn py_config(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.inner()
+            .config
+            .as_ref()
+            .map(|config| config.clone_ref(py))
     }
 
     #[getter]
@@ -1135,8 +1323,15 @@ impl PyDataActor {
 
     #[pyo3(name = "shutdown_system")]
     #[pyo3(signature = (reason=None))]
-    fn py_shutdown_system(&self, reason: Option<String>) {
+    fn py_shutdown_system(&self, reason: Option<String>) -> PyResult<()> {
+        if !self.inner().core.is_registered() {
+            return Err(to_pyruntime_err(
+                "Actor must be registered with a trader before shutting down the system",
+            ));
+        }
+
         self.inner().shutdown_system(reason);
+        Ok(())
     }
 
     #[pyo3(name = "publish_data")]
@@ -1294,6 +1489,10 @@ impl PyDataActor {
     fn py_on_book_deltas(&mut self, deltas: OrderBookDeltas) {}
 
     #[allow(unused_variables)]
+    #[pyo3(name = "on_book_depth")]
+    fn py_on_book_depth(&mut self, depth: &OrderBookDepth10) {}
+
+    #[allow(unused_variables)]
     #[pyo3(name = "on_book")]
     fn py_on_book(&mut self, book: &OrderBook) {}
 
@@ -1393,6 +1592,29 @@ impl PyDataActor {
             instrument_id,
             book_type,
             depth,
+            client_id,
+            managed,
+            params,
+        );
+        Ok(())
+    }
+
+    #[pyo3(name = "subscribe_book_depth10")]
+    #[pyo3(signature = (instrument_id, book_type, client_id=None, managed=false, params=None))]
+    fn py_subscribe_book_depth10(
+        &mut self,
+        py: Python<'_>,
+        instrument_id: InstrumentId,
+        book_type: BookType,
+        client_id: Option<ClientId>,
+        managed: bool,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<()> {
+        let params = dict_to_params(py, params)?;
+        DataActor::subscribe_book_depth10(
+            self.inner_mut(),
+            instrument_id,
+            book_type,
             client_id,
             managed,
             params,
@@ -1579,18 +1801,6 @@ impl PyDataActor {
         Ok(())
     }
 
-    #[pyo3(name = "subscribe_order_fills")]
-    #[pyo3(signature = (instrument_id))]
-    fn py_subscribe_order_fills(&mut self, instrument_id: InstrumentId) {
-        DataActor::subscribe_order_fills(self.inner_mut(), instrument_id);
-    }
-
-    #[pyo3(name = "subscribe_order_cancels")]
-    #[pyo3(signature = (instrument_id))]
-    fn py_subscribe_order_cancels(&mut self, instrument_id: InstrumentId) {
-        DataActor::subscribe_order_cancels(self.inner_mut(), instrument_id);
-    }
-
     #[pyo3(name = "unsubscribe_data")]
     #[pyo3(signature = (data_type, client_id=None, params=None))]
     fn py_unsubscribe_data(
@@ -1650,6 +1860,20 @@ impl PyDataActor {
     ) -> PyResult<()> {
         let params = dict_to_params(py, params)?;
         DataActor::unsubscribe_book_deltas(self.inner_mut(), instrument_id, client_id, params);
+        Ok(())
+    }
+
+    #[pyo3(name = "unsubscribe_book_depth10")]
+    #[pyo3(signature = (instrument_id, client_id=None, params=None))]
+    fn py_unsubscribe_book_depth10(
+        &mut self,
+        py: Python<'_>,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<()> {
+        let params = dict_to_params(py, params)?;
+        DataActor::unsubscribe_book_depth10(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
     }
 
@@ -1816,18 +2040,6 @@ impl PyDataActor {
         client_id: Option<ClientId>,
     ) {
         DataActor::unsubscribe_option_chain(self.inner_mut(), series_id, client_id);
-    }
-
-    #[pyo3(name = "unsubscribe_order_fills")]
-    #[pyo3(signature = (instrument_id))]
-    fn py_unsubscribe_order_fills(&mut self, instrument_id: InstrumentId) {
-        DataActor::unsubscribe_order_fills(self.inner_mut(), instrument_id);
-    }
-
-    #[pyo3(name = "unsubscribe_order_cancels")]
-    #[pyo3(signature = (instrument_id))]
-    fn py_unsubscribe_order_cancels(&mut self, instrument_id: InstrumentId) {
-        DataActor::unsubscribe_order_cancels(self.inner_mut(), instrument_id);
     }
 
     #[pyo3(name = "request_data")]
@@ -2371,12 +2583,12 @@ mod tests {
     use nautilus_model::{
         data::{
             Bar, BarType, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate,
-            InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, QuoteTick,
-            TradeTick,
+            InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth10,
+            QuoteTick, TradeTick,
             close::InstrumentClose,
             greeks::OptionGreekValues,
             option_chain::{OptionChainSlice, OptionGreeks},
-            stubs::stub_custom_data,
+            stubs::{stub_custom_data, stub_depth10},
         },
         enums::{
             AggressorSide, BookType, GreeksConvention, InstrumentCloseType, MarketStatusAction,
@@ -2464,6 +2676,30 @@ mod tests {
     fn test_new_actor_creation() {
         let actor = PyDataActor::new(None);
         assert!(actor.trader_id().is_none());
+    }
+
+    #[rstest]
+    fn test_actor_retains_python_config_object() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'actor_id': 'A-RETAIN-001'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            let actor = py
+                .get_type::<PyDataActor>()
+                .as_any()
+                .call1((config.clone(),))
+                .unwrap();
+
+            let retained = actor.getattr("config").unwrap();
+
+            assert!(retained.is(&config));
+        });
     }
 
     #[rstest]
@@ -2577,8 +2813,12 @@ mod tests {
     ) {
         let actor = create_registered_actor(clock, cache, trader_id);
 
-        actor.py_shutdown_system(Some("Test shutdown".to_string()));
-        actor.py_shutdown_system(None);
+        assert!(
+            actor
+                .py_shutdown_system(Some("Test shutdown".to_string()))
+                .is_ok()
+        );
+        assert!(actor.py_shutdown_system(None).is_ok());
     }
 
     #[rstest]
@@ -3060,6 +3300,30 @@ class CapturingActor:
     }
 
     #[rstest]
+    fn test_book_depth10_subscription_methods_manage_handler(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+        audusd_sim: CurrencyPair,
+    ) {
+        pyo3::Python::initialize();
+
+        let mut actor = create_registered_actor(clock, cache, trader_id);
+
+        Python::attach(|py| {
+            actor
+                .py_subscribe_book_depth10(py, audusd_sim.id, BookType::L2_MBP, None, false, None)
+                .unwrap();
+            assert_eq!(actor.inner().depth10_handler_count(), 1);
+
+            actor
+                .py_unsubscribe_book_depth10(py, audusd_sim.id, None, None)
+                .unwrap();
+            assert_eq!(actor.inner().depth10_handler_count(), 0);
+        });
+    }
+
+    #[rstest]
     fn test_request_methods_signatures_exist() {
         let actor = create_unregistered_actor();
         assert!(actor.trader_id().is_none());
@@ -3153,6 +3417,10 @@ class CapturingActor:
         let delta =
             OrderBookDelta::clear(instrument.id, 0, UnixNanos::default(), UnixNanos::default());
         OrderBookDeltas::new(instrument.id, vec![delta])
+    }
+
+    fn sample_book_depth() -> OrderBookDepth10 {
+        stub_depth10()
     }
 
     fn sample_mark_price() -> MarkPriceUpdate {
@@ -3449,6 +3717,7 @@ class TrackingActor:
         "on_bar",
         "on_book",
         "on_book_deltas",
+        "on_book_depth",
         "on_mark_price",
         "on_index_price",
         "on_funding_rate",
@@ -4100,6 +4369,7 @@ class IndicatorEventActor:
     #[case("on_bar")]
     #[case("on_book")]
     #[case("on_book_deltas")]
+    #[case("on_book_depth")]
     #[case("on_mark_price")]
     #[case("on_index_price")]
     #[case("on_funding_rate")]
@@ -4153,6 +4423,10 @@ class IndicatorEventActor:
                     "on_book_deltas" => {
                         let deltas = sample_book_deltas();
                         rust_actor.inner_mut().on_book_deltas(&deltas)
+                    }
+                    "on_book_depth" => {
+                        let depth = sample_book_depth();
+                        rust_actor.inner_mut().on_book_depth(&depth)
                     }
                     "on_mark_price" => {
                         let update = sample_mark_price();

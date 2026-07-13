@@ -370,6 +370,73 @@ from fills and adjusts to reconstruct positions accurately.
 - **Synthetic fill**: a calculated fill report representing missing activity, priced to achieve the correct average position.
 - **Tolerance**: position matching uses configurable price tolerance (default 0.0001 = 0.01%) to absorb minor calculation differences.
 
+## Rust live runner metrics
+
+Rust `LiveNode` exposes primitive runner metrics through `LiveNodeHandle::metrics_snapshot()`.
+Get the handle from the node before calling `run()`, then poll snapshots from another task and
+derive rates or utilization from deltas.
+
+```rust
+use std::time::Duration;
+
+use nautilus_common::enums::Environment;
+use nautilus_live::node::{LiveNode, RunnerMetricsDelta};
+
+let mut node = LiveNode::builder(trader_id, Environment::Live)?
+    // Add clients, actors, and strategies here.
+    .build()?;
+
+let metrics_handle = node.handle();
+
+tokio::spawn(async move {
+    let mut prev = metrics_handle.metrics_snapshot();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        interval.tick().await;
+
+        let next = metrics_handle.metrics_snapshot();
+        let delta = RunnerMetricsDelta::from_snapshots(prev, next);
+        if delta.elapsed_ns == 0 {
+            prev = next;
+            continue;
+        }
+
+        let elapsed_s = delta.elapsed_ns as f64 / 1_000_000_000.0;
+        let data_event_rate = delta.data_events as f64 / elapsed_s;
+        let data_event_staleness_ns = if next.data_events.last_dispatch_at_ns == 0 {
+            0
+        } else {
+            next.elapsed_ns
+                .saturating_sub(next.data_events.last_dispatch_at_ns)
+        };
+
+        log::info!(
+            "Runner metrics: data_event_rate={data_event_rate:.0} \
+             data_event_staleness_ns={data_event_staleness_ns} \
+             dispatch_utilization={:.6} loop_utilization={:.6} \
+             mean_dispatch_ns={} data_queue_depth={}",
+            delta.dispatch_utilization(),
+            delta.loop_utilization(),
+            delta.mean_dispatch_ns(),
+            next.data_events.queue_depth,
+        );
+
+        prev = next;
+    }
+});
+
+node.run().await?;
+```
+
+The snapshot covers `LiveNode::run` channel dispatch after startup, including residual dispatch
+during the shutdown grace period. `dispatch_busy_ns` covers the five dispatch branches;
+`maintenance_busy_ns` and `external_msgbus_busy_ns` cover non-dispatch loop work. The snapshot does
+not include startup buffering, startup flushes, or the final post-loop drain. Queue depths are point
+samples from the maintenance tick while the node is running, and can be stale during shutdown grace.
+Snapshots are lock-free and may not be a consistent cross-field view; derive rates from successive
+snapshots with saturating deltas. Counters reset when `LiveNode::run` enters steady state.
+
 ## Shutdown on error
 
 Set `LiveNodeConfig.shutdown_on_error=True` so that a Rust error log requests a live node
@@ -399,4 +466,4 @@ node/kernel level instead. Shutdown-on-error observes Rust `log` records, not Py
 - [Configure a live trading node](../how_to/configure_live_trading.md) - Node and engine configuration.
 - [Adapters](adapters.md) - Venue connectivity.
 - [Execution](execution.md) - Order execution in live environments.
-- [Backtesting](backtesting.md) - Testing strategies before deployment.
+- [Backtesting](backtesting/) - Testing strategies before deployment.

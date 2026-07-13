@@ -131,6 +131,7 @@ fn make_fill(
         false,
         Some(position_id),
         None,
+        None,
     )
 }
 
@@ -180,8 +181,8 @@ fn build_portfolio(account_type: AccountType, n: usize) -> Portfolio {
     }
 
     let mut portfolio = Portfolio::new(
-        Rc::new(RefCell::new(cache)),
         Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(cache)),
         None,
     );
 

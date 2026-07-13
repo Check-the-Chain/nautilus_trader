@@ -63,6 +63,8 @@ from nautilus_trader.model import OrderEmulated
 from nautilus_trader.model import OrderExpired
 from nautilus_trader.model import OrderFilled
 from nautilus_trader.model import OrderInitialized
+from nautilus_trader.model import OrderList
+from nautilus_trader.model import OrderListId
 from nautilus_trader.model import OrderModifyRejected
 from nautilus_trader.model import OrderPendingCancel
 from nautilus_trader.model import OrderPendingUpdate
@@ -99,6 +101,7 @@ from nautilus_trader.trading import fx_prev_end
 from nautilus_trader.trading import fx_prev_start
 from tests.providers import TestInstrumentProvider
 from tests.unit.common.actor import OrderFactoryProbeStrategy
+from tests.unit.common.actor import OrderListCacheProbeStrategy
 from tests.unit.common.actor import PortfolioHedgedProbeStrategy
 from tests.unit.common.actor import PortfolioProbeStrategy
 from tests.unit.common.actor import TestStrategy
@@ -289,6 +292,60 @@ def test_strategy_order_factory_returns_registered_factory():
         engine.dispose()
 
 
+def test_strategy_can_recover_order_list_id_from_cache():
+    usd = Currency.from_str("USD")
+    venue = Venue("SIM")
+    instrument = TestInstrumentProvider.audusd_sim()
+    OrderListCacheProbeStrategy.reset()
+
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    engine.add_venue(
+        venue=venue,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money(1_000_000.0, usd)],
+        base_currency=usd,
+    )
+    engine.add_instrument(instrument)
+
+    try:
+        engine.add_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:OrderListCacheProbeStrategy",
+                config_path="nautilus_trader.trading:StrategyConfig",
+                config={},
+            ),
+        )
+        engine.run()
+
+        order_list = OrderListCacheProbeStrategy.observed_order_list
+        order_lists = OrderListCacheProbeStrategy.observed_order_lists
+        order_list_id = OrderListCacheProbeStrategy.observed_order_list_id
+        client_order_ids = OrderListCacheProbeStrategy.observed_client_order_ids
+
+        assert order_list is not None
+        assert order_lists == [order_list]
+        assert type(order_list) is OrderList
+        assert OrderList.__module__ == "nautilus_trader.model"
+        assert isinstance(order_list_id, OrderListId)
+        assert order_list.id == order_list_id
+        assert order_list.instrument_id == instrument.id
+        assert order_list.strategy_id == OrderListCacheProbeStrategy.observed_strategy_id
+        assert order_list.client_order_ids() == client_order_ids
+        assert len(order_list) == 3
+        assert hash(order_list) == hash(order_list.id)
+        assert repr(order_list) == str(order_list)
+
+        returned_ids = order_list.client_order_ids()
+        returned_ids.clear()
+        assert len(order_list) == 3
+
+        with pytest.raises(AttributeError):
+            order_list.id = OrderListId("OL-IMMUTABLE")
+    finally:
+        engine.dispose()
+
+
 def test_strategy_portfolio_returns_registered_kernel_portfolio():
     usd = Currency.from_str("USD")
     venue = Venue("SIM")
@@ -472,7 +529,6 @@ BOOK_INTERVAL_SUBSCRIPTION_PARAMETERS = (
 )
 BOOK_INTERVAL_UNSUBSCRIBE_PARAMETERS = ("instrument_id", "interval_ms", "client_id", "params")
 BAR_SUBSCRIPTION_PARAMETERS = ("bar_type", "client_id", "params")
-ORDER_SUBSCRIPTION_PARAMETERS = ("instrument_id",)
 OPTION_CHAIN_SUBSCRIPTION_PARAMETERS = (
     "series_id",
     "strike_range",
@@ -523,6 +579,7 @@ CLOSE_POSITION_PARAMETERS = (
     "time_in_force",
     "reduce_only",
     "quote_quantity",
+    "params",
 )
 CLOSE_ALL_POSITIONS_PARAMETERS = (
     "instrument_id",
@@ -532,11 +589,23 @@ CLOSE_ALL_POSITIONS_PARAMETERS = (
     "time_in_force",
     "reduce_only",
     "quote_quantity",
+    "params",
 )
 QUERY_ACCOUNT_PARAMETERS = ("account_id", "client_id", "params")
 QUERY_ORDER_PARAMETERS = ("order", "client_id", "params")
+SHUTDOWN_SYSTEM_PARAMETERS = ("reason",)
+PUBLISH_DATA_PARAMETERS = ("data_type", "data")
+PUBLISH_SIGNAL_PARAMETERS = ("name", "value", "ts_event")
+SIGNAL_SUBSCRIPTION_PARAMETERS = ("name", "priority")
+SIGNAL_UNSUBSCRIBE_PARAMETERS = ("name",)
+SYNTHETIC_PARAMETERS = ("synthetic",)
 DATA_SURFACE_SIGNATURES = [
+    ("publish_data", PUBLISH_DATA_PARAMETERS),
+    ("publish_signal", PUBLISH_SIGNAL_PARAMETERS),
+    ("add_synthetic", SYNTHETIC_PARAMETERS),
+    ("update_synthetic", SYNTHETIC_PARAMETERS),
     ("subscribe_data", DATA_SUBSCRIPTION_PARAMETERS),
+    ("subscribe_signal", SIGNAL_SUBSCRIPTION_PARAMETERS),
     ("subscribe_instruments", VENUE_SUBSCRIPTION_PARAMETERS),
     ("subscribe_instrument", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("subscribe_book_deltas", BOOK_DELTAS_SUBSCRIPTION_PARAMETERS),
@@ -551,9 +620,8 @@ DATA_SURFACE_SIGNATURES = [
     ("subscribe_instrument_status", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("subscribe_instrument_close", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("subscribe_option_chain", OPTION_CHAIN_SUBSCRIPTION_PARAMETERS),
-    ("subscribe_order_fills", ORDER_SUBSCRIPTION_PARAMETERS),
-    ("subscribe_order_cancels", ORDER_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_data", DATA_SUBSCRIPTION_PARAMETERS),
+    ("unsubscribe_signal", SIGNAL_UNSUBSCRIBE_PARAMETERS),
     ("unsubscribe_instruments", VENUE_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_instrument", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_book_deltas", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
@@ -568,8 +636,6 @@ DATA_SURFACE_SIGNATURES = [
     ("unsubscribe_instrument_status", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_instrument_close", INSTRUMENT_SUBSCRIPTION_PARAMETERS),
     ("unsubscribe_option_chain", OPTION_CHAIN_UNSUBSCRIBE_PARAMETERS),
-    ("unsubscribe_order_fills", ORDER_SUBSCRIPTION_PARAMETERS),
-    ("unsubscribe_order_cancels", ORDER_SUBSCRIPTION_PARAMETERS),
     ("request_data", DATA_REQUEST_PARAMETERS),
     ("request_instrument", INSTRUMENT_REQUEST_PARAMETERS),
     ("request_instruments", VENUE_REQUEST_PARAMETERS),
@@ -580,6 +646,12 @@ DATA_SURFACE_SIGNATURES = [
     ("request_trades", INSTRUMENT_HISTORY_REQUEST_PARAMETERS),
     ("request_funding_rates", INSTRUMENT_HISTORY_REQUEST_PARAMETERS),
     ("request_bars", BAR_REQUEST_PARAMETERS),
+]
+REMOVED_ORDER_EVENT_SUBSCRIPTION_METHODS = [
+    "subscribe_order_fills",
+    "subscribe_order_cancels",
+    "unsubscribe_order_fills",
+    "unsubscribe_order_cancels",
 ]
 EXECUTION_SIGNATURES = [
     ("submit_order", SUBMIT_ORDER_PARAMETERS),
@@ -703,6 +775,28 @@ def test_strategy_data_surface_methods_expose_expected_signatures(method_name, p
     assert tuple(signature.parameters) == parameter_names
 
 
+def test_strategy_shutdown_system_exposes_actor_signature():
+    strategy = Strategy()
+    signature = inspect.signature(strategy.shutdown_system)
+
+    assert tuple(signature.parameters) == SHUTDOWN_SYSTEM_PARAMETERS
+    assert signature.parameters["reason"].default is None
+
+
+def test_strategy_shutdown_system_requires_registration():
+    strategy = Strategy()
+
+    with pytest.raises(RuntimeError, match="registered"):
+        strategy.shutdown_system("unit test shutdown")
+
+
+@pytest.mark.parametrize("method_name", REMOVED_ORDER_EVENT_SUBSCRIPTION_METHODS)
+def test_strategy_order_event_subscription_methods_are_not_exposed(method_name):
+    strategy = Strategy()
+
+    assert not hasattr(strategy, method_name)
+
+
 @pytest.mark.parametrize(("method_name", "parameter_names"), CALLBACK_SIGNATURES)
 def test_strategy_callback_methods_expose_expected_signatures(method_name, parameter_names):
     strategy = Strategy()
@@ -761,50 +855,40 @@ def _historical_request_time(request_time):
 
 
 def test_strategy_config_defaults():
-    config = StrategyConfig(
-        None,
-        None,
-        None,
-        None,
-        False,
-        False,
-        False,
-        100,
-        100,
-        TimeInForce.GTC,
-        False,
-        True,
-        True,
-        True,
-        True,
-        False,
-    )
+    config = StrategyConfig()
 
     assert config.strategy_id is None
     assert config.order_id_tag is None
     assert config.oms_type is None
+    assert config.external_order_claims is None
     assert config.manage_contingent_orders is False
     assert config.manage_gtd_expiry is False
-    assert config.use_uuid_client_order_ids is True
+    assert config.manage_stop is False
+    assert config.market_exit_interval_ms == 100
+    assert config.market_exit_max_attempts == 100
+    assert config.market_exit_time_in_force == TimeInForce.GTC
+    assert config.market_exit_reduce_only is True
+    assert config.use_uuid_client_order_ids is False
     assert config.use_hyphens_in_client_order_ids is True
     assert config.log_events is True
     assert config.log_commands is True
-    assert config.log_rejected_due_post_only_as_warning is False
+    assert config.log_rejected_due_post_only_as_warning is True
 
 
 def test_strategy_config_with_explicit_values():
+    external_order_claims = [InstrumentId.from_str("ETH/USDT.BINANCE")]
     config = StrategyConfig(
         StrategyId("S-002"),
         "002",
-        None,
-        None,
+        OmsType.HEDGING,
+        external_order_claims,
         True,
         True,
-        False,
+        True,
         500,
         5,
         TimeInForce.IOC,
-        True,
+        False,
         False,
         False,
         False,
@@ -814,8 +898,15 @@ def test_strategy_config_with_explicit_values():
 
     assert config.strategy_id == StrategyId("S-002")
     assert config.order_id_tag == "002"
+    assert config.oms_type == OmsType.HEDGING
+    assert config.external_order_claims == external_order_claims
     assert config.manage_contingent_orders is True
     assert config.manage_gtd_expiry is True
+    assert config.manage_stop is True
+    assert config.market_exit_interval_ms == 500
+    assert config.market_exit_max_attempts == 5
+    assert config.market_exit_time_in_force == TimeInForce.IOC
+    assert config.market_exit_reduce_only is False
     assert config.use_uuid_client_order_ids is False
     assert config.use_hyphens_in_client_order_ids is False
     assert config.log_events is False

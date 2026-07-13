@@ -496,6 +496,7 @@ pub(crate) fn dispatch_order_update(
                                 false,
                                 None,
                                 commission,
+                                None,
                             );
 
                             dispatch_state.insert_filled(client_order_id);
@@ -1071,6 +1072,7 @@ pub(crate) fn dispatch_trade_lite(
         false,
         None,
         None,
+        None,
     );
 
     dispatch_state.insert_filled(client_order_id);
@@ -1302,7 +1304,7 @@ pub(crate) fn dispatch_algo_update(
             algo_client_ids.insert(client_order_id);
         }
         BinanceAlgoStatus::Triggering => {
-            log::info!(
+            log::debug!(
                 "Algo order triggering: client_order_id={}, algo_id={}, symbol={}",
                 algo_data.client_algo_id,
                 algo_data.algo_id,
@@ -1311,7 +1313,7 @@ pub(crate) fn dispatch_algo_update(
         }
         BinanceAlgoStatus::Triggered => {
             triggered_algo_ids.insert(client_order_id);
-            log::info!(
+            log::debug!(
                 "Algo order triggered: client_order_id={}, algo_id={}, actual_order_id={:?}",
                 algo_data.client_algo_id,
                 algo_data.algo_id,

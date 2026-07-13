@@ -1693,6 +1693,13 @@ fn should_retry_error(error: &MyWsError) -> bool {
   unknown outcome and waits for reconciliation or a later venue update.
 - Use `RetryManager` from `nautilus_network::retry` for consistent backoff.
 
+#### Outbound WebSocket payload logging
+
+`nautilus_network::websocket::WebSocketClient::send_text` logs outbound text payloads at TRACE for
+local adapter debugging. Since adapter sends can include authentication data, do not duplicate raw
+payloads in adapter-level DEBUG or INFO logs. At higher levels, log only metadata such as message
+type, channel, and payload length.
+
 ### Naming conventions
 
 Adapters follow standardized naming conventions for consistency across all venue integrations.
@@ -2558,7 +2565,8 @@ class TemplateLiveMarketDataClient(LiveMarketDataClient):
 
 When implementing `_subscribe_order_book_deltas` or streaming order book
 data, adapters **must** set `RecordFlag` flags correctly on each
-`OrderBookDelta`. See also [Delta flags and event boundaries](../concepts/data.md#delta-flags-and-event-boundaries).
+`OrderBookDelta`. See also
+[Delta flags and event boundaries](../concepts/data/index.md#delta-flags-and-event-boundaries).
 
 - **`F_LAST`**: Set on the last delta of every logical event group. The
   `DataEngine` uses this flag as the flush signal when `buffer_deltas` is

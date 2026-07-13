@@ -20,16 +20,12 @@ use std::fmt::Debug;
 use nautilus_core::string::secret::REDACTED;
 use nautilus_model::identifiers::{AccountId, TraderId};
 use nautilus_network::websocket::TransportBackend;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    common::{
-        credential::credential_env_vars,
-        enums::LighterEnvironment,
-        urls::{lighter_http_base_url, lighter_ws_url},
-    },
-    http::client::AccountFeeOverrides,
+use crate::common::{
+    credential::credential_env_vars,
+    enums::LighterEnvironment,
+    urls::{lighter_http_base_url, lighter_ws_url},
 };
 
 /// Configuration for the Lighter data client.
@@ -74,14 +70,6 @@ pub struct LighterDataClientConfig {
     /// Optional REST read-bucket quota override in requests per minute; unset keeps
     /// the conservative 60 req/min default (raising it requires venue IP registration).
     pub rest_quota_per_min: Option<u32>,
-    /// Optional account-tier maker fee override in basis points. Lighter's
-    /// market metadata carries the standard-account fees (zero); premium and
-    /// market-maker tiers pay per-tier fees only the operator knows. When
-    /// set, published instrument definitions carry this fee instead — the
-    /// definition is the single fee source for cost models and fills.
-    pub maker_fee_bps: Option<f64>,
-    /// Optional account-tier taker fee override in basis points.
-    pub taker_fee_bps: Option<f64>,
     /// WebSocket transport backend.
     #[builder(default)]
     pub transport_backend: TransportBackend,
@@ -119,29 +107,6 @@ impl LighterDataClientConfig {
         ensure_readonly_ws_url(url)
     }
 
-    /// Returns the account-tier fee overrides parsed from the bps fields.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a bps value is not a finite number.
-    pub fn account_fee_overrides(&self) -> anyhow::Result<AccountFeeOverrides> {
-        let to_rate = |bps: f64, side: &str| -> anyhow::Result<Decimal> {
-            let bps = Decimal::try_from(bps)
-                .map_err(|e| anyhow::anyhow!("[lighter] {side}_fee_bps: {e}"))?;
-            Ok(bps / Decimal::from(10_000))
-        };
-        Ok(AccountFeeOverrides {
-            maker_fee: self
-                .maker_fee_bps
-                .map(|bps| to_rate(bps, "maker"))
-                .transpose()?,
-            taker_fee: self
-                .taker_fee_bps
-                .map(|bps| to_rate(bps, "taker"))
-                .transpose()?,
-        })
-    }
-
     /// Returns `true` when all REST auth credential fields are available.
     #[must_use]
     pub fn has_credentials(&self) -> bool {
@@ -175,8 +140,6 @@ impl Debug for LighterDataClientConfig {
                 &self.update_instruments_interval_mins,
             )
             .field("rest_quota_per_min", &self.rest_quota_per_min)
-            .field("maker_fee_bps", &self.maker_fee_bps)
-            .field("taker_fee_bps", &self.taker_fee_bps)
             .field("transport_backend", &self.transport_backend)
             .finish()
     }
@@ -231,8 +194,9 @@ pub struct LighterExecClientConfig {
     /// to `LIGHTER_ACCOUNT_INDEX` / `LIGHTER_TESTNET_ACCOUNT_INDEX` when
     /// resolved through `common::credential`.
     pub account_index: Option<u64>,
-    /// API key index (0-254; indices 0-3 are reserved for desktop/mobile
-    /// clients). Falls back to `LIGHTER_API_KEY_INDEX` /
+    /// API key index for a user-created Lighter key. Low indexes are reserved
+    /// for Lighter clients; 255 is the `apikeys` all-keys sentinel. Falls back
+    /// to `LIGHTER_API_KEY_INDEX` /
     /// `LIGHTER_TESTNET_API_KEY_INDEX` when resolved through
     /// `common::credential`.
     pub api_key_index: Option<u8>,
@@ -255,9 +219,6 @@ pub struct LighterExecClientConfig {
     /// WebSocket connect timeout in seconds.
     #[builder(default = 30)]
     pub ws_timeout_secs: u64,
-    /// Venue market IDs to poll during unscoped reconciliation.
-    #[builder(default)]
-    pub active_markets: Vec<i16>,
     /// Slippage buffer in basis points for market-style orders.
     #[builder(default = 50)]
     pub market_order_slippage_bps: u32,
@@ -292,7 +253,6 @@ impl Debug for LighterExecClientConfig {
             .field("environment", &self.environment)
             .field("http_timeout_secs", &self.http_timeout_secs)
             .field("ws_timeout_secs", &self.ws_timeout_secs)
-            .field("active_markets", &self.active_markets)
             .field("market_order_slippage_bps", &self.market_order_slippage_bps)
             .field("rest_quota_per_min", &self.rest_quota_per_min)
             .field("sendtx_quota_per_min", &self.sendtx_quota_per_min)
@@ -379,29 +339,6 @@ mod tests {
     }
 
     #[rstest]
-    fn data_config_account_fee_overrides_convert_bps_to_rates() {
-        let config = LighterDataClientConfig {
-            maker_fee_bps: Some(0.4),
-            taker_fee_bps: Some(2.8),
-            ..Default::default()
-        };
-
-        let fees = config.account_fee_overrides().unwrap();
-
-        assert_eq!(fees.maker_fee, Some(Decimal::new(4, 5))); // 0.00004
-        assert_eq!(fees.taker_fee, Some(Decimal::new(28, 5))); // 0.00028
-    }
-
-    #[rstest]
-    fn data_config_account_fee_overrides_default_to_none() {
-        let fees = LighterDataClientConfig::default()
-            .account_fee_overrides()
-            .unwrap();
-
-        assert_eq!(fees, AccountFeeOverrides::default());
-    }
-
-    #[rstest]
     fn data_config_ws_url_sets_readonly_query() {
         let config = LighterDataClientConfig::default();
 
@@ -453,7 +390,6 @@ mod tests {
             environment: LighterEnvironment::Mainnet,
             http_timeout_secs: 60,
             ws_timeout_secs: 30,
-            active_markets: Vec::new(),
             market_order_slippage_bps: 50,
             rest_quota_per_min: None,
             sendtx_quota_per_min: None,

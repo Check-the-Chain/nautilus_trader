@@ -192,9 +192,9 @@ pub fn parse_candle_bar(
 
 /// Parses a Lighter historical funding row into a Nautilus [`FundingRateUpdate`].
 ///
-/// Lighter returns `rate` as a percent-unit magnitude and `direction` as the
-/// side paying the funding. Nautilus uses the conventional signed decimal rate:
-/// positive when longs pay shorts and negative when shorts pay longs.
+/// Lighter returns `rate` as a magnitude and `direction` as the side paying
+/// the funding. Nautilus uses the conventional signed rate: positive when
+/// longs pay shorts and negative when shorts pay longs.
 ///
 /// # Errors
 ///

@@ -6,6 +6,7 @@ import enum
 import typing
 
 from nautilus_trader import model
+from nautilus_trader import network
 
 __all__ = [
     "HYPERLIQUID_POST_ONLY_WOULD_MATCH",
@@ -81,6 +82,13 @@ class HyperliquidDataClientConfig:
         http_timeout_secs: int | None = None,
         ws_timeout_secs: int | None = None,
         update_instruments_interval_mins: int | None = None,
+        transport_backend: network.TransportBackend | None = None,
+        stale_stream_receive_timeout_secs: int | None = None,
+        stream_health_check_interval_secs: int | None = None,
+        stale_stream_warning_cooldown_secs: int | None = None,
+        stale_stream_recovery_enabled: bool | None = None,
+        stale_stream_recovery_cooldown_secs: int | None = None,
+        stale_stream_max_targeted_resubscribes: int | None = None,
     ) -> None: ...
 
 @typing.final
@@ -108,6 +116,7 @@ class HyperliquidExecClientConfig:
         market_order_slippage_bps: int | None = None,
         include_builder_attribution: bool | None = None,
         ws_post_timeout_secs: int | None = None,
+        transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
 
 @typing.final
@@ -207,7 +216,7 @@ class HyperliquidHttpClient:
     def modify_order(
         self,
         instrument_id: model.InstrumentId,
-        venue_order_id: model.VenueOrderId,
+        venue_order_id: model.VenueOrderId | None,
         order_side: model.OrderSide,
         order_type: model.OrderType,
         price: model.Price,
@@ -321,7 +330,7 @@ class HyperliquidWebSocketClient:
         self,
         signer: HyperliquidHttpClient,
         instrument_id: model.InstrumentId,
-        venue_order_id: model.VenueOrderId,
+        venue_order_id: model.VenueOrderId | None,
         order_side: model.OrderSide,
         order_type: model.OrderType,
         price: model.Price,
@@ -360,6 +369,7 @@ class HyperliquidWebSocketClient:
     def subscribe_book_snapshots(
         self, instrument_id: model.InstrumentId, _book_type: int, _depth: int
     ) -> typing.Any: ...
+    def unsubscribe_book_snapshots(self, instrument_id: model.InstrumentId) -> typing.Any: ...
     def subscribe_quotes(self, instrument_id: model.InstrumentId) -> typing.Any: ...
     def unsubscribe_quotes(self, instrument_id: model.InstrumentId) -> typing.Any: ...
     def subscribe_bars(self, bar_type: model.BarType) -> typing.Any: ...

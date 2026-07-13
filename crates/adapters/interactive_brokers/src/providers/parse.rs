@@ -639,10 +639,7 @@ mod tests {
         };
         let info = equity.info.unwrap();
 
-        assert_eq!(
-            info.get("timeZoneId"),
-            Some(&serde_json::Value::String("US/Eastern".to_string()))
-        );
+        assert_eq!(info.get_str("timeZoneId"), Some("US/Eastern"));
         assert_eq!(
             info.get("liquidHours"),
             Some(&serde_json::json!(["20260625:0930-20260625:1600"]))

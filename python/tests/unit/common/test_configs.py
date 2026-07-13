@@ -119,6 +119,31 @@ def test_data_actor_config_accepts_explicit_kwargs():
     )
 
     assert isinstance(config, DataActorConfig)
+    assert config.actor_id == ActorId("ACTOR-001")
+    assert config.log_events is False
+    assert config.log_commands is True
+
+
+def test_data_actor_config_defaults_are_readable():
+    config = DataActorConfig()
+
+    assert config.actor_id is None
+    assert config.log_events is True
+    assert config.log_commands is True
+
+
+def test_data_actor_config_fields_are_writable_from_python_subclasses():
+    class PythonDataActorConfig(DataActorConfig):
+        def __init__(self):
+            self.actor_id = ActorId("ACTOR-002")
+            self.log_events = False
+            self.log_commands = False
+
+    config = PythonDataActorConfig()
+
+    assert config.actor_id == ActorId("ACTOR-002")
+    assert config.log_events is False
+    assert config.log_commands is False
 
 
 def test_file_writer_config_construction(tmp_path):
@@ -156,6 +181,7 @@ def test_message_bus_config_defaults():
     assert config.timestamps_as_iso8601 is False
     assert config.buffer_interval_ms is None
     assert config.autotrim_mins is None
+    assert config.autotrim_maxlen is None
     assert config.use_trader_prefix is True
     assert config.use_trader_id is True
     assert config.use_instance_id is False
@@ -171,6 +197,7 @@ def test_message_bus_config_accepts_explicit_kwargs():
         timestamps_as_iso8601=True,
         buffer_interval_ms=7,
         autotrim_mins=8,
+        autotrim_maxlen=1_000,
         use_trader_prefix=False,
         use_trader_id=False,
         use_instance_id=True,
@@ -184,6 +211,7 @@ def test_message_bus_config_accepts_explicit_kwargs():
     assert config.timestamps_as_iso8601 is True
     assert config.buffer_interval_ms == 7
     assert config.autotrim_mins == 8
+    assert config.autotrim_maxlen == 1_000
     assert config.use_trader_prefix is False
     assert config.use_trader_id is False
     assert config.use_instance_id is True

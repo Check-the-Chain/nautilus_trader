@@ -193,9 +193,11 @@ pub fn parse_usdm_instrument(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    // Only handle perpetual contracts for now. Some USD-M products such as
-    // listed equity perpetuals use Binance's TRADIFI_PERPETUAL label.
-    if !is_supported_usdm_perpetual_contract_type(&symbol.contract_type) {
+    // Listed equity perpetuals use Binance's `TRADIFI_PERPETUAL` label.
+    if !matches!(
+        symbol.contract_type.as_str(),
+        CONTRACT_TYPE_PERPETUAL | CONTRACT_TYPE_TRADIFI_PERPETUAL
+    ) {
         anyhow::bail!(
             "Unsupported contract type '{}' for symbol '{}', expected '{}' or '{}'",
             symbol.contract_type,
@@ -278,10 +280,6 @@ pub fn parse_usdm_instrument(
     );
 
     Ok(InstrumentAny::CryptoPerpetual(instrument))
-}
-
-fn is_supported_usdm_perpetual_contract_type(contract_type: &str) -> bool {
-    contract_type == CONTRACT_TYPE_PERPETUAL || contract_type == CONTRACT_TYPE_TRADIFI_PERPETUAL
 }
 
 /// Parses a COIN-M Futures symbol definition into a Nautilus CryptoPerpetual instrument.
@@ -1346,19 +1344,12 @@ mod tests {
         symbol.contract_type = CONTRACT_TYPE_TRADIFI_PERPETUAL.to_string();
         let ts = UnixNanos::from(1_700_000_000_000_000_000u64);
 
-        let result = parse_usdm_instrument(&symbol, ts, ts);
-        assert!(result.is_ok(), "Failed: {:?}", result.err());
-
-        let instrument = result.unwrap();
-        match instrument {
-            InstrumentAny::CryptoPerpetual(perp) => {
-                assert_eq!(perp.id.to_string(), "SPCXUSDT-PERP.BINANCE");
-                assert_eq!(perp.raw_symbol.to_string(), "SPCXUSDT");
-                assert_eq!(perp.quote_currency.code.as_str(), "USDT");
-                assert_eq!(perp.settlement_currency.code.as_str(), "USDT");
-            }
-            other => panic!("Expected CryptoPerpetual, was {other:?}"),
-        }
+        let instrument = parse_usdm_instrument(&symbol, ts, ts).unwrap();
+        let InstrumentAny::CryptoPerpetual(perp) = instrument else {
+            panic!("Expected CryptoPerpetual");
+        };
+        assert_eq!(perp.id.to_string(), "SPCXUSDT-PERP.BINANCE");
+        assert_eq!(perp.raw_symbol.to_string(), "SPCXUSDT");
     }
 
     #[rstest]

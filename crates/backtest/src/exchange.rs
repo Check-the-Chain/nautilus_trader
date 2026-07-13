@@ -38,7 +38,7 @@ use nautilus_core::{
 use nautilus_execution::{
     matching_core::RestingOrder,
     matching_engine::{config::OrderMatchingEngineConfig, engine::OrderMatchingEngine},
-    models::{fee::FeeModelHandle, fill::FillModelAny, latency::LatencyModel},
+    models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
 };
 use nautilus_model::{
     accounts::{Account, AccountAny, margin_model::MarginModelAny},
@@ -132,7 +132,7 @@ pub struct SimulatedExchange {
     default_leverage: Decimal,
     exec_client: Option<Rc<dyn ExecutionClient>>,
     fee_model: FeeModelHandle,
-    fill_model: FillModelAny,
+    fill_model: FillModelHandle,
     latency_model: Option<Box<dyn LatencyModel>>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: AHashMap<InstrumentId, OrderMatchingEngine>,
@@ -216,7 +216,7 @@ impl SimulatedExchange {
             book_type: config.book_type,
             default_leverage,
             exec_client: None,
-            fee_model: config.fee_model.into(),
+            fee_model: config.fee_model,
             fill_model: config.fill_model,
             latency_model: config.latency_model,
             instruments: AHashMap::new(),
@@ -274,14 +274,10 @@ impl SimulatedExchange {
     }
 
     /// Sets the fill model for the exchange.
-    pub fn set_fill_model(&mut self, fill_model: FillModelAny) {
+    pub fn set_fill_model(&mut self, fill_model: FillModelHandle) {
         for matching_engine in self.matching_engines.values_mut() {
-            matching_engine.set_fill_model(fill_model.clone().into());
-            log::info!(
-                "Setting fill model for {} to {}",
-                matching_engine.venue,
-                self.fill_model
-            );
+            matching_engine.set_fill_model(fill_model.clone());
+            log::info!("Setting fill model for {}", matching_engine.venue);
         }
         self.fill_model = fill_model;
     }
@@ -305,6 +301,23 @@ impl SimulatedExchange {
     /// Returns an iterator over the instrument IDs registered with this exchange.
     pub fn instrument_ids(&self) -> impl Iterator<Item = &InstrumentId> {
         self.instruments.keys()
+    }
+
+    /// Returns the expiration timestamp for the given instrument, if present.
+    #[must_use]
+    pub fn instrument_expiration(&self, instrument_id: InstrumentId) -> Option<UnixNanos> {
+        self.matching_engines
+            .get(&instrument_id)
+            .and_then(|matching_engine| matching_engine.instrument.expiration_ns())
+    }
+
+    /// Returns whether an unprocessed instrument remains for the given expiration.
+    #[must_use]
+    pub fn has_unprocessed_instrument_expiration(&self, expiration_ns: UnixNanos) -> bool {
+        self.matching_engines.values().any(|matching_engine| {
+            !matching_engine.is_expiration_processed()
+                && matching_engine.instrument.expiration_ns() == Some(expiration_ns)
+        })
     }
 
     pub fn initialize_account(&mut self) {
@@ -404,7 +417,7 @@ impl SimulatedExchange {
         let matching_engine = OrderMatchingEngine::new(
             instrument,
             raw_id,
-            self.fill_model.clone().into(),
+            self.fill_model.clone(),
             self.fee_model.clone(),
             self.book_type,
             self.oms_type,
@@ -1183,7 +1196,7 @@ impl SimulatedExchange {
             let PositionEvent::PositionAdjusted(adjustment) = &event else {
                 continue;
             };
-            let topic = switchboard::get_event_positions_topic(adjustment.strategy_id);
+            let topic = switchboard::get_event_position_topic(adjustment.strategy_id);
             msgbus::publish_position_event(topic, &event);
         }
     }
@@ -1427,13 +1440,31 @@ impl SimulatedExchange {
             command => command,
         };
 
-        if let Some(matching_engine) = self.matching_engines.get_mut(&instrument_id) {
-            let account_id = if let Some(exec_client) = &self.exec_client {
-                exec_client.account_id()
-            } else {
-                panic!("Execution client should be initialized");
-            };
+        let account_id = if let Some(exec_client) = &self.exec_client {
+            exec_client.account_id()
+        } else {
+            panic!("Execution client should be initialized");
+        };
 
+        if let TradingCommand::SubmitOrderList(ref command) = command {
+            let mut orders: Vec<OrderAny> = self
+                .cache
+                .borrow()
+                .orders_for_ids(&command.order_list.client_order_ids, command);
+
+            for order in &mut orders {
+                let order_instrument_id = order.instrument_id();
+                if let Some(matching_engine) = self.matching_engines.get_mut(&order_instrument_id) {
+                    matching_engine.process_order(order, account_id);
+                } else {
+                    panic!("Matching engine not found for instrument {order_instrument_id}");
+                }
+            }
+
+            return;
+        }
+
+        if let Some(matching_engine) = self.matching_engines.get_mut(&instrument_id) {
             match command {
                 TradingCommand::SubmitOrder(command) => {
                     let mut order = self
@@ -1458,16 +1489,6 @@ impl SimulatedExchange {
                 }
                 TradingCommand::CancelAllOrders(ref command) => {
                     matching_engine.process_cancel_all(command, account_id);
-                }
-                TradingCommand::SubmitOrderList(ref command) => {
-                    let mut orders: Vec<OrderAny> = self
-                        .cache
-                        .borrow()
-                        .orders_for_ids(&command.order_list.client_order_ids, command);
-
-                    for order in &mut orders {
-                        matching_engine.process_order(order, account_id);
-                    }
                 }
                 _ => {}
             }

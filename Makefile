@@ -20,10 +20,19 @@ LYCHEE_VERSION := $(shell bash scripts/cargo-tool-version.sh lychee)
 # Tool versions from tools.toml
 PREK_VERSION := $(shell bash scripts/tool-version.sh prek)
 UV_VERSION := $(shell bash scripts/uv-version.sh)
+UV_V2_REQUIRED_SPEC := $(shell awk -F'"' '\
+	/^\[tool\.uv\]/ { in_section=1; next } \
+	/^\[/ { in_section=0 } \
+	in_section && /^[[:space:]]*required-version[[:space:]]*=/ { print $$2; exit } \
+' python/pyproject.toml)
+UV_V2_REQUIRED_VERSION := $(patsubst ==%,%,$(UV_V2_REQUIRED_SPEC))
 
 V = 0  # 0 / 1 - verbose mode
 Q = $(if $(filter 1,$V),,@) # Quiet mode, suppress command output
 M = $(shell printf "\033[0;34m>\033[0m") # Message prefix for commands
+empty :=
+space := $(empty) $(empty)
+comma := ,
 
 # Verbose options for specific targets (defaults to true, can be overridden)
 VERBOSE ?= true
@@ -31,6 +40,8 @@ VERBOSE ?= true
 # UV_SYNC_FLAGS controls whether uv keeps packages not managed by this project
 # Set UV_SYNC_FLAGS= to make uv prune packages not in uv.lock
 UV_SYNC_FLAGS ?= --inexact
+
+V2_CARGO_TARGET_DIR ?= $(CURDIR)/target-v2
 
 PIP_AUDIT_IGNORE_FLAGS :=
 
@@ -161,13 +172,15 @@ CARGO_FEATURES := $(BASE_FEATURES),$(EXTRA_FEATURES)
 else
 CARGO_FEATURES := $(BASE_FEATURES)
 endif
+CORE_SELECTED_FEATURE_LIST := $(filter-out hypersync,$(subst $(comma),$(space),$(CARGO_FEATURES)))
+CORE_SELECTED_FEATURES := $(subst $(space),$(comma),$(strip $(CORE_SELECTED_FEATURE_LIST)))
 
 CARGO_BUILD_JOB_TARGETS := install install-debug build build-debug \
 	build-debug-pyo3 build-wheel build-wheel-debug build-dry-run check-code \
 	check-all-targets clippy clippy-fix clippy-fix-nightly clippy-pedantic-crate-% \
 	docs docs-rust docsrs-check cargo-build cargo-check check-features cargo-test \
-	cargo-test-extras cargo-test-core-local cargo-test-core cargo-test-adapters \
-	cargo-test-sim cargo-test-core-debug \
+	cargo-test-extras cargo-test-core-local cargo-test-core-selected \
+	cargo-test-core cargo-test-adapters cargo-test-sim cargo-test-core-debug \
 	cargo-test-core-local-debug cargo-test-lib cargo-test-standard-precision \
 	cargo-test-debug cargo-test-coverage cargo-test-crate-% \
 	cargo-test-coverage-crate-% cargo-test-coverage-html \
@@ -176,7 +189,7 @@ CARGO_BUILD_JOB_TARGETS := install install-debug build build-debug \
 	install-cli
 
 NEXTEST_ENV_TARGETS := cargo-test cargo-test-extras cargo-test-core-local \
-	cargo-test-core cargo-test-adapters cargo-test-sim cargo-test-core-debug \
+	cargo-test-core-selected cargo-test-core cargo-test-adapters cargo-test-sim cargo-test-core-debug \
 	cargo-test-core-local-debug cargo-test-lib cargo-test-standard-precision \
 	cargo-test-debug cargo-test-coverage cargo-test-crate-% \
 	cargo-test-coverage-crate-% cargo-test-coverage-html \
@@ -534,7 +547,13 @@ docs-rust:  #-- Build Rust documentation with cargo doc
 docsrs-check: export DOCS_RS=1
 docsrs-check: export RUSTDOCFLAGS=--cfg docsrs -D warnings
 docsrs-check: check-hack-installed #-- Check documentation builds for docs.rs compatibility
-	cargo +nightly hack --workspace doc --no-deps --all-features
+	cargo +nightly hack --workspace --ignore-private --ignore-unknown-features \
+		--features arrow,capnp,cloud,cython-compat,defi,display \
+		--features example-databento,examples,ffi,high-precision,host \
+		--features hypersync,indicators,live,node,persistence,plugin \
+		--features postgres,redis,replay,sbe,simulation,streaming,stubs \
+		--features tracing-bridge,transport-sockudo,turmoil \
+		doc --no-deps
 
 .PHONY: docs-check-links
 docs-check-links:  #-- Check for broken links in documentation (periodic audit)
@@ -705,16 +724,21 @@ cargo-test-core-local: check-nextest-installed
 cargo-test-core-local:  #-- Run Rust tests for core crates only with direct package selection (fast local compile)
 ifeq ($(VERBOSE),true)
 	$(info $(M) Running Rust tests for core crates with direct package selection...)
-	cargo nextest run $(foreach crate,$(CORE_CRATES),-p $(crate)) --lib --tests --features "$(CARGO_FEATURES)" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --verbose
+	cargo nextest run $(foreach crate,$(CORE_CRATES),-p $(crate)) --lib --tests --features "$(CORE_SELECTED_FEATURES)" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --verbose
 else
 	$(info $(M) Running Rust tests for core crates with direct package selection (showing summary and failures only)...)
-	cargo nextest run $(foreach crate,$(CORE_CRATES),-p $(crate)) --lib --tests --features "$(CARGO_FEATURES)" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --status-level fail --final-status-level flaky
+	cargo nextest run $(foreach crate,$(CORE_CRATES),-p $(crate)) --lib --tests --features "$(CORE_SELECTED_FEATURES)" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --status-level fail --final-status-level flaky
 endif
+
+.PHONY: cargo-test-core-selected
+# CI uses direct package selection so core jobs do not compile adapter test binaries.
+# This intentionally avoids workspace feature unification from adapter crates.
+cargo-test-core-selected: cargo-test-core-local  #-- Run Rust tests for core crates with direct package selection
 
 .PHONY: cargo-test-core
 cargo-test-core: export RUST_BACKTRACE=1
 cargo-test-core: check-nextest-installed
-cargo-test-core:  #-- Run Rust tests for core crates only (excludes adapters)
+cargo-test-core:  #-- Run Rust tests for core crates with workspace compilation
 ifeq ($(VERBOSE),true)
 	$(info $(M) Running Rust tests for core crates...)
 	cargo nextest run --workspace --lib --tests --features "$(CARGO_FEATURES)" -E '$(CORE_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --verbose
@@ -726,7 +750,7 @@ endif
 .PHONY: cargo-test-adapters
 cargo-test-adapters: export RUST_BACKTRACE=1
 cargo-test-adapters: check-nextest-installed
-cargo-test-adapters:  #-- Run Rust tests for adapter crates only
+cargo-test-adapters:  #-- Run Rust tests for adapter crates with workspace compilation
 ifeq ($(VERBOSE),true)
 	$(info $(M) Running Rust tests for adapter crates...)
 	cargo nextest run --workspace --lib --tests --features "$(CARGO_FEATURES)" -E '$(ADAPTER_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --verbose
@@ -774,7 +798,7 @@ cargo-test-core-debug:  #-- Run Rust tests for core crates (debug profile)
 cargo-test-core-local-debug: export RUST_BACKTRACE=1
 cargo-test-core-local-debug: check-nextest-installed
 cargo-test-core-local-debug:  #-- Run Rust tests for core crates with direct package selection (debug profile)
-	cargo nextest run $(foreach crate,$(CORE_CRATES),-p $(crate)) --lib --tests --features "$(CARGO_FEATURES)" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE)
+	cargo nextest run $(foreach crate,$(CORE_CRATES),-p $(crate)) --lib --tests --features "$(CORE_SELECTED_FEATURES)" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE)
 
 .PHONY: cargo-test-lib
 cargo-test-lib: export RUST_BACKTRACE=1
@@ -966,11 +990,13 @@ cargo-ci-benches:  #-- Run Rust benches for the crates included in the CI perfor
 
 .PHONY: docker-build
 docker-build: clean  #-- Build Docker image for NautilusTrader
-	docker pull $(IMAGE_FULL) || docker pull $(IMAGE):nightly || true
+	bash scripts/ci/docker-pull-retry.sh $(IMAGE_FULL) || bash scripts/ci/docker-pull-retry.sh $(IMAGE):nightly || true
+	bash scripts/ci/docker-pull-retry.sh --from-dockerfile .docker/nautilus_trader.dockerfile
 	docker build -f .docker/nautilus_trader.dockerfile --platform linux/x86_64 -t $(IMAGE_FULL) .
 
 .PHONY: docker-build-force
 docker-build-force:  #-- Force rebuild Docker image without cache
+	bash scripts/ci/docker-pull-retry.sh --from-dockerfile .docker/nautilus_trader.dockerfile
 	docker build --no-cache -f .docker/nautilus_trader.dockerfile -t $(IMAGE_FULL) .
 
 .PHONY: docker-push
@@ -996,6 +1022,9 @@ init-services:  #-- Initialize development services eg. for integration tests (s
 .PHONY: start-services
 start-services:  #-- Start development services (without reinitializing database)
 	$(info $(M) Starting development services...)
+	bash scripts/ci/docker-pull-retry.sh public.ecr.aws/docker/library/postgres
+	bash scripts/ci/docker-pull-retry.sh dpage/pgadmin4
+	bash scripts/ci/docker-pull-retry.sh public.ecr.aws/docker/library/redis
 	docker compose -f .docker/docker-compose.yml up -d
 
 .PHONY: stop-services
@@ -1031,19 +1060,40 @@ test-performance:  #-- Run performance tests with codspeed benchmarking
 
 .PHONY: sync-v2
 sync-v2:  #-- Sync v2 Python dependencies (without building the package)
-	$(info $(M) Syncing v2 Python dependencies...)
-	$Q cd python && VIRTUAL_ENV= uv sync --all-groups --no-install-package nautilus-trader $(UV_SYNC_FLAGS)
+	@if [ -z "$(UV_V2_REQUIRED_SPEC)" ]; then \
+		printf "$(RED)ERROR: Could not find required-version in python/pyproject.toml$(RESET)\n"; \
+		exit 1; \
+	fi
+	@if [ "$(UV_V2_REQUIRED_SPEC)" = "$(UV_V2_REQUIRED_VERSION)" ]; then \
+		printf "$(RED)ERROR: python/pyproject.toml required-version must use ==A.B.C, found $(UV_V2_REQUIRED_SPEC)$(RESET)\n"; \
+		exit 1; \
+	fi
+	@found="$$(uv --version 2>/dev/null | awk '{print $$2}' || true)"; \
+	if [ -z "$$found" ]; then \
+		printf "$(RED)ERROR: uv not found, ==$(UV_V2_REQUIRED_VERSION) required; run \`uv self update --version $(UV_V2_REQUIRED_VERSION)\` or prepend a matching binary to PATH.$(RESET)\n"; \
+		exit 1; \
+	fi; \
+	if [ "$$found" != "$(UV_V2_REQUIRED_VERSION)" ]; then \
+		printf "$(RED)ERROR: uv $$found found, ==$(UV_V2_REQUIRED_VERSION) required; run \`uv self update --version $(UV_V2_REQUIRED_VERSION)\` or prepend a matching binary to PATH.$(RESET)\n"; \
+		exit 1; \
+	fi
+	@printf "$(M) Syncing v2 Python dependencies...\n"
+	$Q cd python && VIRTUAL_ENV= uv sync --all-groups --all-extras --no-install-package nautilus-trader $(UV_SYNC_FLAGS)
 
 .PHONY: build-debug-v2
 build-debug-v2: sync-v2  #-- Build the v2 Python package in debug mode (also regenerates type stubs)
 	@$(MAKE) --no-print-directory py-stubs-v2
 	$(info $(M) Building v2 extension in debug mode...)
-	$Q cd python && VIRTUAL_ENV= CARGO_TARGET_DIR=../target-v2 uv run --no-sync maturin develop
+	$Q cd python && VIRTUAL_ENV= CARGO_TARGET_DIR=$(V2_CARGO_TARGET_DIR) uv run --no-sync maturin develop
 
 .PHONY: py-stubs-v2
 py-stubs-v2: sync-v2  #-- Regenerate v2 Python type stubs from Rust bindings
 	$(info $(M) Generating v2 Python type stubs...)
-	$Q cd python && VIRTUAL_ENV= CARGO_TARGET_DIR=$(CURDIR)/target-v2 uv run --no-sync python generate_stubs.py
+	$Q cd python && VIRTUAL_ENV= CARGO_TARGET_DIR=$(V2_CARGO_TARGET_DIR) uv run --no-sync python generate_stubs.py
+
+.PHONY: check-v2-generated-drift
+check-v2-generated-drift:  #-- Check v2 generated stubs and docstrings are committed
+	$Q bash scripts/ci/check-v2-generated-drift.bash
 
 .PHONY: update-v2
 update-v2: cargo-update  #-- Update v2 dependencies (cargo and uv)
@@ -1058,7 +1108,7 @@ pytest-v2: build-debug-v2  #-- Run v2 Python tests
 
 .PHONY: pre-flight-v2
 pre-flight-v2: export CARGO_TARGET_DIR=target-v2
-pre-flight-v2:  #-- Run comprehensive v2 pre-flight checks (format, check-code, cargo-test, build, pytest)
+pre-flight-v2:  #-- Run v2 pre-flight checks (format, tests, build, generated drift, audit)
 	$(info $(M) Running v2 pre-flight checks...)
 	@if ! git diff --quiet; then \
 		printf "$(RED)ERROR: You have unstaged changes$(RESET)\n"; \
@@ -1071,6 +1121,7 @@ pre-flight-v2:  #-- Run comprehensive v2 pre-flight checks (format, check-code, 
 		&& $(MAKE) --no-print-directory check-code EXTRA_FEATURES="capnp,hypersync" \
 		&& $(MAKE) --no-print-directory cargo-test-extras \
 		&& $(MAKE) --no-print-directory build-debug-v2 \
+		&& $(MAKE) --no-print-directory check-v2-generated-drift \
 		&& $(MAKE) --no-print-directory pytest-v2 \
 		&& $(MAKE) --no-print-directory security-audit \
 	$(call timer_end,Pre-flight)

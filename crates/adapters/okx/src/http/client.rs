@@ -90,8 +90,8 @@ use super::{
         OKXFundingRateHistory, OKXIndexTicker, OKXMarkPrice, OKXOptionSummary, OKXOrderAlgo,
         OKXOrderBookSnapshot, OKXOrderHistory, OKXPlaceAlgoOrderRequest, OKXPlaceAlgoOrderResponse,
         OKXPlaceOrderRequest, OKXPlaceOrderResponse, OKXPlaceSpreadOrderRequest, OKXPosition,
-        OKXPositionHistory, OKXPositionTier, OKXServerTime, OKXSpread, OKXSpreadOrder,
-        OKXSpreadTrade, OKXTransactionDetail,
+        OKXPositionHistory, OKXPositionTier, OKXPriceLimit, OKXServerTime, OKXSpread,
+        OKXSpreadOrder, OKXSpreadTrade, OKXTransactionDetail,
     },
     query::{
         GetAlgoOrdersParams, GetAlgoOrdersParamsBuilder, GetCandlesticksParams,
@@ -101,7 +101,8 @@ use super::{
         GetMarkPriceParams, GetMarkPriceParamsBuilder, GetOptionSummaryParams, GetOrderBookParams,
         GetOrderHistoryParams, GetOrderHistoryParamsBuilder, GetOrderListParams,
         GetOrderListParamsBuilder, GetPositionTiersParams, GetPositionsHistoryParams,
-        GetPositionsParams, GetPositionsParamsBuilder, GetSpreadOrderParams, GetSpreadOrdersParams,
+        GetPositionsParams, GetPositionsParamsBuilder, GetPriceLimitParams,
+        GetPriceLimitParamsBuilder, GetSpreadOrderParams, GetSpreadOrdersParams,
         GetSpreadOrdersParamsBuilder, GetSpreadTradesParams, GetSpreadTradesParamsBuilder,
         GetSpreadsParams, GetTradeFeeParams, GetTradesParams, GetTradesParamsBuilder,
         GetTransactionDetailsParams, GetTransactionDetailsParamsBuilder, SetPositionModeParams,
@@ -112,7 +113,7 @@ use crate::{
     common::{
         consts::{
             OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_HTTP_URL, OKX_NAUTILUS_BROKER_ID,
-            OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE, should_retry_error_code,
+            OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
         },
         credential::Credential,
         enums::{
@@ -413,6 +414,10 @@ impl OKXRawHttpClient {
             (
                 "okx:/api/v5/public/mark-price".to_string(),
                 Quota::per_second(NonZeroU32::new(5).expect("non-zero")).expect("valid constant"),
+            ),
+            (
+                "okx:/api/v5/public/price-limit".to_string(),
+                Quota::per_second(NonZeroU32::new(10).expect("non-zero")).expect("valid constant"),
             ),
             (
                 "okx:/api/v5/sprd/spreads".to_string(),
@@ -763,7 +768,7 @@ impl OKXRawHttpClient {
                 if resp.status.is_success() {
                     let okx_response: OKXResponse<T> = deserialize_okx_response(&resp.body)
                         .map_err(|e| {
-                            log::error!("Failed to deserialize OKXResponse: {e}");
+                            log::warn!("Failed to deserialize OKXResponse: {e}");
                             OKXHttpError::JsonError(e.to_string())
                         })?;
 
@@ -780,7 +785,7 @@ impl OKXRawHttpClient {
                     if resp.status.as_u16() == StatusCode::NOT_FOUND.as_u16() {
                         log::debug!("HTTP 404 with body: {error_body}");
                     } else {
-                        log::error!(
+                        log::warn!(
                             "HTTP error {} with body: {error_body}",
                             resp.status.as_str()
                         );
@@ -812,16 +817,7 @@ impl OKXRawHttpClient {
         //
         // Note: OKX returns many permanent errors which should NOT be retried
         // (e.g., "Invalid instrument", "Insufficient balance", "Invalid API Key")
-        let should_retry = |error: &OKXHttpError| -> bool {
-            match error {
-                OKXHttpError::HttpClientError(_) => true,
-                OKXHttpError::UnexpectedStatus { status, .. } => {
-                    status.as_u16() >= 500 || status.as_u16() == 429
-                }
-                OKXHttpError::OkxError { error_code, .. } => should_retry_error_code(error_code),
-                _ => false,
-            }
-        };
+        let should_retry = |error: &OKXHttpError| -> bool { error.is_retryable() };
 
         let create_error = |msg: String| -> OKXHttpError {
             if msg == "canceled" {
@@ -831,7 +827,8 @@ impl OKXRawHttpClient {
             }
         };
 
-        self.retry_manager
+        let result = self
+            .retry_manager
             .execute_with_retry_with_cancel(
                 path,
                 operation,
@@ -839,7 +836,15 @@ impl OKXRawHttpClient {
                 create_error,
                 &self.cancellation_token,
             )
-            .await
+            .await;
+
+        if let Err(ref e) = result
+            && e.is_retryable()
+        {
+            log::error!("Request exhausted retries: path={path}, error={e}");
+        }
+
+        result
     }
 
     /// Sets the position mode for an account.
@@ -1233,6 +1238,30 @@ impl OKXRawHttpClient {
         self.send_request(
             Method::GET,
             "/api/v5/public/mark-price",
+            Some(&params),
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Requests the current price limits for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or if the response body
+    /// cannot be parsed into [`OKXPriceLimit`].
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#public-data-rest-api-get-limit-price>
+    pub async fn get_price_limit(
+        &self,
+        params: GetPriceLimitParams,
+    ) -> Result<Vec<OKXPriceLimit>, OKXHttpError> {
+        self.send_request(
+            Method::GET,
+            "/api/v5/public/price-limit",
             Some(&params),
             None,
             false,
@@ -2428,6 +2457,30 @@ impl OKXHttpClient {
         Ok(mark_price)
     }
 
+    /// Requests the current price limits for the `instrument_id` from OKX.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or no price limit is returned.
+    pub async fn request_price_limit(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<OKXPriceLimit> {
+        let mut params = GetPriceLimitParamsBuilder::default();
+        params.inst_id(instrument_id.symbol.inner());
+        let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
+
+        let resp = self
+            .inner
+            .get_price_limit(params)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        resp.first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No price limit returned from OKX"))
+    }
+
     fn resolve_forward_price_requests(
         &self,
         underlying: &str,
@@ -2569,7 +2622,7 @@ impl OKXHttpClient {
             book.add(order, 0, (bids_len + i) as u64, ts_event);
         }
 
-        log::info!(
+        log::debug!(
             "Fetched order book for {} with {} bids and {} asks",
             instrument_id,
             snapshot.bids.len(),
@@ -2665,7 +2718,7 @@ impl OKXHttpClient {
             ));
         }
 
-        log::info!(
+        log::debug!(
             "Fetched order book snapshot for {} with {} bids and {} asks",
             instrument_id,
             snapshot.bids.len(),
@@ -2732,7 +2785,7 @@ impl OKXHttpClient {
         // cache.add_funding_rates (which push_fronts) leaves the newest at front
         rates.reverse();
 
-        log::info!(
+        log::debug!(
             "Fetched {} funding rates for {}",
             rates.len(),
             instrument_id,
@@ -5879,15 +5932,9 @@ impl OKXHttpClient {
                 return Ok(reports);
             }
 
-            // OKX's `/orders-algo-history` endpoint rejects calls that
-            // carry neither a `state` nor an `algoId` / `algoClOrdId`
-            // narrowing with code 50015. The reconciliation path wants
-            // only currently-live algo orders (those already appear in
-            // the pending response above), so skip the history leg when
-            // the caller supplied no narrowing. Specific-lookup callers
-            // still hit history because `has_specific_lookup` implies
-            // `algoId` or `algoClOrdId`, which the endpoint accepts.
-            if state.is_some() || has_specific_lookup {
+            // `/orders-algo-history` rejects anything but `state`/`algoId`
+            // with 50015; `algoClOrdId` alone is not accepted.
+            if state.is_some() || algo_id.is_some() {
                 let remaining = limit.map(|l| (l as usize).saturating_sub(reports.len()));
                 let history = self.paginate_algo_history(&params, remaining).await?;
                 self.collect_algo_reports(

@@ -50,7 +50,7 @@ methods such as `clock()`, `cache()`, `order()`, and `portfolio()` on `self`.
 `DataActorNative` is native-only access to runtime wiring and actor-core state;
 `StrategyNative` exposes borrowed strategy state such as order factory, order
 manager, and portfolio access. Import them only for same-binary performance
-paths or host integration internals.
+paths or internal runtime wiring.
 :::
 
 ## Strategy implementation
@@ -241,13 +241,18 @@ def on_start(self) -> None:
     self.register_indicator_for_bars(self.bar_type, self.fast_ema)
     self.register_indicator_for_bars(self.bar_type, self.slow_ema)
 
-    # Get historical data
-    self.request_bars(self.bar_type)
-
-    # Subscribe to live data
-    self.subscribe_bars(self.bar_type)
+    # Get historical data and subscribe to live data
+    self.request_bars(
+        self.bar_type,
+        callback=lambda _: self.subscribe_bars(self.bar_type),
+    )
     self.subscribe_quote_ticks(self.instrument_id)
 ```
+
+Live bars are subscribed via the `request_bars()` `callback` so the stream starts only
+once history has loaded; see
+[Working with bars: request vs. subscribe](data/index.md#working-with-bars-request-vs-subscribe)
+for why this matters under `validate_data_sequence=True`.
 
 ### Clock and timers
 
@@ -722,6 +727,6 @@ See the [`StrategyId` API Reference](/docs/python-api-latest/model/identifiers.h
 ## Related guides
 
 - [Actors](actors.md) - Base class that strategies extend.
-- [Events](events.md) - Event types and handler dispatch.
+- [Events](events/) - Event types and handler dispatch.
 - [Orders](orders/) - Order types and management from strategies.
-- [Backtesting](backtesting.md) - Test strategies with historical data.
+- [Backtesting](backtesting/) - Test strategies with historical data.

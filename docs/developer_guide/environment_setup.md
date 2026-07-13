@@ -149,7 +149,7 @@ to read them.
 | `tools.toml`                                 | External CLIs and binaries without a native manifest. |
 
 The external tool pins in `tools.toml` include `prek`, `pip-audit`, `pypi-attestations`,
-`maturin`, `osv-scanner`, and `capnp`.
+`osv-scanner`, and `capnp`.
 
 The Makefile reads these via `scripts/cargo-tool-version.sh`, `scripts/tool-version.sh`, and
 `scripts/uv-version.sh`, so bumping a version in the source file is the only required version
@@ -220,7 +220,8 @@ Python dependencies are managed by [uv](https://docs.astral.sh/uv). The `[tool.u
   by `scripts/uv-version.sh` for Makefile, CI, and Docker builds. If your local uv drifts off the
   pin, `uv lock`/`uv sync` will fail with `Required uv version ... does not match the running
   version ...`. Run `make update-uv` to install the pinned version (or follow uv's own
-  `uv self update <version>` hint).
+  `uv self update <version>` hint). The v2 stub targets check the `python/pyproject.toml` pin
+  before running `uv`; see [Generated Python artifacts](rust.md#generated-python-artifacts).
 - **`exclude-newer = "3 days"`**: `uv lock` ignores package versions published within the last
   3 days. This gives the community time to detect and quarantine compromised releases before they
   enter the lockfile. The value accepts an RFC 3339 timestamp (`"2026-03-30T00:00:00Z"`), a friendly

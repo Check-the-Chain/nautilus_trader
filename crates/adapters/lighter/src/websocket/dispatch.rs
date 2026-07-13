@@ -976,9 +976,14 @@ pub(crate) fn parse_http_order_to_report(
     match parse_ws_order_status_report(order, &instrument, account_id, ts_init) {
         Ok(report) => Some(translate_order_cloid(report, cloid_map)),
         Err(e) => {
-            if context == HttpOrderReportContext::Inactive && is_twap_order_kind(order.order_type) {
+            if context == HttpOrderReportContext::Inactive
+                && matches!(
+                    order.order_type,
+                    LighterOrderKind::Twap | LighterOrderKind::TwapSub
+                )
+            {
                 log::debug!(
-                    "parse_http_order_to_report: skipping inactive Lighter {:?} order_index={} with no Nautilus order-type equivalent",
+                    "Skipping inactive Lighter {:?} order_index={} with no Nautilus equivalent",
                     order.order_type,
                     order.order_index,
                 );
@@ -991,10 +996,6 @@ pub(crate) fn parse_http_order_to_report(
             None
         }
     }
-}
-
-fn is_twap_order_kind(kind: LighterOrderKind) -> bool {
-    matches!(kind, LighterOrderKind::Twap | LighterOrderKind::TwapSub)
 }
 
 /// Look up a single order via the active+inactive HTTP endpoints, returning
@@ -1067,39 +1068,40 @@ pub(crate) async fn lookup_order_status_report(
     let ts_init = clock.get_time_ns();
     let supplied_cloid = client_order_id.copied();
 
-    let finalize = |order: &LighterOrder| -> Option<OrderStatusReport> {
-        let mut report = parse_http_order_to_report(
-            order,
-            registry,
-            account_id,
-            ts_init,
-            &dispatch.cloid_map,
-            HttpOrderReportContext::Active,
-        )?;
-        // Substitute the caller-supplied cloid whenever it positively
-        // identifies this order: when the order's
-        // `client_order_index` equals the deterministic derivation from
-        // `supplied_cloid`. This covers two cases the cloid_map cannot
-        // serve after a fresh client instance:
-        //   1. The match came via `client_order_index`.
-        //   2. The match came via venue order id, but the caller also
-        //      supplied the matching cloid.
-        // Substituting on the derivation match (rather than which path
-        // matched first) avoids leaving the venue numeric cloid on the
-        // report whenever the supplied cloid is the right one.
-        if let Some(cloid) = supplied_cloid
-            && let Some(client_index) = target_client_index
-            && order.client_order_index == client_index
-            && report.client_order_id != Some(cloid)
-        {
-            report = report.with_client_order_id(cloid);
-        }
-        Some(report)
-    };
+    let finalize =
+        |order: &LighterOrder, context: HttpOrderReportContext| -> Option<OrderStatusReport> {
+            let mut report = parse_http_order_to_report(
+                order,
+                registry,
+                account_id,
+                ts_init,
+                &dispatch.cloid_map,
+                context,
+            )?;
+            // Substitute the caller-supplied cloid whenever it positively
+            // identifies this order: when the order's
+            // `client_order_index` equals the deterministic derivation from
+            // `supplied_cloid`. This covers two cases the cloid_map cannot
+            // serve after a fresh client instance:
+            //   1. The match came via `client_order_index`.
+            //   2. The match came via venue order id, but the caller also
+            //      supplied the matching cloid.
+            // Substituting on the derivation match (rather than which path
+            // matched first) avoids leaving the venue numeric cloid on the
+            // report whenever the supplied cloid is the right one.
+            if let Some(cloid) = supplied_cloid
+                && let Some(client_index) = target_client_index
+                && order.client_order_index == client_index
+                && report.client_order_id != Some(cloid)
+            {
+                report = report.with_client_order_id(cloid);
+            }
+            Some(report)
+        };
 
     for order in &active.orders {
         if matches_order(order)
-            && let Some(report) = finalize(order)
+            && let Some(report) = finalize(order, HttpOrderReportContext::Active)
         {
             return Ok(Some(report));
         }
@@ -1127,7 +1129,7 @@ pub(crate) async fn lookup_order_status_report(
 
         for order in &inactive.orders {
             if matches_order(order)
-                && let Some(report) = finalize(order)
+                && let Some(report) = finalize(order, HttpOrderReportContext::Inactive)
             {
                 return Ok(Some(report));
             }
@@ -1396,20 +1398,6 @@ mod tests {
         let mut r = stub_open_order_status_report(client_order_id_str);
         r.order_status = OrderStatus::Canceled;
         r
-    }
-
-    #[rstest]
-    #[case::twap(LighterOrderKind::Twap)]
-    #[case::twap_sub(LighterOrderKind::TwapSub)]
-    fn twap_order_kinds_are_skippable_in_inactive_reconciliation(#[case] kind: LighterOrderKind) {
-        assert!(is_twap_order_kind(kind));
-    }
-
-    #[rstest]
-    fn non_twap_order_kinds_are_not_skippable_in_inactive_reconciliation() {
-        assert!(!is_twap_order_kind(LighterOrderKind::Limit));
-        assert!(!is_twap_order_kind(LighterOrderKind::Market));
-        assert!(!is_twap_order_kind(LighterOrderKind::Liquidation));
     }
 
     fn stub_position_report(instrument: &str, qty: &str) -> PositionStatusReport {

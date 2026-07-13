@@ -700,7 +700,7 @@ impl BinanceFuturesDataClient {
                 for (instrument_id, depth) in subs {
                     book_buffers.insert(instrument_id, BookBuffer::new(epoch));
 
-                    log::info!(
+                    log::debug!(
                         "OrderBook snapshot rebuild for {instrument_id} @ depth {depth} \
                         starting (reconnect, epoch={epoch})"
                     );
@@ -1056,7 +1056,7 @@ impl BinanceFuturesDataClient {
                     }
                 }
 
-                log::info!(
+                log::debug!(
                     "OrderBook snapshot rebuild for {instrument_id} completed \
                     (lastUpdateId={last_update_id}, replayed={replayed})"
                 );
@@ -1564,7 +1564,7 @@ impl DataClient for BinanceFuturesDataClient {
                 }
             });
             self.tasks.push(poll_handle);
-            log::info!("Futures instrument status polling started: interval={poll_secs}s");
+            log::debug!("Futures instrument status polling started: interval={poll_secs}s");
         }
 
         self.is_connected.store(true, Ordering::Release);
@@ -1582,7 +1582,7 @@ impl DataClient for BinanceFuturesDataClient {
         let _ = self.ws_client.close().await;
         let _ = self.ws_public_client.close().await;
 
-        let handles: Vec<_> = self.tasks.drain(..).collect();
+        let handles: Vec<_> = std::mem::take(&mut self.tasks);
         for handle in handles {
             if let Err(e) = handle.await {
                 log::error!("Error joining WebSocket task: {e}");
@@ -1724,7 +1724,7 @@ impl DataClient for BinanceFuturesDataClient {
         self.book_buffers
             .insert(instrument_id, BookBuffer::new(epoch));
 
-        log::info!("OrderBook snapshot rebuild for {instrument_id} @ depth {depth} starting");
+        log::debug!("OrderBook snapshot rebuild for {instrument_id} @ depth {depth} starting");
 
         // Subscribe to the unthrottled diff depth stream for Futures.
         let ws = self.ws_public_client.clone();
@@ -2079,7 +2079,7 @@ impl DataClient for BinanceFuturesDataClient {
 
         let should_unsubscribe = self
             .force_order_all_market_refs
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 if current == 0 {
                     None
                 } else {

@@ -59,8 +59,8 @@ use nautilus_okx::{
         query::{
             GetAlgoOrdersParamsBuilder, GetInstrumentsParamsBuilder, GetOptionSummaryParamsBuilder,
             GetOrderHistoryParams, GetOrderListParams, GetOrderParamsBuilder,
-            GetPositionTiersParamsBuilder, GetPositionsParamsBuilder, GetSpreadsParamsBuilder,
-            GetTradeFeeParamsBuilder, GetTransactionDetailsParamsBuilder,
+            GetPositionTiersParamsBuilder, GetPositionsParamsBuilder, GetPriceLimitParamsBuilder,
+            GetSpreadsParamsBuilder, GetTradeFeeParamsBuilder, GetTransactionDetailsParamsBuilder,
             SetPositionModeParamsBuilder,
         },
     },
@@ -78,6 +78,7 @@ struct TestServerState {
     last_order_detail_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     option_summary_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     option_summary_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    price_limit_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     instrument_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     spread_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     spread_order_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
@@ -336,6 +337,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
     let event_series_state = state.clone();
     let history_state = state.clone();
     let option_summary_state = state.clone();
+    let price_limit_state = state.clone();
     let pending_state = state.clone();
     let order_history_state = state.clone();
     let order_detail_state = state.clone();
@@ -640,6 +642,16 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                     let data = override_resp
                         .unwrap_or_else(|| load_test_data("http_get_option_summary.json"));
                     Json(data).into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/v5/public/price-limit",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let state = price_limit_state.clone();
+                async move {
+                    state.price_limit_queries.lock().await.push(params);
+                    Json(load_test_data("http_get_price_limit.json"))
                 }
             }),
         )
@@ -3770,6 +3782,13 @@ async fn test_http_request_algo_order_status_report_queries_attached_oco_with_or
             .any(|query| query.get("ordType").map(String::as_str) == Some("oco")),
         "expected at least one pending algo query with ordType=oco, found {pending_queries:?}",
     );
+
+    // algoClOrdId-only lookup must skip history: OKX rejects it with 50015.
+    let history_queries = state.algo_history_queries.lock().await.clone();
+    assert!(
+        history_queries.is_empty(),
+        "expected no algo history queries for an algoClOrdId-only lookup, found {history_queries:?}",
+    );
 }
 
 #[rstest]
@@ -4991,6 +5010,72 @@ async fn test_request_funding_rates() {
         rates[1].instrument_id,
         InstrumentId::from("BTC-USDT-SWAP.OKX")
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_get_price_limit_returns_data() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+    let client = OKXRawHttpClient::new(
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let params = GetPriceLimitParamsBuilder::default()
+        .inst_id("BTC-USDT-SWAP")
+        .build()
+        .unwrap();
+    let limits = client.get_price_limit(params).await.unwrap();
+
+    assert_eq!(limits.len(), 1);
+    assert_eq!(limits[0].inst_type, OKXInstrumentType::Swap);
+    assert_eq!(limits[0].inst_id, Ustr::from("BTC-USDT-SWAP"));
+    assert_eq!(limits[0].buy_lmt, "17057.9");
+    assert_eq!(limits[0].sell_lmt, "16388.9");
+    assert_eq!(limits[0].ts, 1_597_026_383_085);
+    assert!(limits[0].enabled);
+
+    let queries = state.price_limit_queries.lock().await;
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].get("instId"), Some(&"BTC-USDT-SWAP".to_string()));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_request_price_limit_uses_instrument_symbol() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+    let client = OKXHttpClient::new(
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    let limit = client
+        .request_price_limit(InstrumentId::from("BTC-USDT-SWAP.OKX"))
+        .await
+        .unwrap();
+
+    assert_eq!(limit.inst_id, Ustr::from("BTC-USDT-SWAP"));
+    assert!(limit.enabled);
+
+    let queries = state.price_limit_queries.lock().await;
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].get("instId"), Some(&"BTC-USDT-SWAP".to_string()));
 }
 
 #[rstest]

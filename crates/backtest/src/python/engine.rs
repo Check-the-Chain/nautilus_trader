@@ -20,23 +20,20 @@ use std::collections::HashMap;
 use ahash::AHashMap;
 use nautilus_common::{
     actor::data_actor::ImportableActorConfig,
-    python::{actor::PyDataActor, cache::PyCache, config_error_to_pyvalue_err},
+    enums::ComponentState,
+    python::{
+        actor::{PyDataActor, register_python_exec_algorithm_endpoint},
+        cache::PyCache,
+        config_error_to_pyvalue_err,
+    },
 };
 use nautilus_core::{
     UUID4, UnixNanos,
     python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err},
 };
 use nautilus_execution::{
-    models::{
-        fill::{
-            BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FillModelAny,
-            LimitOrderPartialFillModel, MarketHoursFillModel, OneTickSlippageFillModel,
-            ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel,
-            VolumeSensitiveFillModel,
-        },
-        latency::{LatencyModelAny, StaticLatencyModel},
-    },
-    python::fee::pyobject_to_fee_model_any,
+    models::latency::{LatencyModelAny, StaticLatencyModel},
+    python::{fee::pyobject_to_fee_model_handle, fill::pyobject_to_fill_model_handle},
 };
 #[cfg(feature = "defi")]
 use nautilus_model::defi::DefiData;
@@ -48,10 +45,14 @@ use nautilus_model::{
         OrderBookDepth10, QuoteTick, TradeTick,
     },
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
-    identifiers::{ActorId, ClientId, ComponentId, InstrumentId, StrategyId, TraderId, Venue},
+    identifiers::{
+        AccountId, ActorId, ClientId, ComponentId, ExecAlgorithmId, InstrumentId, StrategyId,
+        TraderId, Venue,
+    },
     python::instruments::pyobject_to_instrument_any,
     types::{Currency, Money, Price},
 };
+use nautilus_portfolio::python::PyPortfolio;
 #[cfg(feature = "examples")]
 use nautilus_trading::examples::{
     actors::{BookImbalanceActor, BookImbalanceActorConfig},
@@ -62,9 +63,12 @@ use nautilus_trading::examples::{
     },
 };
 use nautilus_trading::{
-    ImportableStrategyConfig,
+    ImportableExecAlgorithmConfig, ImportableStrategyConfig,
     algorithm::{TwapAlgorithm, TwapAlgorithmConfig},
-    python::strategy::{PyStrategy, PyStrategyInner},
+    python::{
+        algorithm::PyExecutionAlgorithm,
+        strategy::{PyStrategy, PyStrategyInner},
+    },
 };
 use pyo3::prelude::*;
 use rust_decimal::Decimal;
@@ -225,11 +229,11 @@ impl PyBacktestEngine {
             .map(|obj| Python::attach(|py| pyobject_to_margin_model_any(py, obj.bind(py))))
             .transpose()?;
         let fill_model = fill_model
-            .map(|obj| Python::attach(|py| pyobject_to_fill_model_any(py, obj.bind(py))))
+            .map(|obj| Python::attach(|py| pyobject_to_fill_model_handle(obj.bind(py))))
             .transpose()?
             .unwrap_or_default();
         let fee_model = fee_model
-            .map(|obj| Python::attach(|py| pyobject_to_fee_model_any(obj.bind(py))))
+            .map(|obj| Python::attach(|py| pyobject_to_fee_model_handle(obj.bind(py))))
             .transpose()?
             .unwrap_or_default();
         let latency_model = latency_model
@@ -308,7 +312,7 @@ impl PyBacktestEngine {
         venue: Venue,
         fill_model: Py<PyAny>,
     ) -> PyResult<()> {
-        let fill_model = pyobject_to_fill_model_any(py, fill_model.bind(py))?;
+        let fill_model = pyobject_to_fill_model_handle(fill_model.bind(py))?;
         self.0.change_fill_model(venue, fill_model);
         Ok(())
     }
@@ -344,11 +348,16 @@ impl PyBacktestEngine {
             .map_err(to_pyruntime_err)
     }
 
+    /// Adds an actor from a constructed Python instance.
+    ///
+    /// The actor ID and logging flags are sourced from the instance's config.
+    #[pyo3(name = "add_actor")]
+    fn py_add_actor(&mut self, actor: &Bound<'_, PyAny>) -> PyResult<()> {
+        log::debug!("`add_actor` with a constructed instance");
+        self.add_python_actor(&actor.clone().unbind())
+    }
+
     /// Adds an actor from an importable config.
-    #[allow(
-        unsafe_code,
-        reason = "Required for Python actor component registration"
-    )]
     #[pyo3(name = "add_actor_from_config")]
     #[expect(clippy::needless_pass_by_value)]
     fn py_add_actor_from_config(
@@ -368,127 +377,40 @@ impl PyBacktestEngine {
 
         log::info!("Importing actor from module: {module_name} class: {class_name}");
 
-        let (python_actor, actor_id) =
-            Python::attach(|py| -> anyhow::Result<(Py<PyAny>, ActorId)> {
-                let actor_module = py
-                    .import(module_name)
-                    .map_err(|e| anyhow::anyhow!("Failed to import module {module_name}: {e}"))?;
-                let actor_class = actor_module
-                    .getattr(class_name)
-                    .map_err(|e| anyhow::anyhow!("Failed to get class {class_name}: {e}"))?;
+        let actor = Python::attach(|py| -> anyhow::Result<Py<PyAny>> {
+            let actor_module = py
+                .import(module_name)
+                .map_err(|e| anyhow::anyhow!("Failed to import module {module_name}: {e}"))?;
+            let actor_class = actor_module
+                .getattr(class_name)
+                .map_err(|e| anyhow::anyhow!("Failed to get class {class_name}: {e}"))?;
 
-                let config_instance =
-                    create_config_instance(py, &config.config_path, &config.config)?;
+            let config_instance = create_config_instance(py, &config.config_path, &config.config)?;
 
-                let python_actor = if let Some(config_obj) = config_instance.clone() {
-                    actor_class.call1((config_obj,))?
-                } else {
-                    actor_class.call0()?
-                };
+            let python_actor = if let Some(config_obj) = config_instance {
+                actor_class.call1((config_obj,))?
+            } else {
+                actor_class.call0()?
+            };
 
-                let mut py_data_actor_ref = python_actor
-                    .extract::<PyRefMut<PyDataActor>>()
-                    .map_err(Into::<PyErr>::into)
-                    .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
-
-                if let Some(config_obj) = config_instance.as_ref() {
-                    if let Ok(actor_id) = config_obj.getattr("actor_id")
-                        && !actor_id.is_none()
-                    {
-                        let actor_id_val = if let Ok(actor_id_val) = actor_id.extract::<ActorId>() {
-                            actor_id_val
-                        } else if let Ok(actor_id_str) = actor_id.extract::<String>() {
-                            ActorId::new_checked(&actor_id_str)?
-                        } else {
-                            anyhow::bail!("Invalid `actor_id` type");
-                        };
-                        py_data_actor_ref.set_actor_id(actor_id_val);
-                    }
-
-                    if let Ok(log_events) = config_obj.getattr("log_events")
-                        && let Ok(log_events_val) = log_events.extract::<bool>()
-                    {
-                        py_data_actor_ref.set_log_events(log_events_val);
-                    }
-
-                    if let Ok(log_commands) = config_obj.getattr("log_commands")
-                        && let Ok(log_commands_val) = log_commands.extract::<bool>()
-                    {
-                        py_data_actor_ref.set_log_commands(log_commands_val);
-                    }
-                }
-
-                py_data_actor_ref.set_python_instance(python_actor.clone().unbind());
-                let actor_id = py_data_actor_ref.actor_id();
-
-                Ok((python_actor.unbind(), actor_id))
-            })
-            .map_err(to_pyruntime_err)?;
-
-        if self
-            .0
-            .kernel()
-            .trader
-            .borrow()
-            .actor_ids()
-            .contains(&actor_id)
-        {
-            return Err(to_pyruntime_err(format!(
-                "Actor '{actor_id}' is already registered"
-            )));
-        }
-
-        let trader_id = self.0.kernel().config.trader_id();
-        let cache = self.0.kernel().cache.clone();
-        let component_id = ComponentId::new(actor_id.inner().as_str());
-        let clock = self
-            .0
-            .kernel_mut()
-            .trader
-            .borrow_mut()
-            .create_component_clock(component_id);
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            let py_actor = python_actor.bind(py);
-            let mut py_data_actor_ref = py_actor
-                .extract::<PyRefMut<PyDataActor>>()
-                .map_err(Into::<PyErr>::into)
-                .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
-
-            py_data_actor_ref
-                .register(trader_id, clock, cache)
-                .map_err(|e| anyhow::anyhow!("Failed to register PyDataActor: {e}"))?;
-
-            Ok(())
+            Ok(python_actor.unbind())
         })
         .map_err(to_pyruntime_err)?;
 
-        Python::attach(|py| -> anyhow::Result<()> {
-            let py_actor = python_actor.bind(py);
-            let py_data_actor_ref = py_actor
-                .cast::<PyDataActor>()
-                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyDataActor: {e}"))?;
-            py_data_actor_ref.borrow().register_in_global_registries();
-            Ok(())
-        })
-        .map_err(to_pyruntime_err)?;
+        self.add_python_actor(&actor)
+    }
 
-        self.0
-            .kernel_mut()
-            .trader
-            .borrow_mut()
-            .add_actor_id_for_lifecycle(actor_id)
-            .map_err(to_pyruntime_err)?;
-
-        log::info!("Registered Python actor {actor_id}");
-        Ok(())
+    /// Adds a strategy from a constructed Python instance.
+    ///
+    /// The strategy ID, order ID tag, and logging flags are sourced from the instance's
+    /// config.
+    #[pyo3(name = "add_strategy")]
+    fn py_add_strategy(&mut self, strategy: &Bound<'_, PyAny>) -> PyResult<()> {
+        log::debug!("`add_strategy` with a constructed instance");
+        self.add_python_strategy(&strategy.clone().unbind())
     }
 
     /// Adds a strategy from an importable config.
-    #[allow(
-        unsafe_code,
-        reason = "Required for Python strategy component registration"
-    )]
     #[pyo3(name = "add_strategy_from_config")]
     #[expect(clippy::needless_pass_by_value)]
     fn py_add_strategy_from_config(
@@ -508,158 +430,113 @@ impl PyBacktestEngine {
 
         log::info!("Importing strategy from module: {module_name} class: {class_name}");
 
-        let (python_strategy, strategy_id) =
-            Python::attach(|py| -> anyhow::Result<(Py<PyAny>, StrategyId)> {
-                let strategy_module = py
-                    .import(module_name)
-                    .map_err(|e| anyhow::anyhow!("Failed to import module {module_name}: {e}"))?;
-                let strategy_class = strategy_module
-                    .getattr(class_name)
-                    .map_err(|e| anyhow::anyhow!("Failed to get class {class_name}: {e}"))?;
+        let strategy = Python::attach(|py| -> anyhow::Result<Py<PyAny>> {
+            let strategy_module = py
+                .import(module_name)
+                .map_err(|e| anyhow::anyhow!("Failed to import module {module_name}: {e}"))?;
+            let strategy_class = strategy_module
+                .getattr(class_name)
+                .map_err(|e| anyhow::anyhow!("Failed to get class {class_name}: {e}"))?;
 
-                let config_instance =
-                    create_config_instance(py, &config.config_path, &config.config)?;
+            let config_instance = create_config_instance(py, &config.config_path, &config.config)?;
 
-                let python_strategy = if let Some(config_obj) = config_instance.clone() {
-                    strategy_class.call1((config_obj,))?
-                } else {
-                    strategy_class.call0()?
-                };
+            let python_strategy = if let Some(config_obj) = config_instance {
+                strategy_class.call1((config_obj,))?
+            } else {
+                strategy_class.call0()?
+            };
 
-                let mut py_strategy_ref = python_strategy
-                    .extract::<PyRefMut<PyStrategy>>()
-                    .map_err(Into::<PyErr>::into)
-                    .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
-
-                if let Some(config_obj) = config_instance.as_ref() {
-                    if let Ok(strategy_id) = config_obj.getattr("strategy_id")
-                        && !strategy_id.is_none()
-                    {
-                        let strategy_id_val = if let Ok(sid) = strategy_id.extract::<StrategyId>() {
-                            sid
-                        } else if let Ok(sid_str) = strategy_id.extract::<String>() {
-                            StrategyId::new_checked(&sid_str)?
-                        } else {
-                            anyhow::bail!("Invalid `strategy_id` type");
-                        };
-                        py_strategy_ref.set_strategy_id(strategy_id_val)?;
-                    }
-
-                    if let Ok(order_id_tag) = config_obj.getattr("order_id_tag")
-                        && !order_id_tag.is_none()
-                    {
-                        let order_id_tag_val = order_id_tag
-                            .extract::<String>()
-                            .map_err(|e| anyhow::anyhow!("Invalid `order_id_tag` type: {e}"))?;
-                        py_strategy_ref.set_order_id_tag(&order_id_tag_val)?;
-                    }
-
-                    if let Ok(log_events) = config_obj.getattr("log_events")
-                        && let Ok(log_events_val) = log_events.extract::<bool>()
-                    {
-                        py_strategy_ref.set_log_events(log_events_val);
-                    }
-
-                    if let Ok(log_commands) = config_obj.getattr("log_commands")
-                        && let Ok(log_commands_val) = log_commands.extract::<bool>()
-                    {
-                        py_strategy_ref.set_log_commands(log_commands_val);
-                    }
-                }
-
-                py_strategy_ref.set_python_instance(python_strategy.clone().unbind());
-                let strategy_id = py_strategy_ref.strategy_id();
-
-                Ok((python_strategy.unbind(), strategy_id))
-            })
-            .map_err(to_pyruntime_err)?;
-
-        if self
-            .0
-            .kernel()
-            .trader
-            .borrow()
-            .strategy_ids()
-            .contains(&strategy_id)
-        {
-            return Err(to_pyruntime_err(format!(
-                "Strategy '{strategy_id}' is already registered"
-            )));
-        }
-
-        let trader_id = self.0.kernel().config.trader_id();
-        let cache = self.0.kernel().cache.clone();
-        let portfolio = self.0.kernel().portfolio.clone();
-        let component_id = ComponentId::new(strategy_id.inner().as_str());
-        let clock = self
-            .0
-            .kernel_mut()
-            .trader
-            .borrow_mut()
-            .create_component_clock(component_id);
-
-        Python::attach(|py| -> anyhow::Result<()> {
-            let py_strategy = python_strategy.bind(py);
-            let mut py_strategy_ref = py_strategy
-                .extract::<PyRefMut<PyStrategy>>()
-                .map_err(Into::<PyErr>::into)
-                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
-
-            py_strategy_ref
-                .register(trader_id, clock, cache, portfolio)
-                .map_err(|e| anyhow::anyhow!("Failed to register PyStrategy: {e}"))?;
-
-            Ok(())
+            Ok(python_strategy.unbind())
         })
         .map_err(to_pyruntime_err)?;
 
-        Python::attach(|py| -> anyhow::Result<()> {
-            let py_strategy = python_strategy.bind(py);
-            let py_strategy_ref = py_strategy
-                .cast::<PyStrategy>()
-                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyStrategy: {e}"))?;
-            py_strategy_ref.borrow().register_in_global_registries();
-            Ok(())
-        })
-        .map_err(to_pyruntime_err)?;
-
-        self.0
-            .kernel_mut()
-            .trader
-            .borrow_mut()
-            .add_strategy_id_with_subscriptions::<PyStrategyInner>(strategy_id)
-            .map_err(to_pyruntime_err)?;
-
-        log::info!("Registered Python strategy {strategy_id}");
-        Ok(())
+        self.add_python_strategy(&strategy)
     }
 
-    /// Adds a compiled-in native Rust strategy from its type name and config.
+    /// Adds an execution algorithm from a constructed Python instance.
     ///
-    /// The type name determines which built-in strategy is constructed.
-    /// All execution happens in Rust; Python is the configuration layer.
-    #[cfg(feature = "examples")]
-    #[pyo3(name = "add_native_strategy")]
-    fn py_add_native_strategy(
+    /// The execution algorithm ID and logging flags are sourced from the instance's
+    /// config.
+    #[pyo3(name = "add_exec_algorithm")]
+    fn py_add_exec_algorithm(&mut self, exec_algorithm: &Bound<'_, PyAny>) -> PyResult<()> {
+        log::debug!("`add_exec_algorithm` with a constructed instance");
+        self.add_python_exec_algorithm(&exec_algorithm.clone().unbind())
+    }
+
+    /// Adds an execution algorithm from an importable config.
+    #[pyo3(name = "add_exec_algorithm_from_config")]
+    #[expect(clippy::needless_pass_by_value)]
+    fn py_add_exec_algorithm_from_config(
         &mut self,
-        type_name: &str,
-        config: &Bound<'_, PyAny>,
+        _py: Python,
+        config: ImportableExecAlgorithmConfig,
     ) -> PyResult<()> {
-        let register = native_strategy_register(type_name).ok_or_else(|| {
-            to_pytype_err(format!("Unsupported native strategy type: {type_name}"))
+        self.ensure_can_add_exec_algorithm()?;
+
+        log::debug!("`add_exec_algorithm_from_config` with: {config:?}");
+
+        let parts: Vec<&str> = config.exec_algorithm_path.split(':').collect();
+        if parts.len() != 2 {
+            return Err(to_pyvalue_err(
+                "exec_algorithm_path must be in format 'module.path:ClassName'",
+            ));
+        }
+        let (module_name, class_name) = (parts[0], parts[1]);
+
+        log::info!("Importing exec algorithm from module: {module_name} class: {class_name}");
+
+        let exec_algorithm = Python::attach(|py| -> anyhow::Result<Py<PyAny>> {
+            let algo_module = py
+                .import(module_name)
+                .map_err(|e| anyhow::anyhow!("Failed to import module {module_name}: {e}"))?;
+            let algo_class = algo_module
+                .getattr(class_name)
+                .map_err(|e| anyhow::anyhow!("Failed to get class {class_name}: {e}"))?;
+
+            let config_instance = create_config_instance(py, &config.config_path, &config.config)?;
+
+            let python_exec_algorithm = if let Some(config_obj) = config_instance {
+                algo_class.call1((config_obj,))?
+            } else {
+                algo_class.call0()?
+            };
+
+            Ok(python_exec_algorithm.unbind())
+        })
+        .map_err(to_pyruntime_err)?;
+
+        self.add_python_exec_algorithm(&exec_algorithm)
+    }
+
+    /// Adds a built-in example actor from its type name and config.
+    ///
+    /// This method exists only to single-source bundled example actor code across
+    /// Rust and Python tests/examples. It is not a first-class extension path for
+    /// adding native actors.
+    #[cfg(feature = "examples")]
+    #[pyo3(name = "add_builtin_actor")]
+    fn py_add_builtin_actor(&mut self, type_name: &str, config: &Bound<'_, PyAny>) -> PyResult<()> {
+        let register = builtin_actor_register(type_name).ok_or_else(|| {
+            to_pytype_err(format!("Unsupported built-in actor type: {type_name}"))
         })?;
         register(&mut self.0, config)
     }
 
-    /// Adds a compiled-in native Rust actor from its type name and config.
+    /// Adds a built-in example strategy from its type name and config.
     ///
-    /// The type name determines which built-in actor is constructed.
-    /// All execution happens in Rust; Python is the configuration layer.
+    /// This method exists only to single-source bundled example strategy code across
+    /// Rust and Python tests/examples. It is not a first-class extension path for
+    /// adding native strategies.
     #[cfg(feature = "examples")]
-    #[pyo3(name = "add_native_actor")]
-    fn py_add_native_actor(&mut self, type_name: &str, config: &Bound<'_, PyAny>) -> PyResult<()> {
-        let register = native_actor_register(type_name)
-            .ok_or_else(|| to_pytype_err(format!("Unsupported native actor type: {type_name}")))?;
+    #[pyo3(name = "add_builtin_strategy")]
+    fn py_add_builtin_strategy(
+        &mut self,
+        type_name: &str,
+        config: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let register = builtin_strategy_register(type_name).ok_or_else(|| {
+            to_pytype_err(format!("Unsupported built-in strategy type: {type_name}"))
+        })?;
         register(&mut self.0, config)
     }
 
@@ -777,6 +654,46 @@ impl PyBacktestEngine {
         Ok(())
     }
 
+    /// Adds multiple execution algorithms from importable configs. Stops at the first error.
+    #[pyo3(name = "add_exec_algorithms_from_configs")]
+    fn py_add_exec_algorithms_from_configs(
+        &mut self,
+        py: Python,
+        configs: Vec<ImportableExecAlgorithmConfig>,
+    ) -> PyResult<()> {
+        for config in configs {
+            self.py_add_exec_algorithm_from_config(py, config)?;
+        }
+        Ok(())
+    }
+
+    /// Adds multiple actors from constructed Python instances. Stops at the first error.
+    #[pyo3(name = "add_actors")]
+    fn py_add_actors(&mut self, actors: Vec<Py<PyAny>>) -> PyResult<()> {
+        for actor in actors {
+            self.add_python_actor(&actor)?;
+        }
+        Ok(())
+    }
+
+    /// Adds multiple strategies from constructed Python instances. Stops at the first error.
+    #[pyo3(name = "add_strategies")]
+    fn py_add_strategies(&mut self, strategies: Vec<Py<PyAny>>) -> PyResult<()> {
+        for strategy in strategies {
+            self.add_python_strategy(&strategy)?;
+        }
+        Ok(())
+    }
+
+    /// Adds multiple execution algorithms from constructed Python instances. Stops at the first error.
+    #[pyo3(name = "add_exec_algorithms")]
+    fn py_add_exec_algorithms(&mut self, exec_algorithms: Vec<Py<PyAny>>) -> PyResult<()> {
+        for exec_algorithm in exec_algorithms {
+            self.add_python_exec_algorithm(&exec_algorithm)?;
+        }
+        Ok(())
+    }
+
     /// Sorts the engine's internal data stream by timestamp.
     #[pyo3(name = "sort_data")]
     fn py_sort_data(&mut self) {
@@ -866,12 +783,106 @@ impl PyBacktestEngine {
         PyCache::from_rc(self.0.kernel().cache.clone())
     }
 
+    /// Returns the portfolio shared with the kernel and registered components.
+    #[getter]
+    #[pyo3(name = "portfolio")]
+    fn py_portfolio(&self) -> PyPortfolio {
+        PyPortfolio::from_rc(self.0.kernel().portfolio.clone())
+    }
+
+    /// Generates an orders report as a pandas `DataFrame`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Python `ReportProvider` import or call fails.
+    #[pyo3(name = "generate_orders_report")]
+    fn py_generate_orders_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let orders = self.cache_bound(py)?.call_method0("orders")?;
+        Self::report_provider(py)?.call_method1("generate_orders_report", (orders,))
+    }
+
+    /// Generates an order fills report as a pandas `DataFrame`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Python `ReportProvider` import or call fails.
+    #[pyo3(name = "generate_order_fills_report")]
+    fn py_generate_order_fills_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let orders = self.cache_bound(py)?.call_method0("orders")?;
+        Self::report_provider(py)?.call_method1("generate_order_fills_report", (orders,))
+    }
+
+    /// Generates a fills report as a pandas `DataFrame`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Python `ReportProvider` import or call fails.
+    #[pyo3(name = "generate_fills_report")]
+    fn py_generate_fills_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let orders = self.cache_bound(py)?.call_method0("orders")?;
+        Self::report_provider(py)?.call_method1("generate_fills_report", (orders,))
+    }
+
+    /// Generates a positions report as a pandas `DataFrame`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Python `ReportProvider` import or call fails.
+    #[pyo3(name = "generate_positions_report")]
+    fn py_generate_positions_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cache = self.cache_bound(py)?;
+        let positions = cache.call_method0("positions")?;
+        let snapshots = cache.call_method0("position_snapshots")?;
+        Self::report_provider(py)?.call_method1("generate_positions_report", (positions, snapshots))
+    }
+
+    /// Generates an account report as a pandas `DataFrame`.
+    ///
+    /// At least one of `venue` or `account_id` must be provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither `venue` nor `account_id` is provided, or if the Python
+    /// `ReportProvider` import or call fails.
+    #[pyo3(name = "generate_account_report", signature = (venue=None, account_id=None))]
+    fn py_generate_account_report<'py>(
+        &self,
+        py: Python<'py>,
+        venue: Option<Venue>,
+        account_id: Option<AccountId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let cache = self.cache_bound(py)?;
+        let account = match (account_id, venue) {
+            (Some(aid), _) => cache.call_method1("account", (aid,))?,
+            (None, Some(v)) => cache.call_method1("account_for_venue", (v,))?,
+            (None, None) => {
+                return Err(to_pyvalue_err(
+                    "At least one of 'venue' or 'account_id' must be provided",
+                ));
+            }
+        };
+
+        if account.is_none() {
+            return py.import("pandas")?.call_method0("DataFrame");
+        }
+        Self::report_provider(py)?.call_method1("generate_account_report", (account,))
+    }
+
     fn __repr__(&self) -> String {
         format!("{:?}", self.0)
     }
 }
 
 impl PyBacktestEngine {
+    fn cache_bound<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCache>> {
+        Ok(Py::new(py, self.py_cache())?.into_bound(py))
+    }
+
+    fn report_provider(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        py.import("nautilus_trader.analysis.reporter")?
+            .getattr("ReportProvider")
+    }
+
     /// Provides access to the inner [`BacktestEngine`].
     #[must_use]
     pub fn inner(&self) -> &BacktestEngine {
@@ -882,30 +893,495 @@ impl PyBacktestEngine {
     pub fn inner_mut(&mut self) -> &mut BacktestEngine {
         &mut self.0
     }
+
+    /// Configures and registers a constructed Python strategy instance.
+    ///
+    /// Shared by `add_strategy` (caller-constructed instance) and
+    /// `add_strategy_from_config` (imported and constructed here). The strategy ID,
+    /// order ID tag, and logging flags are sourced from the instance's retained
+    /// `.config`, so both entry points use a single config object.
+    #[allow(
+        unsafe_code,
+        reason = "Required for Python strategy component registration"
+    )]
+    fn add_python_strategy(&mut self, strategy: &Py<PyAny>) -> PyResult<()> {
+        let strategy_id = Python::attach(|py| -> anyhow::Result<StrategyId> {
+            let bound = strategy.bind(py);
+
+            let config_instance = bound
+                .getattr("config")
+                .ok()
+                .filter(|config| !config.is_none());
+
+            let mut py_strategy_ref = bound
+                .extract::<PyRefMut<PyStrategy>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+
+            if let Some(config_obj) = config_instance.as_ref() {
+                if let Ok(strategy_id) = config_obj.getattr("strategy_id")
+                    && !strategy_id.is_none()
+                {
+                    let strategy_id_val = if let Ok(sid) = strategy_id.extract::<StrategyId>() {
+                        sid
+                    } else if let Ok(sid_str) = strategy_id.extract::<String>() {
+                        StrategyId::new_checked(&sid_str)?
+                    } else {
+                        anyhow::bail!("Invalid `strategy_id` type");
+                    };
+                    py_strategy_ref.set_strategy_id(strategy_id_val)?;
+                }
+
+                if let Ok(order_id_tag) = config_obj.getattr("order_id_tag")
+                    && !order_id_tag.is_none()
+                {
+                    let order_id_tag_val = order_id_tag
+                        .extract::<String>()
+                        .map_err(|e| anyhow::anyhow!("Invalid `order_id_tag` type: {e}"))?;
+                    py_strategy_ref.set_order_id_tag(&order_id_tag_val)?;
+                }
+
+                if let Ok(log_events) = config_obj.getattr("log_events")
+                    && let Ok(log_events_val) = log_events.extract::<bool>()
+                {
+                    py_strategy_ref.set_log_events(log_events_val);
+                }
+
+                if let Ok(log_commands) = config_obj.getattr("log_commands")
+                    && let Ok(log_commands_val) = log_commands.extract::<bool>()
+                {
+                    py_strategy_ref.set_log_commands(log_commands_val);
+                }
+            }
+
+            py_strategy_ref.set_python_instance(strategy.clone_ref(py));
+            let strategy_id = py_strategy_ref.strategy_id();
+
+            Ok(strategy_id)
+        })
+        .map_err(to_pyruntime_err)?;
+
+        if self
+            .0
+            .kernel()
+            .trader
+            .borrow()
+            .strategy_ids()
+            .contains(&strategy_id)
+        {
+            return Err(to_pyruntime_err(format!(
+                "Strategy '{strategy_id}' is already registered"
+            )));
+        }
+
+        let trader_id = self.0.kernel().config.trader_id();
+        let cache = self.0.kernel().cache.clone();
+        let portfolio = self.0.kernel().portfolio.clone();
+        let component_id = ComponentId::new(strategy_id.inner().as_str());
+        let clock = self
+            .0
+            .kernel_mut()
+            .trader
+            .borrow_mut()
+            .create_component_clock(component_id);
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_strategy = strategy.bind(py);
+            let mut py_strategy_ref = py_strategy
+                .extract::<PyRefMut<PyStrategy>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+
+            py_strategy_ref
+                .register(trader_id, clock, cache, portfolio)
+                .map_err(|e| anyhow::anyhow!("Failed to register PyStrategy: {e}"))?;
+
+            Ok(())
+        })
+        .map_err(to_pyruntime_err)?;
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_strategy = strategy.bind(py);
+            let py_strategy_ref = py_strategy
+                .cast::<PyStrategy>()
+                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyStrategy: {e}"))?;
+            py_strategy_ref.borrow().register_in_global_registries();
+            Ok(())
+        })
+        .map_err(to_pyruntime_err)?;
+
+        self.0
+            .kernel_mut()
+            .trader
+            .borrow_mut()
+            .add_strategy_id_with_subscriptions::<PyStrategyInner>(strategy_id)
+            .map_err(to_pyruntime_err)?;
+
+        log::info!("Registered Python strategy {strategy_id}");
+        Ok(())
+    }
+
+    /// Configures and registers a constructed Python actor instance.
+    ///
+    /// Shared by `add_actor` (caller-constructed instance) and `add_actor_from_config`
+    /// (imported and constructed here). The actor ID and logging flags are sourced from
+    /// the instance's retained `.config`, so both entry points use a single config object.
+    #[allow(
+        unsafe_code,
+        reason = "Required for Python actor component registration"
+    )]
+    fn add_python_actor(&mut self, actor: &Py<PyAny>) -> PyResult<()> {
+        let actor_id = Python::attach(|py| -> anyhow::Result<ActorId> {
+            let bound = actor.bind(py);
+
+            let config_instance = bound
+                .getattr("config")
+                .ok()
+                .filter(|config| !config.is_none());
+
+            let mut py_data_actor_ref = bound
+                .extract::<PyRefMut<PyDataActor>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
+
+            if let Some(config_obj) = config_instance.as_ref() {
+                if let Ok(actor_id) = config_obj.getattr("actor_id")
+                    && !actor_id.is_none()
+                {
+                    let actor_id_val = if let Ok(actor_id_val) = actor_id.extract::<ActorId>() {
+                        actor_id_val
+                    } else if let Ok(actor_id_str) = actor_id.extract::<String>() {
+                        ActorId::new_checked(&actor_id_str)?
+                    } else {
+                        anyhow::bail!("Invalid `actor_id` type");
+                    };
+                    py_data_actor_ref.set_actor_id(actor_id_val);
+                }
+
+                if let Ok(log_events) = config_obj.getattr("log_events")
+                    && let Ok(log_events_val) = log_events.extract::<bool>()
+                {
+                    py_data_actor_ref.set_log_events(log_events_val);
+                }
+
+                if let Ok(log_commands) = config_obj.getattr("log_commands")
+                    && let Ok(log_commands_val) = log_commands.extract::<bool>()
+                {
+                    py_data_actor_ref.set_log_commands(log_commands_val);
+                }
+            }
+
+            py_data_actor_ref.set_python_instance(actor.clone_ref(py));
+            let actor_id = py_data_actor_ref.actor_id();
+
+            Ok(actor_id)
+        })
+        .map_err(to_pyruntime_err)?;
+
+        if self
+            .0
+            .kernel()
+            .trader
+            .borrow()
+            .actor_ids()
+            .contains(&actor_id)
+        {
+            return Err(to_pyruntime_err(format!(
+                "Actor '{actor_id}' is already registered"
+            )));
+        }
+
+        let trader_id = self.0.kernel().config.trader_id();
+        let cache = self.0.kernel().cache.clone();
+        let component_id = ComponentId::new(actor_id.inner().as_str());
+        let clock = self
+            .0
+            .kernel_mut()
+            .trader
+            .borrow_mut()
+            .create_component_clock(component_id);
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_actor = actor.bind(py);
+            let mut py_data_actor_ref = py_actor
+                .extract::<PyRefMut<PyDataActor>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
+
+            py_data_actor_ref
+                .register(trader_id, clock, cache)
+                .map_err(|e| anyhow::anyhow!("Failed to register PyDataActor: {e}"))?;
+
+            Ok(())
+        })
+        .map_err(to_pyruntime_err)?;
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_actor = actor.bind(py);
+            let py_data_actor_ref = py_actor
+                .cast::<PyDataActor>()
+                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyDataActor: {e}"))?;
+            py_data_actor_ref.borrow().register_in_global_registries();
+            Ok(())
+        })
+        .map_err(to_pyruntime_err)?;
+
+        self.0
+            .kernel_mut()
+            .trader
+            .borrow_mut()
+            .add_actor_id_for_lifecycle(actor_id)
+            .map_err(to_pyruntime_err)?;
+
+        log::info!("Registered Python actor {actor_id}");
+        Ok(())
+    }
+
+    /// Configures and registers a constructed Python execution algorithm instance.
+    ///
+    /// Shared by `add_exec_algorithm` (caller-constructed instance) and
+    /// `add_exec_algorithm_from_config` (imported and constructed here). The execution
+    /// algorithm ID and logging flags are sourced from the instance's retained `.config`.
+    #[allow(
+        unsafe_code,
+        reason = "Required for Python exec algorithm component registration"
+    )]
+    fn add_python_exec_algorithm(&mut self, exec_algorithm: &Py<PyAny>) -> PyResult<()> {
+        self.ensure_can_add_exec_algorithm()?;
+
+        if self.try_add_py_execution_algorithm(exec_algorithm)? {
+            return Ok(());
+        }
+
+        let actor_id = Python::attach(|py| -> anyhow::Result<ActorId> {
+            let bound = exec_algorithm.bind(py);
+
+            let config_instance = bound
+                .getattr("config")
+                .ok()
+                .filter(|config| !config.is_none());
+
+            let mut py_data_actor_ref = bound
+                .extract::<PyRefMut<PyDataActor>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
+
+            if let Some(config_obj) = config_instance.as_ref() {
+                let id_attr = config_obj
+                    .getattr("exec_algorithm_id")
+                    .ok()
+                    .filter(|v| !v.is_none())
+                    .or_else(|| config_obj.getattr("actor_id").ok().filter(|v| !v.is_none()));
+
+                if let Some(id_value) = id_attr {
+                    let actor_id_val = if let Ok(eaid) = id_value.extract::<ExecAlgorithmId>() {
+                        ActorId::new(eaid.inner().as_str())
+                    } else if let Ok(aid) = id_value.extract::<ActorId>() {
+                        aid
+                    } else if let Ok(aid_str) = id_value.extract::<String>() {
+                        ActorId::new_checked(&aid_str)?
+                    } else {
+                        anyhow::bail!("Invalid `exec_algorithm_id`/`actor_id` type");
+                    };
+                    py_data_actor_ref.set_actor_id(actor_id_val);
+                }
+
+                if let Ok(log_events) = config_obj.getattr("log_events")
+                    && let Ok(log_events_val) = log_events.extract::<bool>()
+                {
+                    py_data_actor_ref.set_log_events(log_events_val);
+                }
+
+                if let Ok(log_commands) = config_obj.getattr("log_commands")
+                    && let Ok(log_commands_val) = log_commands.extract::<bool>()
+                {
+                    py_data_actor_ref.set_log_commands(log_commands_val);
+                }
+            }
+
+            py_data_actor_ref.set_python_instance(exec_algorithm.clone_ref(py));
+            let actor_id = py_data_actor_ref.actor_id();
+
+            Ok(actor_id)
+        })
+        .map_err(to_pyruntime_err)?;
+
+        let exec_algorithm_id = ExecAlgorithmId::from(actor_id.inner().as_str());
+
+        if self
+            .0
+            .kernel()
+            .trader
+            .borrow()
+            .exec_algorithm_ids()
+            .contains(&exec_algorithm_id)
+        {
+            return Err(to_pyruntime_err(format!(
+                "Execution algorithm '{exec_algorithm_id}' is already registered"
+            )));
+        }
+
+        let trader_id = self.0.kernel().config.trader_id();
+        let cache = self.0.kernel().cache.clone();
+        let component_id = ComponentId::new(actor_id.inner().as_str());
+        let clock = self
+            .0
+            .kernel_mut()
+            .trader
+            .borrow_mut()
+            .create_component_clock(component_id);
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_algo = exec_algorithm.bind(py);
+            let mut py_data_actor_ref = py_algo
+                .extract::<PyRefMut<PyDataActor>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
+
+            py_data_actor_ref
+                .register(trader_id, clock, cache)
+                .map_err(|e| anyhow::anyhow!("Failed to register PyDataActor: {e}"))?;
+
+            Ok(())
+        })
+        .map_err(to_pyruntime_err)?;
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_algo = exec_algorithm.bind(py);
+            let py_data_actor_ref = py_algo
+                .cast::<PyDataActor>()
+                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyDataActor: {e}"))?;
+            py_data_actor_ref.borrow().register_in_global_registries();
+            Ok(())
+        })
+        .map_err(to_pyruntime_err)?;
+
+        register_python_exec_algorithm_endpoint(exec_algorithm_id);
+
+        self.0
+            .kernel_mut()
+            .trader
+            .borrow_mut()
+            .add_exec_algorithm_id_for_lifecycle(exec_algorithm_id)
+            .map_err(to_pyruntime_err)?;
+
+        log::info!("Registered Python exec algorithm {exec_algorithm_id}");
+        Ok(())
+    }
+
+    fn try_add_py_execution_algorithm(&mut self, exec_algorithm: &Py<PyAny>) -> PyResult<bool> {
+        let py_exec_algorithm =
+            Python::attach(|py| -> anyhow::Result<Option<PyExecutionAlgorithm>> {
+                let bound = exec_algorithm.bind(py);
+
+                let config_instance = bound
+                    .getattr("config")
+                    .ok()
+                    .filter(|config| !config.is_none());
+
+                let Ok(mut py_exec_algorithm_ref) =
+                    bound.extract::<PyRefMut<PyExecutionAlgorithm>>()
+                else {
+                    return Ok(None);
+                };
+
+                if let Some(config_obj) = config_instance.as_ref() {
+                    let id_attr = config_obj
+                        .getattr("exec_algorithm_id")
+                        .ok()
+                        .filter(|v| !v.is_none())
+                        .or_else(|| config_obj.getattr("actor_id").ok().filter(|v| !v.is_none()));
+
+                    if let Some(id_value) = id_attr {
+                        let exec_algorithm_id =
+                            if let Ok(eaid) = id_value.extract::<ExecAlgorithmId>() {
+                                eaid
+                            } else if let Ok(aid) = id_value.extract::<ActorId>() {
+                                ExecAlgorithmId::new_checked(aid.inner().as_str())?
+                            } else if let Ok(id_str) = id_value.extract::<String>() {
+                                ExecAlgorithmId::new_checked(&id_str)?
+                            } else {
+                                anyhow::bail!("Invalid `exec_algorithm_id`/`actor_id` type");
+                            };
+                        py_exec_algorithm_ref.set_exec_algorithm_id(exec_algorithm_id);
+                    }
+
+                    if let Ok(log_events) = config_obj.getattr("log_events")
+                        && let Ok(log_events_val) = log_events.extract::<bool>()
+                    {
+                        py_exec_algorithm_ref.set_log_events(log_events_val);
+                    }
+
+                    if let Ok(log_commands) = config_obj.getattr("log_commands")
+                        && let Ok(log_commands_val) = log_commands.extract::<bool>()
+                    {
+                        py_exec_algorithm_ref.set_log_commands(log_commands_val);
+                    }
+                }
+
+                py_exec_algorithm_ref.set_python_instance(exec_algorithm.clone_ref(py));
+
+                Ok(Some(py_exec_algorithm_ref.clone()))
+            })
+            .map_err(to_pyruntime_err)?;
+
+        let Some(py_exec_algorithm) = py_exec_algorithm else {
+            return Ok(false);
+        };
+
+        let exec_algorithm_id = py_exec_algorithm.exec_algorithm_id();
+        self.0
+            .add_exec_algorithm(py_exec_algorithm)
+            .map_err(to_pyruntime_err)?;
+
+        log::info!("Registered Python exec algorithm {exec_algorithm_id}");
+        Ok(true)
+    }
+
+    /// Rejects adding an execution algorithm when the trader is running or disposed.
+    ///
+    /// Checked before importing and constructing the Python class in the `from_config`
+    /// path so a rejected addition never runs user constructor code.
+    fn ensure_can_add_exec_algorithm(&self) -> PyResult<()> {
+        match self.0.kernel().trader.borrow().state() {
+            ComponentState::PreInitialized | ComponentState::Ready | ComponentState::Stopped => {
+                Ok(())
+            }
+            ComponentState::Running => Err(to_pyruntime_err(
+                "Cannot add execution algorithms to running trader",
+            )),
+            ComponentState::Disposed => {
+                Err(to_pyruntime_err("Cannot add components to disposed trader"))
+            }
+            state => Err(to_pyruntime_err(format!(
+                "Cannot add execution algorithms in current state: {state}"
+            ))),
+        }
+    }
 }
 
 #[cfg(feature = "examples")]
-type NativeStrategyRegister = for<'py> fn(&mut BacktestEngine, &Bound<'py, PyAny>) -> PyResult<()>;
+type BuiltinActorRegister = for<'py> fn(&mut BacktestEngine, &Bound<'py, PyAny>) -> PyResult<()>;
 
 #[cfg(feature = "examples")]
-type NativeActorRegister = for<'py> fn(&mut BacktestEngine, &Bound<'py, PyAny>) -> PyResult<()>;
+type BuiltinStrategyRegister = for<'py> fn(&mut BacktestEngine, &Bound<'py, PyAny>) -> PyResult<()>;
 
 #[cfg(feature = "examples")]
-fn native_strategy_register(type_name: &str) -> Option<NativeStrategyRegister> {
+fn builtin_actor_register(type_name: &str) -> Option<BuiltinActorRegister> {
+    match type_name {
+        "BookImbalanceActor" => Some(register_book_imbalance_actor),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "examples")]
+fn builtin_strategy_register(type_name: &str) -> Option<BuiltinStrategyRegister> {
     match type_name {
         "CompositeMarketMaker" => Some(register_composite_market_maker),
         "DeltaNeutralVol" => Some(register_delta_neutral_vol),
         "EmaCross" => Some(register_ema_cross),
         "GridMarketMaker" => Some(register_grid_market_maker),
         "HurstVpinDirectional" => Some(register_hurst_vpin_directional),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "examples")]
-fn native_actor_register(type_name: &str) -> Option<NativeActorRegister> {
-    match type_name {
-        "BookImbalanceActor" => Some(register_book_imbalance_actor),
         _ => None,
     }
 }
@@ -1008,29 +1484,29 @@ mod tests {
     #[case("EmaCross")]
     #[case("GridMarketMaker")]
     #[case("HurstVpinDirectional")]
-    fn test_native_strategy_register_accepts_supported_names(#[case] type_name: &str) {
-        assert!(super::native_strategy_register(type_name).is_some());
+    fn test_builtin_strategy_register_accepts_supported_names(#[case] type_name: &str) {
+        assert!(super::builtin_strategy_register(type_name).is_some());
     }
 
     #[rstest]
     #[case("BookImbalanceActor")]
-    fn test_native_actor_register_accepts_supported_names(#[case] type_name: &str) {
-        assert!(super::native_actor_register(type_name).is_some());
+    fn test_builtin_actor_register_accepts_supported_names(#[case] type_name: &str) {
+        assert!(super::builtin_actor_register(type_name).is_some());
     }
 
     #[rstest]
-    fn test_native_register_rejects_unknown_names() {
-        assert!(super::native_strategy_register("UnknownStrategy").is_none());
-        assert!(super::native_actor_register("UnknownActor").is_none());
+    fn test_builtin_register_rejects_unknown_names() {
+        assert!(super::builtin_strategy_register("UnknownStrategy").is_none());
+        assert!(super::builtin_actor_register("UnknownActor").is_none());
     }
 
     #[rstest]
-    fn test_native_strategy_register_rejects_mismatched_config() {
+    fn test_builtin_strategy_register_rejects_mismatched_config() {
         Python::initialize();
 
         let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
         Python::attach(|py| {
-            let register = super::native_strategy_register("EmaCross").unwrap();
+            let register = super::builtin_strategy_register("EmaCross").unwrap();
             let config = PyDict::new(py);
             let error = register(&mut engine, config.as_any()).unwrap_err();
 
@@ -1039,72 +1515,225 @@ mod tests {
     }
 
     #[rstest]
-    fn test_native_actor_register_rejects_mismatched_config() {
+    fn test_builtin_actor_register_rejects_mismatched_config() {
         Python::initialize();
 
         let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
         Python::attach(|py| {
-            let register = super::native_actor_register("BookImbalanceActor").unwrap();
+            let register = super::builtin_actor_register("BookImbalanceActor").unwrap();
             let config = PyDict::new(py);
             let error = register(&mut engine, config.as_any()).unwrap_err();
 
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
         });
     }
-}
 
-pub(crate) fn pyobject_to_fill_model_any(
-    _py: Python,
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<FillModelAny> {
-    if let Ok(m) = obj.extract::<DefaultFillModel>() {
-        return Ok(FillModelAny::Default(m));
+    #[rstest]
+    fn test_add_strategy_registers_python_instance() {
+        use nautilus_model::identifiers::StrategyId;
+        use nautilus_trading::python::strategy::PyStrategy;
+        use pyo3::{ffi::c_str, types::PyAnyMethods};
+
+        Python::initialize();
+
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
+
+        Python::attach(|py| {
+            let config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'strategy_id': 'S-INSTANCE-001'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let instance = py
+                .get_type::<PyStrategy>()
+                .as_any()
+                .call1((config,))
+                .unwrap();
+
+            engine.py_add_strategy(&instance).unwrap();
+
+            assert!(
+                engine
+                    .0
+                    .kernel()
+                    .trader
+                    .borrow()
+                    .strategy_ids()
+                    .contains(&StrategyId::from("S-INSTANCE-001"))
+            );
+        });
     }
 
-    if let Ok(m) = obj.extract::<BestPriceFillModel>() {
-        return Ok(FillModelAny::BestPrice(m));
+    #[rstest]
+    fn test_add_actor_registers_python_instance() {
+        use nautilus_common::python::actor::PyDataActor;
+        use nautilus_model::identifiers::ActorId;
+        use pyo3::{ffi::c_str, types::PyAnyMethods};
+
+        Python::initialize();
+
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
+
+        Python::attach(|py| {
+            let config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'actor_id': 'A-INSTANCE-001'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let instance = py
+                .get_type::<PyDataActor>()
+                .as_any()
+                .call1((config,))
+                .unwrap();
+
+            engine.py_add_actor(&instance).unwrap();
+
+            assert!(
+                engine
+                    .0
+                    .kernel()
+                    .trader
+                    .borrow()
+                    .actor_ids()
+                    .contains(&ActorId::from("A-INSTANCE-001"))
+            );
+        });
     }
 
-    if let Ok(m) = obj.extract::<OneTickSlippageFillModel>() {
-        return Ok(FillModelAny::OneTickSlippage(m));
+    #[rstest]
+    fn test_add_exec_algorithm_registers_python_instance() {
+        use nautilus_common::python::actor::PyDataActor;
+        use nautilus_model::identifiers::ExecAlgorithmId;
+        use pyo3::{ffi::c_str, types::PyAnyMethods};
+
+        Python::initialize();
+
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
+
+        Python::attach(|py| {
+            let config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'exec_algorithm_id': 'EXEC-INSTANCE-001'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let instance = py
+                .get_type::<PyDataActor>()
+                .as_any()
+                .call1((config,))
+                .unwrap();
+
+            engine.py_add_exec_algorithm(&instance).unwrap();
+
+            assert!(
+                engine
+                    .0
+                    .kernel()
+                    .trader
+                    .borrow()
+                    .exec_algorithm_ids()
+                    .contains(&ExecAlgorithmId::from("EXEC-INSTANCE-001"))
+            );
+        });
     }
 
-    if let Ok(m) = obj.extract::<ProbabilisticFillModel>() {
-        return Ok(FillModelAny::Probabilistic(m));
+    #[rstest]
+    fn test_add_strategies_registers_multiple_python_instances() {
+        use nautilus_model::identifiers::StrategyId;
+        use nautilus_trading::python::strategy::PyStrategy;
+        use pyo3::{ffi::c_str, types::PyAnyMethods};
+
+        Python::initialize();
+
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
+
+        Python::attach(|py| {
+            let strategy_type = py.get_type::<PyStrategy>();
+            let first_config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'strategy_id': 'S-MULTI-001'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let second_config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'strategy_id': 'S-MULTI-002'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let instances = vec![
+                strategy_type
+                    .as_any()
+                    .call1((first_config,))
+                    .unwrap()
+                    .unbind(),
+                strategy_type
+                    .as_any()
+                    .call1((second_config,))
+                    .unwrap()
+                    .unbind(),
+            ];
+
+            engine.py_add_strategies(instances).unwrap();
+
+            let trader = engine.0.kernel().trader.borrow();
+            let strategy_ids = trader.strategy_ids();
+            assert!(strategy_ids.contains(&StrategyId::from("S-MULTI-001")));
+            assert!(strategy_ids.contains(&StrategyId::from("S-MULTI-002")));
+        });
     }
 
-    if let Ok(m) = obj.extract::<TwoTierFillModel>() {
-        return Ok(FillModelAny::TwoTier(m));
-    }
+    #[rstest]
+    fn test_add_exec_algorithms_registers_multiple_python_instances() {
+        use nautilus_common::python::actor::PyDataActor;
+        use nautilus_model::identifiers::ExecAlgorithmId;
+        use pyo3::{ffi::c_str, types::PyAnyMethods};
 
-    if let Ok(m) = obj.extract::<ThreeTierFillModel>() {
-        return Ok(FillModelAny::ThreeTier(m));
-    }
+        Python::initialize();
 
-    if let Ok(m) = obj.extract::<LimitOrderPartialFillModel>() {
-        return Ok(FillModelAny::LimitOrderPartialFill(m));
-    }
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
 
-    if let Ok(m) = obj.extract::<SizeAwareFillModel>() {
-        return Ok(FillModelAny::SizeAware(m));
-    }
+        Python::attach(|py| {
+            let algo_type = py.get_type::<PyDataActor>();
+            let first_config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'exec_algorithm_id': 'EXEC-MULTI-001'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let second_config = py
+                .eval(
+                    c_str!("type('_Cfg', (), {'exec_algorithm_id': 'EXEC-MULTI-002'})()"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let instances = vec![
+                algo_type.as_any().call1((first_config,)).unwrap().unbind(),
+                algo_type.as_any().call1((second_config,)).unwrap().unbind(),
+            ];
 
-    if let Ok(m) = obj.extract::<CompetitionAwareFillModel>() {
-        return Ok(FillModelAny::CompetitionAware(m));
-    }
+            engine.py_add_exec_algorithms(instances).unwrap();
 
-    if let Ok(m) = obj.extract::<VolumeSensitiveFillModel>() {
-        return Ok(FillModelAny::VolumeSensitive(m));
+            let trader = engine.0.kernel().trader.borrow();
+            let exec_algorithm_ids = trader.exec_algorithm_ids();
+            assert!(exec_algorithm_ids.contains(&ExecAlgorithmId::from("EXEC-MULTI-001")));
+            assert!(exec_algorithm_ids.contains(&ExecAlgorithmId::from("EXEC-MULTI-002")));
+        });
     }
-
-    if let Ok(m) = obj.extract::<MarketHoursFillModel>() {
-        return Ok(FillModelAny::MarketHours(m));
-    }
-
-    let type_name = obj.get_type().name()?;
-    Err(to_pytype_err(format!(
-        "Cannot convert {type_name} to FillModel"
-    )))
 }
 
 pub(crate) fn pyobject_to_simulation_module_any(
@@ -1251,4 +1880,109 @@ fn pyobject_to_data(_py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Data> {
 
     let type_name = obj.get_type().name()?;
     Err(to_pytype_err(format!("Cannot convert {type_name} to Data")))
+}
+
+#[cfg(test)]
+mod model_tests {
+    use nautilus_execution::python::{fee::PyFeeModel, fill::PyFillModel};
+    use nautilus_model::{
+        enums::{AccountType, BookType, OmsType, OtoTriggerMode},
+        identifiers::Venue,
+        types::{Currency, Money},
+    };
+    use pyo3::{
+        IntoPyObjectExt, Python,
+        ffi::c_str,
+        types::{PyAnyMethods, PyDict, PyDictMethods},
+    };
+    use rstest::rstest;
+
+    use crate::{config::BacktestEngineConfig, engine::BacktestEngine};
+
+    #[rstest]
+    fn test_add_venue_accepts_python_defined_fee_and_fill_models() {
+        Python::initialize();
+
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals
+                .set_item("FeeModel", py.get_type::<PyFeeModel>())
+                .unwrap();
+            locals
+                .set_item("FillModel", py.get_type::<PyFillModel>())
+                .unwrap();
+
+            let fill_model = py
+                .eval(
+                    c_str!(
+                        "type('CustomFillModel', (FillModel,), {\
+                            'is_limit_filled': lambda self: True, \
+                            'is_slipped': lambda self: False\
+                        })()"
+                    ),
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            let fee_model = py
+                .eval(
+                    c_str!(
+                        "type('CustomFeeModel', (FeeModel,), {\
+                            'get_commission': \
+                                lambda self, order, fill_quantity, fill_px, instrument: self.commission\
+                        })()"
+                    ),
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            fee_model
+                .setattr("commission", Money::from("0 USD").into_py_any(py).unwrap())
+                .unwrap();
+
+            engine
+                .py_add_venue(
+                    Venue::from("SIM"),
+                    OmsType::Netting,
+                    AccountType::Margin,
+                    vec![Money::from("1_000_000 USD")],
+                    None::<Currency>,
+                    None,
+                    None,
+                    None,
+                    Some(fill_model.unbind()),
+                    Some(fee_model.unbind()),
+                    None,
+                    None,
+                    BookType::L1_MBP,
+                    false,
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    true,
+                    true,
+                    false,
+                    true,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    OtoTriggerMode::Partial,
+                    None,
+                    None,
+                    false,
+                    None,
+                    true,
+                )
+                .unwrap();
+
+            assert_eq!(engine.0.list_venues(), vec![Venue::from("SIM")]);
+        });
+    }
 }

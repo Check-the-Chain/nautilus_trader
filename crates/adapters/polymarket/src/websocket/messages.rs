@@ -95,6 +95,8 @@ pub struct PolymarketBookSnapshot {
     pub bids: Vec<PolymarketBookLevel>,
     pub asks: Vec<PolymarketBookLevel>,
     pub timestamp: String,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 /// A single price change entry within a quotes message.
@@ -129,6 +131,8 @@ pub struct PolymarketTrade {
     pub side: PolymarketOrderSide,
     pub size: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub transaction_hash: Option<String>,
 }
 
 /// A tick size change notification from the WebSocket market channel.
@@ -328,6 +332,10 @@ mod tests {
         assert_eq!(snap.bids[0].size, "500.0");
         assert_eq!(snap.asks[0].price, "0.53");
         assert_eq!(snap.timestamp, "1703875200000");
+        assert_eq!(
+            snap.hash.as_deref(),
+            Some("655a38d4977427b086c25b985993691b753ed166")
+        );
     }
 
     #[rstest]
@@ -360,6 +368,19 @@ mod tests {
         assert_eq!(trade.side, PolymarketOrderSide::Buy);
         assert_eq!(trade.fee_rate_bps, "0");
         assert_eq!(trade.timestamp, "1703875202000");
+        assert_eq!(
+            trade.transaction_hash.as_deref(),
+            Some("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab")
+        );
+    }
+
+    #[rstest]
+    fn test_optional_market_hash_fields_default() {
+        let snap: PolymarketBookSnapshot = load("ws_book_snapshot_missing_hash.json");
+        let trade: PolymarketTrade = load("ws_last_trade_missing_transaction_hash.json");
+
+        assert!(snap.hash.is_none());
+        assert!(trade.transaction_hash.is_none());
     }
 
     #[rstest]

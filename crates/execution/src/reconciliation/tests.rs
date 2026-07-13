@@ -33,7 +33,7 @@ use nautilus_model::{
     },
     instruments::{
         Instrument, InstrumentAny,
-        stubs::{audusd_sim, crypto_perpetual_ethusdt},
+        stubs::{audusd_sim, binary_option, crypto_perpetual_ethusdt},
     },
     orders::{
         Order, OrderAny, OrderTestBuilder,
@@ -1324,7 +1324,11 @@ fn make_test_report(
 #[case::accepted(OrderStatus::Accepted, "0", 1, "Accepted")]
 #[case::triggered(OrderStatus::Triggered, "0", 1, "Accepted")]
 #[case::canceled(OrderStatus::Canceled, "0", 2, "Canceled")]
+#[case::partially_canceled(OrderStatus::Canceled, "0.5", 3, "Canceled")]
+#[case::fully_matched_canceled(OrderStatus::Canceled, "1.0", 2, "Filled")]
 #[case::expired(OrderStatus::Expired, "0", 2, "Expired")]
+#[case::partially_expired(OrderStatus::Expired, "0.5", 3, "Expired")]
+#[case::fully_matched_expired(OrderStatus::Expired, "1.0", 2, "Filled")]
 #[case::filled(OrderStatus::Filled, "1.0", 2, "Filled")]
 #[case::partially_filled(OrderStatus::PartiallyFilled, "0.5", 2, "Filled")]
 #[case::rejected(OrderStatus::Rejected, "0", 1, "Rejected")]
@@ -1498,6 +1502,247 @@ fn test_inferred_fill_no_price_returns_none() {
     );
 
     assert!(fill.is_none());
+}
+
+/// A binary option with an explicit `[0.001, 0.999]` price band, as the
+/// Polymarket adapter sets, so the inferred-fill price clamp has bounds to apply.
+fn bounded_binary_option() -> InstrumentAny {
+    let mut bo = binary_option();
+    bo.max_price = Some(Price::from("0.999"));
+    bo.min_price = Some(Price::from("0.001"));
+    InstrumentAny::BinaryOption(bo)
+}
+
+#[rstest]
+fn test_incremental_inferred_fill_clamps_out_of_range_price() {
+    // A tiny qty difference between the cached order and the venue report, with
+    // rounded average prices, makes backing the incremental price out of the
+    // notional difference blow up well outside the instrument's price band; the
+    // inferred fill must be capped at the instrument's max price.
+    let instrument = bounded_binary_option();
+
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100.00"))
+        .price(Price::from("0.500"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
+        TradeId::from("T-1"),
+        Quantity::from("5.00"),
+        Price::from("0.500"),
+    );
+
+    // Report: 5.01 filled @ avg 0.510 -> incremental qty 0.01, notional back-out
+    // 0.0551 / 0.01 = 5.51 (out of [0.001, 0.999]); clamped to max_price.
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        None,
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from("100.00"),
+        Quantity::from("5.01"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(0.510)
+    .unwrap();
+
+    let fill = create_incremental_inferred_fill(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px, instrument.max_price().unwrap());
+}
+
+#[rstest]
+fn test_inferred_fill_clamps_out_of_range_avg_px() {
+    // A synthetic order recovered during partial-window position reconciliation
+    // can carry an avg_px derived from value/dust-qty that lies far outside the
+    // instrument's band. The inferred fill must be clamped to the price band.
+    let instrument = bounded_binary_option();
+
+    let account_id = AccountId::from("TEST-001");
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("0.01"))
+        .build();
+
+    // Out-of-range avg_px (e.g. 43.642 observed live from value/dust-qty).
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        None,
+        VenueOrderId::from("V-001"),
+        OrderSide::Sell,
+        OrderType::Market,
+        TimeInForce::Gtc,
+        OrderStatus::Filled,
+        Quantity::from("0.01"),
+        Quantity::from("0.01"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(43.642)
+    .unwrap();
+
+    let fill = create_inferred_fill(
+        &order,
+        &report,
+        account_id,
+        &instrument,
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px, instrument.max_price().unwrap());
+}
+
+#[rstest]
+fn test_synthetic_partial_window_reports_clamp_out_of_range_price() {
+    // Partial-window reconciliation can synthesise an opening fill whose price is
+    // value/dust-qty (30.41 observed live). The synthetic order and fill reports
+    // must be capped at the instrument's max price.
+    let instrument = bounded_binary_option();
+
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("S-1");
+
+    let synthetic = FillSnapshot::new(
+        venue_order_id,
+        OrderSide::Sell,
+        dec!(0.000089), // dust qty
+        dec!(30.41),    // blown-up price
+        1_000_000,
+    );
+
+    let fill = create_synthetic_fill_report(
+        &synthetic,
+        account_id,
+        instrument.id(),
+        &instrument,
+        venue_order_id,
+    )
+    .unwrap();
+    assert_eq!(fill.last_px, instrument.max_price().unwrap());
+
+    let order = create_synthetic_order_report(
+        &synthetic,
+        account_id,
+        instrument.id(),
+        &instrument,
+        venue_order_id,
+    )
+    .unwrap();
+    assert_eq!(
+        order.avg_px,
+        Some(instrument.max_price().unwrap().as_decimal())
+    );
+}
+
+#[rstest]
+fn test_inferred_fill_for_qty_clamps_out_of_range_avg_px() {
+    // The third inferred-fill chokepoint must also cap an out-of-range report
+    // avg_px at the instrument's max price.
+    let instrument = bounded_binary_option();
+    let account_id = AccountId::from("TEST-001");
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.05"))
+        .build();
+
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        None,
+        VenueOrderId::from("V-001"),
+        OrderSide::Buy,
+        OrderType::Market,
+        TimeInForce::Gtc,
+        OrderStatus::Filled,
+        Quantity::from("0.05"),
+        Quantity::from("0.05"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_avg_px(43.642)
+    .unwrap();
+
+    let fill = create_inferred_fill_for_qty(
+        &order,
+        &report,
+        &account_id,
+        &instrument,
+        Quantity::from("0.05"),
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let filled = match fill.expect("expected an inferred fill") {
+        OrderEventAny::Filled(f) => f,
+        other => panic!("Expected Filled event, was {other:?}"),
+    };
+    assert_eq!(filled.last_px, instrument.max_price().unwrap());
+}
+
+#[rstest]
+#[case(dec!(30.41), "0.99")] // blow-up well above max -> floored cap
+#[case(dec!(0.999), "0.99")] // equals 3dp max on a 2dp instrument -> floored cap
+#[case(dec!(0.995), "0.99")] // below max but would round up to 1.00 -> floored cap
+#[case(dec!(0.50), "0.50")] // genuinely in-band -> unchanged
+#[case(dec!(-0.05), "-0.05")] // negative price -> untouched (lower bound preserved)
+fn test_cap_price_floors_to_precision_so_it_cannot_round_above_max(
+    #[case] px: Decimal,
+    #[case] expected: &str,
+) {
+    // A 2dp instrument whose max_price is 0.999 (3dp): the cap is the max floored
+    // to 2dp (0.99), so rebuilding a Price at 2dp cannot round back above max.
+    let mut bo = binary_option();
+    bo.price_precision = 2;
+    bo.price_increment = Price::from("0.01");
+    bo.max_price = Some(Price::from("0.999"));
+    let instrument = InstrumentAny::BinaryOption(bo);
+
+    let capped = cap_price_at_instrument_max(px, &instrument);
+    let rebuilt = Price::from_decimal_dp(capped, instrument.price_precision()).unwrap();
+    assert!(
+        rebuilt <= instrument.max_price().unwrap(),
+        "{rebuilt} exceeds max"
+    );
+    assert_eq!(rebuilt, Price::from(expected));
 }
 
 // Tests for reconcile_fill_report
@@ -2387,6 +2632,143 @@ fn test_generate_reconciliation_order_events_accepts_before_cancel(instrument: I
     assert_eq!(events.len(), 2);
     assert!(matches!(events[0], OrderEventAny::Accepted(_)));
     assert!(matches!(events[1], OrderEventAny::Canceled(_)));
+}
+
+#[rstest]
+#[case(OrderStatus::Canceled)]
+#[case(OrderStatus::Expired)]
+fn test_generate_reconciliation_order_events_fills_before_partial_terminal(
+    instrument: InstrumentAny,
+    #[case] terminal_status: OrderStatus,
+    #[values(
+        OrderStatus::Accepted,
+        OrderStatus::PendingUpdate,
+        OrderStatus::PendingCancel
+    )]
+    local_status: OrderStatus,
+) {
+    let client_order_id = ClientOrderId::from("O-PARTIAL-CANCEL");
+    let venue_order_id = VenueOrderId::from("V-PARTIAL-CANCEL");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    match local_status {
+        OrderStatus::PendingUpdate => {
+            let event = build_order_pending_update(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                account_id,
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                false,
+                Some(venue_order_id),
+            );
+            order.apply(OrderEventAny::PendingUpdate(event)).unwrap();
+        }
+        OrderStatus::PendingCancel => {
+            let event = build_order_pending_cancel(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                account_id,
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                false,
+                Some(venue_order_id),
+            );
+            order.apply(OrderEventAny::PendingCancel(event)).unwrap();
+        }
+        OrderStatus::Accepted => {}
+        _ => unreachable!(),
+    }
+
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        terminal_status,
+        Quantity::from(150),
+        Quantity::from(120),
+    );
+    report.avg_px = Some(dec!(1.0));
+
+    let events = generate_reconciliation_order_events(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::default(),
+    );
+    let reconciled = apply_events(&order, &events);
+
+    assert_eq!(events.len(), 3);
+    assert!(matches!(events[0], OrderEventAny::Updated(_)));
+    assert!(matches!(events[1], OrderEventAny::Filled(_)));
+    assert!(matches!(
+        (&events[2], terminal_status),
+        (OrderEventAny::Canceled(_), OrderStatus::Canceled)
+            | (OrderEventAny::Expired(_), OrderStatus::Expired),
+    ));
+    assert_eq!(reconciled.quantity(), Quantity::from(150));
+    assert_eq!(reconciled.filled_qty(), Quantity::from(120));
+    assert_eq!(reconciled.status(), terminal_status);
+}
+
+#[rstest]
+#[case(OrderStatus::Canceled)]
+#[case(OrderStatus::Expired)]
+fn test_generate_reconciliation_order_events_full_fill_supersedes_terminal_status(
+    instrument: InstrumentAny,
+    #[case] terminal_status: OrderStatus,
+) {
+    let client_order_id = ClientOrderId::from("O-FULL-TERMINAL");
+    let venue_order_id = VenueOrderId::from("V-FULL-TERMINAL");
+    let account_id = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    let mut report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        terminal_status,
+        Quantity::from(100),
+        Quantity::from(100),
+    );
+    report.avg_px = Some(dec!(1.0));
+
+    let events = generate_reconciliation_order_events(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::default(),
+    );
+    let reconciled = apply_events(&order, &events);
+
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], OrderEventAny::Filled(_)));
+    assert_eq!(reconciled.filled_qty(), Quantity::from(100));
+    assert_eq!(reconciled.status(), OrderStatus::Filled);
 }
 
 #[rstest]
@@ -4484,10 +4866,8 @@ fn test_status_vs_qty_mismatch_emits_updated(instrument: InstrumentAny) {
     order.apply(event).unwrap();
     assert_eq!(order.quantity(), Quantity::from(10));
     assert_eq!(order.filled_qty(), Quantity::from(10));
-    // Documented limitation shared with Python reference: OrderUpdated alone
-    // does not transition PartiallyFilled -> Filled; status persists here
-    // even though filled_qty now equals quantity.
-    assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert!(order.ts_closed().is_some());
 }
 
 #[rstest]

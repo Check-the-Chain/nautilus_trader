@@ -16,10 +16,11 @@
 //! Python bindings for OKX configuration.
 
 use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
 use crate::{
-    common::enums::{OKXEnvironment, OKXInstrumentType, OKXMarginMode, OKXVipLevel},
+    common::enums::{OKXEnvironment, OKXInstrumentType, OKXMarginMode, OKXRegion, OKXVipLevel},
     config::{OKXDataClientConfig, OKXExecClientConfig},
 };
 
@@ -31,6 +32,7 @@ impl OKXDataClientConfig {
     #[pyo3(signature = (
         instrument_types = None,
         environment = None,
+        region = None,
         api_key = None,
         api_secret = None,
         api_passphrase = None,
@@ -43,13 +45,18 @@ impl OKXDataClientConfig {
         retry_delay_initial_ms = None,
         retry_delay_max_ms = None,
         update_instruments_interval_mins = None,
+        book_stale_check_interval_secs = None,
+        book_stale_threshold_secs = None,
+        book_snapshot_timeout_secs = None,
         vip_level = None,
         load_spreads = false,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         instrument_types: Option<Vec<OKXInstrumentType>>,
         environment: Option<OKXEnvironment>,
+        region: Option<OKXRegion>,
         api_key: Option<String>,
         api_secret: Option<String>,
         api_passphrase: Option<String>,
@@ -62,8 +69,12 @@ impl OKXDataClientConfig {
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
         update_instruments_interval_mins: Option<u64>,
+        book_stale_check_interval_secs: Option<u64>,
+        book_stale_threshold_secs: Option<u64>,
+        book_snapshot_timeout_secs: Option<u64>,
         vip_level: Option<OKXVipLevel>,
         load_spreads: bool,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -79,6 +90,7 @@ impl OKXDataClientConfig {
             base_url_ws_business,
             proxy_url,
             environment: environment.unwrap_or(defaults.environment),
+            region: region.unwrap_or(defaults.region),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
@@ -86,8 +98,14 @@ impl OKXDataClientConfig {
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
+            book_stale_check_interval_secs: book_stale_check_interval_secs
+                .unwrap_or(defaults.book_stale_check_interval_secs),
+            book_stale_threshold_secs: book_stale_threshold_secs
+                .unwrap_or(defaults.book_stale_threshold_secs),
+            book_snapshot_timeout_secs: book_snapshot_timeout_secs
+                .unwrap_or(defaults.book_snapshot_timeout_secs),
             vip_level,
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
@@ -106,6 +124,7 @@ impl OKXExecClientConfig {
         account_id,
         instrument_types = None,
         environment = None,
+        region = None,
         api_key = None,
         api_secret = None,
         api_passphrase = None,
@@ -119,6 +138,7 @@ impl OKXExecClientConfig {
         retry_delay_max_ms = None,
         margin_mode = None,
         load_spreads = false,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -126,6 +146,7 @@ impl OKXExecClientConfig {
         account_id: AccountId,
         instrument_types: Option<Vec<OKXInstrumentType>>,
         environment: Option<OKXEnvironment>,
+        region: Option<OKXRegion>,
         api_key: Option<String>,
         api_secret: Option<String>,
         api_passphrase: Option<String>,
@@ -139,6 +160,7 @@ impl OKXExecClientConfig {
         retry_delay_max_ms: Option<u64>,
         margin_mode: Option<OKXMarginMode>,
         load_spreads: bool,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -155,6 +177,7 @@ impl OKXExecClientConfig {
             base_url_ws_business,
             proxy_url,
             environment: environment.unwrap_or(defaults.environment),
+            region: region.unwrap_or(defaults.region),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             use_fills_channel: defaults.use_fills_channel,
             use_mm_mass_cancel: defaults.use_mm_mass_cancel,
@@ -165,7 +188,7 @@ impl OKXExecClientConfig {
             margin_mode,
             load_spreads,
             use_spot_margin: defaults.use_spot_margin,
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
@@ -184,10 +207,13 @@ mod tests {
     fn test_data_config_py_new_load_spreads() {
         let config = OKXDataClientConfig::py_new(
             None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, true,
+            None, None, None, None, None, true, None,
         );
 
         assert!(config.load_spreads);
+        assert_eq!(config.book_stale_check_interval_secs, 5);
+        assert_eq!(config.book_stale_threshold_secs, 30);
+        assert_eq!(config.book_snapshot_timeout_secs, 3);
     }
 
     #[rstest]
@@ -209,7 +235,9 @@ mod tests {
             None,
             None,
             None,
+            None,
             true,
+            None,
         );
 
         assert!(config.load_spreads);

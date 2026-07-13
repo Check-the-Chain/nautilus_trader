@@ -51,7 +51,8 @@ high-precision = [
 ]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["arrow", "examples", "high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -209,6 +210,13 @@ doc = false
 [[example]]
 name = "hyperliquid-outcome-exec-tester"
 path = "examples/node_outcome_exec_tester.rs"
+required-features = ["examples"]
+doc = false
+
+# Run with `cargo run --example hyperliquid-chained-modify-smoke --package nautilus-hyperliquid --features examples`.
+[[example]]
+name = "hyperliquid-chained-modify-smoke"
+path = "examples/chained_modify_smoke.rs"
 required-features = ["examples"]
 doc = false
 

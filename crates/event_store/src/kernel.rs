@@ -1199,10 +1199,10 @@ pub(crate) fn submit_run_started_blocking(
 }
 
 fn encode_run_started(components: &RegisteredComponents) -> Bytes {
-    // bincode keeps the payload compact and matches the manifest encoding the backend
-    // already uses; replay's RunStarted decoder pairs with this representation.
-    let bytes = bincode::serde::encode_to_vec(components, bincode::config::standard())
-        .expect("RegisteredComponents serializes via serde, must not fail under standard config");
+    // The payload uses the same positional codec as the event-store envelope.
+    let bytes = crate::codec::encode_to_vec(components).expect(
+        "RegisteredComponents serializes via serde, must not fail under the positional codec",
+    );
     Bytes::from(bytes)
 }
 
@@ -3327,7 +3327,7 @@ mod tests {
             .ts_init(UnixNanos::from(11))
             .commission(Money::new(0.10, Currency::USDT()))
             .build();
-        let event = OrderEventAny::Filled(filled);
+        let event = OrderEventAny::Filled(filled.clone());
 
         let topic: MStr<msgbus::Topic> = MStr::from("events.order.ETHUSDT-PERP.BINANCE");
         msgbus::publish_order_event(topic, &event);

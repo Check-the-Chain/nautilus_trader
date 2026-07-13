@@ -30,6 +30,7 @@ Live example scripts are available in
 Relevant OKX docs:
 
 - [Get instruments](https://www.okx.com/docs-v5/en/#public-data-rest-api-get-instruments).
+- [Get limit price](https://www.okx.com/docs-v5/en/#public-data-rest-api-get-limit-price).
 - [Get Spreads (Public)](https://www.okx.com/docs-v5/en/#spread-trading-rest-api-get-spreads-public).
 - [Spread trading place order](https://www.okx.com/docs-v5/en/#spread-trading-rest-api-place-order).
 - [Event contract series](https://www.okx.com/docs-v5/en/#public-data-rest-api-get-series).
@@ -45,6 +46,25 @@ Relevant OKX docs:
 **Instrument multipliers**: For derivatives (`SWAP`, `FUTURES`, `OPTION`), instrument
 multipliers are calculated as the product of OKX's `ctMult` and `ctVal` fields. This
 keeps position sizing aligned with OKX contract size and value.
+:::
+
+:::info
+**Price limits**: OKX exposes `initPxLmtPct`, `floatPxLmtPct`, and `maxPxLmtPct`
+on `public/instruments` for spot, margin, swap, and futures instruments. The adapter
+preserves non-empty values in the instrument `info` field as `okx_init_px_lmt_pct`,
+`okx_float_px_lmt_pct`, and `okx_max_px_lmt_pct`. These fields describe exchange
+band percentages, so they are not parsed as static Nautilus `min_price` or `max_price`
+values.
+
+Use `OKXHttpClient.request_price_limit(instrument_id)` when you need the current computed
+buy and sell limits from OKX's `GET /api/v5/public/price-limit` endpoint. OKX documents
+the percentage fields as empty for options and event contracts; the adapter leaves their
+instrument `info` unchanged.
+:::
+
+:::note
+OKX finance-product endpoints such as `/api/v5/finance/okusd/*` are outside the OKX
+trading adapter surface.
 :::
 
 The OKX adapter includes multiple components, which can be used separately or together:
@@ -882,6 +902,43 @@ Demo API keys are separate from production keys. Create API keys for demo tradin
 through the Demo Trading interface. Production API keys do not work in demo mode.
 :::
 
+## Regional endpoints
+
+OKX serves distinct endpoints per region, and an API key is only valid against the region
+where it was registered (using a key against another region's endpoints returns
+`API key doesn't exist`). Set `region` to select the correct endpoint set:
+
+| Region   | Registered on | REST            | WebSocket host       |
+|----------|---------------|-----------------|----------------------|
+| `GLOBAL` | `www.okx.com` | `www.okx.com`   | `ws.okx.com`         |
+| `EEA`    | `my.okx.com`  | `eea.okx.com`   | `wseea.okx.com`      |
+| `US`     | `app.okx.com` | `us.okx.com`    | `wsus.okx.com`       |
+
+`region` defaults to `GLOBAL`. For example, an EEA account:
+
+```python
+from nautilus_trader.core.nautilus_pyo3 import OKXRegion
+
+config = TradingNodeConfig(
+    data_clients={
+        OKX: OKXDataClientConfig(
+            region=OKXRegion.EEA,
+            # ... other config
+        ),
+    },
+    exec_clients={
+        OKX: OKXExecClientConfig(
+            region=OKXRegion.EEA,
+            # ... other config
+        ),
+    },
+)
+```
+
+`region` selects the regional defaults, and combines with `environment` to pick the demo
+hosts (for example `wseeapap.okx.com` for EEA demo). Explicit `base_url_http` and
+`base_url_ws` overrides always take precedence over the region defaults.
+
 ## Funding rates
 
 The adapter receives funding rate data from the
@@ -943,6 +1000,7 @@ responses and temporary throttling on that key.
 | `/api/v5/public/event-contract/events`  | 5               | OKX 10 requests / 2 seconds.                      |
 | `/api/v5/public/event-contract/markets` | 5               | OKX 10 requests / 2 seconds.                      |
 | `/api/v5/public/opt-summary`            | 10              | OKX 20 requests / 2 seconds.                      |
+| `/api/v5/public/price-limit`            | 10              | OKX 20 requests / 2 seconds.                      |
 | `/api/v5/public/time`                   | 5               | OKX 10 requests / 2 seconds.                      |
 | `/api/v5/public/mark-price`             | 5               | OKX 10 requests / 2 seconds.                      |
 | `/api/v5/public/funding-rate-history`   | 5               | OKX 10 requests / 2 seconds.                      |
@@ -987,7 +1045,9 @@ See the [OKX rate limit documentation](https://www.okx.com/docs-v5/en/#rest-api-
 
 ### Configuration options
 
-The OKX data client provides the following configuration options:
+The OKX data client provides the following configuration options. This table describes the
+Rust/pyo3 v2 data client config; Python v1 live configs do not expose the book health
+monitor fields below.
 
 #### Data client
 
@@ -1004,14 +1064,22 @@ The OKX data client provides the following configuration options:
 | `api_secret`                       | `None`                      | Falls back to `OKX_API_SECRET` when unset.   |
 | `api_passphrase`                   | `None`                      | Falls back to `OKX_API_PASSPHRASE`.          |
 | `environment`                      | `None`                      | Environment enum (`LIVE` or `DEMO`).         |
+| `region`                           | `None`                      | Region enum (`GLOBAL`, `EEA`, or `US`).      |
 | `http_timeout_secs`                | `60`                        | REST market data request timeout.            |
 | `max_retries`                      | `3`                         | Retry attempts for recoverable REST errors.  |
 | `retry_delay_initial_ms`           | `1,000`                     | Initial delay before retrying.               |
 | `retry_delay_max_ms`               | `10,000`                    | Maximum exponential backoff delay.           |
 | `update_instruments_interval_mins` | `60`                        | Background instrument refresh interval.      |
+| `book_stale_check_interval_secs`   | `5`                         | Stale book check interval.                   |
+| `book_stale_threshold_secs`        | `30`                        | Idle time before a stale book warning.       |
+| `book_snapshot_timeout_secs`       | `3`                         | Post‑reconnect snapshot wait.                |
 | `vip_level`                        | `None`                      | Enables higher‑depth books by VIP tier.      |
 | `proxy_url`                        | `None`                      | Optional HTTP and WebSocket proxy URL.       |
 | `transport_backend`                | `Sockudo`                   | WebSocket transport backend.                 |
+
+Set `book_stale_check_interval_secs`, `book_stale_threshold_secs`, or
+`book_snapshot_timeout_secs` to `0` to disable that health monitor. Quiet markets can idle
+without book updates; increase `book_stale_threshold_secs` for sparse instruments.
 
 Supported data client `instrument_types` values are `SPOT`, `MARGIN`, `SWAP`,
 `FUTURES`, `OPTION`, and `EVENTS`.
@@ -1038,6 +1106,7 @@ The OKX execution client provides the following configuration options:
 | `api_secret`                      | `None`                      | Falls back to `OKX_API_SECRET` when unset.  |
 | `api_passphrase`                  | `None`                      | Falls back to `OKX_API_PASSPHRASE`.         |
 | `environment`                     | `None`                      | Environment enum (`LIVE` or `DEMO`).        |
+| `region`                          | `None`                      | Region enum (`GLOBAL`, `EEA`, or `US`).     |
 | `margin_mode`                     | `None`                      | Margin mode (`ISOLATED` or `CROSS`).        |
 | `use_spot_margin`                 | `False`                     | Enables spot‑style margin or leverage.      |
 | `http_timeout_secs`               | `60`                        | REST trading request timeout.               |
@@ -1058,11 +1127,12 @@ clients. Spread instruments use OKX spread IDs instead of `instrument_types`; lo
 with `load_spreads=True` on the data client and, for Python v1 execution-only nodes, on
 the execution client before trading them.
 
-### EEA endpoint overrides
+### Manual endpoint overrides
 
-OKX accounts registered through the EEA portal use EEA API infrastructure. The adapter
-defaults to global OKX endpoints, so EEA accounts should set explicit REST and WebSocket
-endpoint overrides.
+Setting `region` (see [Regional endpoints](#regional-endpoints)) selects the correct EEA or
+US endpoints automatically, which is the recommended approach. The explicit `base_url_*`
+overrides below remain available for proxies, custom routing, or endpoints not covered by a
+region; they take precedence over the `region` default. The EEA bases are shown as an example.
 
 | Config field           | Live base                  | Demo base                     | WebSocket path    |
 |------------------------|----------------------------|-------------------------------|-------------------|

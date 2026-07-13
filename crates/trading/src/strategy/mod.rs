@@ -39,10 +39,11 @@ use nautilus_core::{Params, UUID4};
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, PositionSide, TimeInForce, TriggerType},
     events::{
-        OrderAccepted, OrderCancelRejected, OrderDenied, OrderEmulated, OrderEventAny,
-        OrderExpired, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
-        OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
-        OrderUpdated, PositionChanged, PositionClosed, PositionEvent, PositionOpened,
+        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
+        OrderEventAny, OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected,
+        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted,
+        OrderTriggered, OrderUpdated, PositionChanged, PositionClosed, PositionEvent,
+        PositionOpened,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
@@ -179,7 +180,12 @@ pub trait Strategy: DataActor {
 
         {
             let cache_rc = core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
+            let mut cache = cache_rc.try_borrow_mut().map_err(|_| {
+                anyhow::anyhow!(
+                    "Cannot submit order {}: cache is currently borrowed",
+                    order.client_order_id()
+                )
+            })?;
             cache.add_order(order.clone(), position_id, client_id, true)?;
         }
 
@@ -288,7 +294,13 @@ pub trait Strategy: DataActor {
 
         {
             let cache_rc = core.cache_rc();
-            let cache = cache_rc.borrow();
+            let mut cache = cache_rc.try_borrow_mut().map_err(|_| {
+                anyhow::anyhow!(
+                    "Cannot submit order list {}: cache is currently borrowed",
+                    order_list.id
+                )
+            })?;
+
             if cache.order_list_exists(&order_list.id) {
                 anyhow::bail!("OrderList denied: duplicate {}", order_list.id);
             }
@@ -301,21 +313,14 @@ pub trait Strategy: DataActor {
                     );
                 }
             }
-        }
 
-        {
-            let cache_rc = core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
             cache.add_order_list(order_list.clone())?;
+            for order in &orders {
+                cache.add_order(order.clone(), position_id, client_id, true)?;
+            }
         }
 
         for order in &orders {
-            {
-                let cache_rc = core.cache_rc();
-                let mut cache = cache_rc.borrow_mut();
-                cache.add_order(order.clone(), position_id, client_id, true)?;
-            }
-
             publish_order_initialized(order);
         }
 
@@ -830,6 +835,10 @@ pub trait Strategy: DataActor {
 
         let topic = format!("events.order.{strategy_id}");
         msgbus::publish_order_event(topic.into(), &event);
+        msgbus::publish_order_event(
+            msgbus::switchboard::get_order_pending_update_topic(order.instrument_id()),
+            &event,
+        );
 
         Ok(true)
     }
@@ -880,6 +889,10 @@ pub trait Strategy: DataActor {
 
         let topic = format!("events.order.{strategy_id}");
         msgbus::publish_order_event(topic.into(), &event);
+        msgbus::publish_order_event(
+            msgbus::switchboard::get_order_pending_cancel_topic(order.instrument_id()),
+            &event,
+        );
 
         Ok(true)
     }
@@ -898,9 +911,7 @@ pub trait Strategy: DataActor {
             order.strategy_id(),
             order.instrument_id(),
             order.client_order_id(),
-            order
-                .account_id()
-                .expect("Order must have account_id for pending update"),
+            order.account_id(),
             UUID4::new(),
             ts_now,
             ts_now,
@@ -923,9 +934,7 @@ pub trait Strategy: DataActor {
             order.strategy_id(),
             order.instrument_id(),
             order.client_order_id(),
-            order
-                .account_id()
-                .expect("Order must have account_id for pending cancel"),
+            order.account_id(),
             UUID4::new(),
             ts_now,
             ts_now,
@@ -1081,6 +1090,7 @@ pub trait Strategy: DataActor {
     /// # Errors
     ///
     /// Returns an error if the strategy is not registered or position closing fails.
+    #[expect(clippy::too_many_arguments)]
     fn close_position(
         &mut self,
         position: &Position,
@@ -1089,6 +1099,7 @@ pub trait Strategy: DataActor {
         time_in_force: Option<TimeInForce>,
         reduce_only: Option<bool>,
         quote_quantity: Option<bool>,
+        params: Option<Params>,
     ) -> anyhow::Result<()>
     where
         Self: StrategyNative,
@@ -1115,7 +1126,7 @@ pub trait Strategy: DataActor {
             None,
         );
 
-        self.submit_order(order, Some(position.id), client_id, None)
+        self.submit_order(order, Some(position.id), client_id, params)
     }
 
     /// Closes all open positions for the given instrument.
@@ -1133,6 +1144,7 @@ pub trait Strategy: DataActor {
         time_in_force: Option<TimeInForce>,
         reduce_only: Option<bool>,
         quote_quantity: Option<bool>,
+        params: Option<Params>,
     ) -> anyhow::Result<()>
     where
         Self: StrategyNative,
@@ -1190,7 +1202,7 @@ pub trait Strategy: DataActor {
                 None,
             );
 
-            self.submit_order(order, Some(pos_id), client_id, None)?;
+            self.submit_order(order, Some(pos_id), client_id, params.clone())?;
         }
 
         Ok(())
@@ -1340,9 +1352,7 @@ pub trait Strategy: DataActor {
             OrderEventAny::Submitted(e) => self.on_order_submitted(*e),
             OrderEventAny::Rejected(e) => self.on_order_rejected(*e),
             OrderEventAny::Accepted(e) => self.on_order_accepted(*e),
-            OrderEventAny::Canceled(e) => {
-                let _ = DataActor::on_order_canceled(self, e);
-            }
+            OrderEventAny::Canceled(e) => self.on_order_canceled(e),
             OrderEventAny::Expired(e) => self.on_order_expired(*e),
             OrderEventAny::Triggered(e) => self.on_order_triggered(*e),
             OrderEventAny::PendingUpdate(e) => self.on_order_pending_update(*e),
@@ -1350,9 +1360,7 @@ pub trait Strategy: DataActor {
             OrderEventAny::ModifyRejected(e) => self.on_order_modify_rejected(*e),
             OrderEventAny::CancelRejected(e) => self.on_order_cancel_rejected(*e),
             OrderEventAny::Updated(e) => self.on_order_updated(*e),
-            OrderEventAny::Filled(e) => {
-                let _ = DataActor::on_order_filled(self, e);
-            }
+            OrderEventAny::Filled(e) => self.on_order_filled(e),
         }
         self.on_order_event(event);
     }
@@ -1525,7 +1533,17 @@ pub trait Strategy: DataActor {
     #[allow(unused_variables)]
     fn on_order_updated(&mut self, event: OrderUpdated) {}
 
-    // Note: on_order_filled is inherited from DataActor trait
+    /// Called when an order is canceled.
+    ///
+    /// Override this method to implement custom logic when an order is canceled.
+    #[allow(unused_variables)]
+    fn on_order_canceled(&mut self, event: &OrderCanceled) {}
+
+    /// Called when an order is filled.
+    ///
+    /// Override this method to implement custom logic when an order is filled.
+    #[allow(unused_variables)]
+    fn on_order_filled(&mut self, event: &OrderFilled) {}
 
     /// Called when a position is opened.
     ///
@@ -1659,6 +1677,7 @@ pub trait Strategy: DataActor {
                 Some(vec![market_exit_tag]),
                 Some(time_in_force),
                 Some(reduce_only),
+                None,
                 None,
             ) {
                 log::error!("Error closing positions for {instrument_id}: {e}");
@@ -2230,7 +2249,13 @@ mod tests {
         enums::{
             LiquiditySide, OrderSide, OrderStatus, OrderType, PositionAdjustmentType, PositionSide,
         },
-        events::{OrderAccepted, OrderCanceled, OrderFilled, OrderRejected, PositionAdjusted},
+        events::{
+            OrderAccepted, OrderCanceled, OrderFilled, OrderRejected, PositionAdjusted,
+            order::spec::{
+                OrderAcceptedSpec, OrderCanceledSpec, OrderExpiredSpec, OrderFilledSpec,
+                OrderRejectedSpec,
+            },
+        },
         identifiers::{
             AccountId, ActorId, ClientOrderId, ComponentId, InstrumentId, OrderListId, PositionId,
             StrategyId, TradeId, TraderId, VenueOrderId,
@@ -2319,19 +2344,17 @@ mod tests {
         }
     }
 
-    impl DataActor for TestStrategy {
-        fn on_order_canceled(&mut self, _event: &OrderCanceled) -> anyhow::Result<()> {
-            self.on_order_canceled_called = true;
-            Ok(())
-        }
-
-        fn on_order_filled(&mut self, _event: &OrderFilled) -> anyhow::Result<()> {
-            self.on_order_filled_called = true;
-            Ok(())
-        }
-    }
+    impl DataActor for TestStrategy {}
 
     nautilus_strategy!(TestStrategy, {
+        fn on_order_canceled(&mut self, _event: &OrderCanceled) {
+            self.on_order_canceled_called = true;
+        }
+
+        fn on_order_filled(&mut self, _event: &OrderFilled) {
+            self.on_order_filled_called = true;
+        }
+
         fn on_order_rejected(&mut self, _event: OrderRejected) {
             self.on_order_rejected_called = true;
         }
@@ -2379,8 +2402,8 @@ mod tests {
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
-            cache.clone(),
             clock.clone(),
+            cache.clone(),
             None,
         )));
 
@@ -2400,93 +2423,76 @@ mod tests {
     }
 
     fn make_filled(client_order_id: ClientOrderId) -> OrderEventAny {
-        OrderEventAny::Filled(OrderFilled {
-            trader_id: TraderId::from("TRADER-001"),
-            strategy_id: StrategyId::from("TEST-001"),
-            instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
-            client_order_id,
-            venue_order_id: VenueOrderId::test_default(),
-            account_id: AccountId::from("ACC-001"),
-            trade_id: TradeId::test_default(),
-            position_id: None,
-            order_side: OrderSide::Buy,
-            order_type: OrderType::Market,
-            last_qty: Quantity::default(),
-            last_px: Price::default(),
-            currency: Currency::from("USD"),
-            liquidity_side: LiquiditySide::Taker,
-            event_id: UUID4::default(),
-            ts_event: UnixNanos::default(),
-            ts_init: UnixNanos::default(),
-            reconciliation: false,
-            commission: None,
-            causation_id: None,
-        })
+        OrderEventAny::Filled(
+            OrderFilledSpec::builder()
+                .trader_id(TraderId::from("TRADER-001"))
+                .strategy_id(StrategyId::from("TEST-001"))
+                .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+                .client_order_id(client_order_id)
+                .venue_order_id(VenueOrderId::test_default())
+                .account_id(AccountId::from("ACC-001"))
+                .trade_id(TradeId::test_default())
+                .last_qty(Quantity::default())
+                .last_px(Price::default())
+                .currency(Currency::from("USD"))
+                .liquidity_side(LiquiditySide::Taker)
+                .event_id(UUID4::default())
+                .build(),
+        )
     }
 
     fn make_canceled(client_order_id: ClientOrderId) -> OrderEventAny {
-        OrderEventAny::Canceled(OrderCanceled {
-            trader_id: TraderId::from("TRADER-001"),
-            strategy_id: StrategyId::from("TEST-001"),
-            instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
-            client_order_id,
-            venue_order_id: None,
-            account_id: Some(AccountId::from("ACC-001")),
-            event_id: UUID4::default(),
-            ts_event: UnixNanos::default(),
-            ts_init: UnixNanos::default(),
-            reconciliation: false,
-            causation_id: None,
-        })
+        OrderEventAny::Canceled(
+            OrderCanceledSpec::builder()
+                .trader_id(TraderId::from("TRADER-001"))
+                .strategy_id(StrategyId::from("TEST-001"))
+                .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+                .client_order_id(client_order_id)
+                .account_id(AccountId::from("ACC-001"))
+                .event_id(UUID4::default())
+                .build(),
+        )
     }
 
     fn make_rejected(client_order_id: ClientOrderId) -> OrderEventAny {
-        OrderEventAny::Rejected(OrderRejected {
-            trader_id: TraderId::from("TRADER-001"),
-            strategy_id: StrategyId::from("TEST-001"),
-            instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
-            client_order_id,
-            account_id: AccountId::from("ACC-001"),
-            reason: "Test rejection".into(),
-            event_id: UUID4::default(),
-            ts_event: UnixNanos::default(),
-            ts_init: UnixNanos::default(),
-            reconciliation: false,
-            due_post_only: false,
-            causation_id: None,
-        })
+        OrderEventAny::Rejected(
+            OrderRejectedSpec::builder()
+                .trader_id(TraderId::from("TRADER-001"))
+                .strategy_id(StrategyId::from("TEST-001"))
+                .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+                .client_order_id(client_order_id)
+                .account_id(AccountId::from("ACC-001"))
+                .reason("Test rejection".into())
+                .event_id(UUID4::default())
+                .build(),
+        )
     }
 
     fn make_expired(client_order_id: ClientOrderId) -> OrderEventAny {
-        OrderEventAny::Expired(OrderExpired {
-            trader_id: TraderId::from("TRADER-001"),
-            strategy_id: StrategyId::from("TEST-001"),
-            instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
-            client_order_id,
-            venue_order_id: None,
-            account_id: Some(AccountId::from("ACC-001")),
-            event_id: UUID4::default(),
-            ts_event: UnixNanos::default(),
-            ts_init: UnixNanos::default(),
-            reconciliation: false,
-            causation_id: None,
-        })
+        OrderEventAny::Expired(
+            OrderExpiredSpec::builder()
+                .trader_id(TraderId::from("TRADER-001"))
+                .strategy_id(StrategyId::from("TEST-001"))
+                .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+                .client_order_id(client_order_id)
+                .account_id(AccountId::from("ACC-001"))
+                .event_id(UUID4::default())
+                .build(),
+        )
     }
 
     fn make_accepted(client_order_id: ClientOrderId) -> OrderEventAny {
-        OrderEventAny::Accepted(OrderAccepted {
-            trader_id: TraderId::from("TRADER-001"),
-            strategy_id: StrategyId::from("TEST-001"),
-            instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
-            client_order_id,
-            venue_order_id: VenueOrderId::test_default(),
-            account_id: AccountId::from("ACC-001"),
-            event_id: UUID4::default(),
-            ts_event: UnixNanos::default(),
-            ts_init: UnixNanos::default(),
-            reconciliation: false,
-            causation_id: None,
-        })
+        OrderEventAny::Accepted(
+            OrderAcceptedSpec::builder()
+                .trader_id(TraderId::from("TRADER-001"))
+                .strategy_id(StrategyId::from("TEST-001"))
+                .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+                .client_order_id(client_order_id)
+                .venue_order_id(VenueOrderId::test_default())
+                .account_id(AccountId::from("ACC-001"))
+                .event_id(UUID4::default())
+                .build(),
+        )
     }
 
     fn make_accepted_market_order(client_order_id: &str) -> OrderAny {
@@ -2748,20 +2754,7 @@ mod tests {
         register_strategy(&mut strategy);
         start_strategy(&mut strategy);
 
-        let event = OrderEventAny::Rejected(OrderRejected {
-            trader_id: TraderId::from("TRADER-001"),
-            strategy_id: StrategyId::from("TEST-001"),
-            instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
-            client_order_id: ClientOrderId::from("O-001"),
-            account_id: AccountId::from("ACC-001"),
-            reason: "Test rejection".into(),
-            event_id: UUID4::default(),
-            ts_event: UnixNanos::default(),
-            ts_init: UnixNanos::default(),
-            reconciliation: false,
-            due_post_only: false,
-            causation_id: None,
-        });
+        let event = make_rejected(ClientOrderId::from("O-001"));
 
         strategy.handle_order_event(event);
 
@@ -2829,7 +2822,7 @@ mod tests {
         strategy.on_order_released(OrderReleased::default());
         strategy.on_order_submitted(OrderSubmitted::default());
         strategy.on_order_rejected(OrderRejected::default());
-        let _ = DataActor::on_order_canceled(&mut strategy, &OrderCanceled::default());
+        strategy.on_order_canceled(&OrderCanceled::default());
         strategy.on_order_expired(OrderExpired::default());
         strategy.on_order_triggered(OrderTriggered::default());
         strategy.on_order_pending_update(OrderPendingUpdate::default());
@@ -2837,6 +2830,7 @@ mod tests {
         strategy.on_order_modify_rejected(OrderModifyRejected::default());
         strategy.on_order_cancel_rejected(OrderCancelRejected::default());
         strategy.on_order_updated(OrderUpdated::default());
+        strategy.on_order_filled(&OrderFilledSpec::builder().build());
         strategy.on_position_event(make_position_opened());
     }
 
@@ -2988,6 +2982,30 @@ mod tests {
     }
 
     #[rstest]
+    fn test_submit_order_returns_error_when_cache_already_borrowed() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let order = make_initialized_market_order("O-20250208-BORROWED-001");
+        let cache_rc = strategy.core.cache_rc();
+        let _cache = cache_rc.borrow();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            strategy.submit_order(order, None, None, None)
+        }));
+
+        let err = result
+            .expect("submit_order should not panic")
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "Cannot submit order O-20250208-BORROWED-001: cache is currently borrowed"
+        );
+    }
+
+    #[rstest]
     fn test_submit_order_list_publishes_order_initialized_after_cache_insert_before_send() {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
@@ -3016,7 +3034,15 @@ mod tests {
                 move |event: &OrderEventAny| {
                     match event {
                         OrderEventAny::Initialized(e) if e.client_order_id == client_order_id1 => {
-                            assert!(cache_rc.borrow().order_exists(&client_order_id1));
+                            let cache = cache_rc.borrow();
+                            assert!(cache.order_exists(&client_order_id1));
+                            assert!(cache.order_exists(&client_order_id2));
+                            assert!(cache.order_list_exists(&order_list_id));
+                            let order_list = cache.order_list(&order_list_id).unwrap();
+                            assert_eq!(
+                                order_list.client_order_ids.as_slice(),
+                                &[client_order_id1, client_order_id2]
+                            );
                             timeline.borrow_mut().push("init1");
                         }
                         OrderEventAny::Initialized(e) if e.client_order_id == client_order_id2 => {
@@ -3067,6 +3093,39 @@ mod tests {
     }
 
     #[rstest]
+    fn test_submit_order_list_returns_error_when_cache_already_borrowed() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let order_list_id = OrderListId::from("OL-20250208-BORROWED");
+        let mut orders = vec![
+            make_initialized_market_order("O-20250208-LIST-BORROWED-001"),
+            make_initialized_market_order("O-20250208-LIST-BORROWED-002"),
+        ];
+
+        for order in &mut orders {
+            order.set_order_list_id(order_list_id);
+        }
+
+        let cache_rc = strategy.core.cache_rc();
+        let _cache = cache_rc.borrow();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            strategy.submit_order_list(orders, None, None, None)
+        }));
+
+        let err = result
+            .expect("submit_order_list should not panic")
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "Cannot submit order list OL-20250208-BORROWED: cache is currently borrowed"
+        );
+    }
+
+    #[rstest]
     fn test_submit_order_list_create_list_branch_publishes_init_after_cache_insert() {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
@@ -3090,7 +3149,17 @@ mod tests {
                 move |event: &OrderEventAny| {
                     match event {
                         OrderEventAny::Initialized(e) if e.client_order_id == client_order_id1 => {
-                            assert!(cache_rc.borrow().order_exists(&client_order_id1));
+                            let cache = cache_rc.borrow();
+                            let cached_order1 = cache.order(&client_order_id1).unwrap();
+                            let cached_order2 = cache.order(&client_order_id2).unwrap();
+                            let order_list_id = cached_order1.order_list_id().unwrap();
+                            assert_eq!(cached_order2.order_list_id(), Some(order_list_id));
+                            assert!(cache.order_list_exists(&order_list_id));
+                            let order_list = cache.order_list(&order_list_id).unwrap();
+                            assert_eq!(
+                                order_list.client_order_ids.as_slice(),
+                                &[client_order_id1, client_order_id2]
+                            );
                             timeline.borrow_mut().push("init1");
                         }
                         OrderEventAny::Initialized(e) if e.client_order_id == client_order_id2 => {
@@ -4009,8 +4078,8 @@ mod tests {
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
-            cache.clone(),
             clock.clone(),
+            cache.clone(),
             None,
         )));
         strategy
@@ -4038,8 +4107,8 @@ mod tests {
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
-            cache.clone(),
             clock.clone(),
+            cache.clone(),
             None,
         )));
         strategy
@@ -4087,8 +4156,8 @@ mod tests {
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
-            cache.clone(),
             clock.clone(),
+            cache.clone(),
             None,
         )));
         strategy
@@ -4218,8 +4287,8 @@ mod tests {
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
-            cache.clone(),
             clock.clone(),
+            cache.clone(),
             None,
         )));
         strategy
@@ -4302,8 +4371,8 @@ mod tests {
             .register_default_handler(TimeEventCallback::from(|_event: TimeEvent| {}));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
-            cache.clone(),
             clock.clone(),
+            cache.clone(),
             None,
         )));
         strategy

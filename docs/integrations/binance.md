@@ -224,8 +224,14 @@ formula does not account for contract size. Configure `default_taker_fee` on
 
 When `use_position_ids` is enabled (default), exchange-generated fill reports
 include a `venue_position_id` derived from the instrument and position side
-(e.g. `ETHUSDT-PERP.BINANCE-LONG`). Set `use_position_ids` to false on
-`BinanceExecClientConfig` for virtual positions with `OmsType.HEDGING`.
+(e.g. `ETHUSDT-PERP.BINANCE-LONG`). Keep this enabled for Binance dual-side
+positions. Set `use_position_ids` to false only for virtual positions with
+`OmsType.HEDGING`, where the engine manages position identity.
+
+For Futures accounts using the Rust adapter in dual-side position mode, set
+`oms_type=OmsType::Hedging`. Its Python bindings use `OmsType.HEDGING`. The
+Rust adapter defaults to `OmsType::Netting` for one-way position mode. Leave
+`use_position_ids` enabled to track Binance's separate long and short sides.
 
 :::note
 The status report and fill report are emitted bundled as a single
@@ -694,9 +700,15 @@ Some endpoints have higher weight costs per request:
 | `/api/v3/allOrders`       | 20     | Spot historical orders (expensive).    |
 | `/api/v3/klines`          | 2+     | Scales with `limit` parameter.         |
 | `/fapi/v1/order`          | 1      | Futures order placement.               |
+| `/fapi/v1/algoOrder`      | 0      | Uses order‑count limits.               |
 | `/fapi/v1/allOrders`      | 20     | Futures historical orders (expensive). |
 | `/fapi/v1/commissionRate` | 20     | Futures commission rate query.         |
 | `/fapi/v1/klines`         | 5+     | Scales with `limit` parameter.         |
+
+USD-M Futures `POST /fapi/v1/algoOrder` consumes `1` from both
+`X-MBX-ORDER-COUNT-10S` and `X-MBX-ORDER-COUNT-1M`. Binance charges no IP
+request weight for this endpoint; the adapter still queues it through the
+global bucket as part of its local pacing model.
 
 ### WebSocket API limits
 
@@ -789,6 +801,7 @@ definitive list of Rust config options.
 | `futures_leverages`                     | `None`    | Mapping of `BinanceSymbol` to initial leverage for futures accounts. |
 | `futures_margin_types`                  | `None`    | Mapping of `BinanceSymbol` to futures margin type (isolated/cross). |
 | `use_ws_trading`                        | `True`    | Use the WebSocket trading API for order operations (Spot and USD-M Futures). When `False`, HTTP is used. |
+| `oms_type`                              | `None`    | *Rust only.* Set to `Hedging` for Futures accounts in dual‑side position mode; `None` uses `Netting`. |
 | `default_taker_fee`                     | `0.0004`  | Default taker fee rate for commission estimation on exchange‑generated fills (liquidation, ADL, settlement). |
 | `bnfcr_currency`                        | `USDT`    | USD-M Futures Credits Trading Mode: currency that `BNFCR` balances and fees resolve to. See [Futures Credits Trading Mode (BNFCR)](#futures-credits-trading-mode-bnfcr). |
 | `log_rejected_due_post_only_as_warning` | `True`    | Log post‑only rejections as warnings when `True`; otherwise as errors. |
@@ -1158,6 +1171,11 @@ instrument_provider=InstrumentProviderConfig(
 Binance Futures Hedge mode allows holding both long and short positions on the
 same instrument simultaneously.
 
+The steps below apply to the Python adapter. For the Rust adapter, including
+its Python bindings, configure hedge mode on Binance and set `oms_type` to
+`OmsType::Hedging` in Rust or `OmsType.HEDGING` in Python. Keep
+`use_position_ids` enabled to track both venue position sides.
+
 To use hedge mode:
 
 1. Configure hedge mode on Binance before starting the strategy.
@@ -1218,6 +1236,58 @@ To use hedge mode:
             position_id = PositionId(f"{self.instrument_id}-SHORT")
             self.submit_order(order, position_id)
     ```
+
+### COIN-M / USD-M architecture
+
+Binance COIN-M Futures (CM / DAPI) and USD-M Futures (UM / FAPI) share a
+unified architecture. This section covers the implications for the adapter.
+
+See the [Important CM-UM Integration Notice](https://developers.binance.com/docs/derivatives/coin-margined-futures/Important-CM-UM-Integration-Notice)
+for the full details.
+
+#### WebSocket streams
+
+Market-data stream payloads include `st` (symbol type: `1` = UM, `2` = CM) on
+`<symbol>@aggTrade`, `<symbol>@ticker`, `<symbol>@bookTicker`,
+`<symbol>@depth<levels>`, `<symbol>@miniTicker`, and all `!*@arr` streams.
+UM-side single-symbol streams also include `ps` (pair symbol) on
+`<symbol>@bookTicker`, `<symbol>@depth<levels>`, `<symbol>@miniTicker`, and
+`<symbol>@rpiDepth`.
+
+The adapter uses `msgspec` (Python) and `serde` (Rust) for JSON decoding, both
+of which ignore unknown fields by default. These fields are silently dropped.
+
+All-market array streams (`!ticker@arr`, `!miniTicker@arr`, `!bookTicker`,
+`!forceOrder@arr`, `!contractInfo`) deliver merged UM + CM content on both
+`fstream` and `dstream`.
+
+#### REST and WebSocket API
+
+- Order placement and modification acknowledgement responses do not include
+  `avgPrice` / `cumQuote` / `cumBase`. The adapter sources fills from the user
+  data stream. Query endpoints (`GET /{f,d}api/v1/order`, `userTrades`) still
+  return these fields.
+- `PUT /dapi/v1/order` (COIN-M modify) requires both `price` and `quantity`.
+  The adapter's `_modify_order` sends both fields, falling back to the cached
+  order's values.
+- COIN-M conditional orders (STOP, TAKE_PROFIT, etc.) use the
+  `/dapi/v1/algoOrder` endpoint. The adapter routes all futures conditional
+  orders through the algo order API.
+- `GET /dapi/v1/openOrders` with an invalid symbol returns error `-1121`.
+
+#### Rate-limit pools
+
+UM and CM share a single rate-limit pool per IP (2400 weight/min,
+1200 orders/min, 300 orders/10s). The adapter creates separate HTTP client
+instances for UM and CM, each with its own rate limiter. If a node drives both
+UM and CM clients simultaneously, the combined traffic may exceed the shared
+server-side budget.
+
+#### dualSidePosition
+
+UM and CM share the same `dualSidePosition` setting. Changing it on either
+side affects both. Ensure both UM and CM have no open orders or positions
+before flipping the setting.
 
 ## Contributing
 

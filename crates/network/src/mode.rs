@@ -90,7 +90,7 @@ impl ConnectionMode {
     /// queries keep reporting `Closed`).
     pub fn request_disconnect(value: &AtomicU8) -> bool {
         value
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |mode| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |mode| {
                 (!Self::from_u8(mode).is_closed()).then_some(Self::Disconnect.as_u8())
             })
             .is_ok()

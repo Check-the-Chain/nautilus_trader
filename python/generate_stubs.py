@@ -119,7 +119,9 @@ class ClassMethodFixup:
     """
 
     python_name: str | None = None
+    subclass: bool = False
     getters: set[str] = field(default_factory=set)
+    setters: dict[str, str] = field(default_factory=dict)
     staticmethods: set[str] = field(default_factory=set)
     classmethods: set[str] = field(default_factory=set)
     renames: dict[str, str] = field(default_factory=dict)
@@ -154,6 +156,56 @@ MODULE_FIXUPS: dict[str, StubFixup] = {
         imports=("from enum import Enum",),
         all_exports=("AmmType", "Blockchain", "Chain", "DataType", "Dex", "DexType"),
     ),
+}
+
+# Re-exports of hand-written (pure-Python) symbols to inject into generated module
+# stubs. PyO3's stub generator only knows about Rust pyclasses, so it drops these on
+# every regeneration; the redundant `as` alias marks them as explicit re-exports so
+# `from <module> import <symbol>` type-checks. Keyed by stub path suffix.
+EXTRA_REEXPORTS: dict[str, tuple[str, ...]] = {
+    "nautilus_trader/analysis/__init__.pyi": (
+        "from nautilus_trader.analysis.config import GridLayout as GridLayout",
+        "from nautilus_trader.analysis.config import TearsheetBarsWithFillsChart as TearsheetBarsWithFillsChart",
+        "from nautilus_trader.analysis.config import TearsheetChart as TearsheetChart",
+        "from nautilus_trader.analysis.config import TearsheetConfig as TearsheetConfig",
+        "from nautilus_trader.analysis.config import TearsheetCustomChart as TearsheetCustomChart",
+        "from nautilus_trader.analysis.config import TearsheetDistributionChart as TearsheetDistributionChart",
+        "from nautilus_trader.analysis.config import TearsheetDrawdownChart as TearsheetDrawdownChart",
+        "from nautilus_trader.analysis.config import TearsheetEquityChart as TearsheetEquityChart",
+        "from nautilus_trader.analysis.config import TearsheetMonthlyReturnsChart as TearsheetMonthlyReturnsChart",
+        "from nautilus_trader.analysis.config import TearsheetRollingSharpeChart as TearsheetRollingSharpeChart",
+        "from nautilus_trader.analysis.config import TearsheetRunInfoChart as TearsheetRunInfoChart",
+        "from nautilus_trader.analysis.config import TearsheetStatsTableChart as TearsheetStatsTableChart",
+        "from nautilus_trader.analysis.config import TearsheetYearlyReturnsChart as TearsheetYearlyReturnsChart",
+        "from nautilus_trader.analysis.reporter import ReportProvider as ReportProvider",
+        "from nautilus_trader.analysis.tearsheet import create_bars_with_fills as create_bars_with_fills",
+        "from nautilus_trader.analysis.tearsheet import create_drawdown_chart as create_drawdown_chart",
+        "from nautilus_trader.analysis.tearsheet import create_equity_curve as create_equity_curve",
+        "from nautilus_trader.analysis.tearsheet import create_monthly_returns_heatmap as create_monthly_returns_heatmap",
+        "from nautilus_trader.analysis.tearsheet import create_returns_distribution as create_returns_distribution",
+        "from nautilus_trader.analysis.tearsheet import create_rolling_sharpe as create_rolling_sharpe",
+        "from nautilus_trader.analysis.tearsheet import create_tearsheet as create_tearsheet",
+        "from nautilus_trader.analysis.tearsheet import create_tearsheet_from_stats as create_tearsheet_from_stats",
+        "from nautilus_trader.analysis.tearsheet import create_yearly_returns as create_yearly_returns",
+        "from nautilus_trader.analysis.tearsheet import get_chart as get_chart",
+        "from nautilus_trader.analysis.tearsheet import list_charts as list_charts",
+        "from nautilus_trader.analysis.tearsheet import register_chart as register_chart",
+        "from nautilus_trader.analysis.tearsheet import register_tearsheet_chart as register_tearsheet_chart",
+        "from nautilus_trader.analysis.themes import get_theme as get_theme",
+        "from nautilus_trader.analysis.themes import list_themes as list_themes",
+        "from nautilus_trader.analysis.themes import register_theme as register_theme",
+    ),
+    "nautilus_trader/core/__init__.pyi": (
+        "from nautilus_trader.core.datetime import dt_to_unix_nanos as dt_to_unix_nanos",
+        "from nautilus_trader.core.datetime import unix_nanos_to_dt as unix_nanos_to_dt",
+    ),
+    "nautilus_trader/trading/__init__.pyi": (
+        "from nautilus_trader.trading.controller import Controller as Controller",
+    ),
+}
+
+EXTRA_ALL_EXPORTS: dict[str, tuple[str, ...]] = {
+    "nautilus_trader/trading/__init__.pyi": ("Controller",),
 }
 
 MODEL_EXPORTS = frozenset(MODULE_FIXUPS["model"].all_exports)
@@ -258,6 +310,10 @@ def generate_stubs() -> bool:
     maturin_features = pyproject.get("tool", {}).get("maturin", {}).get("features", [])
     cargo_features = [f for f in maturin_features if f != "extension-module"]
 
+    # extension-module (stripped above) is what enables gateway in the wheel build
+    if "nautilus-interactive-brokers/gateway" not in cargo_features:
+        cargo_features.append("nautilus-interactive-brokers/gateway")
+
     cmd = ["cargo", "run", "--bin", "python-stub-gen"]
 
     if cargo_features:
@@ -311,6 +367,37 @@ def generate_stubs() -> bool:
     return True
 
 
+def inject_reexports(content: str, stub_path: Path) -> str:
+    """
+    Inject configured re-export imports for hand-written symbols into a module stub.
+    """
+    posix = stub_path.as_posix()
+    reexports = next((v for k, v in EXTRA_REEXPORTS.items() if posix.endswith(k)), None)
+    exports = next((v for k, v in EXTRA_ALL_EXPORTS.items() if posix.endswith(k)), None)
+
+    if not reexports and not exports:
+        return content
+
+    if reexports:
+        lines = content.split("\n")
+        missing = [imp for imp in reexports if imp not in lines]
+
+        if missing:
+            insert_at = 0
+
+            for i, line in enumerate(lines):
+                if line.startswith(("import ", "from ")):
+                    insert_at = i + 1
+
+            lines[insert_at:insert_at] = missing
+            content = "\n".join(lines)
+
+    if exports:
+        content = _add_names_to_all(content, list(exports))
+
+    return content
+
+
 def post_process_stubs(root: Path) -> None:
     """Post-process all stub files: fix headers, rename methods, fix return types."""
     workspace_root = Path(__file__).parent.parent
@@ -337,6 +424,9 @@ def post_process_stubs(root: Path) -> None:
         # Rename wrapper classes to their public Python names
         content = rename_stub_classes(content, rust_fixups)
 
+        # Remove stale final markers from classes PyO3 exposes as subclassable
+        content = remove_final_from_subclassable_classes(content, rust_fixups)
+
         # Escape keywords introduced by fixup renames (e.g. py_from -> from)
         content = _escape_keyword_methods(content)
 
@@ -360,6 +450,9 @@ def post_process_stubs(root: Path) -> None:
 
         # Import model symbols used without a module qualifier
         content = add_missing_model_imports(content)
+
+        # Inject re-exports for hand-written Python symbols (e.g. ReportProvider)
+        content = inject_reexports(content, stub_file)
 
         # Normalize formatting
         content = normalize_stub_content(content)
@@ -404,7 +497,7 @@ INJECTABLE_STATICMETHODS = frozenset({"from_json", "from_msgpack"})
 # Methods to suppress from public stubs (implementation details, not user-facing API)
 SUPPRESSED_METHODS = frozenset({"__richcmp__", "_safe_constructor"})
 PYMETHODS_ATTRS = frozenset({"#[pymethods]", "#[pyo3::pymethods]"})
-PYCLASS_ATTR_PREFIXES = ("#[pyclass", "#[pyo3::pyclass")
+PYCLASS_ATTR_RE = re.compile(r"\b(?:pyo3::)?pyclass\s*\(")
 PYO3_NAME_RE = re.compile(r'#\[pyo3\(\s*name\s*=\s*"([^"]+)"')
 ATTR_NAME_RE = re.compile(r'\bname\s*=\s*"([^"]+)"')
 RUST_IMPL_RE = re.compile(r"^\s*impl(?:\s*<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:<>]*)\s*\{")
@@ -472,7 +565,7 @@ def _resolve_signature_params(
 
     for raw_param in _split_signature_params(params_str):
         param = raw_param.strip()
-        if not param or param == "*":
+        if not param or param.startswith("*"):
             continue
         if "=" not in param:
             params.append((param, None))
@@ -585,9 +678,12 @@ def collect_rust_class_fixups(workspace_root: Path) -> dict[str, ClassMethodFixu
     """
     fixups: dict[str, ClassMethodFixup] = {}
 
-    for rust_file in sorted(workspace_root.glob("crates/**/src/python/**/*.rs")):
+    for rust_file in sorted(workspace_root.glob("crates/**/src/**/*.rs")):
         source = rust_file.read_text()
         _collect_pyclass_name_fixups(source, fixups)
+
+    for rust_file in sorted(workspace_root.glob("crates/**/src/python/**/*.rs")):
+        source = rust_file.read_text()
         _collect_identifier_macro_fixups(source, fixups)
         _collect_pymethod_fixups(source, fixups)
         _collect_pyfunction_signature_defaults(source, fixups)
@@ -916,18 +1012,18 @@ def _collect_pyclass_name_fixups(source: str, fixups: dict[str, ClassMethodFixup
             i += 1
             continue
 
-        pyclass_attr = next(
-            (attr for attr in pending_attrs if attr.startswith(PYCLASS_ATTR_PREFIXES)),
-            None,
-        )
+        pyclass_attr = next((attr for attr in pending_attrs if PYCLASS_ATTR_RE.search(attr)), None)
 
         if pyclass_attr is not None:
+            rust_name = struct_match.group(1)
+            fixup = fixups.setdefault(rust_name, ClassMethodFixup())
             name_match = ATTR_NAME_RE.search(pyclass_attr)
             if name_match is not None:
-                rust_name = struct_match.group(1)
                 python_name = name_match.group(1)
                 if python_name != rust_name:
-                    fixups.setdefault(rust_name, ClassMethodFixup()).python_name = python_name
+                    fixup.python_name = python_name
+            if pyclass_has_option(pyclass_attr, "subclass"):
+                fixup.subclass = True
 
         pending_attrs.clear()
         i += 1
@@ -938,6 +1034,52 @@ def _collect_identifier_macro_fixups(source: str, fixups: dict[str, ClassMethodF
         fixup = fixups.setdefault(class_name, ClassMethodFixup())
         fixup.getters.update(IDENTIFIER_MACRO_METHOD_FIXUPS.getters)
         fixup.staticmethods.update(IDENTIFIER_MACRO_METHOD_FIXUPS.staticmethods)
+
+
+def pyclass_has_option(attribute: str, option: str) -> bool:
+    """
+    Return whether a ``#[pyclass(...)]`` attribute includes a bare option token.
+    """
+    match = PYCLASS_ATTR_RE.search(attribute)
+    if match is None:
+        return False
+
+    args = _extract_signature_params_str(attribute, match.end() - 1)
+    args = strip_double_quoted_strings(args)
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(option)}(?![A-Za-z0-9_])", args) is not None
+
+
+def strip_double_quoted_strings(text: str) -> str:
+    """
+    Replace double-quoted string literal contents with spaces.
+    """
+    chars: list[str] = []
+    in_string = False
+    escaped = False
+
+    for ch in text:
+        if escaped:
+            chars.append(" ")
+            escaped = False
+            continue
+
+        if in_string:
+            chars.append(" ")
+
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            chars.append(" ")
+            in_string = True
+            continue
+
+        chars.append(ch)
+
+    return "".join(chars)
 
 
 def _collect_custom_data_macro_fixups(source: str, fixups: dict[str, ClassMethodFixup]) -> None:
@@ -1219,6 +1361,7 @@ def register_rust_method_fixup(
     params = method_match.group(2)
 
     is_getter = any(attr.startswith("#[getter") for attr in attrs)
+    is_setter = any(attr.startswith("#[setter") for attr in attrs)
     is_staticmethod = any(attr.startswith("#[staticmethod") for attr in attrs)
     is_classmethod = any(attr.startswith("#[classmethod") for attr in attrs)
     python_name = _python_exposed_name(rust_name, attrs, is_getter)
@@ -1238,6 +1381,9 @@ def register_rust_method_fixup(
     if is_getter:
         fixup.getters.update(method_names)
 
+    if is_setter:
+        register_rust_setter_fixup(rust_name, attrs, method_names, fixup)
+
     _extract_method_signature_defaults(attrs, python_name, fixup)
 
     if is_classmethod:
@@ -1255,6 +1401,31 @@ def register_rust_method_fixup(
     rendered = render_missing_staticmethod_stub(class_name, python_name, params)
     if rendered is not None:
         fixup.injected_staticmethods[python_name] = rendered
+
+
+def register_rust_setter_fixup(
+    rust_name: str,
+    attrs: list[str],
+    method_names: set[str],
+    fixup: ClassMethodFixup,
+) -> None:
+    setter_name = _setter_property_name(rust_name, attrs)
+    if setter_name is None:
+        return
+
+    for method_name in method_names:
+        fixup.setters[method_name] = setter_name
+
+
+def _setter_property_name(rust_name: str, attrs: list[str]) -> str | None:
+    for attr in attrs:
+        name_match = PYO3_NAME_RE.search(attr)
+        if name_match:
+            return name_match.group(1)
+
+    if rust_name.startswith("set_"):
+        return rust_name[4:]
+    return None
 
 
 def _extract_method_signature_defaults(
@@ -1365,6 +1536,40 @@ def rename_stub_classes(content: str, class_fixups: dict[str, ClassMethodFixup])
     return content
 
 
+def remove_final_from_subclassable_classes(
+    content: str,
+    class_fixups: dict[str, ClassMethodFixup],
+) -> str:
+    """
+    Remove ``@typing.final`` from classes declared ``#[pyclass(subclass)]``.
+    """
+    subclassable = {
+        name
+        for rust_name, fixup in class_fixups.items()
+        if fixup.subclass
+        for name in {rust_name, fixup.python_name or rust_name}
+    }
+
+    if not subclassable:
+        return content
+
+    lines = content.split("\n")
+    result: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        if lines[i].strip() == "@typing.final" and i + 1 < len(lines):
+            class_match = STUB_CLASS_RE.match(lines[i + 1].strip())
+            if class_match is not None and class_match.group(1) in subclassable:
+                i += 1
+                continue
+
+        result.append(lines[i])
+        i += 1
+
+    return "\n".join(result)
+
+
 def apply_class_block_fixups(
     class_block: list[str],
     class_name: str,
@@ -1389,8 +1594,13 @@ def apply_class_block_fixups(
         seen_methods.add(method_name)
         seen_methods.add(resolved_name)
         is_suppressed = method_name in SUPPRESSED_METHODS or resolved_name in SUPPRESSED_METHODS
+        setter_property = fixup.setters.get(method_name) or fixup.setters.get(resolved_name)
         if not is_duplicate and not is_suppressed:
-            result.extend(rewrite_stub_method_block(method_name, method_block, fixup))
+            rewritten = rewrite_stub_method_block(method_name, method_block, fixup)
+            if setter_property:
+                result.extend(render_stub_property_setter(setter_property, rewritten))
+            else:
+                result.extend(rewritten)
         i = next_index
 
     missing = [
@@ -1539,6 +1749,7 @@ def rewrite_stub_method_block(
     """
     needs_fixup = (
         method_name in fixup.getters
+        or method_name in fixup.setters
         or method_name in fixup.staticmethods
         or method_name in fixup.classmethods
         or method_name in fixup.renames
@@ -1574,6 +1785,26 @@ def rewrite_stub_method_block(
         decorators.append("    @property")
 
     return decorators + signature_text.split("\n") + remainder
+
+
+def render_stub_property_setter(property_name: str, method_block: list[str]) -> list[str]:
+    decorators, signature_text, remainder = split_method_block(method_block)
+    decorators = [decorator for decorator in decorators if decorator.strip() != "@property"]
+    signature_text = re.sub(
+        r"\bdef\s+\w+\(",
+        f"def {property_name}(",
+        signature_text,
+        count=1,
+    )
+    signature_text = drop_stub_param_default(signature_text, property_name)
+    return [f"    @{property_name}.setter", *decorators, *signature_text.split("\n"), *remainder]
+
+
+def drop_stub_param_default(signature_text: str, param_name: str) -> str:
+    pattern = re.compile(
+        rf"(\b{re.escape(param_name)}\s*:[^,)\n=]*?\S)\s*=\s*(?:\.\.\.|[^,)\n]+)",
+    )
+    return pattern.sub(r"\1", signature_text, count=1)
 
 
 def drop_stub_method_receiver(signature_text: str) -> str:
@@ -2120,6 +2351,11 @@ def _fix_optional_defaults_in_line(line: str) -> str:
     return line[: paren_start + 1] + ", ".join(params) + line[paren_end:]
 
 
+def _is_property_setter_decorator(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("@") and stripped.endswith(".setter")
+
+
 def add_optional_defaults(content: str) -> str:
     """
     Add ``= ...`` to trailing Optional parameters that lack a default value.
@@ -2136,8 +2372,23 @@ def add_optional_defaults(content: str) -> str:
     """
     lines = content.split("\n")
     result = []
+    after_property_setter = False
 
     for line in lines:
+        stripped = line.strip()
+        if _is_property_setter_decorator(line):
+            result.append(line)
+            after_property_setter = True
+            continue
+
+        if after_property_setter and "def " in line:
+            result.append(line)
+            after_property_setter = False
+            continue
+
+        if stripped and not stripped.startswith("@"):
+            after_property_setter = False
+
         if "def " in line and ("Optional" in line or "| None" in line):
             result.append(_fix_optional_defaults_in_line(line))
         else:
@@ -2223,8 +2474,8 @@ def _apply_defaults_to_line(line: str, defaults: dict[str, str]) -> str:
     """
     Apply known defaults to parameter declarations on a single line.
 
-    Handles both:
-    - Replacing ``= ...`` with the actual default
+    Handles:
+    - Replacing stale defaults with the actual default
     - Adding ``= <default>`` to parameters that have no default in the stub
 
     """
@@ -2246,6 +2497,9 @@ def _apply_defaults_to_line(line: str, defaults: dict[str, str]) -> str:
             after_dots = line[eq_pos:]
             after_dots = re.sub(r"=\s*(?:\w+\.)?\.\.\.", f"= {qualified}", after_dots, count=1)
             line = before_eq + " " + after_dots
+        elif eq_pos >= 0:
+            before_eq = line[:eq_pos].rstrip()
+            line = before_eq + f" = {qualified}" + line[end_pos:]
         elif eq_pos < 0:
             line = line[:end_pos] + f" = {qualified}" + line[end_pos:]
 
@@ -2263,7 +2517,7 @@ def _scan_param_type(line: str, start: int) -> tuple[int, int, bool]:
 
     """
     depth = 0
-    end_pos = len(line)
+
     for i in range(start, len(line)):
         ch = line[i]
         if ch in "([":
@@ -2276,12 +2530,49 @@ def _scan_param_type(line: str, start: int) -> tuple[int, int, bool]:
         elif ch == "," and depth == 0:
             return i, -1, False
         elif ch == "=" and depth == 0:
-            rest = line[i + 1 :].lstrip()
+            end_pos = _scan_param_default_end(line, i + 1)
+            default_text = line[i + 1 : end_pos].strip()
+            return end_pos, i, _is_ellipsis_default(default_text)
+    return len(line), -1, False
 
-            # Match both plain `...` and pyo3-stub-gen's malformed `model....`
-            is_ellipsis = rest.startswith("...") or re.match(r"\w+\.\.\.\.", rest)
-            return end_pos, i, bool(is_ellipsis)
-    return end_pos, -1, False
+
+def _scan_param_default_end(line: str, start: int) -> int:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+
+    for i in range(start, len(line)):
+        ch = line[i]
+        if quote is not None:
+            quote, escaped = _advance_quoted_default(ch, quote, escaped)
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            if depth > 0:
+                depth -= 1
+            else:
+                return i
+        elif ch == "," and depth == 0:
+            return i
+    return len(line)
+
+
+def _advance_quoted_default(ch: str, quote: str, escaped: bool) -> tuple[str | None, bool]:
+    if escaped:
+        return quote, False
+    if ch == "\\":
+        return quote, True
+    if ch == quote:
+        return None, False
+    return quote, False
+
+
+def _is_ellipsis_default(default_text: str) -> bool:
+    return default_text.startswith("...") or bool(re.match(r"\w+\.\.\.\.", default_text))
 
 
 def _qualify_enum_default(py_default: str, type_text: str) -> str:

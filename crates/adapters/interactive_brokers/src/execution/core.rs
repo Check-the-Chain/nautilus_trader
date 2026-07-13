@@ -113,9 +113,6 @@ use crate::{
 };
 
 fn require_informational_reconciliation_notice(notice: &ibapi::Notice) -> anyhow::Result<()> {
-    // These codes only describe healthy or idle IBKR data-farm state. Any
-    // other notice can mean the requested snapshot is incomplete and must
-    // fail startup reconciliation.
     if matches!(notice.code, 1102 | 2104 | 2106 | 2107 | 2108 | 2158) {
         tracing::debug!(
             code = notice.code,
@@ -141,6 +138,12 @@ fn require_informational_reconciliation_notice(notice: &ibapi::Notice) -> anyhow
     pyo3::pyclass(
         module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
         unsendable
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 pub struct InteractiveBrokersExecutionClient {
@@ -422,12 +425,12 @@ impl InteractiveBrokersExecutionClient {
         let subscription = tokio::time::timeout(timeout_dur, client.all_open_orders())
             .await
             .context("Timeout requesting open orders for next order ID initialization")??;
-        let mut subscription = subscription.filter_data();
+        let mut subscription = subscription;
         let mut highest_order_id = None;
 
         while let Some(order_result) = subscription.next().await {
             match order_result {
-                Ok(Orders::OrderData(data)) => {
+                Ok(SubscriptionItem::Data(Orders::OrderData(data))) => {
                     highest_order_id = Some(
                         highest_order_id
                             .map_or(data.order_id, |current: i32| current.max(data.order_id)),
@@ -658,13 +661,13 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .max(client_scoped_next_id);
 
         if starting_order_id != next_id {
-            tracing::info!(
+            tracing::debug!(
                 "Adjusted next Interactive Brokers order ID from {} to {} based on client ID/open orders",
                 next_id,
                 starting_order_id
             );
         } else {
-            tracing::info!(
+            tracing::debug!(
                 "Initialized next Interactive Brokers order ID to {}",
                 starting_order_id
             );
@@ -691,7 +694,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .await
         {
             Ok((balances, margins)) => {
-                tracing::info!(
+                tracing::debug!(
                     "Received account summary: {} balances, {} margins",
                     balances.len(),
                     margins.len()
@@ -1500,7 +1503,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 {
                     tracing::error!("query_order: failed to send inferred order canceled event");
                 } else {
-                    tracing::info!(
+                    tracing::debug!(
                         "query_order: inferred cancel for {} from missing open order {}",
                         client_order_id,
                         target_order.label()
@@ -1559,7 +1562,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .map(Arc::new);
 
         if original_order.is_none() {
-            tracing::info!(
+            tracing::debug!(
                 "Order {} not found in cache for modify; querying IB open orders",
                 cmd.client_order_id
             );
@@ -1714,11 +1717,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         };
 
         if orders_to_cancel.is_empty() {
-            tracing::info!("No open orders to cancel");
+            tracing::debug!("No open orders to cancel");
             return Ok(());
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Canceling {} open order(s) for instrument {}",
             orders_to_cancel.len(),
             cmd.instrument_id
@@ -2167,7 +2170,7 @@ impl InteractiveBrokersExecutionClient {
             }
         }
 
-        tracing::info!("Finished canceling all orders");
+        tracing::debug!("Finished canceling all orders");
 
         Ok(())
     }
@@ -2202,7 +2205,7 @@ impl InteractiveBrokersExecutionClient {
             strategy_id,
             instrument_id,
             client_order_id,
-            account_id,
+            Some(account_id),
             UUID4::new(),
             ts_init,
             ts_init,

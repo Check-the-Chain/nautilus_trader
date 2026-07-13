@@ -449,6 +449,16 @@ pub struct GetMarkPriceParams {
     pub inst_id: Option<String>,
 }
 
+/// Parameters for the GET /api/v5/public/price-limit endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetPriceLimitParams {
+    /// Instrument ID, e.g. "BTC-USDT-SWAP".
+    pub inst_id: String,
+}
+
 /// Parameters for the GET /api/v5/market/index-tickers.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]

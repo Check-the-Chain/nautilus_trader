@@ -1327,7 +1327,7 @@ impl LogGuard {
     pub fn new() -> Option<Self> {
         let tx = LOGGER_TX.get()?;
         LOGGING_GUARDS_ACTIVE
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 if count == u8::MAX {
                     None
                 } else {
@@ -1347,7 +1347,7 @@ impl Drop for LogGuard {
     /// logging thread, and resets the subsystem state.
     fn drop(&mut self) {
         let previous_count = LOGGING_GUARDS_ACTIVE
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 assert!(count != 0, "LogGuard reference count underflow");
                 Some(count - 1)
             })

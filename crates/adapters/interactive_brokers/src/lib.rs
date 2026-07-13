@@ -77,7 +77,6 @@
 pub mod common;
 pub mod config;
 pub mod data;
-pub mod data_types;
 pub mod error;
 pub mod execution;
 pub mod factories;

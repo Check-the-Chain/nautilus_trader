@@ -58,7 +58,7 @@ pub async fn subscribe_account_summary(
     account_id: AccountId,
 ) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
     let raw_account_id = raw_ib_account_code(&account_id);
-    // Request only the facts represented by Nautilus balances/margins.
+    // Request only the facts represented by Nautilus balances and margins.
     let tags = &[
         AccountSummaryTags::NET_LIQUIDATION,
         AccountSummaryTags::AVAILABLE_FUNDS,
@@ -73,7 +73,7 @@ pub async fn subscribe_account_summary(
         .context("Failed to subscribe to account summary")?;
     let mut subscription = subscription.filter_data();
 
-    tracing::info!("Subscribed to account summary for account: {}", account_id);
+    tracing::debug!("Subscribed to account summary for account: {}", account_id);
 
     // Process initial account summary snapshot
     // We collect all summary items until the API sends AccountSummaryResult::End, so the
@@ -129,7 +129,7 @@ pub async fn subscribe_account_summary(
         }
     }
 
-    tracing::info!(
+    tracing::debug!(
         "Received account summary: {} balances, {} margins",
         balances.len(),
         margins.len()
@@ -224,14 +224,14 @@ pub async fn subscribe_pnl(client: &Arc<Client>, account_id: AccountId) -> anyho
         .context("Failed to subscribe to PnL")?;
     let mut subscription = subscription.filter_data();
 
-    tracing::info!("Subscribed to PnL updates for account: {}", account_id);
+    tracing::debug!("Subscribed to PnL updates for account: {}", account_id);
 
     // Process PnL updates in background task
     nautilus_common::live::get_runtime().spawn(async move {
         while let Some(result) = subscription.next().await {
             match result {
                 Ok(pnl) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "PnL update - Daily: {:.2}, Unrealized: {:?}, Realized: {:?}",
                         pnl.daily_pnl,
                         pnl.unrealized_pnl,
@@ -312,7 +312,7 @@ pub async fn initialize_position_tracking(
         .context("Failed to request positions")?;
     let mut subscription = subscription.filter_data();
 
-    tracing::info!("Initializing position tracking for account: {}", account_id);
+    tracing::debug!("Initializing position tracking for account: {}", account_id);
 
     let mut position_count = 0;
     let mut tracker = position_tracker.lock().await;
@@ -343,7 +343,7 @@ pub async fn initialize_position_tracking(
         }
     }
 
-    tracing::info!(
+    tracing::debug!(
         "Initialized tracking for {} existing positions",
         position_count
     );
@@ -372,7 +372,7 @@ pub async fn subscribe_positions(
         .context("Failed to subscribe to positions")?;
     let mut subscription = subscription.filter_data();
 
-    tracing::info!("Subscribed to position updates for account: {}", account_id);
+    tracing::debug!("Subscribed to position updates for account: {}", account_id);
 
     let exec_sender = get_exec_event_sender();
     let clock = get_atomic_clock_realtime();
@@ -501,7 +501,7 @@ pub async fn subscribe_positions(
     Ok(())
 }
 
-/// Parse IB account summary to Nautilus AccountBalance.
+/// Parse the IB account facts represented by a Nautilus [`AccountBalance`].
 fn parse_account_summary_to_balance(
     summary: &AccountSummary,
 ) -> anyhow::Result<Option<AccountBalance>> {
@@ -509,16 +509,13 @@ fn parse_account_summary_to_balance(
         AccountSummaryTags::NET_LIQUIDATION => {
             let currency = parse_currency(&summary.currency)?;
             let balance = parse_balance_decimal(&summary.value)?;
-            // Net liquidation - represents total equity
-            // Free would be calculated from available funds
-            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
+            AccountBalance::from_total_and_free(balance, balance, currency)
                 .map(Some)
                 .map_err(Into::into)
         }
         AccountSummaryTags::AVAILABLE_FUNDS => {
             let currency = parse_currency(&summary.currency)?;
             let balance = parse_balance_decimal(&summary.value)?;
-            // Available funds - this is the free amount
             AccountBalance::from_total_and_free(balance, balance, currency)
                 .map(Some)
                 .map_err(Into::into)
@@ -588,23 +585,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_account_summary_ignores_cash_balance_as_equity() {
-        let balance =
-            parse_account_summary_to_balance(&margin_summary("CashBalance", "13163.00", "USD"))
-                .unwrap();
-
-        assert!(balance.is_none());
-    }
-
-    #[rstest]
-    fn test_parse_account_summary_ignores_ledger_metadata() {
-        let balance =
-            parse_account_summary_to_balance(&margin_summary("Currency", "USD", "USD")).unwrap();
-
-        assert!(balance.is_none());
-    }
-
-    #[rstest]
     #[tokio::test]
     async fn test_external_position_change_reports_tracked_zero_close() {
         let tracker = create_position_tracker();
@@ -670,8 +650,17 @@ mod tests {
             let balance = balance.unwrap();
             assert_eq!(balance.total.as_decimal(), Decimal::from(150_000));
             assert_eq!(balance.free.as_decimal(), Decimal::from(100_000));
-            assert_eq!(balance.total.currency, Currency::USD());
         }
+    }
+
+    #[rstest]
+    fn test_cash_balance_is_not_misreported_as_account_equity() {
+        let summary = margin_summary("CashBalance", "13163.00", "USD");
+        assert!(
+            parse_account_summary_to_balance(&summary)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[rstest]

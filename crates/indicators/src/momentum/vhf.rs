@@ -16,7 +16,7 @@
 use std::fmt::Display;
 
 use arraydeque::{ArrayDeque, Wrapping};
-use nautilus_model::data::Bar;
+use nautilus_model::data::{Bar, QuoteTick, TradeTick};
 
 use crate::{
     average::{MovingAverageFactory, MovingAverageType},
@@ -65,6 +65,12 @@ impl Indicator for VerticalHorizontalFilter {
         self.initialized
     }
 
+    fn handle_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn handle_trade(&mut self, _trade: &TradeTick) {}
+
     fn handle_bar(&mut self, bar: &Bar) {
         self.update_raw((&bar.close).into());
     }
@@ -111,6 +117,10 @@ impl VerticalHorizontalFilter {
     pub fn update_raw(&mut self, close: f64) {
         if !self.has_inputs {
             self.previous_close = close;
+        }
+
+        if self.prices.len() == self.period {
+            let _ = self.prices.pop_front();
         }
 
         let _ = self.prices.push_back(close);
@@ -217,5 +227,20 @@ mod tests {
         assert_eq!(vhf_10.prices.len(), 0);
         assert!(!vhf_10.has_inputs);
         assert!(!vhf_10.initialized);
+    }
+
+    #[rstest]
+    fn test_value_respects_period_window() {
+        let mut vhf = VerticalHorizontalFilter::new(3, None);
+
+        vhf.update_raw(100.0); // Early spike must leave the 3-period window
+        vhf.update_raw(1.0);
+        vhf.update_raw(2.0);
+        vhf.update_raw(3.0);
+        vhf.update_raw(4.0);
+
+        // Window is now [2, 3, 4]: |max - min| = 2, and the SMA(3) of the last
+        // three absolute price changes (1, 1, 1) is 1, so value = 2 / 3 / 1.
+        assert_eq!(vhf.value, 2.0 / 3.0);
     }
 }

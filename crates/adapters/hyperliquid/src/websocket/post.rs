@@ -233,7 +233,7 @@ impl PostBatcher {
                 }
             }
         }
-        log::info!("Post lane terminated: lane={lane_name}");
+        log::debug!("Post lane terminated: lane={lane_name}");
     }
 
     pub async fn enqueue(&self, item: ScheduledPost) -> Result<()> {
@@ -482,6 +482,7 @@ pub fn cancel_many(cancels: Vec<(u32, u64)>) -> ActionRequest {
             .into_iter()
             .map(|(a, o)| CancelRequest { a, o })
             .collect(),
+        fast: None,
     }
 }
 pub fn cancel_by_cloid(asset: u32, cloid: impl Into<String>) -> ActionRequest {
@@ -490,6 +491,7 @@ pub fn cancel_by_cloid(asset: u32, cloid: impl Into<String>) -> ActionRequest {
             asset,
             cloid: cloid.into(),
         }],
+        fast: None,
     }
 }
 pub fn modify(oid: u64, new_order: OrderRequest) -> ActionRequest {

@@ -64,9 +64,10 @@
 //!
 //! The open-source live crate does not host dynamic plug-ins directly.
 //! `nautilus-plugin` is the public guest ABI crate, while host-side loading,
-//! vtables, bridge adapters, and server policy belong in `nautilus-plugin-host`.
-//! A non-empty `LiveNodeConfig.plugins` list is rejected unless that private
-//! host layer wires it in.
+//! vtables, bridge adapters, and server policy belong to the host-side plug-in
+//! integration.
+//! A non-empty `LiveNodeConfig.plugins` list is rejected unless an application
+//! provides that host-side integration.
 //!
 //! ```toml
 //! nautilus-live = { workspace = true, default-features = false, features = ["node"] }
@@ -106,31 +107,20 @@
     reason = "config types deserialize plain field values; unsafe in unrelated impls is sound"
 )]
 
-pub mod emitter;
+pub mod execution;
 pub mod runner;
 
 #[cfg(feature = "node")]
-pub mod builder;
-
-#[cfg(feature = "node")]
-pub mod config;
-
-#[cfg(feature = "node")]
-pub mod manager;
-
-#[cfg(feature = "node")]
 pub mod node;
-
-#[cfg(feature = "node")]
-mod execution;
-
-#[cfg(feature = "plugin")]
-pub mod plugin;
 
 #[cfg(feature = "python")]
 pub mod python;
 
 // Re-exports for adapters
-pub use emitter::ExecutionEventEmitter;
+pub use execution::{emitter, emitter::ExecutionEventEmitter, manager};
 pub use nautilus_common::factories::OrderEventFactory;
 pub use nautilus_execution::client::core::ExecutionClientCore;
+#[cfg(feature = "plugin")]
+pub use node::plugin;
+#[cfg(feature = "node")]
+pub use node::{builder, config};

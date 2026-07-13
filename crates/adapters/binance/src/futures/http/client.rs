@@ -95,6 +95,15 @@ use crate::{
 const BINANCE_GLOBAL_RATE_KEY: &str = "binance:global";
 const BINANCE_ORDERS_RATE_KEY: &str = "binance:orders";
 
+/// A Binance Futures Algo Service order with optional matching-engine details.
+#[derive(Debug)]
+pub struct BinanceFuturesAlgoOrderQueryResult {
+    /// The original conditional order from the Algo Service.
+    pub algo: BinanceFuturesAlgoOrder,
+    /// The matching-engine order created after the condition triggered, when enrichment succeeds.
+    pub actual: Option<BinanceFuturesOrder>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BatchCancelParams {
@@ -535,7 +544,10 @@ impl BinanceRawFuturesHttpClient {
                         default = Some(q);
                     }
                     BinanceRateLimitType::Orders => {
-                        let key = format!("{}:{:?}", BINANCE_ORDERS_RATE_KEY, quota.interval);
+                        let key = format!(
+                            "{}:{}:{:?}",
+                            BINANCE_ORDERS_RATE_KEY, quota.interval_num, quota.interval
+                        );
                         order_keys.push(key.clone());
                         keyed.push((key, q));
                     }
@@ -559,13 +571,25 @@ impl BinanceRawFuturesHttpClient {
 
     fn quota_from(quota: &BinanceRateLimitQuota) -> Option<Quota> {
         let burst = NonZeroU32::new(quota.limit)?;
+        let period = Self::quota_period(quota)?;
+        let replenish_interval_ns = period.as_nanos() / u128::from(quota.limit);
+        let replenish_interval_ns = u64::try_from(replenish_interval_ns).ok()?;
+
+        Quota::with_period(Duration::from_nanos(replenish_interval_ns))
+            .map(|q| q.allow_burst(burst))
+    }
+
+    fn quota_period(quota: &BinanceRateLimitQuota) -> Option<Duration> {
         match quota.interval {
-            BinanceRateLimitInterval::Second => Quota::per_second(burst),
-            BinanceRateLimitInterval::Minute => Some(Quota::per_minute(burst)),
-            BinanceRateLimitInterval::Day => {
-                Quota::with_period(Duration::from_secs(SECONDS_IN_DAY))
-                    .map(|q| q.allow_burst(burst))
+            BinanceRateLimitInterval::Second => {
+                Some(Duration::from_secs(u64::from(quota.interval_num)))
             }
+            BinanceRateLimitInterval::Minute => {
+                Some(Duration::from_secs(60 * u64::from(quota.interval_num)))
+            }
+            BinanceRateLimitInterval::Day => Some(Duration::from_secs(
+                SECONDS_IN_DAY * u64::from(quota.interval_num),
+            )),
             BinanceRateLimitInterval::Unknown => None,
         }
     }
@@ -1463,7 +1487,7 @@ impl BinanceFuturesHttpClient {
                     }
                 }
 
-                log::info!(
+                log::debug!(
                     "Loaded USD-M perpetual instruments: count={}",
                     instruments.len()
                 );
@@ -1494,7 +1518,7 @@ impl BinanceFuturesHttpClient {
                     }
                 }
 
-                log::info!(
+                log::debug!(
                     "Loaded COIN-M perpetual instruments: count={}",
                     instruments.len()
                 );
@@ -1703,6 +1727,7 @@ impl BinanceFuturesHttpClient {
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = format_binance_symbol(&instrument_id);
         let size_precision = self.get_size_precision(&symbol)?;
+        let price_precision = self.get_price_precision(&symbol)?;
 
         let binance_side = BinanceSide::try_from(order_side)?;
         let binance_order_type = order_type_to_binance_futures(order_type)?;
@@ -1772,6 +1797,7 @@ impl BinanceFuturesHttpClient {
         order.to_order_status_report(
             account_id,
             instrument_id,
+            price_precision,
             size_precision,
             self.treat_expired_as_canceled,
             ts_init,
@@ -1811,6 +1837,7 @@ impl BinanceFuturesHttpClient {
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = format_binance_symbol(&instrument_id);
         let size_precision = self.get_size_precision(&symbol)?;
+        let price_precision = self.get_price_precision(&symbol)?;
 
         let binance_side = BinanceSide::try_from(order_side)?;
         let binance_order_type = order_type_to_binance_futures(order_type)?;
@@ -1897,7 +1924,13 @@ impl BinanceFuturesHttpClient {
 
         let order = self.inner.submit_algo_order(&params).await?;
         let ts_init = self.clock.get_time_ns();
-        order.to_order_status_report(account_id, instrument_id, size_precision, ts_init)
+        order.to_order_status_report(
+            account_id,
+            instrument_id,
+            price_precision,
+            size_precision,
+            ts_init,
+        )
     }
 
     /// Submits multiple orders in a single request (up to 5 orders).
@@ -1943,6 +1976,7 @@ impl BinanceFuturesHttpClient {
 
         let symbol = format_binance_symbol(&instrument_id);
         let size_precision = self.get_size_precision(&symbol)?;
+        let price_precision = self.get_price_precision(&symbol)?;
 
         let binance_side = BinanceSide::try_from(order_side)?;
 
@@ -1967,6 +2001,7 @@ impl BinanceFuturesHttpClient {
         order.to_order_status_report(
             account_id,
             instrument_id,
+            price_precision,
             size_precision,
             self.treat_expired_as_canceled,
             ts_init,
@@ -2168,6 +2203,143 @@ impl BinanceFuturesHttpClient {
         self.inner.query_algo_order(&params).await
     }
 
+    /// Queries a single algo order by venue order ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the venue order ID is not numeric or the request fails.
+    pub async fn query_algo_order_by_venue_order_id(
+        &self,
+        venue_order_id: VenueOrderId,
+    ) -> BinanceFuturesHttpResult<BinanceFuturesAlgoOrder> {
+        let algo_id = venue_order_id
+            .inner()
+            .parse::<i64>()
+            .map_err(|e| BinanceFuturesHttpError::ValidationError(e.to_string()))?;
+        let params = BinanceAlgoOrderQueryParams {
+            algo_id: Some(algo_id),
+            client_algo_id: None,
+            recv_window: None,
+        };
+
+        self.inner.query_algo_order(&params).await
+    }
+
+    async fn query_historical_algo_order_by_venue_order_id(
+        &self,
+        instrument_id: InstrumentId,
+        venue_order_id: VenueOrderId,
+    ) -> BinanceFuturesHttpResult<Option<BinanceFuturesAlgoOrder>> {
+        let algo_id = venue_order_id
+            .inner()
+            .parse::<i64>()
+            .map_err(|e| BinanceFuturesHttpError::ValidationError(e.to_string()))?;
+        let symbol = format_binance_symbol(&instrument_id);
+        let params = BinanceAllAlgoOrdersParams {
+            symbol,
+            algo_id: Some(algo_id),
+            start_time: None,
+            end_time: None,
+            page: None,
+            limit: Some(1),
+            recv_window: None,
+        };
+        let order = self
+            .inner
+            .query_all_algo_orders(&params)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|order| order.algo_id == algo_id);
+
+        Ok(order)
+    }
+
+    /// Queries an algo order by venue ID, falling back to recent history when needed.
+    ///
+    /// Uses the client order ID only when no venue order ID is available.
+    /// Matching-engine details are best-effort; remote enrichment failures fall back to the
+    /// Algo Service execution fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an ID is invalid, the Algo Service request fails, or matching-engine
+    /// enrichment fails because of a local configuration or validation error.
+    pub async fn query_algo_order_with_history(
+        &self,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        algo_venue_order_id: Option<VenueOrderId>,
+    ) -> BinanceFuturesHttpResult<Option<BinanceFuturesAlgoOrderQueryResult>> {
+        let order = if let Some(venue_order_id) = algo_venue_order_id {
+            match self
+                .query_algo_order_by_venue_order_id(venue_order_id)
+                .await
+            {
+                Ok(order) => Some(order),
+                Err(BinanceFuturesHttpError::BinanceError { code: -2013, .. }) => {
+                    self.query_historical_algo_order_by_venue_order_id(
+                        instrument_id,
+                        venue_order_id,
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            let Some(client_order_id) = client_order_id else {
+                return Ok(None);
+            };
+
+            match self.query_algo_order(client_order_id).await {
+                Ok(order) => Some(order),
+                Err(BinanceFuturesHttpError::BinanceError { code: -2013, .. }) => None,
+                Err(e) => return Err(e),
+            }
+        };
+
+        let Some(order) = order else {
+            return Ok(None);
+        };
+        let actual = if let Some(actual_order_id) = order
+            .actual_order_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::parse::<i64>)
+            .transpose()
+            .map_err(|e| BinanceFuturesHttpError::ValidationError(e.to_string()))?
+        {
+            let params = BinanceOrderQueryParams {
+                symbol: format_binance_symbol(&instrument_id),
+                order_id: Some(actual_order_id),
+                orig_client_order_id: None,
+                recv_window: None,
+            };
+
+            match self.inner.query_order(&params).await {
+                Ok(actual) => Some(actual),
+                Err(
+                    e @ (BinanceFuturesHttpError::MissingCredentials
+                    | BinanceFuturesHttpError::ValidationError(_)),
+                ) => return Err(e),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to enrich algo order with matching-engine order \
+                         {actual_order_id}: {e}; falling back to Algo Service execution fields"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Some(BinanceFuturesAlgoOrderQueryResult {
+            algo: order,
+            actual,
+        }))
+    }
+
     /// Returns the size precision for an instrument from the cache.
     fn get_size_precision(&self, symbol: &str) -> anyhow::Result<u8> {
         let instrument = self
@@ -2233,6 +2405,7 @@ impl BinanceFuturesHttpClient {
 
         let symbol = format_binance_symbol(&instrument_id);
         let size_precision = self.get_size_precision(&symbol)?;
+        let price_precision = self.get_price_precision(&symbol)?;
 
         let order_id = venue_order_id
             .map(|id| id.inner().parse::<i64>())
@@ -2254,6 +2427,7 @@ impl BinanceFuturesHttpClient {
         order.to_order_status_report(
             account_id,
             instrument_id,
+            price_precision,
             size_precision,
             self.treat_expired_as_canceled,
             ts_init,
@@ -2307,11 +2481,13 @@ impl BinanceFuturesHttpClient {
                 InstrumentId::from(format!("{}{}.BINANCE", order.symbol, suffix))
             });
 
-            let size_precision = self.get_size_precision(&order.symbol).unwrap_or(8); // Default precision if not in cache
+            let price_precision = self.get_price_precision(&order.symbol).unwrap_or(8);
+            let size_precision = self.get_size_precision(&order.symbol).unwrap_or(8);
 
             match order.to_order_status_report(
                 account_id,
                 order_instrument_id,
+                price_precision,
                 size_precision,
                 self.treat_expired_as_canceled,
                 ts_init,
@@ -2656,8 +2832,30 @@ mod tests {
 
         assert!(config.default_quota.is_some());
         assert_eq!(config.order_keys.len(), 2);
-        assert!(config.order_keys.iter().any(|k| k.contains("Second")));
-        assert!(config.order_keys.iter().any(|k| k.contains("Minute")));
+        assert!(
+            config
+                .order_keys
+                .iter()
+                .any(|key| key == "binance:orders:10:Second")
+        );
+        assert!(
+            config
+                .order_keys
+                .iter()
+                .any(|key| key == "binance:orders:1:Minute")
+        );
+
+        let ten_second_quota = config
+            .keyed_quotas
+            .iter()
+            .find(|(key, _)| key == "binance:orders:10:Second")
+            .map(|(_, quota)| quota)
+            .expect("USD-M 10-second order quota");
+        assert_eq!(ten_second_quota.burst_size().get(), 300);
+        assert_eq!(
+            ten_second_quota.replenish_interval(),
+            Duration::from_nanos(33_333_333)
+        );
     }
 
     #[rstest]
@@ -2666,6 +2864,46 @@ mod tests {
 
         assert!(config.default_quota.is_some());
         assert_eq!(config.order_keys.len(), 2);
+        assert!(
+            config
+                .order_keys
+                .iter()
+                .any(|key| key == "binance:orders:1:Second")
+        );
+        assert!(
+            config
+                .order_keys
+                .iter()
+                .any(|key| key == "binance:orders:1:Minute")
+        );
+    }
+
+    #[rstest]
+    fn test_rate_limit_keys_usdm_include_order_buckets() {
+        let client = BinanceRawFuturesHttpClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Live,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.rate_limit_keys(false),
+            vec![BINANCE_GLOBAL_RATE_KEY.to_string()]
+        );
+        assert_eq!(
+            client.rate_limit_keys(true),
+            vec![
+                BINANCE_GLOBAL_RATE_KEY.to_string(),
+                "binance:orders:10:Second".to_string(),
+                "binance:orders:1:Minute".to_string(),
+            ]
+        );
     }
 
     #[rstest]

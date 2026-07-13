@@ -22,14 +22,17 @@ use nautilus_model::{
         CurrencyPair, Equity, FuturesContract, FuturesSpread, InstrumentAny, OptionContract,
         OptionSpread,
     },
-    types::Currency,
+    types::{Currency, Quantity},
 };
 use ustr::Ustr;
 
-use super::primitives::{
-    decode_lot_size, decode_multiplier, decode_optional_timestamp, decode_price,
-    decode_price_increment, decode_timestamp, decode_underlying, parse_cfi_iso10926,
-    parse_currency_or_usd_default, parse_option_kind,
+use super::{
+    expiration::{DatabentoDecodeConfig, corrected_option_expiration},
+    primitives::{
+        decode_lot_size, decode_multiplier, decode_optional_timestamp, decode_price,
+        decode_price_increment, decode_timestamp, decode_underlying, parse_cfi_iso10926,
+        parse_currency_or_usd_default, parse_option_kind,
+    },
 };
 
 /// # Errors
@@ -42,6 +45,7 @@ pub fn decode_instrument_def_msg(
     msg: &dbn::InstrumentDefMsg,
     instrument_id: InstrumentId,
     ts_init: Option<UnixNanos>,
+    decode_config: Option<&DatabentoDecodeConfig>,
 ) -> anyhow::Result<Option<InstrumentAny>> {
     match msg.instrument_class as u8 as char {
         'K' => Ok(Some(InstrumentAny::Equity(decode_equity(
@@ -64,11 +68,13 @@ pub fn decode_instrument_def_msg(
             msg,
             instrument_id,
             ts_init,
+            decode_config,
         )?))),
         'T' | 'M' => Ok(Some(InstrumentAny::OptionSpread(decode_option_spread(
             msg,
             instrument_id,
             ts_init,
+            decode_config,
         )?))),
         other => {
             let label = match other {
@@ -308,6 +314,7 @@ pub fn decode_option_contract(
     msg: &dbn::InstrumentDefMsg,
     instrument_id: InstrumentId,
     ts_init: Option<UnixNanos>,
+    decode_config: Option<&DatabentoDecodeConfig>,
 ) -> anyhow::Result<OptionContract> {
     let currency = parse_currency_or_usd_default(msg.currency());
     let strike_price_currency = parse_currency_or_usd_default(msg.strike_price_currency());
@@ -325,9 +332,17 @@ pub fn decode_option_contract(
         strike_price_currency.precision,
         "strike_price",
     )?;
+    let dataset = msg.hd.publisher().ok().map(|p| p.dataset());
     let price_increment = decode_price_increment(msg.min_price_increment, currency.precision);
-    let multiplier = decode_multiplier(msg.unit_of_measure_qty)?;
+    let multiplier =
+        decode_option_multiplier(dataset, msg.contract_multiplier, msg.unit_of_measure_qty)?;
     let lot_size = decode_lot_size(msg.min_lot_size_round_lot);
+    let expiration = corrected_option_expiration(
+        decode_timestamp(msg.expiration, "expiration")?,
+        underlying,
+        dataset,
+        decode_config,
+    );
     let ts_event = UnixNanos::from(msg.ts_recv); // More accurate and reliable timestamp
     let ts_init = ts_init.unwrap_or(ts_event);
 
@@ -341,7 +356,7 @@ pub fn decode_option_contract(
         strike_price,
         currency,
         decode_optional_timestamp(msg.activation).unwrap_or_default(),
-        decode_timestamp(msg.expiration, "expiration")?,
+        expiration,
         price_increment.precision,
         price_increment,
         multiplier,
@@ -361,6 +376,23 @@ pub fn decode_option_contract(
     )?)
 }
 
+fn decode_option_multiplier(
+    dataset: Option<dbn::Dataset>,
+    contract_multiplier: i32,
+    unit_of_measure_qty: i64,
+) -> anyhow::Result<Quantity> {
+    match (dataset, contract_multiplier) {
+        (Some(dbn::Dataset::OpraPillar), 0 | i32::MAX) => decode_multiplier(unit_of_measure_qty),
+        (Some(dbn::Dataset::OpraPillar), value) if value < 0 => {
+            anyhow::bail!("Invalid negative `contract_multiplier`: {value}")
+        }
+        (Some(dbn::Dataset::OpraPillar), value) => {
+            Ok(Quantity::from_mantissa_exponent(value as u64, 0, 0))
+        }
+        _ => decode_multiplier(unit_of_measure_qty),
+    }
+}
+
 /// Decodes a Databento instrument definition message into an `OptionSpread` instrument.
 ///
 /// # Errors
@@ -370,6 +402,7 @@ pub fn decode_option_spread(
     msg: &dbn::InstrumentDefMsg,
     instrument_id: InstrumentId,
     ts_init: Option<UnixNanos>,
+    decode_config: Option<&DatabentoDecodeConfig>,
 ) -> anyhow::Result<OptionSpread> {
     let exchange = Ustr::from(msg.exchange()?);
     let underlying = decode_underlying(msg.underlying()?, &instrument_id.symbol);
@@ -384,6 +417,12 @@ pub fn decode_option_spread(
     let price_increment = decode_price_increment(msg.min_price_increment, currency.precision);
     let multiplier = decode_multiplier(msg.unit_of_measure_qty)?;
     let lot_size = decode_lot_size(msg.min_lot_size_round_lot);
+    let expiration = corrected_option_expiration(
+        decode_timestamp(msg.expiration, "expiration")?,
+        underlying,
+        msg.hd.publisher().ok().map(|p| p.dataset()),
+        decode_config,
+    );
     let ts_event = msg.ts_recv.into(); // More accurate and reliable timestamp
     let ts_init = ts_init.unwrap_or(ts_event);
 
@@ -395,7 +434,7 @@ pub fn decode_option_spread(
         underlying,
         strategy_type,
         decode_optional_timestamp(msg.activation).unwrap_or_default(),
-        decode_timestamp(msg.expiration, "expiration")?,
+        expiration,
         currency,
         price_increment.precision,
         price_increment,

@@ -28,7 +28,8 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDeltas, QuoteTick, TradeTick, option_chain::OptionGreeks,
+        MarkPriceUpdate, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        option_chain::OptionGreeks,
     },
     identifiers::InstrumentId,
     instruments::InstrumentAny,
@@ -126,16 +127,15 @@ impl DataActor for DataTester {
                 );
             }
 
-            // TODO: Support subscribe_book_depth when the method is available
-            // if self.config.subscribe_book_depth {
-            //     self.subscribe_book_depth(
-            //         instrument_id,
-            //         self.config.book_type,
-            //         self.config.book_depth,
-            //         client_id,
-            //         subscribe_params.clone(),
-            //     );
-            // }
+            if self.config.subscribe_book_depth {
+                self.subscribe_book_depth10(
+                    instrument_id,
+                    self.config.book_type,
+                    client_id,
+                    self.config.manage_book,
+                    subscribe_params.clone(),
+                );
+            }
 
             if self.config.subscribe_quotes {
                 self.subscribe_quotes(instrument_id, client_id, subscribe_params.clone());
@@ -311,10 +311,9 @@ impl DataActor for DataTester {
                 );
             }
 
-            // TODO: Support unsubscribe_book_depth when the method is available
-            // if self.config.subscribe_book_depth {
-            //     self.unsubscribe_book_depth(instrument_id, client_id, subscribe_params.clone());
-            // }
+            if self.config.subscribe_book_depth {
+                self.unsubscribe_book_depth10(instrument_id, client_id, subscribe_params.clone());
+            }
 
             if self.config.subscribe_quotes {
                 self.unsubscribe_quotes(instrument_id, client_id, subscribe_params.clone());
@@ -412,6 +411,13 @@ impl DataActor for DataTester {
             deltas.ts_event,
             deltas.ts_init,
         );
+        Ok(())
+    }
+
+    fn on_book_depth(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
+        if self.config.log_data {
+            log_info!("{depth:?}", color = LogColor::Cyan);
+        }
         Ok(())
     }
 

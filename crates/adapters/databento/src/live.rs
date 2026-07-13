@@ -482,7 +482,7 @@ impl DatabentoFeedHandler {
                         attempt = 0;
                         self.backoff.reset();
                     } else {
-                        log::info!("Session ended normally");
+                        log::debug!("Session ended normally");
                         break Ok(());
                     }
                 }
@@ -497,8 +497,7 @@ impl DatabentoFeedHandler {
                             log::error!("Giving up reconnection after {timeout_mins} minutes");
                             self.send_msg(DatabentoMessage::Error(anyhow::anyhow!(
                                 "Reconnection timeout after {timeout_mins} minutes: {e}"
-                            )))
-                            .await;
+                            )));
                             break Err(e);
                         }
                     }
@@ -512,21 +511,26 @@ impl DatabentoFeedHandler {
                         delay.as_secs()
                     );
 
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {}
-                        cmd = self.cmd_rx.recv() => {
-                            match cmd {
-                                Some(HandlerCommand::Close) => {
-                                    log::info!("Close received during backoff");
-                                    return Ok(());
-                                }
-                                None => {
-                                    log::debug!("Command channel closed during backoff");
-                                    return Ok(());
-                                }
-                                Some(cmd) => {
-                                    log::debug!("Buffering command received during backoff: {cmd:?}");
-                                    self.buffered_commands.push(cmd);
+                    let sleep = tokio::time::sleep(delay);
+                    tokio::pin!(sleep);
+
+                    loop {
+                        tokio::select! {
+                            () = &mut sleep => break,
+                            cmd = self.cmd_rx.recv() => {
+                                match cmd {
+                                    Some(HandlerCommand::Close) => {
+                                        log::debug!("Close received during backoff");
+                                        return Ok(());
+                                    }
+                                    None => {
+                                        log::debug!("Command channel closed during backoff");
+                                        return Ok(());
+                                    }
+                                    Some(cmd) => {
+                                        log::debug!("Buffering command received during backoff: {cmd:?}");
+                                        self.buffered_commands.push(cmd);
+                                    }
                                 }
                             }
                         }
@@ -598,7 +602,7 @@ impl DatabentoFeedHandler {
         let mut start_buffered = false;
 
         if !self.buffered_commands.is_empty() {
-            log::info!(
+            log::debug!(
                 "Processing {} buffered commands",
                 self.buffered_commands.len()
             );
@@ -644,7 +648,7 @@ impl DatabentoFeedHandler {
             running = true;
             log::info!("Resubscription complete");
         } else if start_buffered {
-            log::info!("Starting session from buffered Start command");
+            log::debug!("Starting session from buffered Start command");
             buffering_start = if self.replay {
                 Some(clock.get_time_ns())
             } else {
@@ -755,14 +759,14 @@ impl DatabentoFeedHandler {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     if session_start.elapsed() >= self.success_threshold {
-                        log::info!("Session ended after successful run");
+                        log::debug!("Session ended after successful run");
                         return Ok(true);
                     }
                     anyhow::bail!("Session ended by gateway");
                 }
                 Err(e) => {
                     if session_start.elapsed() >= self.success_threshold {
-                        log::info!("Connection error after successful run: {e}");
+                        log::debug!("Connection error after successful run: {e}");
                         return Ok(true);
                     }
                     anyhow::bail!("Connection error: {e}");
@@ -776,7 +780,7 @@ impl DatabentoFeedHandler {
                 handle_error_msg(msg);
             } else if let Some(msg) = record.get::<dbn::SystemMsg>() {
                 if let Some(ack) = handle_system_msg(msg, ts_init) {
-                    self.send_msg(DatabentoMessage::SubscriptionAck(ack)).await;
+                    self.send_msg(DatabentoMessage::SubscriptionAck(ack));
                 }
             } else if let Some(msg) = record.get::<dbn::SymbolMappingMsg>() {
                 // Remove instrument ID index as the raw symbol may have changed
@@ -801,94 +805,78 @@ impl DatabentoFeedHandler {
                         )?;
                     }
                 }
-                let maybe_data = {
-                    let sym_map = self.symbol_venue_map.load();
-                    handle_instrument_def_msg(
-                        msg,
-                        &record,
-                        &symbol_map,
-                        &self.publisher_venue_map,
-                        &sym_map,
-                        &mut instrument_id_map,
-                        ts_init,
-                    )?
-                };
+                let maybe_data = handle_instrument_def_msg(
+                    msg,
+                    &record,
+                    &symbol_map,
+                    &self.publisher_venue_map,
+                    &self.symbol_venue_map,
+                    &mut instrument_id_map,
+                    ts_init,
+                )?;
 
                 if let Some(data) = maybe_data {
                     instrument_def_price_precision_map
                         .insert(msg.hd.instrument_id, data.price_precision());
-                    self.send_msg(DatabentoMessage::Instrument(Box::new(data)))
-                        .await;
+                    self.send_msg(DatabentoMessage::Instrument(Box::new(data)));
                 }
             } else if let Some(msg) = record.get::<dbn::StatusMsg>() {
-                let data = {
-                    let sym_map = self.symbol_venue_map.load();
-                    handle_status_msg(
-                        msg,
-                        &record,
-                        &symbol_map,
-                        &self.publisher_venue_map,
-                        &sym_map,
-                        &mut instrument_id_map,
-                        ts_init,
-                    )?
-                };
-                self.send_msg(DatabentoMessage::Status(data)).await;
+                let data = handle_status_msg(
+                    msg,
+                    &record,
+                    &symbol_map,
+                    &self.publisher_venue_map,
+                    &self.symbol_venue_map,
+                    &mut instrument_id_map,
+                    ts_init,
+                )?;
+                self.send_msg(DatabentoMessage::Status(data));
             } else if let Some(msg) = record.get::<dbn::ImbalanceMsg>() {
-                let data = {
-                    let sym_map = self.symbol_venue_map.load();
-                    handle_imbalance_msg(
-                        msg,
-                        &record,
-                        &symbol_map,
-                        &self.publisher_venue_map,
-                        &sym_map,
-                        &mut instrument_id_map,
-                        &instrument_def_price_precision_map,
-                        &subscription_price_precision_map,
-                        &self.price_precision_overrides,
-                        ts_init,
-                    )?
-                };
-                self.send_msg(DatabentoMessage::Imbalance(data)).await;
+                let data = handle_imbalance_msg(
+                    msg,
+                    &record,
+                    &symbol_map,
+                    &self.publisher_venue_map,
+                    &self.symbol_venue_map,
+                    &mut instrument_id_map,
+                    &instrument_def_price_precision_map,
+                    &subscription_price_precision_map,
+                    &self.price_precision_overrides,
+                    ts_init,
+                )?;
+                self.send_msg(DatabentoMessage::Imbalance(data));
             } else if let Some(msg) = record.get::<dbn::StatMsg>() {
-                let maybe_data = {
-                    let sym_map = self.symbol_venue_map.load();
-                    handle_statistics_msg(
-                        msg,
-                        &record,
-                        &symbol_map,
-                        &self.publisher_venue_map,
-                        &sym_map,
-                        &mut instrument_id_map,
-                        &instrument_def_price_precision_map,
-                        &subscription_price_precision_map,
-                        &self.price_precision_overrides,
-                        ts_init,
-                    )?
-                };
+                let maybe_data = handle_statistics_msg(
+                    msg,
+                    &record,
+                    &symbol_map,
+                    &self.publisher_venue_map,
+                    &self.symbol_venue_map,
+                    &mut instrument_id_map,
+                    &instrument_def_price_precision_map,
+                    &subscription_price_precision_map,
+                    &self.price_precision_overrides,
+                    ts_init,
+                )?;
 
                 if let Some(data) = maybe_data {
-                    self.send_msg(DatabentoMessage::Statistics(data)).await;
+                    self.send_msg(DatabentoMessage::Statistics(data));
                 }
             } else {
                 // Decode a generic record with possible errors
-                let res = {
-                    let sym_map = self.symbol_venue_map.load();
-                    handle_record(
-                        record,
-                        &symbol_map,
-                        &self.publisher_venue_map,
-                        &sym_map,
-                        &mut instrument_id_map,
-                        &instrument_def_price_precision_map,
-                        &subscription_price_precision_map,
-                        &self.price_precision_overrides,
-                        ts_init,
-                        &initialized_books,
-                        self.bars_timestamp_on_close,
-                    )
-                };
+                let res = handle_record(
+                    record,
+                    &symbol_map,
+                    &self.publisher_venue_map,
+                    &self.symbol_venue_map,
+                    &mut instrument_id_map,
+                    &instrument_def_price_precision_map,
+                    &subscription_price_precision_map,
+                    &self.price_precision_overrides,
+                    ts_init,
+                    &initialized_books,
+                    self.bars_timestamp_on_close,
+                );
                 let (mut data1, data2) = match res {
                     Ok(decoded) => decoded,
                     Err(e) => {
@@ -900,11 +888,7 @@ impl DatabentoFeedHandler {
                 if let Some(msg) = record.get::<dbn::MboMsg>() {
                     if let Some(Data::Delta(delta)) = &data1 {
                         initialized_books.insert(delta.instrument_id);
-                    } else {
-                        continue;
-                    }
 
-                    if let Some(Data::Delta(delta)) = &data1 {
                         log::trace!(
                             "Buffering delta: {} {buffering_start:?} flags={}",
                             delta.ts_event,
@@ -916,26 +900,52 @@ impl DatabentoFeedHandler {
                             msg.flags.raw(),
                             &mut buffering_start,
                             &mut buffered_deltas,
-                        )? {
+                        ) {
                             Some(deltas) => data1 = Some(Data::Deltas(deltas)),
                             None => continue,
                         }
+                    } else {
+                        // Records that decode to no delta (`Action::Fill`
+                        // attribution, `Action::None` status, or trades) may
+                        // still carry the match-event boundary: honor the raw
+                        // `F_LAST` flag or a buffered partial event is
+                        // stranded and merged into the next event (e.g. a
+                        // non-terminal 'C' followed by 'N' | F_LAST).
+                        let instrument_id = update_instrument_id_map(
+                            &record,
+                            &symbol_map,
+                            &self.publisher_venue_map,
+                            &self.symbol_venue_map,
+                            &mut instrument_id_map,
+                        )?;
+
+                        if let Some(deltas) = flush_mbo_event_boundary(
+                            instrument_id,
+                            msg.ts_recv.into(),
+                            msg.flags.raw(),
+                            &mut buffering_start,
+                            &mut buffered_deltas,
+                        ) {
+                            self.send_msg(DatabentoMessage::Data(Data::Deltas(deltas)));
+                        }
+
+                        continue;
                     }
                 }
 
                 if let Some(data) = data1 {
-                    self.send_msg(DatabentoMessage::Data(data)).await;
+                    self.send_msg(DatabentoMessage::Data(data));
                 }
 
                 if let Some(data) = data2 {
-                    self.send_msg(DatabentoMessage::Data(data)).await;
+                    self.send_msg(DatabentoMessage::Data(data));
                 }
             }
         }
     }
 
     /// Sends a message to the message processing task.
-    async fn send_msg(&self, msg: DatabentoMessage) {
+    fn send_msg(&self, msg: DatabentoMessage) {
         log::trace!("Sending {msg:?}");
         match self.msg_tx.send(msg) {
             Ok(()) => {}
@@ -960,7 +970,7 @@ fn handle_system_msg(msg: &dbn::SystemMsg, ts_received: UnixNanos) -> Option<Sub
     match msg.code() {
         Ok(dbn::SystemCode::SubscriptionAck) => {
             let message = msg.msg().unwrap_or("<invalid utf-8>");
-            log::info!("Subscription acknowledged: {message}");
+            log::debug!("Subscription acknowledged: {message}");
 
             let schema = parse_ack_message(message);
 
@@ -981,7 +991,7 @@ fn handle_system_msg(msg: &dbn::SystemMsg, ts_received: UnixNanos) -> Option<Sub
         }
         Ok(dbn::SystemCode::ReplayCompleted) => {
             let message = msg.msg().unwrap_or("<invalid utf-8>");
-            log::info!("Replay completed: {message}");
+            log::debug!("Replay completed: {message}");
             None
         }
         _ => {
@@ -1025,6 +1035,10 @@ fn update_price_precision_map_with_symbol_mapping_msg(
     subscription_price_precision_map: &mut AHashMap<u32, u8>,
 ) -> anyhow::Result<()> {
     subscription_price_precision_map.remove(&msg.hd.instrument_id);
+
+    if price_precision_overrides.is_empty() {
+        return Ok(());
+    }
 
     let stype_in_symbol = msg
         .stype_in_symbol()
@@ -1074,7 +1088,7 @@ fn update_instrument_id_map(
     record: &dbn::RecordRef,
     symbol_map: &PitSymbolMap,
     publisher_venue_map: &IndexMap<PublisherId, Venue>,
-    symbol_venue_map: &AHashMap<Symbol, Venue>,
+    symbol_venue_map: &AtomicMap<Symbol, Venue>,
     instrument_id_map: &mut AHashMap<u32, InstrumentId>,
 ) -> anyhow::Result<InstrumentId> {
     let header = record.header();
@@ -1094,8 +1108,8 @@ fn update_instrument_id_map(
     let symbol = Symbol::from_str_unchecked(raw_symbol);
 
     let publisher_id = header.publisher_id;
-    let venue = if let Some(venue) = symbol_venue_map.get(&symbol) {
-        *venue
+    let venue = if let Some(venue) = symbol_venue_map.get_cloned(&symbol) {
+        venue
     } else {
         let venue = publisher_venue_map
             .get(&publisher_id)
@@ -1118,7 +1132,7 @@ fn handle_instrument_def_msg(
     record: &dbn::RecordRef,
     symbol_map: &PitSymbolMap,
     publisher_venue_map: &IndexMap<PublisherId, Venue>,
-    symbol_venue_map: &AHashMap<Symbol, Venue>,
+    symbol_venue_map: &AtomicMap<Symbol, Venue>,
     instrument_id_map: &mut AHashMap<u32, InstrumentId>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<InstrumentAny>> {
@@ -1130,7 +1144,7 @@ fn handle_instrument_def_msg(
         instrument_id_map,
     )?;
 
-    decode_instrument_def_msg(msg, instrument_id, Some(ts_init))
+    decode_instrument_def_msg(msg, instrument_id, Some(ts_init), None)
 }
 
 fn handle_status_msg(
@@ -1138,7 +1152,7 @@ fn handle_status_msg(
     record: &dbn::RecordRef,
     symbol_map: &PitSymbolMap,
     publisher_venue_map: &IndexMap<PublisherId, Venue>,
-    symbol_venue_map: &AHashMap<Symbol, Venue>,
+    symbol_venue_map: &AtomicMap<Symbol, Venue>,
     instrument_id_map: &mut AHashMap<u32, InstrumentId>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentStatus> {
@@ -1159,7 +1173,7 @@ fn handle_imbalance_msg(
     record: &dbn::RecordRef,
     symbol_map: &PitSymbolMap,
     publisher_venue_map: &IndexMap<PublisherId, Venue>,
-    symbol_venue_map: &AHashMap<Symbol, Venue>,
+    symbol_venue_map: &AtomicMap<Symbol, Venue>,
     instrument_id_map: &mut AHashMap<u32, InstrumentId>,
     instrument_def_price_precision_map: &AHashMap<u32, u8>,
     subscription_price_precision_map: &AHashMap<u32, u8>,
@@ -1191,7 +1205,7 @@ fn handle_statistics_msg(
     record: &dbn::RecordRef,
     symbol_map: &PitSymbolMap,
     publisher_venue_map: &IndexMap<PublisherId, Venue>,
-    symbol_venue_map: &AHashMap<Symbol, Venue>,
+    symbol_venue_map: &AtomicMap<Symbol, Venue>,
     instrument_id_map: &mut AHashMap<u32, InstrumentId>,
     instrument_def_price_precision_map: &AHashMap<u32, u8>,
     subscription_price_precision_map: &AHashMap<u32, u8>,
@@ -1228,7 +1242,7 @@ fn handle_record(
     record: dbn::RecordRef,
     symbol_map: &PitSymbolMap,
     publisher_venue_map: &IndexMap<PublisherId, Venue>,
-    symbol_venue_map: &AHashMap<Symbol, Venue>,
+    symbol_venue_map: &AtomicMap<Symbol, Venue>,
     instrument_id_map: &mut AHashMap<u32, InstrumentId>,
     instrument_def_price_precision_map: &AHashMap<u32, u8>,
     subscription_price_precision_map: &AHashMap<u32, u8>,
@@ -1306,35 +1320,70 @@ fn process_mbo_delta(
     flags: u8,
     buffering_start: &mut Option<UnixNanos>,
     buffered_deltas: &mut AHashMap<InstrumentId, Vec<OrderBookDelta>>,
-) -> anyhow::Result<Option<OrderBookDeltas_API>> {
+) -> Option<OrderBookDeltas_API> {
+    let is_last = RecordFlag::F_LAST.matches(flags);
+    let is_snapshot = RecordFlag::F_SNAPSHOT.matches(flags);
+
+    // Most live MBO events are single non-snapshot deltas, avoid map churn on that path
+    if is_last
+        && !is_snapshot
+        && buffering_start.is_none()
+        && !buffered_deltas.contains_key(&delta.instrument_id)
+    {
+        let deltas = OrderBookDeltas::new(delta.instrument_id, vec![delta]);
+        return Some(OrderBookDeltas_API::new(deltas));
+    }
+
     let buffer = buffered_deltas.entry(delta.instrument_id).or_default();
     buffer.push(delta);
 
-    if !RecordFlag::F_LAST.matches(flags) {
-        return Ok(None);
+    if is_snapshot {
+        return None;
     }
 
-    if RecordFlag::F_SNAPSHOT.matches(flags) {
-        return Ok(None);
+    flush_mbo_event_boundary(
+        delta.instrument_id,
+        delta.ts_event,
+        flags,
+        buffering_start,
+        buffered_deltas,
+    )
+}
+
+/// Flushes the buffered deltas for `instrument_id` when `flags` marks a
+/// non-snapshot match-event boundary (`F_LAST`).
+///
+/// Databento documents that records which decode to no delta (`Action::Fill`,
+/// `Action::None`) may carry `F_LAST`, so the boundary must be processed
+/// independently of the decoded payload or a buffered partial event is
+/// stranded (follow-up to #4445).
+fn flush_mbo_event_boundary(
+    instrument_id: InstrumentId,
+    ts_event: UnixNanos,
+    flags: u8,
+    buffering_start: &mut Option<UnixNanos>,
+    buffered_deltas: &mut AHashMap<InstrumentId, Vec<OrderBookDelta>>,
+) -> Option<OrderBookDeltas_API> {
+    if !RecordFlag::F_LAST.matches(flags) || RecordFlag::F_SNAPSHOT.matches(flags) {
+        return None;
+    }
+
+    let buffer = buffered_deltas.get(&instrument_id)?;
+
+    if buffer.is_empty() {
+        return None;
     }
 
     if let Some(start_ns) = *buffering_start {
-        if delta.ts_event <= start_ns {
-            return Ok(None);
+        if ts_event <= start_ns {
+            return None;
         }
         *buffering_start = None;
     }
 
-    let buffer = buffered_deltas
-        .remove(&delta.instrument_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Internal error: no buffered deltas for instrument {id}",
-                id = delta.instrument_id
-            )
-        })?;
-    let deltas = OrderBookDeltas::new(delta.instrument_id, buffer);
-    Ok(Some(OrderBookDeltas_API::new(deltas)))
+    let buffer = buffered_deltas.remove(&instrument_id)?;
+    let deltas = OrderBookDeltas::new(instrument_id, buffer);
+    Some(OrderBookDeltas_API::new(deltas))
 }
 
 #[cfg(test)]
@@ -1347,6 +1396,170 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+
+    fn stub_delta(instrument_id: InstrumentId, ts: u64) -> OrderBookDelta {
+        use nautilus_model::{
+            data::BookOrder,
+            enums::{BookAction, OrderSide},
+            types::{Price, Quantity},
+        };
+
+        OrderBookDelta::new(
+            instrument_id,
+            BookAction::Delete,
+            BookOrder::new(
+                OrderSide::Sell,
+                Price::from("100.00"),
+                Quantity::from("5"),
+                42,
+            ),
+            0, // non-terminal: no F_LAST
+            1,
+            ts.into(),
+            ts.into(),
+        )
+    }
+
+    #[rstest]
+    fn test_boundary_flag_on_recordless_message_flushes_buffered_event() {
+        // A non-terminal 'C' delta buffers; the event terminates on an 'N'
+        // record carrying F_LAST which decodes to no delta — the raw flag
+        // must still flush the buffer (follow-up to #4445).
+        let instrument_id = InstrumentId::from("TEST.GLBX");
+        let mut buffering_start = None;
+        let mut buffered = AHashMap::new();
+
+        let buffered_result = process_mbo_delta(
+            stub_delta(instrument_id, 1),
+            0,
+            &mut buffering_start,
+            &mut buffered,
+        );
+        assert!(buffered_result.is_none());
+
+        let flushed = flush_mbo_event_boundary(
+            instrument_id,
+            2.into(),
+            RecordFlag::F_LAST as u8,
+            &mut buffering_start,
+            &mut buffered,
+        );
+        assert!(flushed.is_some());
+        assert!(buffered.is_empty());
+    }
+
+    #[rstest]
+    fn test_boundary_flag_with_empty_buffer_is_noop() {
+        let instrument_id = InstrumentId::from("TEST.GLBX");
+        let start = UnixNanos::from(1);
+        let mut buffering_start = Some(start);
+        let mut buffered: AHashMap<InstrumentId, Vec<OrderBookDelta>> = AHashMap::new();
+        buffered.insert(instrument_id, Vec::new());
+
+        let flushed = flush_mbo_event_boundary(
+            instrument_id,
+            2.into(),
+            RecordFlag::F_LAST as u8,
+            &mut buffering_start,
+            &mut buffered,
+        );
+
+        assert!(flushed.is_none());
+        assert_eq!(buffering_start, Some(start));
+    }
+
+    #[rstest]
+    fn test_empty_boundary_preserves_replay_gate_for_buffered_instrument() {
+        let empty_id = InstrumentId::from("EMPTY.GLBX");
+        let buffered_id = InstrumentId::from("BUFFERED.GLBX");
+        let start = UnixNanos::from(10);
+        let mut buffering_start = Some(start);
+        let mut buffered = AHashMap::new();
+        let _ = process_mbo_delta(
+            stub_delta(buffered_id, 1),
+            0,
+            &mut buffering_start,
+            &mut buffered,
+        );
+
+        let empty_boundary = flush_mbo_event_boundary(
+            empty_id,
+            11.into(),
+            RecordFlag::F_LAST as u8,
+            &mut buffering_start,
+            &mut buffered,
+        );
+        let buffered_boundary = flush_mbo_event_boundary(
+            buffered_id,
+            5.into(),
+            RecordFlag::F_LAST as u8,
+            &mut buffering_start,
+            &mut buffered,
+        );
+
+        assert!(empty_boundary.is_none());
+        assert!(buffered_boundary.is_none());
+        assert_eq!(buffering_start, Some(start));
+        assert!(buffered.contains_key(&buffered_id));
+    }
+
+    #[rstest]
+    fn test_boundary_flag_respects_replay_buffering_gate() {
+        let instrument_id = InstrumentId::from("TEST.GLBX");
+        let mut buffering_start = Some(UnixNanos::from(10));
+        let mut buffered = AHashMap::new();
+        let _ = process_mbo_delta(
+            stub_delta(instrument_id, 1),
+            0,
+            &mut buffering_start,
+            &mut buffered,
+        );
+
+        // Boundary inside the replay gate: keep buffering
+        let flushed = flush_mbo_event_boundary(
+            instrument_id,
+            5.into(),
+            RecordFlag::F_LAST as u8,
+            &mut buffering_start,
+            &mut buffered,
+        );
+        assert!(flushed.is_none());
+        assert!(!buffered.is_empty());
+
+        // Boundary past the gate: flush and clear the gate
+        let flushed = flush_mbo_event_boundary(
+            instrument_id,
+            11.into(),
+            RecordFlag::F_LAST as u8,
+            &mut buffering_start,
+            &mut buffered,
+        );
+        assert!(flushed.is_some());
+        assert!(buffering_start.is_none());
+    }
+
+    #[rstest]
+    fn test_boundary_snapshot_flag_never_flushes() {
+        let instrument_id = InstrumentId::from("TEST.GLBX");
+        let mut buffering_start = None;
+        let mut buffered = AHashMap::new();
+        let _ = process_mbo_delta(
+            stub_delta(instrument_id, 1),
+            0,
+            &mut buffering_start,
+            &mut buffered,
+        );
+
+        let flags = RecordFlag::F_LAST as u8 | RecordFlag::F_SNAPSHOT as u8;
+        let flushed = flush_mbo_event_boundary(
+            instrument_id,
+            2.into(),
+            flags,
+            &mut buffering_start,
+            &mut buffered,
+        );
+        assert!(flushed.is_none());
+    }
 
     fn create_test_handler(reconnect_timeout_mins: Option<u64>) -> DatabentoFeedHandler {
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1524,10 +1737,36 @@ mod tests {
         let mut buffering_start = None;
         let mut buffered = AHashMap::new();
 
-        let result = process_mbo_delta(delta, 0, &mut buffering_start, &mut buffered).unwrap();
+        let result = process_mbo_delta(delta, 0, &mut buffering_start, &mut buffered);
 
         assert!(result.is_none());
         assert_eq!(buffered[&instrument_id].len(), 1);
+    }
+
+    #[rstest]
+    fn test_mbo_single_f_last_emits_without_buffering() {
+        let instrument_id = InstrumentId::from("ESM4.GLBX");
+        let ts_event = 1_000_000_000;
+        let mut delta = test_delta(instrument_id, ts_event);
+        delta.flags = 128;
+        delta.sequence = 42;
+        let mut buffering_start = None;
+        let mut buffered = AHashMap::new();
+
+        let result = process_mbo_delta(delta, delta.flags, &mut buffering_start, &mut buffered);
+
+        let emitted = result.expect("single F_LAST delta should emit");
+        assert_eq!(emitted.instrument_id, instrument_id);
+        assert_eq!(emitted.deltas.len(), 1);
+        assert_eq!(emitted.flags, 128);
+        assert_eq!(emitted.sequence, 42);
+        assert_eq!(emitted.ts_event, UnixNanos::from(ts_event));
+        assert_eq!(emitted.deltas[0].instrument_id, instrument_id);
+        assert_eq!(emitted.deltas[0].flags, 128);
+        assert_eq!(emitted.deltas[0].sequence, 42);
+        assert_eq!(emitted.deltas[0].ts_event, UnixNanos::from(ts_event));
+        assert!(buffering_start.is_none());
+        assert!(buffered.is_empty());
     }
 
     #[rstest]
@@ -1536,21 +1775,19 @@ mod tests {
         let mut buffering_start = None;
         let mut buffered = AHashMap::new();
 
-        process_mbo_delta(
+        let _ = process_mbo_delta(
             test_delta(instrument_id, 1_000_000_000),
             0,
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
 
         let result = process_mbo_delta(
             test_delta(instrument_id, 2_000_000_000),
             128, // F_LAST
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().deltas.len(), 2);
@@ -1568,8 +1805,7 @@ mod tests {
             128 | 32, // F_LAST | F_SNAPSHOT
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
 
         assert!(result.is_none());
         assert_eq!(buffered[&instrument_id].len(), 1);
@@ -1587,8 +1823,7 @@ mod tests {
             128, // F_LAST
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
         assert!(result.is_none());
 
         let result = process_mbo_delta(
@@ -1596,8 +1831,7 @@ mod tests {
             128,
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
         assert!(result.is_none());
 
         // Delta past start: emits and clears buffering_start
@@ -1606,8 +1840,7 @@ mod tests {
             128,
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
         assert!(result.is_some());
         assert!(buffering_start.is_none());
     }
@@ -1624,8 +1857,7 @@ mod tests {
                 0,
                 &mut buffering_start,
                 &mut buffered,
-            )
-            .unwrap();
+            );
         }
 
         let result = process_mbo_delta(
@@ -1633,8 +1865,7 @@ mod tests {
             128,
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().deltas.len(), 6);
@@ -1652,15 +1883,13 @@ mod tests {
             0,
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
         process_mbo_delta(
             test_delta(id_b, 1_000_000_000),
             0,
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
 
         // F_LAST for A: only A's deltas emitted, B remains
         let result = process_mbo_delta(
@@ -1668,8 +1897,7 @@ mod tests {
             128,
             &mut buffering_start,
             &mut buffered,
-        )
-        .unwrap();
+        );
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().instrument_id, id_a);
@@ -1699,7 +1927,7 @@ mod tests {
                         0, // No F_LAST
                         &mut buffering_start,
                         &mut buffered,
-                    ).unwrap();
+                    );
                     prop_assert!(result.is_none());
                 }
 
@@ -1708,7 +1936,7 @@ mod tests {
                     128, // F_LAST
                     &mut buffering_start,
                     &mut buffered,
-                ).unwrap();
+                );
 
                 prop_assert!(result.is_some());
                 let emitted = result.unwrap();
@@ -1730,7 +1958,7 @@ mod tests {
                         128 | 32, // F_LAST | F_SNAPSHOT
                         &mut buffering_start,
                         &mut buffered,
-                    ).unwrap();
+                    );
                     prop_assert!(result.is_none());
                 }
 
@@ -1754,7 +1982,7 @@ mod tests {
                         128, // F_LAST
                         &mut buffering_start,
                         &mut buffered,
-                    ).unwrap();
+                    );
                     prop_assert!(result.is_none());
                 }
 
@@ -1763,7 +1991,7 @@ mod tests {
                     128,
                     &mut buffering_start,
                     &mut buffered,
-                ).unwrap();
+                );
 
                 prop_assert!(result.is_some());
                 prop_assert!(buffering_start.is_none());

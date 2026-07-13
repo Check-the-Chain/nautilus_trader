@@ -20,14 +20,18 @@ from nautilus_trader.common import DataActor
 from nautilus_trader.common import DataActorConfig
 from nautilus_trader.common import Environment
 from nautilus_trader.common import ImportableActorConfig
+from nautilus_trader.common import MessageBusConfig
 from nautilus_trader.live import LiveDataEngineConfig
 from nautilus_trader.live import LiveExecEngineConfig
 from nautilus_trader.live import LiveNode
+from nautilus_trader.live import LiveNodeConfig
 from nautilus_trader.live import LiveRiskEngineConfig
 from nautilus_trader.live import PortfolioConfig
 from nautilus_trader.model import TraderId
+from nautilus_trader.trading import ImportableControllerConfig
 from nautilus_trader.trading import ImportableExecAlgorithmConfig
 from nautilus_trader.trading import ImportableStrategyConfig
+from tests.unit.common.actor import ControllerRegistrationProbe
 
 
 @pytest.fixture(scope="module")
@@ -93,6 +97,82 @@ def test_importable_strategy_config_construction():
     assert config.strategy_path == "tests.unit.common.actor:TestStrategy"
     assert config.config_path == "nautilus_trader.trading:StrategyConfig"
     assert config.config == {"strategy_id": "S-001"}
+
+
+def test_importable_controller_config_construction():
+    config = ImportableControllerConfig(
+        controller_path="tests.unit.common.actor:StrategyCreatingController",
+        config_path="tests.unit.common.actor:TestControllerConfig",
+        config={"actor_id": "Controller-001"},
+    )
+
+    assert config.controller_path == "tests.unit.common.actor:StrategyCreatingController"
+    assert config.config_path == "tests.unit.common.actor:TestControllerConfig"
+    assert config.config == {"actor_id": "Controller-001"}
+
+
+def test_live_node_config_registers_importable_controller():
+    ControllerRegistrationProbe.reset()
+    trader_id = TraderId("TESTER-003")
+    node = LiveNode.build(
+        "TEST",
+        LiveNodeConfig(
+            trader_id=trader_id,
+            environment=Environment.SANDBOX,
+            exec_engine=LiveExecEngineConfig(reconciliation=False),
+            controller=ImportableControllerConfig(
+                controller_path="tests.unit.common.actor:ControllerRegistrationProbe",
+                config_path="tests.unit.common.actor:ControllerRegistrationProbeConfig",
+                config={"actor_id": "Controller-001"},
+            ),
+        ),
+    )
+
+    assert node.trader_id == trader_id
+    assert ControllerRegistrationProbe.constructed == 1
+    assert ControllerRegistrationProbe.received_actor_id == "Controller-001"
+
+
+@pytest.mark.parametrize(
+    ("trader_id", "stop_before_dispose"),
+    [
+        ("TESTER-004", True),
+        ("TESTER-005", False),
+    ],
+)
+def test_live_node_start_stop_dispose_local(trader_id, stop_before_dispose):
+    node = LiveNode.build(
+        "TEST",
+        LiveNodeConfig(
+            trader_id=TraderId(trader_id),
+            environment=Environment.SANDBOX,
+            exec_engine=LiveExecEngineConfig(reconciliation=False),
+            msgbus=MessageBusConfig(external_streams=["signals"]),
+            timeout_connection_secs=0,
+            timeout_reconciliation_secs=0,
+            timeout_portfolio_secs=0,
+            timeout_disconnection_secs=0,
+            delay_post_stop_secs=0,
+            timeout_shutdown_secs=0,
+        ),
+    )
+
+    try:
+        assert node.is_running is False
+
+        node.start()
+        assert node.is_running is True
+
+        if stop_before_dispose:
+            node.stop()
+        else:
+            node.dispose()
+
+        assert node.is_running is False
+    finally:
+        node.dispose()
+
+    assert node.is_running is False
 
 
 def test_importable_exec_algorithm_config_construction():

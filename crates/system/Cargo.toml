@@ -26,8 +26,10 @@ defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]
 extension-module = ["python", "pyo3/extension-module", "streaming"]
 live = ["nautilus-common/live"]
 python = [
+  "nautilus-common/python",
   "nautilus-core/python",
   "nautilus-persistence/python",
+  "nautilus-trading/python",
   "pyo3",
   "streaming",
 ]
@@ -40,7 +42,8 @@ ignored = [
 ] # Optional dep activated only via the streaming feature
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["defi", "live", "streaming", "tracing-bridge"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -61,6 +64,7 @@ bon = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sysinfo = { workspace = true }
 ustr = { workspace = true }
 
@@ -70,5 +74,4 @@ pyo3 = { workspace = true, optional = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 rstest = { workspace = true }
-serde_json = { workspace = true }
 toml = { workspace = true }

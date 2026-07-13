@@ -86,6 +86,15 @@ pub struct OKXInstrument {
     /// `category` field is intentionally ignored).
     #[serde(default)]
     pub inst_category: Option<OKXInstrumentCategory>,
+    /// Initial price-limit band for newly listed contracts.
+    #[serde(default)]
+    pub init_px_lmt_pct: String,
+    /// Floating price-limit band during normal trading.
+    #[serde(default)]
+    pub float_px_lmt_pct: String,
+    /// Maximum price-limit cap.
+    #[serde(default)]
+    pub max_px_lmt_pct: String,
     /// Base currency, e.g. "BTC" in BTC-USDT. Applicable to SPOT/MARGIN.
     pub base_ccy: Ustr,
     /// Quote currency, e.g. "USDT" in BTC-USDT.

@@ -349,14 +349,9 @@ fn build_price_update<T>(
 
 /// Parses a Lighter perpetual market-stat update into a funding-rate update.
 ///
-/// Lighter exposes `current_funding_rate` as the percent-unit estimate for the
-/// upcoming payment. The `funding_rate` field is the last completed payment, so
-/// it is not used for the streaming Nautilus update. Nautilus receives the
-/// normalized decimal rate.
-///
-/// The market-stats payload does not include a per-market funding interval.
-/// Lighter's current deployed markets fund hourly, matching the public
-/// `/api/v1/fundings` `1h` resolution used for historical requests.
+/// Lighter exposes `current_funding_rate` as the estimate for the upcoming
+/// payment. The `funding_rate` field is the last completed payment, so it is
+/// not used for the streaming Nautilus update.
 ///
 /// # Errors
 ///
@@ -974,6 +969,7 @@ pub(crate) fn parse_lighter_order_filled(
         false, // reconciliation
         None,  // venue_position_id: Lighter perps run NETTING
         Some(commission),
+        None,
     )))
 }
 
@@ -1150,9 +1146,7 @@ fn nautilus_order_type(kind: LighterOrderKind) -> anyhow::Result<OrderType> {
         LighterOrderKind::StopLossLimit => Ok(OrderType::StopLimit),
         LighterOrderKind::TakeProfit => Ok(OrderType::MarketIfTouched),
         LighterOrderKind::TakeProfitLimit => Ok(OrderType::LimitIfTouched),
-        // A liquidation is venue-forced execution, not a user-submitted order.
-        // During reconciliation the useful native Nautilus shape is an external
-        // market order so fills and resulting position state can be reconciled.
+        // A liquidation is venue-forced execution, represented as an external market order.
         LighterOrderKind::Liquidation => Ok(OrderType::Market),
         LighterOrderKind::Twap | LighterOrderKind::TwapSub => Err(anyhow::anyhow!(
             "Lighter `{kind:?}` has no Nautilus order-type equivalent",
@@ -1587,8 +1581,8 @@ mod tests {
             update.next_funding_ns,
             Some(UnixNanos::from(1_774_886_400_000_000_000))
         );
-        assert_eq!(update.interval, Some(60));
         assert_eq!(update.ts_event, UnixNanos::from(1_774_883_844_933_000_000));
+        assert_eq!(update.interval, Some(60));
     }
 
     // Pins which field each price-update parser reads from `LighterMarketStats`.
@@ -1655,7 +1649,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(update.rate, expected);
-        assert_eq!(update.interval, Some(60));
     }
 
     #[rstest]

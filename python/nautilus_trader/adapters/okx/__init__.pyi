@@ -5,6 +5,7 @@ import enum
 import typing
 
 from nautilus_trader import model
+from nautilus_trader import network
 
 __all__ = [
     "OKX",
@@ -22,6 +23,7 @@ __all__ = [
     "OKXMarginMode",
     "OKXOrderStatus",
     "OKXPositionMode",
+    "OKXRegion",
     "OKXTradeMode",
     "OKXVipLevel",
     "OKXWebSocketClient",
@@ -51,6 +53,7 @@ class OKXDataClientConfig:
         self,
         instrument_types: typing.Sequence[OKXInstrumentType] | None = None,
         environment: OKXEnvironment | None = None,
+        region: OKXRegion | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
         api_passphrase: str | None = None,
@@ -63,8 +66,12 @@ class OKXDataClientConfig:
         retry_delay_initial_ms: int | None = None,
         retry_delay_max_ms: int | None = None,
         update_instruments_interval_mins: int | None = None,
+        book_stale_check_interval_secs: int | None = None,
+        book_stale_threshold_secs: int | None = None,
+        book_snapshot_timeout_secs: int | None = None,
         vip_level: OKXVipLevel | None = None,
         load_spreads: bool = False,
+        transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
 
 @typing.final
@@ -80,6 +87,7 @@ class OKXExecClientConfig:
         account_id: model.AccountId,
         instrument_types: typing.Sequence[OKXInstrumentType] | None = None,
         environment: OKXEnvironment | None = None,
+        region: OKXRegion | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
         api_passphrase: str | None = None,
@@ -93,6 +101,7 @@ class OKXExecClientConfig:
         retry_delay_max_ms: int | None = None,
         margin_mode: OKXMarginMode | None = None,
         load_spreads: bool = False,
+        transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
 
 @typing.final
@@ -189,6 +198,7 @@ class OKXHttpClient:
         self, underlying: str, instrument_id: model.InstrumentId | None = None
     ) -> typing.Any: ...
     def request_mark_price(self, instrument_id: model.InstrumentId) -> typing.Any: ...
+    def request_price_limit(self, instrument_id: model.InstrumentId) -> typing.Any: ...
     def request_index_price(self, instrument_id: model.InstrumentId) -> typing.Any: ...
     def request_order_status_reports(
         self,
@@ -577,6 +587,23 @@ class OKXPositionMode(enum.Enum):
     def from_str(cls, data: typing.Any) -> OKXPositionMode: ...
 
 @typing.final
+class OKXRegion(enum.Enum):
+    GLOBAL = ...
+    EEA = ...
+    US = ...
+
+    def __init__(self, value: typing.Any) -> None: ...
+    def __hash__(self) -> int: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+    @classmethod
+    def variants(cls) -> list[str]: ...
+    @classmethod
+    def from_str(cls, data: typing.Any) -> OKXRegion: ...
+
+@typing.final
 class OKXTradeMode(enum.Enum):
     CASH = ...
     ISOLATED = ...
@@ -619,8 +646,10 @@ class OKXVipLevel(enum.Enum):
     def from_str(cls, data: typing.Any) -> OKXVipLevel: ...
 
 def derive_okx_ws_url(base_url: str, channel: str) -> str: ...
-def get_okx_http_base_url() -> str: ...
-def get_okx_ws_url_business(environment: OKXEnvironment) -> str: ...
-def get_okx_ws_url_private(environment: OKXEnvironment) -> str: ...
-def get_okx_ws_url_public(environment: OKXEnvironment) -> str: ...
+def get_okx_http_base_url(region: OKXRegion | None = None) -> str: ...
+def get_okx_ws_url_business(
+    environment: OKXEnvironment, region: OKXRegion | None = None
+) -> str: ...
+def get_okx_ws_url_private(environment: OKXEnvironment, region: OKXRegion | None = None) -> str: ...
+def get_okx_ws_url_public(environment: OKXEnvironment, region: OKXRegion | None = None) -> str: ...
 def okx_requires_authentication(endpoint_type: OKXEndpointType) -> bool: ...

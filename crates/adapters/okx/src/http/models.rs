@@ -90,6 +90,26 @@ pub struct OKXMarkPrice {
     pub ts: u64,
 }
 
+/// Represents a price-limit row from the GET /api/v5/public/price-limit endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXPriceLimit {
+    /// Instrument type.
+    pub inst_type: OKXInstrumentType,
+    /// Instrument ID.
+    pub inst_id: Ustr,
+    /// Highest buy limit price.
+    pub buy_lmt: String,
+    /// Lowest sell limit price.
+    pub sell_lmt: String,
+    /// Data timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub ts: u64,
+    /// Whether the price limit is effective.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Represents an option summary row from the GET /api/v5/public/opt-summary endpoint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

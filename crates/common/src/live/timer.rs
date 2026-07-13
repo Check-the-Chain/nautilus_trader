@@ -41,6 +41,54 @@ use crate::{
     timer::{TimeEvent, TimeEventCallback, TimeEventHandler, Timer},
 };
 
+const TIMER_STARTUP_OVERHEAD: Duration = Duration::from_millis(1);
+
+fn should_fire_scheduled_time(next_time_ns: UnixNanos, stop_time_ns: Option<UnixNanos>) -> bool {
+    stop_time_ns.is_none_or(|stop_time_ns| next_time_ns <= stop_time_ns)
+}
+
+fn expires_after_scheduled_time(next_time_ns: UnixNanos, stop_time_ns: Option<UnixNanos>) -> bool {
+    stop_time_ns == Some(next_time_ns)
+}
+
+fn is_stop_boundary(next_time_ns: u64, stop_time_ns: Option<UnixNanos>) -> bool {
+    stop_time_ns == Some(UnixNanos::from(next_time_ns))
+}
+
+fn should_adjust_past_due_time(
+    observed_next: u64,
+    now_ns: UnixNanos,
+    stop_time_ns: Option<UnixNanos>,
+) -> bool {
+    observed_next <= now_ns.as_u64() && !is_stop_boundary(observed_next, stop_time_ns)
+}
+
+fn normalize_start_time_ns(
+    observed_next: u64,
+    now_ns: UnixNanos,
+    stop_time_ns: Option<UnixNanos>,
+) -> UnixNanos {
+    if is_stop_boundary(observed_next, stop_time_ns) {
+        return UnixNanos::from(observed_next);
+    }
+
+    let now_raw = now_ns.as_u64();
+    let start_time_ns = if observed_next <= now_raw {
+        now_raw
+    } else {
+        observed_next
+    };
+
+    UnixNanos::from(floor_to_nearest_microsecond(start_time_ns))
+}
+
+fn timer_start_delay(next_time_ns: UnixNanos, now_ns: UnixNanos) -> Duration {
+    let delay = Duration::from_nanos(next_time_ns.saturating_sub(now_ns.as_u64()));
+
+    // Subtract the estimated startup overhead, saturating to zero for sub-overhead delays.
+    delay.saturating_sub(TIMER_STARTUP_OVERHEAD)
+}
+
 /// A live timer for use with a `LiveClock`.
 ///
 /// `LiveTimer` triggers events at specified intervals in a real-time environment,
@@ -64,6 +112,7 @@ pub struct LiveTimer {
     next_time_ns: Arc<AtomicU64>,
     callback: TimeEventCallback,
     task_handle: Option<JoinHandle<()>>,
+    canceled: bool,
     sender: Option<Arc<dyn TimeEventSender>>,
 }
 
@@ -102,6 +151,7 @@ impl LiveTimer {
             next_time_ns: Arc::new(AtomicU64::new(next_time_ns)),
             callback,
             task_handle: None,
+            canceled: false,
             sender,
         }
     }
@@ -120,9 +170,11 @@ impl LiveTimer {
     /// A timer that has not been started is not expired.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.task_handle
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
+        self.canceled
+            || self
+                .task_handle
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 
     /// Starts the timer.
@@ -156,7 +208,7 @@ impl LiveTimer {
         let now_raw = now_ns.as_u64();
         let mut observed_next = self.next_time_ns.load(atomic::Ordering::SeqCst);
 
-        if observed_next <= now_raw {
+        if should_adjust_past_due_time(observed_next, now_ns, stop_time_ns) {
             loop {
                 match self.next_time_ns.compare_exchange(
                     observed_next,
@@ -177,7 +229,7 @@ impl LiveTimer {
                     }
                     Err(actual) => {
                         observed_next = actual;
-                        if observed_next > now_raw {
+                        if !should_adjust_past_due_time(observed_next, now_ns, stop_time_ns) {
                             break;
                         }
                     }
@@ -186,7 +238,7 @@ impl LiveTimer {
         }
 
         // Floor the next time to the nearest microsecond which is within the timers accuracy
-        let mut next_time_ns = UnixNanos::from(floor_to_nearest_microsecond(observed_next));
+        let mut next_time_ns = normalize_start_time_ns(observed_next, now_ns, stop_time_ns);
         let next_time_atomic = self.next_time_ns.clone();
         next_time_atomic.store(next_time_ns.as_u64(), atomic::Ordering::SeqCst);
 
@@ -196,23 +248,19 @@ impl LiveTimer {
         let handle = rt.spawn(async move {
             let clock = get_atomic_clock_realtime();
 
-            // 1-millisecond delay to account for the overhead of initializing a tokio timer
-            let overhead = Duration::from_millis(1);
-            let delay_ns = next_time_ns.saturating_sub(now_ns.as_u64());
-            let mut delay = Duration::from_nanos(delay_ns);
-
-            // Subtract the estimated startup overhead; saturating to zero for sub-ms delays
-            if delay > overhead {
-                delay -= overhead;
-            } else {
-                delay = Duration::from_nanos(0);
-            }
-
-            let start = Instant::now() + delay;
+            let start = Instant::now() + timer_start_delay(next_time_ns, now_ns);
 
             let mut timer = tokio::time::interval_at(start, Duration::from_nanos(interval_ns));
 
             loop {
+                // Never fire an event scheduled past the stop time. The event's
+                // `ts_event` is the scheduled `next_time_ns`, so the bound is
+                // enforced on the scheduled time (matching `TestTimer`), not on
+                // the wall-clock read used only for `ts_init`.
+                if !should_fire_scheduled_time(next_time_ns, stop_time_ns) {
+                    break; // Timer expired before this event
+                }
+
                 // `timer.tick` is cancellation safe, if the cancel branch completes
                 // first then no tick has been consumed (no event was ready).
                 timer.tick().await;
@@ -239,20 +287,22 @@ impl LiveTimer {
                     }
                 }
 
+                // The event scheduled exactly at the stop time fires (inclusive
+                // boundary), then the timer expires.
+                let expires_after_fire = expires_after_scheduled_time(next_time_ns, stop_time_ns);
+
                 // Prepare next time interval
                 next_time_ns += interval_ns;
                 next_time_atomic.store(next_time_ns.as_u64(), atomic::Ordering::SeqCst);
 
-                // Check if expired
-                if let Some(stop_time_ns) = stop_time_ns
-                    && std::cmp::max(next_time_ns, now_ns) >= stop_time_ns
-                {
-                    break; // Timer expired
+                if expires_after_fire {
+                    break; // Timer expired at the stop boundary
                 }
             }
         });
 
         self.task_handle = Some(handle);
+        self.canceled = false;
     }
 
     /// Cancels the timer.
@@ -261,17 +311,16 @@ impl LiveTimer {
     pub fn cancel(&mut self) {
         log::trace!("Cancel timer '{}'", self.name);
 
-        if let Some(ref handle) = self.task_handle {
+        if let Some(handle) = self.task_handle.take() {
             handle.abort();
         }
+        self.canceled = true;
     }
 }
 
 impl Timer for LiveTimer {
     fn is_expired(&self) -> bool {
-        self.task_handle
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
+        Self::is_expired(self)
     }
 
     fn cancel(&mut self) {
@@ -279,18 +328,26 @@ impl Timer for LiveTimer {
     }
 }
 
+impl Drop for LiveTimer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU64, sync::Arc};
+    use std::num::NonZeroU64;
     #[cfg(feature = "python")]
     use std::{
-        sync::{Mutex, mpsc},
+        sync::{Arc, Mutex, mpsc},
         time::Duration as StdDuration,
     };
 
-    use nautilus_core::{
-        UnixNanos, datetime::floor_to_nearest_microsecond, time::get_atomic_clock_realtime,
-    };
+    use nautilus_core::UnixNanos;
+    #[cfg(feature = "python")]
+    use nautilus_core::time::get_atomic_clock_realtime;
     #[cfg(feature = "python")]
     use pyo3::{
         Python,
@@ -300,10 +357,150 @@ mod tests {
     use ustr::Ustr;
 
     use super::LiveTimer;
-    use crate::{
-        runner::TimeEventSender,
-        timer::{TimeEventCallback, TimeEventHandler},
-    };
+    #[cfg(feature = "python")]
+    use crate::runner::TimeEventSender;
+    use crate::timer::TimeEventCallback;
+    #[cfg(feature = "python")]
+    use crate::timer::TimeEventHandler;
+
+    #[rstest]
+    fn test_live_timer_stop_bound_allows_unbounded_scheduled_time() {
+        assert!(super::should_fire_scheduled_time(
+            UnixNanos::from(100),
+            None
+        ));
+        assert!(!super::expires_after_scheduled_time(
+            UnixNanos::from(100),
+            None
+        ));
+    }
+
+    #[rstest]
+    fn test_live_timer_stop_bound_skips_time_past_stop() {
+        let next_time_ns = UnixNanos::from(110);
+        let stop_time_ns = Some(UnixNanos::from(100));
+
+        assert!(!super::should_fire_scheduled_time(
+            next_time_ns,
+            stop_time_ns
+        ));
+        assert!(!super::expires_after_scheduled_time(
+            next_time_ns,
+            stop_time_ns
+        ));
+    }
+
+    #[rstest]
+    fn test_live_timer_stop_bound_allows_time_before_stop_without_expiring() {
+        let next_time_ns = UnixNanos::from(90);
+        let stop_time_ns = Some(UnixNanos::from(100));
+
+        assert!(super::should_fire_scheduled_time(
+            next_time_ns,
+            stop_time_ns
+        ));
+        assert!(!super::expires_after_scheduled_time(
+            next_time_ns,
+            stop_time_ns
+        ));
+    }
+
+    #[rstest]
+    fn test_live_timer_stop_bound_fires_time_at_stop_then_expires() {
+        let next_time_ns = UnixNanos::from(100);
+        let stop_time_ns = Some(UnixNanos::from(100));
+
+        assert!(super::should_fire_scheduled_time(
+            next_time_ns,
+            stop_time_ns
+        ));
+        assert!(super::expires_after_scheduled_time(
+            next_time_ns,
+            stop_time_ns
+        ));
+    }
+
+    #[rstest]
+    fn test_live_timer_past_due_stop_boundary_is_not_adjusted_forward() {
+        let observed_next = 100;
+        let now = UnixNanos::from(110);
+        let stop_time_ns = Some(UnixNanos::from(observed_next));
+
+        assert!(!super::should_adjust_past_due_time(
+            observed_next,
+            now,
+            stop_time_ns
+        ));
+    }
+
+    #[rstest]
+    fn test_live_timer_past_due_time_before_stop_is_adjusted_forward() {
+        let observed_next = 90;
+        let now = UnixNanos::from(110);
+        let stop_time_ns = Some(UnixNanos::from(120));
+
+        assert!(super::should_adjust_past_due_time(
+            observed_next,
+            now,
+            stop_time_ns
+        ));
+    }
+
+    #[rstest]
+    fn test_live_timer_start_time_normalization_adjusts_past_due_time() {
+        let observed_next = 1_234_567;
+        let now = UnixNanos::from(2_345_678);
+
+        assert_eq!(
+            super::normalize_start_time_ns(observed_next, now, None),
+            UnixNanos::from(2_345_000)
+        );
+    }
+
+    #[rstest]
+    fn test_live_timer_start_time_normalization_keeps_future_time() {
+        let observed_next = 3_456_789;
+        let now = UnixNanos::from(2_345_678);
+
+        assert_eq!(
+            super::normalize_start_time_ns(observed_next, now, None),
+            UnixNanos::from(3_456_000)
+        );
+    }
+
+    #[rstest]
+    fn test_live_timer_start_time_normalization_keeps_stop_boundary_exact() {
+        let observed_next = 1_234_567;
+        let now = UnixNanos::from(2_345_678);
+        let stop_time_ns = Some(UnixNanos::from(observed_next));
+
+        assert_eq!(
+            super::normalize_start_time_ns(observed_next, now, stop_time_ns),
+            UnixNanos::from(observed_next)
+        );
+    }
+
+    #[rstest]
+    fn test_live_timer_start_delay_subtracts_startup_overhead() {
+        let next_time_ns = UnixNanos::from(12_000_000);
+        let now = UnixNanos::from(10_000_000);
+
+        assert_eq!(
+            super::timer_start_delay(next_time_ns, now),
+            tokio::time::Duration::from_millis(1)
+        );
+    }
+
+    #[rstest]
+    fn test_live_timer_start_delay_saturates_below_startup_overhead() {
+        let next_time_ns = UnixNanos::from(10_500_000);
+        let now = UnixNanos::from(10_000_000);
+
+        assert_eq!(
+            super::timer_start_delay(next_time_ns, now),
+            tokio::time::Duration::from_nanos(0)
+        );
+    }
 
     #[rstest]
     fn test_live_timer_fire_immediately_field() {
@@ -343,38 +540,6 @@ mod tests {
         assert_eq!(timer.next_time_ns(), UnixNanos::from(1100));
     }
 
-    #[rstest]
-    fn test_live_timer_adjusts_past_due_start_time() {
-        #[derive(Debug)]
-        struct NoopSender;
-
-        impl TimeEventSender for NoopSender {
-            fn send(&self, _handler: TimeEventHandler) {}
-        }
-
-        let sender = Arc::new(NoopSender);
-        let mut timer = LiveTimer::new(
-            Ustr::from("PAST_TIMER"),
-            NonZeroU64::new(1).unwrap(),
-            UnixNanos::from(0),
-            None,
-            TimeEventCallback::from(|_| {}),
-            true,
-            Some(sender),
-        );
-
-        let before = get_atomic_clock_realtime().get_time_ns();
-
-        timer.start();
-
-        // `next_time_ns` is floored to microsecond precision, so compare against
-        // the same floor applied to the baseline
-        let before_floored = UnixNanos::from(floor_to_nearest_microsecond(before.as_u64()));
-        assert!(timer.next_time_ns() >= before_floored);
-
-        timer.cancel();
-    }
-
     #[cfg(feature = "python")]
     #[rstest]
     fn test_live_timer_with_sender_defers_python_callback_to_handler() {
@@ -410,7 +575,7 @@ mod tests {
                 Ustr::from("PY_TIMER"),
                 NonZeroU64::new(1_000_000).unwrap(),
                 now,
-                Some(UnixNanos::from(now.as_u64() + 2_000_000)),
+                None,
                 callback,
                 true,
                 Some(sender),

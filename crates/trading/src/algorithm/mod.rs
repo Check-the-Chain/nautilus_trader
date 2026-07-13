@@ -229,6 +229,10 @@ pub trait ExecutionAlgorithm: DataActor {
 
         let topic = format!("events.order.{}", order.strategy_id());
         msgbus::publish_order_event(topic.into(), &event);
+        msgbus::publish_order_event(
+            msgbus::switchboard::get_order_canceled_topic(order.instrument_id()),
+            &event,
+        );
 
         Ok(())
     }
@@ -270,9 +274,7 @@ pub trait ExecutionAlgorithm: DataActor {
             order.strategy_id(),
             order.instrument_id(),
             order.client_order_id(),
-            order
-                .account_id()
-                .expect("Order must have account_id for pending update"),
+            order.account_id(),
             UUID4::new(),
             ts_now,
             ts_now,
@@ -295,9 +297,7 @@ pub trait ExecutionAlgorithm: DataActor {
             order.strategy_id(),
             order.instrument_id(),
             order.client_order_id(),
-            order
-                .account_id()
-                .expect("Order must have account_id for pending cancel"),
+            order.account_id(),
             UUID4::new(),
             ts_now,
             ts_now,
@@ -784,6 +784,10 @@ pub trait ExecutionAlgorithm: DataActor {
 
             let topic = format!("events.order.{strategy_id}");
             msgbus::publish_order_event(topic.into(), &event);
+            msgbus::publish_order_event(
+                msgbus::switchboard::get_order_pending_update_topic(order.instrument_id()),
+                &event,
+            );
         }
 
         let ts_init = ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
@@ -971,6 +975,10 @@ pub trait ExecutionAlgorithm: DataActor {
 
             let topic = format!("events.order.{strategy_id}");
             msgbus::publish_order_event(topic.into(), &event);
+            msgbus::publish_order_event(
+                msgbus::switchboard::get_order_pending_cancel_topic(order.instrument_id()),
+                &event,
+            );
         }
 
         let ts_init = ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
@@ -1161,7 +1169,7 @@ pub trait ExecutionAlgorithm: DataActor {
             OrderEventAny::ModifyRejected(e) => self.on_order_modify_rejected(*e),
             OrderEventAny::CancelRejected(e) => self.on_order_cancel_rejected(*e),
             OrderEventAny::Updated(e) => self.on_order_updated(*e),
-            OrderEventAny::Filled(e) => self.on_algo_order_filled(*e),
+            OrderEventAny::Filled(e) => self.on_algo_order_filled(e.clone()),
         }
 
         self.on_order_event(event);
@@ -2278,6 +2286,74 @@ mod tests {
         assert_eq!(event.strategy_id, StrategyId::from("STRAT-001"));
         assert_eq!(event.instrument_id, InstrumentId::from("BTC/USDT.BINANCE"));
         assert_eq!(event.client_order_id, ClientOrderId::from("O-001"));
+    }
+
+    #[rstest]
+    fn test_algorithm_handle_cancel_order_publishes_instrument_canceled_topic() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-CANCEL-PUBLISH");
+        let instrument_id = InstrumentId::from("BTC/USDT.BINANCE");
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            instrument_id,
+            ClientOrderId::from("O-ALGO-CANCEL"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let order = TestOrderStubs::make_accepted_order(&order);
+
+        {
+            let cache_rc = algo.core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            cache.add_order(order.clone(), None, None, false).unwrap();
+        }
+
+        let received = Rc::new(RefCell::new(Vec::<OrderEventAny>::new()));
+        let handler = TypedHandler::from({
+            let received = received.clone();
+            move |event: &OrderEventAny| {
+                received.borrow_mut().push(event.clone());
+            }
+        });
+        let topic = msgbus::switchboard::get_order_canceled_topic(instrument_id);
+        msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+
+        let command = CancelOrder::new(
+            order.trader_id(),
+            None,
+            strategy_id,
+            instrument_id,
+            order.client_order_id(),
+            order.venue_order_id(),
+            UUID4::new(),
+            0.into(),
+            None,
+            None,
+        );
+        algo.handle_cancel_order(command).unwrap();
+
+        msgbus::unsubscribe_order_events(topic.into(), &handler);
+        let received = received.borrow();
+        assert_eq!(received.len(), 1);
+        assert!(matches!(received[0], OrderEventAny::Canceled(_)));
+        assert_eq!(received[0].client_order_id(), order.client_order_id());
+        assert_eq!(received[0].instrument_id(), instrument_id);
     }
 
     #[rstest]

@@ -135,6 +135,27 @@ impl PolymarketExecutionClient {
         }
     }
 
+    pub(super) async fn await_pending_tasks(&self) {
+        loop {
+            let tasks: Vec<_> = self
+                .pending_tasks
+                .lock()
+                .expect(MUTEX_POISONED)
+                .drain(..)
+                .collect();
+
+            if tasks.is_empty() {
+                break;
+            }
+
+            for handle in tasks {
+                if let Err(e) = handle.await {
+                    log::warn!("Pending execution task failed to join during disconnect: {e}");
+                }
+            }
+        }
+    }
+
     pub(super) async fn refresh_account_state(&self) -> anyhow::Result<()> {
         fetch_and_emit_account_state(
             &self.http_client,
@@ -195,6 +216,7 @@ impl PolymarketExecutionClient {
         let http_client = self.http_client.clone();
         let clock = self.clock;
         let signature_type = self.config.signature_type;
+        let stopping = self.stopping.clone();
         let user_address = self
             .secrets
             .funder
@@ -205,9 +227,9 @@ impl PolymarketExecutionClient {
         let fill_tracker = self.fill_tracker.clone();
         let pending_submits = self.pending_submits.clone();
         let order_identities = self.order_identities.clone();
+        let ws_dispatch_state = self.ws_dispatch_state.clone();
 
         let handle = get_runtime().spawn(async move {
-            let mut state = WsDispatchState::default();
             let ctx = WsDispatchContext {
                 token_instruments: &token_instruments,
                 fill_tracker: &fill_tracker,
@@ -223,9 +245,12 @@ impl PolymarketExecutionClient {
             loop {
                 match rx.recv().await {
                     Some(PolymarketWsMessage::User(user_msg)) => {
-                        if let Some(_refresh) =
+                        let refresh = {
+                            let mut state = ws_dispatch_state.lock().expect(MUTEX_POISONED);
                             dispatch_user_message(&user_msg, &ctx, &mut state)
-                        {
+                        };
+
+                        if refresh.is_some() {
                             let http = http_client.clone();
                             let emit = emitter.clone();
 
@@ -235,7 +260,7 @@ impl PolymarketExecutionClient {
                                 )
                                 .await
                                 {
-                                    Ok(()) => log::info!(
+                                    Ok(()) => log::debug!(
                                         "Account state refreshed after finalized trade for {account_id}"
                                     ),
                                     Err(e) => log::warn!(
@@ -248,6 +273,25 @@ impl PolymarketExecutionClient {
                     Some(PolymarketWsMessage::Market(_)) => {}
                     Some(PolymarketWsMessage::Reconnected) => {
                         log::info!("User WebSocket reconnected");
+                        if stopping.load(Ordering::Acquire) {
+                            log::debug!("Skipping account refresh because execution client is stopping");
+                            continue;
+                        }
+
+                        let http = http_client.clone();
+                        let emit = emitter.clone();
+                        get_runtime().spawn(async move {
+                            match fetch_and_emit_account_state(&http, &emit, clock, signature_type)
+                                .await
+                            {
+                                Ok(()) => {
+                                    log::info!("Account state refreshed after WebSocket reconnect");
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to refresh account after reconnect: {e}");
+                                }
+                            }
+                        });
                     }
                     None => {
                         log::debug!("User WebSocket stream ended");
@@ -296,7 +340,7 @@ impl PolymarketExecutionClient {
             self.upsert_execution_lookup(inst);
         }
 
-        log::info!("Loaded {} instruments from cache", instruments.len());
+        log::debug!("Loaded {} instruments from cache", instruments.len());
     }
 
     pub(super) fn start_client(&mut self) {
@@ -331,7 +375,6 @@ impl PolymarketExecutionClient {
             handle.abort();
         }
 
-        self.abort_pending_tasks();
         self.ws_client.abort();
 
         self.core.set_disconnected();
@@ -347,6 +390,7 @@ impl PolymarketExecutionClient {
         self.clear_position_event_subscription();
         self.shared_token_instruments.store(AHashMap::new());
         self.neg_risk_index.store(AHashMap::new());
+        *self.ws_dispatch_state.lock().expect(MUTEX_POISONED) = WsDispatchState::default();
     }
 
     pub(super) async fn connect_client(&mut self) -> anyhow::Result<()> {
@@ -395,6 +439,7 @@ impl PolymarketExecutionClient {
         log::info!("Disconnecting Polymarket execution client");
 
         self.stopping.store(true, Ordering::Release);
+        self.await_pending_tasks().await;
         self.clear_order_event_subscription();
         self.clear_position_event_subscription();
 
@@ -404,7 +449,6 @@ impl PolymarketExecutionClient {
             handle.abort();
         }
 
-        self.abort_pending_tasks();
         self.core.set_disconnected();
 
         log::info!("Disconnected: client_id={}", self.core.client_id);
@@ -993,6 +1037,12 @@ mod tests {
         client.upsert_execution_lookup(&expired);
         client.ensure_order_event_subscription();
         client.ensure_position_event_subscription();
+        client
+            .ws_dispatch_state
+            .lock()
+            .expect(MUTEX_POISONED)
+            .processed_fills
+            .add("trade-1".to_string());
 
         client.reset_client();
 
@@ -1004,5 +1054,37 @@ mod tests {
                 .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
         );
         assert!(!client.neg_risk_index.contains_key(&expired.id()));
+        assert!(
+            !client
+                .ws_dispatch_state
+                .lock()
+                .expect(MUTEX_POISONED)
+                .processed_fills
+                .contains(&"trade-1".to_string())
+        );
+    }
+
+    #[rstest]
+    fn stop_preserves_websocket_dedup_state_for_reconnect() {
+        let (mut client, _cache) = test_client();
+        let dedup_key = "trade-reconnect".to_string();
+        client.start_client();
+        client
+            .ws_dispatch_state
+            .lock()
+            .expect(MUTEX_POISONED)
+            .processed_fills
+            .add(dedup_key.clone());
+
+        client.stop_client();
+
+        assert!(
+            client
+                .ws_dispatch_state
+                .lock()
+                .expect(MUTEX_POISONED)
+                .processed_fills
+                .contains(&dedup_key)
+        );
     }
 }

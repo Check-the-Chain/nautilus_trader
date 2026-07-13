@@ -620,7 +620,7 @@ impl SandboxExecutionClient {
             position_handler,
         });
 
-        log::info!(
+        log::debug!(
             "Sandbox registered message handlers for venue={}",
             self.config.venue
         );
@@ -640,7 +640,7 @@ impl SandboxExecutionClient {
                 &handlers.position_handler,
             );
 
-            log::info!(
+            log::debug!(
                 "Sandbox deregistered message handlers for venue={}",
                 self.config.venue
             );
@@ -1164,12 +1164,8 @@ impl ExecutionClient for SandboxExecutionClient {
         &self,
         _lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        let ts_init = self.clock.borrow().timestamp_ns();
         let core = self.core.borrow();
-
-        // The sandbox starts from an empty simulated venue. Report that state
-        // explicitly so startup reconciliation can distinguish success from an
-        // adapter that did not provide a snapshot.
+        let ts_init = self.clock.borrow().timestamp_ns();
         Ok(Some(ExecutionMassStatus::new(
             core.client_id,
             core.account_id,

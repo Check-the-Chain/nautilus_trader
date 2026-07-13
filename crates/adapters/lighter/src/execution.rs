@@ -41,7 +41,7 @@ use nautilus_common::{
     clients::ExecutionClient,
     enums::LogColor,
     live::{runner::get_exec_event_sender, runtime::get_runtime},
-    log_info,
+    log_debug,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
@@ -64,7 +64,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Price, Quantity},
+    types::{AccountBalance, MarginBalance, Quantity},
 };
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
@@ -72,9 +72,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        consts::{LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX, LIGHTER_VENUE},
+        consts::{
+            DISCONNECT_TIMEOUT, LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX,
+            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_VENUE,
+        },
         credential::{Credential, scrub_auth},
-        enums::{LighterAccountTier, LighterPositionMarginMode, LighterProductType, LighterTxType},
+        enums::{
+            LighterAccountTier, LighterOrderKind, LighterPositionMarginMode, LighterProductType,
+            LighterTxType,
+        },
         rate_limit::{LighterTxRateLimiter, await_tx_quota, build_tx_rate_limiter, resolve_quota},
         symbol::{MarketRegistry, product_type_from_instrument_id},
         urls::lighter_chain_id,
@@ -83,7 +89,7 @@ use crate::{
     http::{
         client::{LIGHTER_REST_PAGE_SIZE, LighterHttpClient, LighterRawHttpClient},
         error::LighterHttpError,
-        models::LighterSendTxBatchRequest,
+        models::{LighterSendTxBatchRequest, LighterSendTxRequest},
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
             LighterSortDirection, LighterTradeSortBy, LighterTradesQuery,
@@ -93,8 +99,8 @@ use crate::{
         auth_token::{build_auth_token_for, fresh_k},
         nonce::NonceError,
         tx::{
-            CancelOrderTxInfo, CreateOrderTxInfo, L2TxAttributes, ModifyOrderTxInfo, OrderInfo,
-            TxContext, TxInfoJson, UpdateLeverageTxInfo, sign_tx,
+            ApproveIntegratorTxInfo, CancelOrderTxInfo, CreateOrderTxInfo, L2TxAttributes,
+            ModifyOrderTxInfo, OrderInfo, TxContext, TxInfoJson, UpdateLeverageTxInfo, sign_tx,
         },
     },
     websocket::{
@@ -153,7 +159,6 @@ const AUTH_TOKEN_REFRESH_BACKOFF: AuthTokenRefreshBackoff = AuthTokenRefreshBack
     max_delay: AUTH_TOKEN_REFRESH_RETRY_MAX_DELAY,
     window: AUTH_TOKEN_REFRESH_RETRY_WINDOW,
 };
-const WS_CONSUMER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 // Bounds the informational tier-detection call so a slow or failing
 // `/account` endpoint cannot stall connect for the HTTP retry budget.
 const ACCOUNT_TIER_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -163,6 +168,8 @@ const ACCOUNT_TIER_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// this window we attribute and emit `OrderRejected`. Outside the window
 /// the existing submit-timeout drives expiry.
 const SENDTX_BARE_ERROR_WINDOW_MS: u64 = 1_000;
+const INTEGRATOR_AUTO_APPROVAL_MAX_TTL_MS: i64 = 5 * 365 * 24 * 60 * 60 * 1_000;
+const INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK: u32 = 0;
 
 #[derive(Debug)]
 pub struct LighterExecutionClient {
@@ -243,11 +250,6 @@ impl LighterExecutionClient {
             AccountType::Margin,
             None,
         );
-        let dispatch = WsDispatchState::new();
-        for market_index in &config.active_markets {
-            dispatch.note_active_market(*market_index);
-        }
-
         Ok(Self {
             core,
             clock,
@@ -262,7 +264,7 @@ impl LighterExecutionClient {
             pending_tasks: Mutex::new(Vec::new()),
             ws_stream_handle: Mutex::new(None),
             cancellation_token: CancellationToken::new(),
-            dispatch,
+            dispatch: WsDispatchState::new(),
             nonce_recovery_inflight: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -424,7 +426,7 @@ impl LighterExecutionClient {
         let (active_rest, cross_check) =
             tier_quota_report(tier, self.config.rest_quota_per_min, standard_rest);
 
-        log_info!(
+        log_debug!(
             "Lighter execution account {account_index} reported tier {tier} \
              (account_type={code}); active REST quota {active_rest} req/min",
             color = LogColor::Blue
@@ -439,7 +441,7 @@ impl LighterExecutionClient {
                 );
             }
             Some(TierCrossCheck::RaiseHint { documented }) => {
-                log_info!(
+                log_debug!(
                     "Lighter {tier} tier permits up to {documented} REST req/min; set \
                      rest_quota_per_min (and register the caller IP with Lighter) to use it",
                     color = LogColor::Blue
@@ -447,6 +449,125 @@ impl LighterExecutionClient {
             }
             None => {}
         }
+    }
+
+    /// Returns `Ok(true)` if this credential's `api_key_index` is maker-only.
+    /// Maker-only keys cannot submit `ApproveIntegrator`, so the caller skips
+    /// the integrator auto-approval when `true`.
+    async fn is_maker_only_api_key(&self, credential: &Credential) -> anyhow::Result<bool> {
+        let auth_token = build_auth_token_for(credential)
+            .context("failed to mint Lighter auth token for maker-only check")?;
+        let response = self
+            .http_client
+            .get_maker_only_api_keys(credential.account_index(), auth_token)
+            .await
+            .context("failed to query getMakerOnlyApiKeys")?;
+        let api_key_index = i64::from(credential.api_key_index());
+        Ok(response.api_key_indexes.contains(&api_key_index))
+    }
+
+    async fn submit_integrator_auto_approval(&self) -> anyhow::Result<()> {
+        let Some(credential) = &self.credential else {
+            return Ok(());
+        };
+
+        let mut maker_only_check_failed = false;
+
+        match self.is_maker_only_api_key(credential).await {
+            Ok(true) => {
+                log::warn!(
+                    "Skipping Lighter integrator auto-approval: api_key_index={} is maker-only; \
+                     ensure the account has been approved by a non-maker-only key",
+                    credential.api_key_index(),
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                maker_only_check_failed = true;
+                log::debug!(
+                    "Lighter maker-only api key check failed; attempting integrator approval \
+                     anyway: {e:?}"
+                );
+            }
+        }
+
+        let mut approval = self.prepare_integrator_auto_approval(credential)?;
+
+        let request = LighterSendTxRequest::new(
+            LighterTxType::ApproveIntegrator as u8,
+            approval.tx_info.clone(),
+        );
+
+        approval.send_reservation.wait_for_turn().await;
+
+        let response = self.http_client.send_tx(&request).await.with_context(|| {
+            let hint = if maker_only_check_failed {
+                " (maker-only pre-flight check failed earlier; venue may reject with 62007 \
+                 if this key is maker-only)"
+            } else {
+                ""
+            };
+            format!(
+                "failed to submit Lighter integrator approval nonce={} api_key_index={}{hint}",
+                approval.nonce, approval.api_key_index,
+            )
+        })?;
+
+        approval.send_reservation.release();
+
+        log::debug!(
+            "Submitted Lighter integrator approval: integrator={}, nonce={}, \
+             api_key_index={}, approval_expiry={}, tx_hash={}",
+            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+            approval.nonce,
+            approval.api_key_index,
+            approval.approval_expiry,
+            response.tx_hash,
+        );
+        Ok(())
+    }
+
+    fn prepare_integrator_auto_approval(
+        &self,
+        credential: &Credential,
+    ) -> anyhow::Result<PreparedIntegratorApproval> {
+        let ReservedTxContext {
+            context,
+            send_reservation,
+        } = self.build_tx_context(credential)?;
+
+        let now_ms = (self.clock.get_time_ns().as_u64() as i64) / 1_000_000;
+        let approval_expiry = now_ms.saturating_add(INTEGRATOR_AUTO_APPROVAL_MAX_TTL_MS);
+        let nonce = context.nonce;
+        let api_key_index = context.api_key_index;
+
+        let tx = ApproveIntegratorTxInfo {
+            context,
+            integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX as i64,
+            max_perps_taker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
+            max_perps_maker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
+            max_spot_taker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
+            max_spot_maker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
+            approval_expiry,
+            skip_nonce: 0,
+        };
+
+        let signed = sign_tx(
+            &tx,
+            lighter_chain_id(self.config.environment),
+            &credential.private_key()?,
+            fresh_k(),
+        );
+        let tx_info = TxInfoJson::approve_integrator(&tx, &signed, "");
+
+        Ok(PreparedIntegratorApproval {
+            tx_info,
+            nonce,
+            api_key_index,
+            approval_expiry,
+            send_reservation,
+        })
     }
 
     async fn spawn_ws_consumer(&mut self) -> anyhow::Result<()> {
@@ -809,7 +930,7 @@ impl LighterExecutionClient {
                                                 credential.api_key_index(),
                                                 response.nonce,
                                             );
-                                            log::info!(
+                                            log::debug!(
                                                 "Hard-refreshed Lighter nonce after invalid-nonce \
                                                  rejection: account_index={}, next_nonce={}",
                                                 credential.account_index(),
@@ -1027,7 +1148,7 @@ impl LighterExecutionClient {
                         api_key_index,
                         response.nonce,
                     );
-                    log::info!(
+                    log::debug!(
                         "Resynced Lighter nonce baseline after skip-window exhaustion: \
                          account_index={account_index}, api_key_index={api_key_index}, \
                          next_nonce={}",
@@ -1262,7 +1383,7 @@ impl LighterExecutionClient {
                 trigger_price: trigger_price_ticks,
                 order_expiry,
             },
-            attributes: order_tx_attributes(),
+            attributes: integrator_attributes(),
         };
 
         let signed = sign_tx(
@@ -1579,20 +1700,39 @@ impl LighterExecutionClient {
             .clone();
 
         let new_qty = cmd.quantity.unwrap_or(order.quantity());
-        let new_price = cmd.price.or(order.price()).ok_or_else(|| {
-            anyhow::anyhow!("modify_order requires a price (none on order or command)")
-        })?;
-        let new_trigger = cmd
-            .trigger_price
-            .or(order.trigger_price())
-            .unwrap_or(Price::from_raw(0, instrument.price_precision()));
+        let price_precision = instrument.price_precision();
+        let new_trigger = cmd.trigger_price.or(order.trigger_price());
+
+        // Market-style stops carry no limit price; Lighter still needs a worst-
+        // acceptable `price` cap, derived from the trigger and slippage like submit.
+        let price_ticks = match order.order_type() {
+            OrderType::StopMarket | OrderType::MarketIfTouched => {
+                let trigger = new_trigger.ok_or_else(|| {
+                    anyhow::anyhow!("{:?} orders require a trigger_price", order.order_type())
+                })?;
+                let is_buy = matches!(order.order_side(), OrderSide::Buy);
+                let slippage_bps = self.resolve_slippage_bps(cmd.params.as_ref());
+
+                derive_market_order_price_ticks(
+                    trigger.as_decimal(),
+                    is_buy,
+                    price_precision,
+                    slippage_bps,
+                )?
+            }
+            _ => {
+                let new_price = cmd.price.or(order.price()).ok_or_else(|| {
+                    anyhow::anyhow!("modify_order requires a price (none on order or command)")
+                })?;
+
+                price_to_ticks(&new_price, price_precision)?
+            }
+        };
 
         let base_amount = quantity_to_ticks(&new_qty, instrument.size_precision())?;
-        let price_ticks = price_to_ticks(&new_price, instrument.price_precision())?;
-        let trigger_price_ticks = if new_trigger.raw == 0 {
-            0
-        } else {
-            price_to_ticks(&new_trigger, instrument.price_precision())?
+        let trigger_price_ticks = match new_trigger {
+            Some(trigger) if trigger.raw != 0 => price_to_ticks(&trigger, price_precision)?,
+            _ => 0,
         };
 
         let ReservedTxContext {
@@ -1602,6 +1742,7 @@ impl LighterExecutionClient {
 
         let captured_nonce = context.nonce;
         let captured_api_key_index = context.api_key_index;
+
         let mut rollback_guard =
             TxDispatchGuard::new(self.dispatch.clone(), credential, None, captured_nonce);
         let tx = ModifyOrderTxInfo {
@@ -1611,7 +1752,7 @@ impl LighterExecutionClient {
             base_amount,
             price: price_ticks,
             trigger_price: trigger_price_ticks,
-            attributes: order_tx_attributes(),
+            attributes: integrator_attributes(),
         };
 
         let signed = sign_tx(
@@ -2073,6 +2214,14 @@ struct PreparedModifyOrder {
     nonce: i64,
     api_key_index: u8,
     tx_hash: String,
+    send_reservation: TxSendReservation,
+}
+
+struct PreparedIntegratorApproval {
+    tx_info: String,
+    nonce: i64,
+    api_key_index: u8,
+    approval_expiry: i64,
     send_reservation: TxSendReservation,
 }
 
@@ -2599,7 +2748,7 @@ async fn resync_nonce_after_invalid_nonce(
                 credential.api_key_index(),
                 response.nonce,
             );
-            log::info!(
+            log::debug!(
                 "Hard-refreshed Lighter nonce after invalid-nonce batch rejection: \
                  account_index={}, next_nonce={}",
                 credential.account_index(),
@@ -2669,8 +2818,33 @@ fn rollback_tx_dispatch_indices(
     }
 }
 
-fn order_tx_attributes() -> L2TxAttributes {
-    L2TxAttributes::default()
+fn integrator_attributes() -> L2TxAttributes {
+    L2TxAttributes {
+        integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+        integrator_taker_fee: 0,
+        integrator_maker_fee: 0,
+        skip_nonce: 0,
+    }
+}
+
+/// Format a `start_secs-end_secs` window for Lighter's `between_timestamps`
+/// query parameter. Returns `None` when neither bound is set; an unset end
+/// defaults to the current time so the venue scopes pagination to the
+/// half-open window.
+fn format_between_timestamps(
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    ts_now: UnixNanos,
+) -> Option<String> {
+    let (start, end) = match (start, end) {
+        (None, None) => return None,
+        (Some(s), Some(e)) => (s, e),
+        (Some(s), None) => (s, ts_now),
+        (None, Some(e)) => (UnixNanos::from(0), e),
+    };
+    let start_secs = start.as_u64() / 1_000_000_000;
+    let end_secs = end.as_u64() / 1_000_000_000;
+    Some(format!("{start_secs}-{end_secs}"))
 }
 
 #[async_trait(?Send)]
@@ -2792,6 +2966,33 @@ impl ExecutionClient for LighterExecutionClient {
         self.ensure_instruments_initialized_async().await?;
         self.refresh_nonce().await?;
         self.detect_account_tier().await;
+
+        if let Err(e) = self.submit_integrator_auto_approval().await {
+            // Bail on venue 21149 ("integrator is not approved") so the
+            // operator catches it at startup rather than at first order.
+            // Other failures are tolerated: approval is account-scoped and
+            // may already be in place, or a reconnect can retry.
+            let is_unapproved = e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<LighterHttpError>(),
+                    Some(LighterHttpError::Venue { code: 21149, .. }),
+                )
+            });
+
+            if is_unapproved {
+                return Err(e.context(
+                    "Lighter account is not integrator-approved (venue 21149); \
+                     orders cannot be placed",
+                ));
+            }
+            log::error!("Lighter integrator approval failed; continuing startup: {e:?}");
+        }
+
+        if let Err(e) = self.refresh_nonce().await {
+            log::debug!(
+                "Failed to refresh Lighter nonce after integrator approval; continuing startup: {e:?}"
+            );
+        }
         self.spawn_ws_consumer().await?;
 
         if let Err(e) = self.await_account_streams_ready(30.0).await {
@@ -2826,7 +3027,7 @@ impl ExecutionClient for LighterExecutionClient {
                             "Lighter execution consumer task error during connect teardown: {join_err}"
                         ),
                     },
-                    () = tokio::time::sleep(WS_CONSUMER_SHUTDOWN_TIMEOUT) => {
+                    () = tokio::time::sleep(DISCONNECT_TIMEOUT) => {
                         log::warn!(
                             "Timeout waiting for Lighter execution consumer during connect teardown, aborting",
                         );
@@ -2867,7 +3068,7 @@ impl ExecutionClient for LighterExecutionClient {
 
         if let Some(handle) = ws_stream_handle {
             let abort_handle = handle.abort_handle();
-            match tokio::time::timeout(WS_CONSUMER_SHUTDOWN_TIMEOUT, handle).await {
+            match tokio::time::timeout(DISCONNECT_TIMEOUT, handle).await {
                 Ok(Ok(())) => log::debug!("Lighter execution consumer task completed"),
                 Ok(Err(e)) if e.is_cancelled() => {
                     log::debug!("Lighter execution consumer task cancelled");
@@ -3351,6 +3552,7 @@ impl ExecutionClient for LighterExecutionClient {
                 &self.dispatch,
                 credential,
                 &auth,
+                format_between_timestamps(cmd.start, cmd.end, ts_init),
             )
             .await?;
         }
@@ -3359,10 +3561,7 @@ impl ExecutionClient for LighterExecutionClient {
             Some(id) => match self.registry.market_index(&id) {
                 Some(idx) => vec![idx],
                 None => {
-                    log::warn!(
-                        "Lighter generate_order_status_reports: market_index unknown for {id}",
-                    );
-                    return Ok(Vec::new());
+                    anyhow::bail!("Lighter market_index unknown for {id}");
                 }
             },
             None => self.dispatch.active_markets_snapshot(),
@@ -3426,8 +3625,9 @@ impl ExecutionClient for LighterExecutionClient {
         // asks for non-`open_only` reports during a wider reconciliation.
         // Pagination is followed because a single market can hold more than
         // 200 historical inactive orders for a long-running account. The
-        // Lighter endpoint currently rejects its optional timestamp filter for
-        // this call, so time scoping is applied below after reports are parsed.
+        // venue-side `between_timestamps` window is set when `cmd.start`
+        // / `cmd.end` are present so the venue, not the client, scopes the
+        // pagination: important under the 60 req/min REST quota.
         if !cmd.open_only {
             let inactive_markets: Vec<i16> = match cmd.instrument_id {
                 Some(id) => self
@@ -3437,6 +3637,8 @@ impl ExecutionClient for LighterExecutionClient {
                     .unwrap_or_default(),
                 None => self.dispatch.active_markets_snapshot(),
             };
+
+            let between_timestamps = format_between_timestamps(cmd.start, cmd.end, ts_init);
 
             for market_id in inactive_markets {
                 let mut cursor: Option<String> = None;
@@ -3450,7 +3652,7 @@ impl ExecutionClient for LighterExecutionClient {
                             account_index: credential.account_index(),
                             market_id: Some(market_id),
                             ask_filter: None,
-                            between_timestamps: None,
+                            between_timestamps: between_timestamps.clone(),
                             cursor: cursor.clone(),
                             limit: LIGHTER_REST_PAGE_SIZE,
                         })
@@ -3464,15 +3666,26 @@ impl ExecutionClient for LighterExecutionClient {
 
                     for order in &inactive.orders {
                         self.dispatch.note_active_market(order.market_index);
-                        if let Some(report) = parse_http_order_to_report(
+                        let report = parse_http_order_to_report(
                             order,
                             &self.registry,
                             self.core.account_id,
                             ts_init,
                             &self.dispatch.cloid_map,
                             HttpOrderReportContext::Inactive,
-                        ) {
-                            inactive_reports.push(report);
+                        );
+                        match report {
+                            Some(report) => inactive_reports.push(report),
+                            None if matches!(
+                                order.order_type,
+                                LighterOrderKind::Twap | LighterOrderKind::TwapSub
+                            ) => {}
+                            None => anyhow::bail!(
+                                "cannot reconcile inactive Lighter order_index={} market_index={} kind={:?}",
+                                order.order_index,
+                                order.market_index,
+                                order.order_type,
+                            ),
                         }
                     }
 
@@ -3676,20 +3889,6 @@ impl ExecutionClient for LighterExecutionClient {
         let position_cmd =
             GeneratePositionStatusReports::new(UUID4::new(), ts_init, None, None, None, None, None);
 
-        // Capture the WS-backed position snapshot before the slower REST
-        // fan-out. Lighter has no REST position source, so startup
-        // reconciliation should package the account_all_positions state seen
-        // at the start of mass-status generation, not whatever remains after
-        // order/fill history pagination completes.
-        let position_reports = self
-            .generate_position_status_reports(&position_cmd)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Lighter mass-status position reports failed: {}",
-                    scrub_auth(&format!("{e:#}")),
-                )
-            })?;
         let order_reports = self
             .generate_order_status_reports(&order_cmd)
             .await
@@ -3705,6 +3904,15 @@ impl ExecutionClient for LighterExecutionClient {
                 scrub_auth(&format!("{e:#}")),
             )
         })?;
+        let position_reports = self
+            .generate_position_status_reports(&position_cmd)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Lighter mass-status position reports failed: {}",
+                    scrub_auth(&format!("{e:#}")),
+                )
+            })?;
 
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
@@ -3817,6 +4025,7 @@ async fn seed_active_markets_from_inactive_orders(
     dispatch: &WsDispatchState,
     credential: &Credential,
     auth: &str,
+    between_timestamps: Option<String>,
 ) -> anyhow::Result<()> {
     let mut cursor: Option<String> = None;
     let mut orders_seen = 0_usize;
@@ -3829,7 +4038,7 @@ async fn seed_active_markets_from_inactive_orders(
                 account_index: credential.account_index(),
                 market_id: None,
                 ask_filter: None,
-                between_timestamps: None,
+                between_timestamps: between_timestamps.clone(),
                 cursor: cursor.clone(),
                 limit: LIGHTER_REST_PAGE_SIZE,
             })
@@ -4390,7 +4599,7 @@ mod tests {
         },
         instruments::CryptoPerpetual,
         orders::{LimitOrder, OrderList},
-        types::{Currency, Money},
+        types::{Currency, Money, Price},
     };
     use rstest::rstest;
 
@@ -4442,12 +4651,32 @@ mod tests {
             environment: LighterEnvironment::Testnet,
             http_timeout_secs: 1,
             ws_timeout_secs: 1,
-            active_markets: Vec::new(),
             market_order_slippage_bps: 50,
             rest_quota_per_min: None,
             sendtx_quota_per_min: None,
             transport_backend: Default::default(),
         }
+    }
+
+    #[rstest]
+    fn format_between_timestamps_uses_lighter_seconds_range() {
+        let start = UnixNanos::from(1_700_000_000_123_456_789);
+        let end = UnixNanos::from(1_700_003_600_987_654_321);
+        let now = UnixNanos::from(1_700_007_200_000_000_000);
+
+        assert_eq!(
+            format_between_timestamps(Some(start), Some(end), now),
+            Some("1700000000-1700003600".to_string()),
+        );
+        assert_eq!(
+            format_between_timestamps(Some(start), None, now),
+            Some("1700000000-1700007200".to_string()),
+        );
+        assert_eq!(
+            format_between_timestamps(None, Some(end), now),
+            Some("0-1700003600".to_string()),
+        );
+        assert_eq!(format_between_timestamps(None, None, now), None);
     }
 
     fn create_execution_client() -> (
@@ -4635,7 +4864,7 @@ mod tests {
             strategy_id(),
             instrument_id,
             client_order_id,
-            account_id(),
+            Some(account_id()),
             UUID4::new(),
             UnixNanos::default(),
             UnixNanos::default(),
@@ -6437,6 +6666,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn modify_stop_market_derives_price_from_trigger_without_explicit_price() {
+        // A trigger-only STOP_MARKET carries no limit price; modifying its trigger
+        // must derive the wire cap from the trigger rather than trip the price
+        // guard. Prepare succeeds, so the only failure here is the test harness's
+        // missing WS send handler.
+        let (client, cache, mut rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let mut factory = test_order_factory();
+        let order = factory.stop_market(
+            instrument_id,
+            OrderSide::Sell,
+            Quantity::from("0.1000"),
+            Price::from("2300.00"), // trigger
+            None,
+            Some(TimeInForce::Gtc),
+            None,
+            Some(false),
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ClientOrderId::from("O-MODIFY-STOP-MARKET")),
+        );
+        let client_order_id = order.client_order_id();
+        let venue_order_id = VenueOrderId::from("123");
+        cache_order(&cache, order);
+
+        let command = ModifyOrder::new(
+            trader_id(),
+            Some(client_id()),
+            strategy_id(),
+            instrument_id,
+            client_order_id,
+            Some(venue_order_id),
+            None,
+            None,
+            Some(Price::from("2310.00")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        client.modify_order(command).unwrap();
+
+        let rejected = recv_order_event(&mut rx).await;
+        match rejected {
+            OrderEventAny::ModifyRejected(event) => {
+                assert!(
+                    !event.reason.as_str().contains("requires a price"),
+                    "trigger-only stop modify must not trip the price guard, was: {}",
+                    event.reason,
+                );
+                assert!(
+                    event.reason.as_str().contains("dispatch failed"),
+                    "expected send-stage failure after a successful prepare, was: {}",
+                    event.reason,
+                );
+            }
+            event => panic!("expected modify rejected event, was {event:?}"),
+        }
+        assert_nonce_reusable(&client.dispatch);
+    }
+
+    #[tokio::test]
     async fn modify_order_nonce_prepare_failure_emits_modify_rejected() {
         let mut config = test_config();
         config.base_url_http = Some(spawn_next_nonce_server(101).await);
@@ -7116,13 +7412,15 @@ mod tests {
     }
 
     #[rstest]
-    fn order_tx_attributes_do_not_require_integrator_approval() {
-        let attrs = order_tx_attributes();
-        assert_eq!(attrs.integrator_account_index, 0);
+    fn integrator_attributes_tags_nautilus_account_at_zero_fees() {
+        let attrs = integrator_attributes();
+        assert_eq!(
+            attrs.integrator_account_index,
+            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+        );
         assert_eq!(attrs.integrator_taker_fee, 0);
         assert_eq!(attrs.integrator_maker_fee, 0);
         assert_eq!(attrs.skip_nonce, 0);
-        assert!(attrs.is_empty());
     }
 
     use std::str::FromStr;
@@ -7838,7 +8136,7 @@ mod tests {
         };
         order.client_order_id = "1".to_string();
 
-        let applied = dispatch_lighter_order(
+        dispatch_lighter_order(
             &order,
             &dispatch,
             &emitter,
@@ -7849,7 +8147,6 @@ mod tests {
         );
 
         let events = drain_events(&mut rx);
-        assert!(!applied, "incomplete order frames must withhold readiness");
         assert!(
             events.is_empty(),
             "no event for uncached instrument, was {events:?}"

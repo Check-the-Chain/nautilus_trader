@@ -28,10 +28,14 @@ from nautilus_trader.model import ContingencyType
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import MarketOrder
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import Venue
+from nautilus_trader.trading import Controller
+from nautilus_trader.trading import ImportableStrategyConfig
 from nautilus_trader.trading import Strategy
+from nautilus_trader.trading import StrategyConfig
 
 
 class TestActorConfig(DataActorConfig):
@@ -44,6 +48,92 @@ class TestActor(DataActor):
 
 class TestStrategy(Strategy):
     pass
+
+
+class TestStrategyConfig(StrategyConfig):
+    def __new__(cls, *args, strategy_id: str | None = None, **kwargs):
+        instance = super().__new__(cls, *args, **kwargs)
+        instance._strategy_id_override = strategy_id
+        return instance
+
+    def __init__(self, strategy_id: str | None = None, **kwargs):
+        super().__init__()
+
+    @property
+    def strategy_id(self):
+        if self._strategy_id_override is not None:
+            return self._strategy_id_override
+        return super().strategy_id
+
+
+class TestControllerConfig(DataActorConfig):
+    pass
+
+
+class ControllerRegistrationProbeConfig(DataActorConfig):
+    def __init__(self, actor_id=None, log_events: bool = True, log_commands: bool = True):
+        self.actor_id = actor_id
+        self.log_events = log_events
+        self.log_commands = log_commands
+
+
+class ControllerRegistrationProbe(Controller):
+    constructed = 0
+    received_actor_id = None
+
+    @classmethod
+    def reset(cls):
+        cls.constructed = 0
+        cls.received_actor_id = None
+
+    def __init__(self, config):
+        super().__init__(config)
+        type(self).constructed += 1
+        type(self).received_actor_id = str(config.actor_id)
+
+
+class ControllerCreatedStrategy(Strategy):
+    started = 0
+
+    @classmethod
+    def reset(cls):
+        cls.started = 0
+
+    def on_start(self):
+        type(self).started += 1
+
+
+class StrategyCreatingController(Controller):
+    started = 0
+    created_strategy_id = None
+
+    @classmethod
+    def reset(cls):
+        cls.started = 0
+        cls.created_strategy_id = None
+
+    def on_start(self):
+        type(self).started += 1
+        type(self).created_strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ControllerCreatedStrategy",
+                config_path="tests.unit.common.actor:TestStrategyConfig",
+                config={"strategy_id": "ControllerCreatedStrategy-001"},
+            ),
+        )
+
+
+class NonStartingStrategyCreatingController(StrategyCreatingController):
+    def on_start(self):
+        type(self).started += 1
+        type(self).created_strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ControllerCreatedStrategy",
+                config_path="tests.unit.common.actor:TestStrategyConfig",
+                config={"strategy_id": "ControllerCreatedStrategy-001"},
+            ),
+            start=False,
+        )
 
 
 class PortfolioProbeStrategy(Strategy):
@@ -114,6 +204,45 @@ def _market_order(
         quote_quantity=False,
         contingency_type=ContingencyType.NO_CONTINGENCY,
     )
+
+
+class OrderListCacheProbeStrategy(Strategy):
+    observed_order_list = None
+    observed_order_lists = None
+    observed_order_list_id = None
+    observed_client_order_ids = None
+    observed_strategy_id = None
+
+    @classmethod
+    def reset(cls):
+        cls.observed_order_list = None
+        cls.observed_order_lists = None
+        cls.observed_order_list_id = None
+        cls.observed_client_order_ids = None
+        cls.observed_strategy_id = None
+
+    def on_start(self):
+        instrument_id = InstrumentId.from_str("AUD/USD.SIM")
+        orders = self.order_factory.bracket(
+            instrument_id=instrument_id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_str("100000"),
+            tp_price=Price.from_str("1.10000"),
+            sl_trigger_price=Price.from_str("0.90000"),
+        )
+
+        type(self).observed_client_order_ids = [order.client_order_id for order in orders]
+        type(self).observed_strategy_id = self.strategy_id
+        self.submit_order_list(orders)
+
+        order_lists = self.cache.order_lists(
+            instrument_id=instrument_id,
+            strategy_id=self.strategy_id,
+        )
+        cached = order_lists[0]
+        type(self).observed_order_lists = order_lists
+        type(self).observed_order_list_id = cached.id
+        type(self).observed_order_list = self.cache.order_list(cached.id)
 
 
 class PortfolioHedgedProbeStrategy(Strategy):
