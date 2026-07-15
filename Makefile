@@ -512,8 +512,8 @@ security-audit: check-audit-installed check-deny-installed check-vet-installed c
 	@$(call audit_step,cargo audit lighter fuzz,cargo audit --color never --file crates/adapters/lighter/fuzz/Cargo.lock)
 	@$(call audit_step,cargo audit derive fuzz,cargo audit --color never --file crates/adapters/derive/fuzz/Cargo.lock)
 	@$(call audit_step,cargo deny,cargo deny --all-features check advisories licenses sources bans)
-	@$(call audit_step,cargo deny lighter fuzz,cargo deny --manifest-path crates/adapters/lighter/fuzz/Cargo.toml --locked --all-features check --config .cargo/deny-fuzz.toml advisories licenses sources bans)
-	@$(call audit_step,cargo deny derive fuzz,cargo deny --manifest-path crates/adapters/derive/fuzz/Cargo.toml --locked --all-features check --config .cargo/deny-fuzz.toml advisories licenses sources bans)
+	@$(call audit_step,cargo deny lighter fuzz,cargo deny --manifest-path crates/adapters/lighter/fuzz/Cargo.toml --config .cargo/deny-fuzz.toml --locked --all-features check advisories licenses sources bans)
+	@$(call audit_step,cargo deny derive fuzz,cargo deny --manifest-path crates/adapters/derive/fuzz/Cargo.toml --config .cargo/deny-fuzz.toml --locked --all-features check advisories licenses sources bans)
 	@$(call audit_step,cargo vet,cargo vet --locked)
 	@$(call audit_step,cargo vet lighter fuzz,cargo vet --locked --manifest-path crates/adapters/lighter/fuzz/Cargo.toml --store-path .supply-chain)
 	@$(call audit_step,cargo vet derive fuzz,cargo vet --locked --manifest-path crates/adapters/derive/fuzz/Cargo.toml --store-path .supply-chain)
@@ -600,9 +600,20 @@ check-audit-installed:  #-- Verify cargo-audit is installed
 	fi
 
 .PHONY: check-deny-installed
-check-deny-installed:  #-- Verify cargo-deny is installed
+check-deny-installed:  #-- Verify the pinned cargo-deny version is installed
 	@if ! cargo deny --version >/dev/null 2>&1; then \
-		echo "cargo-deny is not installed. You can install it using 'cargo install cargo-deny'"; \
+		printf "$(YELLOW)cargo-deny %s is required but not installed$(RESET)\n" \
+			"$(CARGO_DENY_VERSION)"; \
+		printf "Install with: $(CYAN)cargo install cargo-deny --version %s --locked$(RESET)\n" \
+			"$(CARGO_DENY_VERSION)"; \
+		exit 1; \
+	fi
+	@INSTALLED=$$(cargo deny --version | awk '{print $$2}'); \
+	if [ "$$INSTALLED" != "$(CARGO_DENY_VERSION)" ]; then \
+		printf "$(RED)cargo-deny version mismatch: installed %s, expected %s (from Cargo.toml)$(RESET)\n" \
+			"$$INSTALLED" "$(CARGO_DENY_VERSION)"; \
+		printf "Install with: $(CYAN)cargo install cargo-deny --version %s --locked$(RESET)\n" \
+			"$(CARGO_DENY_VERSION)"; \
 		exit 1; \
 	fi
 
@@ -762,7 +773,8 @@ endif
 # DST simulation smoke test. Compiles the in-scope crates under cfg(madsim)
 # and runs every test that is sim-compatible today: all of nautilus-common,
 # nautilus-network, and nautilus-execution (transport-bound tests are gated
-# out at the source), plus the cross-crate seam pinning tests in nautilus-core.
+# out at the source), the LiveNode startup reconciliation timeout regression,
+# plus the cross-crate seam pinning tests in nautilus-core.
 # Each leg runs with the standard fixed-precision build first, then again
 # under `high-precision` for the crates that consume `nautilus-model` types,
 # so the seam-routed code paths are exercised under both `QuantityRaw` /
@@ -774,11 +786,13 @@ cargo-test-sim: export RUSTFLAGS=--cfg madsim
 cargo-test-sim: check-nextest-installed
 cargo-test-sim:  #-- Run DST simulation smoke tests (cfg madsim + simulation feature)
 	$(info $(M) Building in-scope crates under simulation (compile gate)...)
-	cargo build -p nautilus-common -p nautilus-core -p nautilus-network -p nautilus-execution --tests --lib --features simulation
+	cargo build -p nautilus-common -p nautilus-core -p nautilus-network -p nautilus-execution -p nautilus-live --tests --lib --features simulation
 	$(info $(M) Running nautilus-common tests under simulation...)
 	cargo nextest run -p nautilus-common --features simulation $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --status-level fail --final-status-level flaky
 	$(info $(M) Running nautilus-common tests under simulation + high-precision...)
 	cargo nextest run -p nautilus-common --features "simulation,high-precision" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --status-level fail --final-status-level flaky
+	$(info $(M) Running nautilus-live startup reconciliation test under simulation...)
+	cargo nextest run -p nautilus-live --features simulation --test node -E 'test(test_startup_reconciliation_times_out_waiting_for_mass_status)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --status-level fail --final-status-level flaky
 	$(info $(M) Running nautilus-network tests under simulation...)
 	cargo nextest run -p nautilus-network --features simulation $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) --status-level fail --final-status-level flaky
 	$(info $(M) Running nautilus-execution tests under simulation...)
