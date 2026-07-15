@@ -79,6 +79,7 @@
 
 use std::{collections::HashSet, fmt::Debug, future::Future, pin::Pin, time::Duration};
 
+use anyhow::Context;
 use indexmap::IndexSet;
 use nautilus_common::{
     actor::{Actor, DataActor, DataActorNative},
