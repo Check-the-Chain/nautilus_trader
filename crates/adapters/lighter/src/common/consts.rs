@@ -39,7 +39,7 @@ pub const LIGHTER_MAINNET_CHAIN_ID: u32 = 304;
 pub const LIGHTER_TESTNET_CHAIN_ID: u32 = 300;
 
 /// Nautilus integrator account index on Lighter.
-pub const LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX: u64 = 723_813;
+pub const LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX: u64 = 727_418;
 
 /// Venue error code for missing integrator approval.
 pub const LIGHTER_ERROR_CODE_INTEGRATOR_NOT_APPROVED: u64 = 21_149;

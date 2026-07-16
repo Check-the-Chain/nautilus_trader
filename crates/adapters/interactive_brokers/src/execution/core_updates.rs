@@ -617,6 +617,40 @@ impl InteractiveBrokersExecutionClient {
                     .map_err(|e| anyhow::anyhow!("Failed to send order canceled event: {e}"))?;
                 tracing::debug!("Order {} canceled", client_order_id);
             }
+            Some(IbOrderStatus::Inactive) => {
+                pending_cancel_orders
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Failed to lock pending cancel orders map"))?
+                    .remove(&client_order_id);
+
+                let (trader_id, strategy_id) = Self::get_required_order_actor_ids(
+                    status.order_id,
+                    trader_id_map,
+                    strategy_id_map,
+                )?;
+                let reason = if status.why_held.is_empty() {
+                    "IB order became inactive".to_string()
+                } else {
+                    format!("IB order became inactive: {}", status.why_held)
+                };
+                let event = OrderRejected::new(
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    account_id,
+                    Ustr::from(reason.as_str()),
+                    UUID4::new(),
+                    ts_init,
+                    ts_init,
+                    false,
+                    false,
+                );
+                exec_sender
+                    .send(ExecutionEvent::Order(OrderEventAny::Rejected(event)))
+                    .map_err(|e| anyhow::anyhow!("Failed to send order rejected event: {e}"))?;
+                tracing::debug!("Order {} rejected as inactive", client_order_id);
+            }
             Some(IbOrderStatus::PendingCancel) => {
                 Self::emit_order_pending_cancel(
                     status.order_id,

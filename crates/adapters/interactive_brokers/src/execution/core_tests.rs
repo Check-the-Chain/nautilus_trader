@@ -1351,6 +1351,110 @@ async fn test_handle_order_status_canceled_emits_canceled_event() {
 }
 
 #[tokio::test]
+async fn test_handle_order_status_inactive_emits_rejected_and_evicts_state() {
+    let instrument_provider = create_test_instrument_provider();
+    let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let trader_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let strategy_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let active_order_contexts = Arc::new(Mutex::new(AHashMap::new()));
+    let terminal_order_contexts = Arc::new(Mutex::new(FifoCacheMap::new()));
+    let order_avg_prices = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fills = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fill_avgs = Arc::new(Mutex::new(AHashMap::new()));
+    let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_cancel_orders = Arc::new(Mutex::new(ahash::AHashSet::new()));
+    let order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let spread_fill_tracking = Arc::new(Mutex::new(AHashMap::new()));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let order_id = 7002;
+    let client_order_id = ClientOrderId::from("O-INACTIVE-001");
+    let instrument_id = create_test_spread_instrument();
+
+    venue_order_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, client_order_id);
+    order_id_map
+        .lock()
+        .unwrap()
+        .insert(client_order_id, order_id);
+    instrument_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, instrument_id);
+    trader_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, TraderId::from("TRADER-001"));
+    strategy_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, StrategyId::from("STRATEGY-001"));
+    active_order_contexts.lock().unwrap().insert(
+        order_id,
+        create_tracked_order_context(client_order_id, instrument_id),
+    );
+    pending_cancel_orders
+        .lock()
+        .unwrap()
+        .insert(client_order_id);
+
+    let mut status = create_test_order_status(order_id, "Inactive");
+    status.why_held = "price cap".to_string();
+    InteractiveBrokersExecutionClient::handle_order_status(
+        &status,
+        &order_id_map,
+        &venue_order_id_map,
+        &instrument_provider,
+        &exec_sender,
+        UnixNanos::new(1),
+        AccountId::from("IB-001"),
+        &instrument_id_map,
+        &trader_id_map,
+        &strategy_id_map,
+        &active_order_contexts,
+        &terminal_order_contexts,
+        &order_avg_prices,
+        &pending_combo_fills,
+        &pending_combo_fill_avgs,
+        &order_fill_progress,
+        &pending_cancel_orders,
+        &spread_fill_tracking,
+    )
+    .await
+    .unwrap();
+
+    let event = exec_receiver.try_recv().unwrap();
+    match event {
+        ExecutionEvent::Order(OrderEventAny::Rejected(event)) => {
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.instrument_id, instrument_id);
+            assert!(event.reason.as_str().contains("price cap"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert!(
+        !pending_cancel_orders
+            .lock()
+            .unwrap()
+            .contains(&client_order_id)
+    );
+    assert!(order_id_map.lock().unwrap().is_empty());
+    assert!(venue_order_id_map.lock().unwrap().is_empty());
+    assert!(instrument_id_map.lock().unwrap().is_empty());
+    assert!(trader_id_map.lock().unwrap().is_empty());
+    assert!(strategy_id_map.lock().unwrap().is_empty());
+    assert!(active_order_contexts.lock().unwrap().is_empty());
+    assert!(
+        terminal_order_contexts
+            .lock()
+            .unwrap()
+            .contains_key(&order_id)
+    );
+}
+
+#[tokio::test]
 async fn test_process_order_update_stream_emits_accepted_then_canceled() {
     let instrument_provider = create_test_instrument_provider();
     let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));

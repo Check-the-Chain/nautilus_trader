@@ -1424,84 +1424,101 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let raw_account_id = raw_ib_account_code(&self.core.account_id);
 
         let handle = get_runtime().spawn(async move {
+            enum QueryScan {
+                Found,
+                Missing,
+                Failed,
+            }
+
             let timeout_dur = Duration::from_secs(request_timeout_secs);
-            let subscription =
-                match tokio::time::timeout(timeout_dur, client_clone.all_open_orders()).await {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => {
+            let scan = tokio::time::timeout(timeout_dur, async {
+                let subscription = match client_clone.all_open_orders().await {
+                    Ok(subscription) => subscription,
+                    Err(e) => {
                         tracing::error!("query_order: failed to request open orders: {e}");
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::error!("query_order: timeout requesting open orders");
-                        return;
+                        return QueryScan::Failed;
                     }
                 };
-            let mut subscription = subscription.filter_data();
+                let mut subscription = subscription.filter_data();
 
-            while let Some(order_result) = subscription.next().await {
-                if let Ok(Orders::OrderData(data)) = order_result {
-                    if !data.order.account.is_empty() && data.order.account != raw_account_id {
-                        continue;
-                    }
-
-                    if !target_order.matches(data.order_id, data.order.perm_id) {
-                        continue;
-                    }
-
-                    let instrument_id = match instrument_id_map.lock() {
-                        Ok(map) => map.get(&data.order_id).copied(),
-                        Err(_) => None,
-                    };
-                    let instrument_id = match instrument_id {
-                        Some(id) => id,
-                        None => match instrument_provider
-                            .resolve_instrument_id_for_contract(&data.contract)
-                        {
-                            Ok(id) => id,
-                            Err(e) => {
-                                tracing::warn!("query_order: failed to convert contract: {e}");
-                                return;
-                            }
-                        },
-                    };
-
-                    let report = match parse_order_status_to_report(
-                        &IBOrderStatus {
-                            order_id: data.order_id,
-                            status: data.order_state.status,
-                            filled: data.order.filled_quantity,
-                            remaining: (data.order.total_quantity - data.order.filled_quantity)
-                                .max(0.0),
-                            average_fill_price: None,
-                            perm_id: data.order.perm_id,
-                            parent_id: 0,
-                            last_fill_price: None,
-                            client_id: data.order.client_id,
-                            why_held: String::new(),
-                            market_cap_price: None,
-                        },
-                        Some(&data.order),
-                        instrument_id,
-                        account_id,
-                        &instrument_provider,
-                        ts_init,
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("query_order: failed to parse order status: {e}");
-                            return;
+                while let Some(order_result) = subscription.next().await {
+                    if let Ok(Orders::OrderData(data)) = order_result {
+                        if !data.order.account.is_empty() && data.order.account != raw_account_id {
+                            continue;
                         }
-                    };
 
-                    if exec_sender
-                        .send(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
-                            report,
-                        ))))
-                        .is_err()
-                    {
-                        tracing::error!("query_order: failed to send order status report");
+                        if !target_order.matches(data.order_id, data.order.perm_id) {
+                            continue;
+                        }
+
+                        let instrument_id = match instrument_id_map.lock() {
+                            Ok(map) => map.get(&data.order_id).copied(),
+                            Err(_) => None,
+                        };
+                        let instrument_id = match instrument_id {
+                            Some(id) => id,
+                            None => match instrument_provider
+                                .resolve_instrument_id_for_contract(&data.contract)
+                            {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    tracing::warn!("query_order: failed to convert contract: {e}");
+                                    return QueryScan::Failed;
+                                }
+                            },
+                        };
+
+                        let report = match parse_order_status_to_report(
+                            &IBOrderStatus {
+                                order_id: data.order_id,
+                                status: data.order_state.status,
+                                filled: data.order.filled_quantity,
+                                remaining: (data.order.total_quantity - data.order.filled_quantity)
+                                    .max(0.0),
+                                average_fill_price: None,
+                                perm_id: data.order.perm_id,
+                                parent_id: 0,
+                                last_fill_price: None,
+                                client_id: data.order.client_id,
+                                why_held: String::new(),
+                                market_cap_price: None,
+                            },
+                            Some(&data.order),
+                            instrument_id,
+                            account_id,
+                            &instrument_provider,
+                            ts_init,
+                        ) {
+                            Ok(report) => report,
+                            Err(e) => {
+                                tracing::warn!("query_order: failed to parse order status: {e}");
+                                return QueryScan::Failed;
+                            }
+                        };
+
+                        if exec_sender
+                            .send(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
+                                report,
+                            ))))
+                            .is_err()
+                        {
+                            tracing::error!("query_order: failed to send order status report");
+                            return QueryScan::Failed;
+                        }
+                        return QueryScan::Found;
                     }
+                }
+                QueryScan::Missing
+            })
+            .await;
+
+            match scan {
+                Ok(QueryScan::Found | QueryScan::Failed) => return,
+                Ok(QueryScan::Missing) => {}
+                Err(_) => {
+                    tracing::error!(
+                        "query_order: timeout waiting for complete open-order response"
+                    );
                     return;
                 }
             }
