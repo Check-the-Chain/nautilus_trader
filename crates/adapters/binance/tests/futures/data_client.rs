@@ -70,6 +70,7 @@ use nautilus_model::{
     data::{CustomData, Data, DataType},
     enums::{BookAction, BookType, OrderSide, RecordFlag},
     identifiers::InstrumentId,
+    instruments::InstrumentAny,
 };
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
@@ -169,6 +170,15 @@ fn json_response(body: &serde_json::Value) -> Response {
         .into_response()
 }
 
+fn load_fixture(name: &str) -> serde_json::Value {
+    let path = format!(
+        "{}/test_data/futures/http_json/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let content = std::fs::read_to_string(&path).expect("Failed to read fixture");
+    serde_json::from_str(&content).expect("Failed to parse fixture JSON")
+}
+
 async fn handle_ws(
     State(state): State<DataTestServerState>,
     ws: axum::extract::WebSocketUpgrade,
@@ -210,11 +220,16 @@ async fn handle_ws_connection(mut socket: WebSocket, state: DataTestServerState)
                 }
 
                 for stream in streams {
+                    let symbol = stream
+                        .split_once('@')
+                        .map_or(stream.as_str(), |(symbol, _)| symbol)
+                        .to_ascii_uppercase();
+
                     if stream.contains("@aggTrade") {
                         let trade = json!({
                             "e": "aggTrade",
                             "E": 1700000000000_i64,
-                            "s": "BTCUSDT",
+                            "s": symbol,
                             "a": 1,
                             "p": "50000.00",
                             "q": "0.001",
@@ -231,7 +246,7 @@ async fn handle_ws_connection(mut socket: WebSocket, state: DataTestServerState)
                             "u": 12345,
                             "E": 1700000000000_i64,
                             "T": 1700000000000_i64,
-                            "s": "BTCUSDT",
+                            "s": symbol,
                             "b": "50000.00",
                             "B": "1.000",
                             "a": "50001.00",
@@ -440,6 +455,23 @@ async fn handle_open_interest_hist(raw_query: RawQuery) -> Response {
         ]));
     }
 
+    if params.get("pair").is_some_and(|pair| pair == "BTCUSD")
+        && params
+            .get("contractType")
+            .is_some_and(|contract_type| contract_type == "CURRENT_QUARTER")
+        && params.get("period").is_some_and(|period| period == "5m")
+    {
+        return json_response(&json!([
+            {
+                "pair": "BTCUSD",
+                "contractType": "CURRENT_QUARTER",
+                "sumOpenInterest": "300.0",
+                "sumOpenInterestValue": "2500.0",
+                "timestamp": 1700001200000_i64
+            }
+        ]));
+    }
+
     (
         StatusCode::BAD_REQUEST,
         [("content-type", "application/json")],
@@ -484,48 +516,22 @@ async fn handle_funding_rate(raw_query: RawQuery) -> Response {
 fn create_data_test_router(state: DataTestServerState) -> Router {
     Router::new()
         .route("/fapi/v1/ping", get(|| async { json_response(&json!({})) }))
+        .route("/dapi/v1/ping", get(|| async { json_response(&json!({})) }))
         .route(
             "/fapi/v1/exchangeInfo",
-            get(|| async {
-                json_response(&json!({
-                    "timezone": "UTC",
-                    "serverTime": 1700000000000_i64,
-                    "rateLimits": [],
-                    "exchangeFilters": [],
-                    "symbols": [{
-                        "symbol": "BTCUSDT",
-                        "pair": "BTCUSDT",
-                        "contractType": "PERPETUAL",
-                        "deliveryDate": 4133404800000_i64,
-                        "onboardDate": 1569398400000_i64,
-                        "status": "TRADING",
-                        "baseAsset": "BTC",
-                        "quoteAsset": "USDT",
-                        "marginAsset": "USDT",
-                        "pricePrecision": 2,
-                        "quantityPrecision": 3,
-                        "baseAssetPrecision": 8,
-                        "quotePrecision": 8,
-                        "maintMarginPercent": "2.5000",
-                        "requiredMarginPercent": "5.0000",
-                        "underlyingType": "COIN",
-                        "settlePlan": 0,
-                        "triggerProtect": "0.0500",
-                        "filters": [
-                            {"filterType": "PRICE_FILTER", "minPrice": "0.10", "maxPrice": "1000000", "tickSize": "0.10"},
-                            {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
-                            {"filterType": "MIN_NOTIONAL", "notional": "5"}
-                        ],
-                        "orderTypes": ["LIMIT", "MARKET", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"],
-                        "timeInForce": ["GTC", "IOC", "FOK", "GTD"]
-                    }]
-                }))
-            }),
+            get(|| async { json_response(&load_fixture("exchange_info_delivery_usdm.json")) }),
+        )
+        .route(
+            "/dapi/v1/exchangeInfo",
+            get(|| async { json_response(&load_fixture("exchange_info_delivery_coinm.json")) }),
         )
         .route("/fapi/v1/depth", get(handle_depth))
         .route("/fapi/v1/openInterest", get(handle_open_interest))
         .route("/dapi/v1/openInterest", get(handle_open_interest_coinm))
-        .route("/futures/data/openInterestHist", get(handle_open_interest_hist))
+        .route(
+            "/futures/data/openInterestHist",
+            get(handle_open_interest_hist),
+        )
         .route("/fapi/v1/fundingRate", get(handle_funding_rate))
         .route("/ws", get(handle_ws))
         .with_state(state)
@@ -637,6 +643,81 @@ async fn test_client_creation() {
     assert_eq!(client.client_id(), *BINANCE_CLIENT_ID);
     assert_eq!(client.venue(), Some(*BINANCE_VENUE));
     assert!(!client.is_connected());
+}
+
+#[rstest]
+#[case::usdm(
+    BinanceProductType::UsdM,
+    "BTCUSDT_260925.BINANCE",
+    "btcusdt_260925@bookTicker"
+)]
+#[case::coinm(
+    BinanceProductType::CoinM,
+    "BTCUSD_260925.BINANCE",
+    "btcusd_260925@bookTicker"
+)]
+#[tokio::test]
+async fn test_delivery_instrument_connects_and_subscribes_with_raw_symbol(
+    #[case] product_type: BinanceProductType,
+    #[case] expected_id: &str,
+    #[case] expected_stream: &str,
+) {
+    let state = DataTestServerState::default();
+    let addr = start_data_test_server_with_state(state.clone()).await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, mut rx) =
+        create_test_data_client_for_product_type(base_url_http, base_url_ws, product_type);
+    let instrument_id = InstrumentId::from(expected_id);
+
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                matches!(
+                    event,
+                    DataEvent::Instrument(InstrumentAny::CryptoFuture(future))
+                        if future.id == instrument_id
+                )
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client
+        .subscribe_quotes(SubscribeQuotes::new(
+            instrument_id,
+            Some(*BINANCE_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = recorded_streams_include(&state.subscriptions, expected_stream);
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                matches!(event, DataEvent::Data(Data::Quote(quote)) if quote.instrument_id == instrument_id)
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
 }
 
 #[rstest]
@@ -896,6 +977,65 @@ async fn test_request_open_interest_hist_coinm_uses_pair_and_contract_type_mappi
                     && payload.points[1].sum_open_interest_value
                         == Decimal::from_str("1510.0").unwrap()
                     && custom.data_type == data_type
+            });
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_open_interest_hist_coinm_delivery_uses_exchange_contract_type() {
+    let addr = start_data_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, mut rx) = create_test_data_client_for_product_type(
+        base_url_http,
+        base_url_ws,
+        BinanceProductType::CoinM,
+    );
+    let instrument_id = InstrumentId::from("BTCUSD_260925.BINANCE");
+    let data_type = open_interest_hist_data_type_for_instrument(instrument_id, "5m");
+
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    client
+        .request_data(RequestCustomData::new(
+            *BINANCE_CLIENT_ID,
+            data_type.clone(),
+            None,
+            None,
+            Some(NonZeroUsize::new(1).unwrap()),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let found = rx.try_recv().is_ok_and(|event| {
+                let DataEvent::Response(DataResponse::Data(resp)) = event else {
+                    return false;
+                };
+                let Some(custom) = resp.data.as_ref().downcast_ref::<CustomData>() else {
+                    return false;
+                };
+
+                custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<BinanceFuturesOpenInterestHist>()
+                    .is_some_and(|payload| {
+                        payload.instrument_id == instrument_id
+                            && payload.points.len() == 1
+                            && payload.points[0].sum_open_interest == Decimal::from(300)
+                            && custom.data_type == data_type
+                    })
             });
             async move { found }
         },

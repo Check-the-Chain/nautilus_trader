@@ -28,7 +28,7 @@ use nautilus_architect_ax::{
 };
 use nautilus_common::{cache::InstrumentLookupError, testing::wait_until_async};
 use nautilus_model::{
-    enums::{OrderSide, OrderType, TimeInForce},
+    enums::{OrderSide, TimeInForce},
     identifiers::{AccountId, ClientOrderId, StrategyId, TraderId, VenueOrderId},
     instruments::Instrument,
     types::{Price, Quantity},
@@ -1133,11 +1133,9 @@ async fn test_orders_submit_order() {
             instrument.id(),
             ClientOrderId::from("TEST-001"),
             OrderSide::Buy,
-            OrderType::Limit,
             Quantity::from("100"),
             TimeInForce::Gtc,
-            Some(Price::from("50000.00")),
-            None,
+            Price::from("50000.00"),
             false,
         )
         .await
@@ -1190,11 +1188,9 @@ async fn test_orders_submit_order_missing_cached_instrument_returns_lookup_error
             instrument.id(),
             ClientOrderId::from("TEST-001"),
             OrderSide::Buy,
-            OrderType::Limit,
             Quantity::from("100"),
             TimeInForce::Gtc,
-            Some(Price::from("50000.00")),
-            None,
+            Price::from("50000.00"),
             false,
         )
         .await;

@@ -72,12 +72,17 @@ impl AxDataClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(AxDataClientConfig).to_string()
     }
 
     fn __str__(&self) -> String {
-        format!("{self:?}")
+        stringify!(AxDataClientConfig).to_string()
     }
 }
 
@@ -131,11 +136,16 @@ impl AxExecClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(AxExecClientConfig).to_string()
     }
 
     fn __str__(&self) -> String {
-        format!("{self:?}")
+        stringify!(AxExecClientConfig).to_string()
     }
 }

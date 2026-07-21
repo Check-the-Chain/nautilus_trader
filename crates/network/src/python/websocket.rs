@@ -125,6 +125,84 @@ impl WebSocketConfig {
         config.validate().map_err(to_pyvalue_err)?;
         Ok(config)
     }
+
+    #[getter]
+    #[pyo3(name = "url")]
+    fn py_url(&self) -> &str {
+        &self.url
+    }
+
+    #[getter]
+    #[pyo3(name = "header_names")]
+    fn py_header_names(&self) -> Vec<String> {
+        self.headers.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    #[getter]
+    #[pyo3(name = "heartbeat")]
+    const fn py_heartbeat(&self) -> Option<u64> {
+        self.heartbeat
+    }
+
+    #[getter]
+    #[pyo3(name = "heartbeat_msg")]
+    fn py_heartbeat_msg(&self) -> Option<&str> {
+        self.heartbeat_msg.as_deref()
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_timeout_ms")]
+    const fn py_reconnect_timeout_ms(&self) -> Option<u64> {
+        self.reconnect_timeout_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_delay_initial_ms")]
+    const fn py_reconnect_delay_initial_ms(&self) -> Option<u64> {
+        self.reconnect_delay_initial_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_delay_max_ms")]
+    const fn py_reconnect_delay_max_ms(&self) -> Option<u64> {
+        self.reconnect_delay_max_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_backoff_factor")]
+    const fn py_reconnect_backoff_factor(&self) -> Option<f64> {
+        self.reconnect_backoff_factor
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_jitter_ms")]
+    const fn py_reconnect_jitter_ms(&self) -> Option<u64> {
+        self.reconnect_jitter_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_max_attempts")]
+    const fn py_reconnect_max_attempts(&self) -> Option<u32> {
+        self.reconnect_max_attempts
+    }
+
+    #[getter]
+    #[pyo3(name = "idle_timeout_ms")]
+    const fn py_idle_timeout_ms(&self) -> Option<u64> {
+        self.idle_timeout_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "backend")]
+    const fn py_backend(&self) -> TransportBackend {
+        self.backend
+    }
+
+    #[getter]
+    #[pyo3(name = "has_proxy_url")]
+    fn py_has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
 }
 
 #[pymethods]

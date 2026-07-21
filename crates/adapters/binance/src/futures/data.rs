@@ -84,7 +84,7 @@ use crate::{
     },
     futures::{
         http::{
-            client::BinanceFuturesHttpClient,
+            client::{BinanceFuturesHttpClient, BinanceFuturesInstrument},
             models::BinanceOrderBook,
             query::{BinanceDepthParams, BinanceOpenInterestHistParams, BinanceOpenInterestParams},
         },
@@ -331,19 +331,27 @@ impl BinanceFuturesDataClient {
         Ok(period.to_string())
     }
 
-    /// Returns COIN-M historical OI request parameters for the current
-    /// perpetual-only Binance futures instrument surface.
     fn coinm_open_interest_hist_params(
+        http: &BinanceFuturesHttpClient,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<(String, String)> {
         let symbol = format_binance_symbol(instrument_id);
-        let Some(pair) = symbol.strip_suffix("_PERP") else {
-            anyhow::bail!(
-                "COIN-M open interest history requires a perpetual instrument, received {instrument_id}"
-            );
+        if let Some(pair) = symbol.strip_suffix("_PERP") {
+            return Ok((pair.to_string(), "PERPETUAL".to_string()));
+        }
+
+        let cache = http.instruments_cache();
+        let definition = cache
+            .get(&Ustr::from(symbol.as_str()))
+            .with_context(|| format!("missing COIN-M definition for {instrument_id}"))?;
+        let BinanceFuturesInstrument::CoinM(definition) = definition.value() else {
+            anyhow::bail!("expected a COIN-M definition for {instrument_id}");
         };
 
-        Ok((pair.to_string(), "PERPETUAL".to_string()))
+        Ok((
+            definition.pair.to_string(),
+            definition.contract_type.clone(),
+        ))
     }
 
     fn parse_open_interest_decimal(field: &str, value: &str) -> anyhow::Result<Decimal> {
@@ -2087,6 +2095,7 @@ impl DataClient for BinanceFuturesDataClient {
                 }
             })
             .is_ok_and(|prev| prev == 1);
+
         if should_unsubscribe {
             self.spawn_liquidation_stream_reconcile("all-market forceOrder unsubscribe");
         }
@@ -2470,7 +2479,7 @@ impl DataClient for BinanceFuturesDataClient {
                     },
                     BinanceProductType::CoinM => {
                         let (pair, contract_type) =
-                            match Self::coinm_open_interest_hist_params(&instrument_id) {
+                            match Self::coinm_open_interest_hist_params(&http, &instrument_id) {
                                 Ok(values) => values,
                                 Err(e) => {
                                     log::error!(

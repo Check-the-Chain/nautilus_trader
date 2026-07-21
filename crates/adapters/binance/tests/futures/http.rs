@@ -44,7 +44,13 @@ use nautilus_binance::{
 };
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::time::get_atomic_clock_realtime;
-use nautilus_model::{data::BarType, identifiers::InstrumentId};
+use nautilus_model::{
+    data::BarType,
+    enums::MarketStatusAction,
+    identifiers::{AccountId, InstrumentId},
+    instruments::{Instrument, InstrumentAny},
+    types::Quantity,
+};
 use rstest::rstest;
 use serde_json::json;
 
@@ -129,37 +135,11 @@ async fn handle_time() -> Response {
 }
 
 async fn handle_exchange_info() -> Response {
-    json_response(&json!({
-        "timezone": "UTC",
-        "serverTime": 1700000000000_i64,
-        "rateLimits": [],
-        "exchangeFilters": [],
-        "symbols": [{
-            "symbol": "BTCUSDT",
-            "pair": "BTCUSDT",
-            "contractType": "PERPETUAL",
-            "deliveryDate": 4133404800000_i64,
-            "onboardDate": 1569398400000_i64,
-            "status": "TRADING",
-            "baseAsset": "BTC",
-            "quoteAsset": "USDT",
-            "marginAsset": "USDT",
-            "pricePrecision": 2,
-            "quantityPrecision": 3,
-            "baseAssetPrecision": 8,
-            "quotePrecision": 8,
-            "underlyingType": "COIN",
-            "settlePlan": 0,
-            "triggerProtect": "0.0500",
-            "filters": [
-                {"filterType": "PRICE_FILTER", "minPrice": "0.10", "maxPrice": "1000000", "tickSize": "0.10"},
-                {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
-                {"filterType": "MIN_NOTIONAL", "notional": "5"}
-            ],
-            "orderTypes": ["LIMIT", "MARKET", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"],
-            "timeInForce": ["GTC", "IOC", "FOK", "GTD"]
-        }]
-    }))
+    json_response(&load_fixture("exchange_info_delivery_usdm.json"))
+}
+
+async fn handle_coinm_exchange_info() -> Response {
+    json_response(&load_fixture("exchange_info_delivery_coinm.json"))
 }
 
 async fn handle_depth() -> Response {
@@ -249,7 +229,25 @@ async fn handle_open_orders(headers: HeaderMap, State(state): State<TestServerSt
     if state.increment_and_check() {
         return rate_limit_response();
     }
-    json_response(&json!([]))
+    let mut order = load_fixture("order_response.json");
+    order["symbol"] = json!("BTCUSDT_260925");
+    json_response(&json!([order]))
+}
+
+async fn handle_coinm_open_orders(
+    headers: HeaderMap,
+    State(state): State<TestServerState>,
+) -> Response {
+    if !has_auth_headers(&headers) {
+        return unauthorized_response();
+    }
+
+    if state.increment_and_check() {
+        return rate_limit_response();
+    }
+    let mut order = load_fixture("order_response.json");
+    order["symbol"] = json!("BTCUSD_260925");
+    json_response(&json!([order]))
 }
 
 async fn handle_cancel_all(headers: HeaderMap, State(state): State<TestServerState>) -> Response {
@@ -345,6 +343,7 @@ fn create_router(state: TestServerState) -> Router {
         .route("/fapi/v1/ping", get(handle_ping))
         .route("/fapi/v1/time", get(handle_time))
         .route("/fapi/v1/exchangeInfo", get(handle_exchange_info))
+        .route("/dapi/v1/exchangeInfo", get(handle_coinm_exchange_info))
         .route("/fapi/v1/depth", get(handle_depth))
         .route(
             "/futures/data/openInterestHist",
@@ -361,6 +360,7 @@ fn create_router(state: TestServerState) -> Router {
                 .put(handle_order_post),
         )
         .route("/fapi/v1/openOrders", get(handle_open_orders))
+        .route("/dapi/v1/openOrders", get(handle_coinm_open_orders))
         .route("/fapi/v1/allOrders", get(handle_all_orders))
         .route("/fapi/v1/allOpenOrders", delete(handle_cancel_all))
         .route(
@@ -402,6 +402,25 @@ fn create_raw_client(
         None,
         Some(60),
         None,
+    )
+    .unwrap()
+}
+
+fn create_domain_client(
+    addr: &SocketAddr,
+    product_type: BinanceProductType,
+) -> BinanceFuturesHttpClient {
+    BinanceFuturesHttpClient::new(
+        product_type,
+        BinanceEnvironment::Live,
+        get_atomic_clock_realtime(),
+        None,
+        None,
+        Some(format!("http://{addr}")),
+        None,
+        Some(60),
+        None,
+        false,
     )
     .unwrap()
 }
@@ -496,6 +515,64 @@ async fn test_exchange_info() {
     let symbols = result["symbols"].as_array().unwrap();
     assert!(!symbols.is_empty());
     assert_eq!(symbols[0]["symbol"], "BTCUSDT");
+}
+
+#[rstest]
+#[case::usdm(
+    BinanceProductType::UsdM,
+    "BTCUSDT_260925",
+    "BTCUSDT_260925.BINANCE",
+    "USDT",
+    false,
+    Quantity::from(1)
+)]
+#[case::coinm(
+    BinanceProductType::CoinM,
+    "BTCUSD_260925",
+    "BTCUSD_260925.BINANCE",
+    "BTC",
+    true,
+    Quantity::from(100)
+)]
+#[tokio::test]
+async fn test_request_delivery_instrument_populates_cache_and_status(
+    #[case] product_type: BinanceProductType,
+    #[case] raw_symbol: &str,
+    #[case] expected_id: &str,
+    #[case] settlement_currency: &str,
+    #[case] is_inverse: bool,
+    #[case] multiplier: Quantity,
+) {
+    let addr = start_test_server(TestServerState::default()).await.unwrap();
+    let client = create_domain_client(&addr, product_type);
+    let raw_symbol = ustr::Ustr::from(raw_symbol);
+
+    let instruments = client.request_instruments().await.unwrap();
+    let statuses = client.request_symbol_statuses().await.unwrap();
+    let instrument = instruments
+        .iter()
+        .find(|instrument| instrument.raw_symbol().inner() == raw_symbol)
+        .unwrap();
+    let InstrumentAny::CryptoFuture(future) = instrument else {
+        panic!("Expected CryptoFuture, was {instrument:?}");
+    };
+    let cache = client.instruments_cache();
+    let cached = cache
+        .get(&raw_symbol)
+        .expect("delivery instrument missing from HTTP cache");
+
+    assert_eq!(future.id.to_string(), expected_id);
+    assert_eq!(
+        future.settlement_currency.code.as_str(),
+        settlement_currency
+    );
+    assert_eq!(future.is_inverse, is_inverse);
+    assert_eq!(future.multiplier, multiplier);
+    assert_eq!(cached.id().to_string(), expected_id);
+    assert_eq!(
+        statuses.get(&raw_symbol),
+        Some(&MarketStatusAction::Trading),
+    );
 }
 
 #[rstest]
@@ -602,6 +679,38 @@ async fn test_open_orders_with_credentials() {
         .await
         .unwrap();
     assert!(result.as_array().is_some());
+}
+
+#[rstest]
+#[case::usdm(BinanceProductType::UsdM, "BTCUSDT_260925.BINANCE")]
+#[case::coinm(BinanceProductType::CoinM, "BTCUSD_260925.BINANCE")]
+#[tokio::test]
+async fn test_request_delivery_order_status_reports_without_instrument_id(
+    #[case] product_type: BinanceProductType,
+    #[case] expected_id: &str,
+) {
+    let addr = start_test_server(TestServerState::default()).await.unwrap();
+    let client = BinanceFuturesHttpClient::new(
+        product_type,
+        BinanceEnvironment::Live,
+        get_atomic_clock_realtime(),
+        Some("test-key".to_string()),
+        Some("test-secret".to_string()),
+        Some(format!("http://{addr}")),
+        None,
+        Some(60),
+        None,
+        false,
+    )
+    .unwrap();
+
+    let reports = client
+        .request_order_status_reports(AccountId::from("BINANCE-001"), None, true)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].instrument_id, InstrumentId::from(expected_id));
 }
 
 #[rstest]

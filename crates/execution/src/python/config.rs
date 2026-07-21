@@ -21,8 +21,8 @@ use pyo3::{PyResult, pymethods};
 
 use crate::{engine::config::ExecutionEngineConfig, order_emulator::config::OrderEmulatorConfig};
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl ExecutionEngineConfig {
     /// Configuration for `ExecutionEngine` instances.
     #[new]
@@ -115,6 +115,48 @@ impl ExecutionEngineConfig {
     #[pyo3(name = "allow_overfills")]
     const fn py_allow_overfills(&self) -> bool {
         self.allow_overfills
+    }
+
+    #[getter]
+    #[pyo3(name = "external_clients")]
+    fn py_external_clients(&self) -> Option<Vec<ClientId>> {
+        self.external_clients.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_closed_orders_interval_mins")]
+    const fn py_purge_closed_orders_interval_mins(&self) -> Option<u32> {
+        self.purge_closed_orders_interval_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_closed_orders_buffer_mins")]
+    const fn py_purge_closed_orders_buffer_mins(&self) -> Option<u32> {
+        self.purge_closed_orders_buffer_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_closed_positions_interval_mins")]
+    const fn py_purge_closed_positions_interval_mins(&self) -> Option<u32> {
+        self.purge_closed_positions_interval_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_closed_positions_buffer_mins")]
+    const fn py_purge_closed_positions_buffer_mins(&self) -> Option<u32> {
+        self.purge_closed_positions_buffer_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_account_events_interval_mins")]
+    const fn py_purge_account_events_interval_mins(&self) -> Option<u32> {
+        self.purge_account_events_interval_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_account_events_lookback_mins")]
+    const fn py_purge_account_events_lookback_mins(&self) -> Option<u32> {
+        self.purge_account_events_lookback_mins
     }
 
     #[getter]

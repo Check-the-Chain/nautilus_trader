@@ -131,7 +131,7 @@ pub(crate) fn parse_order_message(raw: &str) -> Result<AxOrdersWsFrame, serde_js
     }
 
     if let Some(res) = value.get("res") {
-        if res.is_array() {
+        if res.get("orders").is_some() {
             return serde_json::from_value(value)
                 .map(|r| AxOrdersWsFrame::Response(AxWsOrderResponse::OpenOrders(r)));
         }
@@ -262,11 +262,28 @@ mod tests {
         let AxWsOrderEvent::Replaced(replaced) = *event else {
             panic!("expected Replaced event");
         };
-        let order = replaced
-            .updated_order()
-            .expect("replacement should expose updated order");
 
-        assert_eq!(order.oid, "O-01KWY01WX8JT4DABKC6FRS5NT4");
-        assert_eq!(order.rq, 100);
+        assert_eq!(replaced.no.oid, "O-01KWY01WX8JT4DABKC6FRS5NT4");
+        assert_eq!(replaced.no.rq, 100);
+    }
+
+    #[rstest]
+    #[case::direct_open_orders_array(
+        include_str!("../../test_data/ws_order_open_orders_response_invalid_direct_array.json"),
+        "unrecognized order response shape",
+    )]
+    #[case::single_replacement_order(
+        include_str!("../../test_data/ws_order_replaced_invalid_single_order.json"),
+        "missing field `ro`",
+    )]
+    fn test_parse_order_message_rejects_obsolete_shapes(
+        #[case] raw: &str,
+        #[case] expected_error: &str,
+    ) {
+        let error = parse_order_message(raw).expect_err("obsolete shape should be rejected");
+        assert!(
+            error.to_string().contains(expected_error),
+            "expected {expected_error:?} in {error}",
+        );
     }
 }

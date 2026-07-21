@@ -793,7 +793,7 @@ pub fn parse_order_update_msg(
     // Uses external IDs; callers enrich with tracked identity when available
     let trader_id = TraderId::external();
     let strategy_id = StrategyId::external();
-    let instrument_id = parse_instrument_id(msg.symbol);
+    let instrument_id = parse_instrument_id(msg.symbol?);
     let venue_order_id = Some(VenueOrderId::new(msg.order_id.to_string()));
     let client_order_id = msg
         .cl_ord_id
@@ -808,6 +808,8 @@ pub fn parse_order_update_msg(
     };
     let price = msg
         .price
+        .value()
+        .copied()
         .map(|p| Price::new(p, instrument.price_precision()));
 
     // BitMEX doesn't send trigger price in regular order updates?

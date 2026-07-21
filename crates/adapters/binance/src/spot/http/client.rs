@@ -1907,6 +1907,7 @@ impl BinanceSpotHttpClient {
         post_only: bool,
         quote_quantity: bool,
         display_qty: Option<Quantity>,
+        use_gtd: bool,
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = instrument_id.symbol.inner();
         let instrument = self
@@ -1958,7 +1959,7 @@ impl BinanceSpotHttpClient {
         );
         let binance_tif = if supports_tif {
             Some(
-                time_in_force_to_binance_spot(time_in_force)
+                time_in_force_to_binance_spot(time_in_force, use_gtd)
                     .map_err(|e| Self::command_validation_error(e.to_string()))?,
             )
         } else {
@@ -2055,6 +2056,7 @@ impl BinanceSpotHttpClient {
         quantity: Quantity,
         time_in_force: TimeInForce,
         price: Option<Price>,
+        use_gtd: bool,
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = instrument_id.symbol.inner();
         let instrument = self
@@ -2066,7 +2068,7 @@ impl BinanceSpotHttpClient {
             .map_err(|e| Self::command_validation_error(e.to_string()))?;
         let binance_order_type = order_type_to_binance_spot(order_type, false)
             .map_err(|e| Self::command_validation_error(e.to_string()))?;
-        let binance_tif = time_in_force_to_binance_spot(time_in_force)
+        let binance_tif = time_in_force_to_binance_spot(time_in_force, use_gtd)
             .map_err(|e| Self::command_validation_error(e.to_string()))?;
 
         let cancel_order_id: i64 = venue_order_id.inner().parse().map_err(|_| {

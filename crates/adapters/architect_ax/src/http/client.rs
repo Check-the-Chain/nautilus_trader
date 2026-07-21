@@ -16,7 +16,7 @@
 //! Provides the HTTP client integration for the Ax REST API.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     num::NonZeroU32,
     sync::{
@@ -25,6 +25,7 @@ use std::{
     },
 };
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use nautilus_core::{
     AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, nanos::UnixNanos,
@@ -65,14 +66,13 @@ use super::{
         PlaceOrderRequest, PreviewAggressiveLimitOrderRequest, ReplaceOrderRequest,
     },
     parse::{
-        parse_account_state, parse_bar, parse_fill_report, parse_funding_rate,
-        parse_order_status_report, parse_perp_instrument, parse_position_status_report,
-        parse_trade_tick,
+        parse_account_state, parse_bar, parse_fill_report, parse_funding_rate, parse_instrument,
+        parse_order_status_report, parse_position_status_report, parse_trade_tick,
     },
     query::{
         GetBookParams, GetCandleParams, GetCandlesParams, GetFillsParams, GetFundingRatesParams,
-        GetInstrumentParams, GetOrderStatusParams, GetOrdersParams, GetTickerParams,
-        GetTickersParams, GetTradesParams, GetTransactionsParams,
+        GetInstrumentParams, GetOpenOrdersParams, GetOrderStatusParams, GetOrdersParams,
+        GetTickerParams, GetTickersParams, GetTradesParams, GetTransactionsParams,
     },
 };
 use crate::common::{
@@ -691,7 +691,7 @@ impl AxRawHttpClient {
         .await
     }
 
-    /// Cancels all open orders, optionally filtered by symbol or venue.
+    /// Cancels all open orders, optionally filtered by account or symbol.
     ///
     /// # Endpoint
     /// `POST /cancel-all-orders` (orders base URL)
@@ -725,18 +725,30 @@ impl AxRawHttpClient {
     ///
     /// Returns an error if the request fails or the response cannot be parsed.
     pub async fn get_open_orders(&self) -> Result<AxOpenOrdersResponse, AxHttpError> {
-        self.send_request_to_url::<AxOpenOrdersResponse, ()>(
+        self.get_open_orders_page(&GetOpenOrdersParams::new()).await
+    }
+
+    /// Fetches one page of open orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_open_orders_page(
+        &self,
+        params: &GetOpenOrdersParams,
+    ) -> Result<AxOpenOrdersResponse, AxHttpError> {
+        self.send_request_to_url::<AxOpenOrdersResponse, _>(
             &self.orders_base_url,
             Method::GET,
             "/open-orders",
-            None,
+            Some(params),
             None,
             true,
         )
         .await
     }
 
-    /// Fetches all fills/trades.
+    /// Fetches the default page of fills/trades.
     ///
     /// # Endpoint
     /// `GET /fills`
@@ -750,7 +762,19 @@ impl AxRawHttpClient {
         end_timestamp_ns: i64,
     ) -> Result<AxFillsResponse, AxHttpError> {
         let params = GetFillsParams::new(start_timestamp_ns, end_timestamp_ns);
-        self.send_request::<AxFillsResponse, _>(Method::GET, "/fills", Some(&params), None, true)
+        self.get_fills_page(&params).await
+    }
+
+    /// Fetches one page of fills/trades.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_fills_page(
+        &self,
+        params: &GetFillsParams,
+    ) -> Result<AxFillsResponse, AxHttpError> {
+        self.send_request::<AxFillsResponse, _>(Method::GET, "/fills", Some(params), None, true)
             .await
     }
 
@@ -833,7 +857,7 @@ impl AxRawHttpClient {
         Ok(response.candle)
     }
 
-    /// Fetches funding rates for a symbol.
+    /// Fetches the default page of funding rates for a symbol.
     ///
     /// # Endpoint
     /// `GET /funding-rates`
@@ -848,10 +872,22 @@ impl AxRawHttpClient {
         end_timestamp_ns: i64,
     ) -> Result<AxFundingRatesResponse, AxHttpError> {
         let params = GetFundingRatesParams::new(symbol, start_timestamp_ns, end_timestamp_ns);
+        self.get_funding_rates_page(&params).await
+    }
+
+    /// Fetches one page of funding rates for a symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_funding_rates_page(
+        &self,
+        params: &GetFundingRatesParams,
+    ) -> Result<AxFundingRatesResponse, AxHttpError> {
         self.send_request::<AxFundingRatesResponse, _>(
             Method::GET,
             "/funding-rates",
-            Some(&params),
+            Some(params),
             None,
             true,
         )
@@ -905,7 +941,7 @@ impl AxRawHttpClient {
         .await
     }
 
-    /// Fetches transactions filtered by type.
+    /// Fetches the default page of transactions filtered by type.
     ///
     /// # Endpoint
     /// `GET /transactions`
@@ -921,10 +957,22 @@ impl AxRawHttpClient {
     ) -> Result<AxTransactionsResponse, AxHttpError> {
         let params =
             GetTransactionsParams::new(transaction_types, start_timestamp_ns, end_timestamp_ns);
+        self.get_transactions_page(&params).await
+    }
+
+    /// Fetches one page of transactions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_transactions_page(
+        &self,
+        params: &GetTransactionsParams,
+    ) -> Result<AxTransactionsResponse, AxHttpError> {
         self.send_request::<AxTransactionsResponse, _>(
             Method::GET,
             "/transactions",
-            Some(&params),
+            Some(params),
             None,
             true,
         )
@@ -1326,7 +1374,7 @@ impl AxHttpClient {
                 continue;
             }
 
-            match parse_perp_instrument(inst, maker_fee, taker_fee, ts_init, ts_init) {
+            match parse_instrument(inst, maker_fee, taker_fee, ts_init, ts_init) {
                 Ok(instrument) => instruments.push(instrument),
                 Err(e) => {
                     log::warn!("Failed to parse instrument {}: {e}", inst.symbol);
@@ -1358,7 +1406,7 @@ impl AxHttpClient {
         let taker_fee = taker_fee.unwrap_or(Decimal::ZERO);
         let ts_init = self.generate_ts_init();
 
-        parse_perp_instrument(&resp, maker_fee, taker_fee, ts_init, ts_init)
+        parse_instrument(&resp, maker_fee, taker_fee, ts_init, ts_init)
     }
 
     /// Requests an order book snapshot from Ax and builds a Nautilus [`OrderBook`].
@@ -1520,6 +1568,9 @@ impl AxHttpClient {
 
     /// Requests funding rates from Ax and parses them to Nautilus types.
     ///
+    /// Traverses the provider's cursor chain. This is a best-effort historical
+    /// read, not an atomic snapshot if AX corrects rows during the traversal.
+    ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails.
@@ -1529,25 +1580,143 @@ impl AxHttpClient {
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
     ) -> Result<Vec<FundingRateUpdate>, AxHttpError> {
+        const PAGE_SIZE: i32 = 100;
+
         let symbol = instrument_id.symbol.inner();
         let start_ns = start.and_then(|dt| dt.timestamp_nanos_opt()).unwrap_or(0);
         let end_ns = end
             .and_then(|dt| dt.timestamp_nanos_opt())
             .unwrap_or_else(|| self.generate_ts_init().as_i64());
-        let response = self
-            .inner
-            .get_funding_rates(symbol, start_ns, end_ns)
-            .await?;
+        let mut params = GetFundingRatesParams::new(symbol, start_ns, end_ns);
+        params.limit = Some(PAGE_SIZE);
+        params.sort_ts = Some("desc".to_string());
+
+        let mut funding_rates = Vec::new();
+        let mut seen_rows = HashSet::new();
+        let mut seen_cursors = HashSet::new();
+        let mut expected_total = None;
+
+        loop {
+            let response = self.inner.get_funding_rates_page(&params).await?;
+            let page_len = response.funding_rates.len();
+
+            if page_len > PAGE_SIZE as usize {
+                return Err(format!(
+                    "AX funding-rates page length {page_len} exceeds requested limit {PAGE_SIZE}"
+                )
+                .into());
+            }
+
+            if let Some(limit) = response.limit {
+                if !(0..=PAGE_SIZE).contains(&limit) {
+                    return Err(format!(
+                        "AX funding-rates applied limit must be between 0 and {PAGE_SIZE}, was {limit}"
+                    )
+                    .into());
+                }
+
+                if page_len > limit as usize {
+                    return Err(format!(
+                        "AX funding-rates page length {page_len} exceeds applied limit {limit}"
+                    )
+                    .into());
+                }
+            }
+
+            if let Some(total_count) = response.total_count {
+                if total_count < 0 {
+                    return Err(format!(
+                        "AX funding-rates total_count must be non-negative, was {total_count}"
+                    )
+                    .into());
+                }
+
+                if let Some(expected) = expected_total {
+                    if total_count != expected {
+                        return Err(format!(
+                            "AX funding-rates total_count changed during pagination: expected {expected}, was {total_count}"
+                        )
+                        .into());
+                    }
+                } else {
+                    expected_total = Some(total_count);
+                }
+            }
+
+            for rate in response.funding_rates {
+                let identity = (
+                    rate.symbol,
+                    rate.timestamp_ns,
+                    rate.funding_rate,
+                    rate.funding_amount,
+                    rate.benchmark_price,
+                    rate.settlement_price,
+                );
+
+                if !seen_rows.insert(identity) {
+                    return Err(format!(
+                        "AX funding-rates pagination returned an exact duplicate row for {} at {}",
+                        rate.symbol, rate.timestamp_ns
+                    )
+                    .into());
+                }
+                funding_rates.push(rate);
+            }
+
+            if let Some(total_count) = expected_total
+                && funding_rates.len() as i64 > total_count
+            {
+                return Err(format!(
+                    "AX funding-rates pagination returned more unique rows ({}) than total_count {total_count}",
+                    funding_rates.len()
+                )
+                .into());
+            }
+
+            match response.next_cursor {
+                Some(next_cursor) => {
+                    if next_cursor.is_empty() {
+                        return Err("AX funding-rates returned an empty next_cursor"
+                            .to_string()
+                            .into());
+                    }
+
+                    if page_len == 0 {
+                        return Err("AX funding-rates returned an empty page with a next_cursor"
+                            .to_string()
+                            .into());
+                    }
+
+                    if !seen_cursors.insert(next_cursor.clone()) {
+                        return Err(format!(
+                            "AX funding-rates pagination repeated cursor {next_cursor:?}"
+                        )
+                        .into());
+                    }
+                    params.cursor = Some(next_cursor);
+                }
+                None => break,
+            }
+        }
+
+        if let Some(total_count) = expected_total
+            && funding_rates.len() as i64 != total_count
+        {
+            return Err(format!(
+                "AX funding-rates pagination returned {} unique rows, expected {total_count}",
+                funding_rates.len()
+            )
+            .into());
+        }
 
         let ts_init = self.generate_ts_init();
-        let funding_rates = response
-            .funding_rates
+        let updates = funding_rates
             .iter()
             .map(|r| parse_funding_rate(r, instrument_id, ts_init))
             .collect::<anyhow::Result<Vec<_>>>()
             .map_err(|e| AxHttpError::from(e.to_string()))?;
 
-        Ok(funding_rates)
+        Ok(updates)
     }
 
     /// Requests account state from Ax and parses to a Nautilus [`AccountState`].
@@ -1672,16 +1841,105 @@ impl AxHttpClient {
     where
         F: Fn(u64) -> Option<ClientOrderId>,
     {
-        let response = self
-            .inner
-            .get_open_orders()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        const PAGE_SIZE: i32 = 100;
+
+        let mut orders = Vec::new();
+        let mut seen_order_ids = HashSet::new();
+        let mut offset = 0_i64;
+        let mut expected_total = None;
+
+        loop {
+            let request_offset = i32::try_from(offset)
+                .context("AX open-orders offset exceeds the documented int32 range")?;
+            let params = GetOpenOrdersParams {
+                account_id: None,
+                limit: Some(PAGE_SIZE),
+                offset: Some(request_offset),
+                sort_ts: Some("desc".to_string()),
+            };
+            let response = self
+                .inner
+                .get_open_orders_page(&params)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            anyhow::ensure!(
+                response.total_count >= 0,
+                "AX open-orders total_count must be non-negative, was {}",
+                response.total_count
+            );
+            anyhow::ensure!(
+                response.limit >= 0 && response.limit <= PAGE_SIZE,
+                "AX open-orders applied limit must be between 0 and {PAGE_SIZE}, was {}",
+                response.limit
+            );
+            anyhow::ensure!(
+                i64::from(response.offset) == offset,
+                "AX open-orders response offset mismatch: requested {offset}, was {}",
+                response.offset
+            );
+
+            let total_count = *expected_total.get_or_insert(response.total_count);
+            anyhow::ensure!(
+                response.total_count == total_count,
+                "AX open-orders total_count changed during pagination: expected {total_count}, was {}",
+                response.total_count
+            );
+
+            let page_len = i64::try_from(response.orders.len())
+                .context("AX open-orders page length exceeds i64")?;
+            anyhow::ensure!(
+                page_len <= i64::from(response.limit),
+                "AX open-orders page length {page_len} exceeds applied limit {}",
+                response.limit
+            );
+            let next_offset = offset
+                .checked_add(page_len)
+                .context("AX open-orders offset overflow")?;
+            anyhow::ensure!(
+                next_offset <= total_count,
+                "AX open-orders page exceeds total_count: next offset {next_offset}, total {total_count}"
+            );
+
+            if total_count == 0 {
+                anyhow::ensure!(
+                    response.orders.is_empty(),
+                    "AX open-orders returned rows with total_count zero"
+                );
+                break;
+            }
+
+            anyhow::ensure!(
+                !response.orders.is_empty(),
+                "AX open-orders returned an empty page before offset {offset} reached total {total_count}"
+            );
+
+            for order in response.orders {
+                anyhow::ensure!(
+                    seen_order_ids.insert(order.oid.clone()),
+                    "AX open-orders pagination returned duplicate order ID {}",
+                    order.oid
+                );
+                orders.push(order);
+            }
+
+            if next_offset == total_count {
+                break;
+            }
+
+            offset = next_offset;
+        }
+
+        anyhow::ensure!(
+            i64::try_from(orders.len()).context("AX open-orders result length exceeds i64")?
+                == expected_total.unwrap_or_default(),
+            "AX open-orders pagination did not return the advertised number of unique orders"
+        );
 
         let ts_init = self.generate_ts_init();
-        let mut reports = Vec::with_capacity(response.orders.len());
+        let mut reports = Vec::with_capacity(orders.len());
 
-        for order in &response.orders {
+        for order in &orders {
             let instrument = self
                 .get_instrument(&order.s)
                 .ok_or_else(|| anyhow::anyhow!("Instrument {} not found in cache", order.s))?;
@@ -1706,6 +1964,8 @@ impl AxHttpClient {
     /// Requests fills from Ax and parses them to Nautilus [`FillReport`].
     ///
     /// Requires instruments to be cached for parsing fill details.
+    /// Traverses the provider's cursor chain. This is a best-effort historical
+    /// read, not an atomic snapshot if AX corrects rows during the traversal.
     ///
     /// # Errors
     ///
@@ -1719,32 +1979,117 @@ impl AxHttpClient {
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<FillReport>> {
+        const PAGE_SIZE: i32 = 100;
+
         // The AX `/fills` endpoint requires a bounded time range and caps the span at 7 days
         let max_span_ns = AX_FILLS_MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1_000_000_000;
         let end_ns = end.map_or_else(|| self.generate_ts_init().as_i64(), |e| e.as_i64());
         let floor_ns = end_ns - max_span_ns;
         let start_ns = start.map_or(floor_ns, |s| s.as_i64().max(floor_ns));
+        let mut params = GetFillsParams::new(start_ns, end_ns);
+        params.limit = Some(PAGE_SIZE);
+        params.sort_ts = Some("desc".to_string());
 
-        let response = self
-            .inner
-            .get_fills(start_ns, end_ns)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut fills = Vec::new();
+        let mut seen_trade_ids = HashSet::new();
+        let mut seen_cursors = HashSet::new();
+        let mut expected_total = None;
+
+        loop {
+            let response = self
+                .inner
+                .get_fills_page(&params)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let page_len = response.fills.len();
+
+            anyhow::ensure!(
+                page_len <= PAGE_SIZE as usize,
+                "AX fills page length {page_len} exceeds requested limit {PAGE_SIZE}"
+            );
+
+            if let Some(limit) = response.limit {
+                anyhow::ensure!(
+                    (0..=PAGE_SIZE).contains(&limit),
+                    "AX fills applied limit must be between 0 and {PAGE_SIZE}, was {limit}"
+                );
+                anyhow::ensure!(
+                    page_len <= limit as usize,
+                    "AX fills page length {page_len} exceeds applied limit {limit}"
+                );
+            }
+
+            if let Some(total_count) = response.total_count {
+                anyhow::ensure!(
+                    total_count >= 0,
+                    "AX fills total_count must be non-negative, was {total_count}"
+                );
+
+                if let Some(expected) = expected_total {
+                    anyhow::ensure!(
+                        total_count == expected,
+                        "AX fills total_count changed during pagination: expected {expected}, was {total_count}"
+                    );
+                } else {
+                    expected_total = Some(total_count);
+                }
+            }
+
+            for fill in response.fills {
+                anyhow::ensure!(
+                    seen_trade_ids.insert(fill.trade_id.clone()),
+                    "AX fills pagination returned duplicate trade ID {}",
+                    fill.trade_id
+                );
+                fills.push(fill);
+            }
+
+            if let Some(total_count) = expected_total {
+                anyhow::ensure!(
+                    fills.len() as i64 <= total_count,
+                    "AX fills pagination returned more unique rows ({}) than total_count {total_count}",
+                    fills.len()
+                );
+            }
+
+            match response.next_cursor {
+                Some(next_cursor) => {
+                    anyhow::ensure!(
+                        !next_cursor.is_empty(),
+                        "AX fills returned an empty next_cursor"
+                    );
+                    anyhow::ensure!(
+                        page_len > 0,
+                        "AX fills returned an empty page with a next_cursor"
+                    );
+                    anyhow::ensure!(
+                        seen_cursors.insert(next_cursor.clone()),
+                        "AX fills pagination repeated cursor {next_cursor:?}"
+                    );
+                    params.cursor = Some(next_cursor);
+                }
+                None => break,
+            }
+        }
+
+        if let Some(total_count) = expected_total {
+            anyhow::ensure!(
+                fills.len() as i64 == total_count,
+                "AX fills pagination returned {} unique rows, expected {total_count}",
+                fills.len()
+            );
+        }
 
         let ts_init = self.generate_ts_init();
-        let mut reports = Vec::with_capacity(response.fills.len());
+        let mut reports = Vec::with_capacity(fills.len());
 
-        for fill in &response.fills {
+        for fill in &fills {
             let instrument = self
                 .get_instrument(&fill.symbol)
                 .ok_or_else(|| anyhow::anyhow!("Instrument {} not found in cache", fill.symbol))?;
-
-            match parse_fill_report(fill, account_id, &instrument, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => {
-                    log::warn!("Failed to parse fill {}: {e}", fill.trade_id);
-                }
-            }
+            let report = parse_fill_report(fill, account_id, &instrument, ts_init)
+                .with_context(|| format!("Failed to parse AX fill {}", fill.trade_id))?;
+            reports.push(report);
         }
 
         Ok(reports)

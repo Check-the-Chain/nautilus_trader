@@ -2,8 +2,8 @@
 
 use std::str::FromStr;
 
-use libfuzzer_sys::fuzz_target;
 use nautilus_core::serialization::{deserialize_decimal, deserialize_optional_decimal};
+use nautilus_live::fuzz::fuzz_target;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Number, Value, json};
@@ -26,13 +26,13 @@ fuzz_target!(|data: &[u8]| {
     }
 
     if let Some(value) = probe_value(data) {
-        decode_value(value);
+        decode_value(&value);
     }
 
     if let Ok(text) = std::str::from_utf8(&data[1..])
         && let Ok(value) = serde_json::from_str::<Value>(text)
     {
-        decode_value(value);
+        decode_value(&value);
     }
 });
 
@@ -51,7 +51,7 @@ fn probe_value(data: &[u8]) -> Option<Value> {
     }
 }
 
-fn decode_value(value: Value) {
+fn decode_value(value: &Value) {
     let object = json!({ "value": value });
 
     if let Ok(probe) = serde_json::from_value::<DecimalProbe>(object.clone()) {

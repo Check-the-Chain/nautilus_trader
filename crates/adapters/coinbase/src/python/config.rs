@@ -75,14 +75,13 @@ impl CoinbaseDataClientConfig {
         }
     }
 
-    /// Returns the optional proxy URL for HTTP and WebSocket transports.
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(CoinbaseDataClientConfig).to_string()
     }
 }
 
@@ -147,13 +146,12 @@ impl CoinbaseExecClientConfig {
         }
     }
 
-    /// Returns the optional proxy URL for HTTP and WebSocket transports.
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(CoinbaseExecClientConfig).to_string()
     }
 }

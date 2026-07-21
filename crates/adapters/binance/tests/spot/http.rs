@@ -961,6 +961,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         if state.increment_and_check() {
                             return rate_limit_response().into_response();
                         }
+
                         let symbol = params
                             .get("symbol")
                             .cloned()
@@ -993,6 +994,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         if state.increment_and_check() {
                             return rate_limit_response().into_response();
                         }
+
                         let symbol = params
                             .get("symbol")
                             .cloned()
@@ -1032,6 +1034,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         if state.increment_and_check() {
                             return rate_limit_response().into_response();
                         }
+
                         let symbol = params
                             .get("symbol")
                             .cloned()
@@ -1071,6 +1074,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         if state.increment_and_check() {
                             return rate_limit_response().into_response();
                         }
+
                         let symbol = params
                             .get("symbol")
                             .cloned()
@@ -1768,6 +1772,7 @@ async fn test_domain_submit_order() {
             false,
             false,
             None,
+            true,
         )
         .await
         .unwrap();

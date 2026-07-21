@@ -61,8 +61,8 @@ use crate::{
         consts::{KRAKEN_VENUE, NAUTILUS_KRAKEN_BROKER_ID},
         credential::KrakenCredential,
         enums::{
-            KrakenApiResult, KrakenEnvironment, KrakenFuturesOrderType, KrakenOrderSide,
-            KrakenProductType, KrakenSendStatus, KrakenTriggerSignal,
+            KrakenApiResult, KrakenEnvironment, KrakenFuturesOrderStatus, KrakenFuturesOrderType,
+            KrakenOrderSide, KrakenProductType, KrakenSendStatus, KrakenTriggerSignal,
         },
         parse::{
             bar_type_to_futures_resolution, parse_bar, parse_futures_fill_report,
@@ -1621,6 +1621,33 @@ impl KrakenFuturesHttpClient {
             anyhow::bail!("Failed to get open orders: {error_msg}");
         }
 
+        let position_sizes = if response
+            .open_orders
+            .iter()
+            .any(|order| order.unfilled_size.is_none())
+        {
+            match self.inner.get_open_positions().await {
+                Ok(response) if response.result == KrakenApiResult::Success => response
+                    .open_positions
+                    .into_iter()
+                    .map(|position| (position.symbol, position.size))
+                    .collect::<AHashMap<_, _>>(),
+                Ok(response) => {
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| "Unknown error".to_string());
+                    log::warn!("Failed to get open positions for order quantities: {error}");
+                    AHashMap::new()
+                }
+                Err(e) => {
+                    log::warn!("Failed to get open positions for order quantities: {e}");
+                    AHashMap::new()
+                }
+            }
+        } else {
+            AHashMap::new()
+        };
+
         for order in &response.open_orders {
             if let Some(ref target_id) = instrument_id {
                 let instrument = self.get_cached_instrument(&target_id.symbol.inner());
@@ -1632,7 +1659,29 @@ impl KrakenFuturesHttpClient {
             }
 
             if let Some(instrument) = self.get_instrument_by_raw_symbol(&order.symbol) {
-                match parse_futures_order_status_report(order, &instrument, account_id, ts_init) {
+                let position_size = if order.unfilled_size.is_none()
+                    && matches!(
+                        order.order_type,
+                        KrakenFuturesOrderType::Stop
+                            | KrakenFuturesOrderType::StopLower
+                            | KrakenFuturesOrderType::StopLoss
+                            | KrakenFuturesOrderType::TakeProfit
+                    )
+                    && order.status == KrakenFuturesOrderStatus::Untouched
+                    && order.reduce_only == Some(true)
+                {
+                    position_sizes.get(&order.symbol).copied()
+                } else {
+                    None
+                };
+
+                match parse_futures_order_status_report(
+                    order,
+                    &instrument,
+                    account_id,
+                    position_size,
+                    ts_init,
+                ) {
                     Ok(report) => all_reports.push(report),
                     Err(e) => {
                         let order_id = &order.order_id;
@@ -1991,7 +2040,13 @@ impl KrakenFuturesHttpClient {
             .iter()
             .find(|o| o.order_id == venue_order_id)
         {
-            return parse_futures_order_status_report(order, &instrument, account_id, ts_init);
+            return parse_futures_order_status_report(
+                order,
+                &instrument,
+                account_id,
+                Some(quantity.as_decimal()),
+                ts_init,
+            );
         }
 
         // Order not in open orders - may have filled immediately (market order or aggressive limit)

@@ -1903,6 +1903,7 @@ impl ExecutionEngine {
                         .borrow()
                         .order(&cmd.client_order_id)
                         .map(|o| o.clone());
+
                     if let Some(order) = order {
                         self.deny_order(&order, &reason);
                     }
@@ -3051,6 +3052,7 @@ impl ExecutionEngine {
                         .borrow()
                         .order(&client_order_id)
                         .is_some_and(|o| o.is_closed());
+
                     if already_closed && !matches!(event, OrderEventAny::Filled(_)) {
                         log::debug!("InvalidStateTrigger: {e}, did not apply {event}");
                     } else {
@@ -3096,6 +3098,7 @@ impl ExecutionEngine {
                         .borrow()
                         .order(&client_order_id)
                         .map(|o| o.clone());
+
                     if let Some(order) = order {
                         let should_update_own_book = {
                             let cache = self.cache.borrow();

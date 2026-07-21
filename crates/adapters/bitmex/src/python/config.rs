@@ -93,8 +93,13 @@ impl BitmexDataClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(BitmexDataClientConfig).to_string()
     }
 }
 
@@ -183,7 +188,22 @@ impl BitmexExecClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
+    #[getter]
+    const fn has_submitter_proxy_urls(&self) -> bool {
+        self.submitter_proxy_urls.is_some()
+    }
+
+    #[getter]
+    const fn has_canceller_proxy_urls(&self) -> bool {
+        self.canceller_proxy_urls.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(BitmexExecClientConfig).to_string()
     }
 }

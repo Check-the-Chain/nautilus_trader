@@ -65,8 +65,8 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
 pub struct HttpClient {
     /// The underlying HTTP client used to make requests.
     pub(crate) client: InnerHttpClient,
-    /// The rate limiter to control the request rate.
-    pub(crate) rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+    /// The rate limiters that control the request rate.
+    pub(crate) rate_limiters: Arc<[Arc<RateLimiter<Ustr, MonotonicClock>>]>,
 }
 
 impl HttpClient {
@@ -112,6 +112,32 @@ impl HttpClient {
         timeout_secs: Option<u64>,
         proxy_url: Option<String>,
         rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+    ) -> Result<Self, HttpClientError> {
+        Self::new_with_rate_limiters(
+            headers,
+            header_keys,
+            timeout_secs,
+            proxy_url,
+            vec![rate_limiter],
+        )
+    }
+
+    /// Creates a new [`HttpClient`] instance sharing multiple externally-owned rate limiters.
+    ///
+    /// Each request awaits every limiter with the same keys. A limiter with no default quota
+    /// ignores keys it does not own, allowing independent quota scopes such as per-IP and
+    /// per-account limits to apply to one request.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `InvalidProxy` if the proxy URL is malformed.
+    /// - Returns `ClientBuildError` if building the underlying `reqwest::Client` fails.
+    pub fn new_with_rate_limiters(
+        headers: HashMap<String, String>,
+        header_keys: Vec<String>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+        rate_limiters: Vec<Arc<RateLimiter<Ustr, MonotonicClock>>>,
     ) -> Result<Self, HttpClientError> {
         install_cryptographic_provider();
 
@@ -173,7 +199,7 @@ impl HttpClient {
 
         Ok(Self {
             client,
-            rate_limiter,
+            rate_limiters: rate_limiters.into(),
         })
     }
 
@@ -224,8 +250,7 @@ impl HttpClient {
         keys: Option<Vec<String>>,
     ) -> Result<HttpResponse, HttpClientError> {
         let keys = keys.map(into_ustr_vec);
-        let rate_limiter = self.rate_limiter.clone();
-        rate_limiter.await_keys_ready(keys.as_deref()).await;
+        self.await_rate_limits(keys.as_deref()).await;
 
         self.client
             .send_request_with_query(method, url, params, headers, body, timeout_secs)
@@ -248,12 +273,17 @@ impl HttpClient {
         timeout_secs: Option<u64>,
         keys: Option<Vec<Ustr>>,
     ) -> Result<HttpResponse, HttpClientError> {
-        let rate_limiter = self.rate_limiter.clone();
-        rate_limiter.await_keys_ready(keys.as_deref()).await;
+        self.await_rate_limits(keys.as_deref()).await;
 
         self.client
             .send_request(method, url, params, headers, body, timeout_secs)
             .await
+    }
+
+    pub(crate) async fn await_rate_limits(&self, keys: Option<&[Ustr]>) {
+        for rate_limiter in self.rate_limiters.iter() {
+            rate_limiter.await_keys_ready(keys).await;
+        }
     }
 
     /// Sends an HTTP GET request.
@@ -596,7 +626,7 @@ fn encode_url_params<'a>(
 #[cfg(test)]
 #[cfg(target_os = "linux")] // Only run network tests on Linux (CI stability)
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, num::NonZeroU32};
 
     use axum::{
         Router,
@@ -638,6 +668,33 @@ mod tests {
         });
 
         Ok(addr)
+    }
+
+    #[tokio::test]
+    async fn test_http_client_awaits_multiple_rate_limiters() {
+        let quota = Quota::per_minute(NonZeroU32::MIN);
+        let request_key = Ustr::from("scope:request");
+        let order_key = Ustr::from("scope:order");
+        let request_limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(request_key, quota)],
+        ));
+        let order_limiter = Arc::new(RateLimiter::new_with_quota(None, vec![(order_key, quota)]));
+        let client = HttpClient::new_with_rate_limiters(
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            vec![Arc::clone(&request_limiter), Arc::clone(&order_limiter)],
+        )
+        .unwrap();
+
+        client
+            .await_rate_limits(Some(&[request_key, order_key]))
+            .await;
+
+        assert!(request_limiter.check_key(&request_key).is_err());
+        assert!(order_limiter.check_key(&order_key).is_err());
     }
 
     #[tokio::test]

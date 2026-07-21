@@ -21,8 +21,8 @@ use crate::{
     orders::OrderList,
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl OrderList {
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
@@ -70,6 +70,12 @@ impl OrderList {
     #[pyo3(name = "client_order_ids")]
     fn py_client_order_ids(&self) -> Vec<ClientOrderId> {
         self.client_order_ids.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "first_client_order_id")]
+    fn py_first_client_order_id(&self) -> Option<ClientOrderId> {
+        self.first().copied()
     }
 
     #[getter]
@@ -146,6 +152,14 @@ mod tests {
                     .extract::<Vec<ClientOrderId>>()
                     .unwrap(),
                 order_list.client_order_ids,
+            );
+            assert_eq!(
+                bound
+                    .getattr("first_client_order_id")
+                    .unwrap()
+                    .extract::<ClientOrderId>()
+                    .unwrap(),
+                order_list.client_order_ids[0],
             );
             assert_eq!(bound.len().unwrap(), order_list.len());
             assert_eq!(

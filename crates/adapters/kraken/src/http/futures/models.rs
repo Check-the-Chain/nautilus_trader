@@ -16,6 +16,7 @@
 //! Data models for Kraken Futures HTTP API responses.
 
 use ahash::AHashMap;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::common::enums::{
@@ -222,10 +223,11 @@ pub struct FuturesOpenOrder {
     pub limit_price: Option<f64>,
     #[serde(default)]
     pub stop_price: Option<f64>,
-    pub unfilled_size: f64,
+    #[serde(default)]
+    pub unfilled_size: Option<Decimal>,
     pub received_time: String,
     pub status: KrakenFuturesOrderStatus,
-    pub filled_size: f64,
+    pub filled_size: Decimal,
     #[serde(default)]
     pub reduce_only: Option<bool>,
     pub last_update_time: String,
@@ -339,7 +341,7 @@ pub struct FuturesPosition {
     pub symbol: String,
     pub price: f64,
     pub fill_time: String,
-    pub size: f64,
+    pub size: Decimal,
     #[serde(default)]
     pub unrealized_funding: Option<f64>,
 }
@@ -759,6 +761,7 @@ pub struct FuturesMarginRequirements {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -829,8 +832,30 @@ mod tests {
         assert_eq!(order.side, KrakenOrderSide::Buy);
         assert_eq!(order.order_type, KrakenFuturesOrderType::Limit);
         assert_eq!(order.limit_price, Some(1200.0));
-        assert_eq!(order.unfilled_size, 100.0);
-        assert_eq!(order.filled_size, 0.0);
+        assert_eq!(order.unfilled_size, Some(dec!(100)));
+        assert_eq!(order.filled_size, dec!(0));
+
+        let trigger_order = &response.open_orders[1];
+        assert_eq!(
+            trigger_order.order_id,
+            "c8135f52-2a86-4e26-b629-43cc37da9dbf"
+        );
+        assert_eq!(trigger_order.order_type, KrakenFuturesOrderType::TakeProfit);
+        assert_eq!(trigger_order.symbol, "PI_XBTUSD");
+        assert_eq!(trigger_order.side, KrakenOrderSide::Buy);
+        assert_eq!(trigger_order.limit_price, None);
+        assert_eq!(trigger_order.stop_price, Some(1880.4));
+        assert_eq!(trigger_order.unfilled_size, None);
+        assert_eq!(trigger_order.received_time, "2023-04-07T15:14:25.995Z");
+        assert_eq!(trigger_order.status, KrakenFuturesOrderStatus::Untouched);
+        assert_eq!(trigger_order.filled_size, dec!(0));
+        assert_eq!(trigger_order.reduce_only, Some(true));
+        assert_eq!(trigger_order.last_update_time, "2023-04-07T15:14:25.995Z");
+        assert_eq!(
+            trigger_order.trigger_signal,
+            Some(KrakenTriggerSignal::Last)
+        );
+        assert_eq!(trigger_order.cli_ord_id, None);
     }
 
     #[rstest]
@@ -864,7 +889,7 @@ mod tests {
         let position = &response.open_positions[0];
         assert_eq!(position.side, KrakenPositionSide::Short);
         assert_eq!(position.symbol, "PI_XBTUSD");
-        assert_eq!(position.size, 8000.0);
+        assert_eq!(position.size, dec!(8000));
         assert!(position.unrealized_funding.is_some());
     }
 

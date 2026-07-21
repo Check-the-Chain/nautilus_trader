@@ -64,8 +64,8 @@ use nautilus_kraken::{
 use nautilus_model::{
     data::BarType,
     enums::{
-        AccountType, MarketStatusAction, OrderSide as ModelOrderSide, OrderType as ModelOrderType,
-        TimeInForce,
+        AccountType, MarketStatusAction, OrderSide as ModelOrderSide, OrderStatus,
+        OrderType as ModelOrderType, TimeInForce, TriggerType,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
     instruments::{CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
@@ -2000,6 +2000,126 @@ async fn test_futures_raw_get_open_orders() {
 
 #[rstest]
 #[tokio::test]
+async fn test_futures_domain_request_order_status_reports_uses_position_size_for_attached_trigger()
+{
+    let (addr, _) = start_test_server().await;
+    let base_url = format!("http://{addr}");
+
+    let client = KrakenFuturesHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let instruments = client.request_instruments().await.unwrap();
+    client.cache_instruments(&instruments);
+
+    let account_id = AccountId::from("KRAKEN-001");
+    let reports = client
+        .request_order_status_reports(account_id, None, None, None, true)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 2);
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.venue_order_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "c8135f52-2a86-4e26-b629-43cc37da9dbf",
+            "7a9f8b3e-1c2d-4e5f-9a8b-7c6d5e4f3a2b",
+        ]
+    );
+
+    let report = reports
+        .iter()
+        .find(|report| report.venue_order_id.as_str() == "c8135f52-2a86-4e26-b629-43cc37da9dbf")
+        .unwrap();
+    assert_eq!(report.account_id, account_id);
+    assert_eq!(report.instrument_id, InstrumentId::from("PI_XBTUSD.KRAKEN"));
+    assert_eq!(report.client_order_id, None);
+    assert_eq!(report.order_side, ModelOrderSide::Buy);
+    assert_eq!(report.order_type, ModelOrderType::MarketIfTouched);
+    assert_eq!(report.time_in_force, TimeInForce::Gtc);
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(report.quantity, Quantity::from("8000"));
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+    assert_eq!(report.price, None);
+    assert_eq!(report.trigger_price, Some(Price::from("1880.4")));
+    assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+    assert!(report.reduce_only);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_futures_domain_submit_order_uses_submitted_size_for_attached_trigger() {
+    let (addr, _) = start_test_server().await;
+    let base_url = format!("http://{addr}");
+
+    let client = KrakenFuturesHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let instruments = client.request_instruments().await.unwrap();
+    client.cache_instruments(&instruments);
+
+    let account_id = AccountId::from("KRAKEN-001");
+    let report = client
+        .submit_order(
+            account_id,
+            InstrumentId::from("PI_XBTUSD.KRAKEN"),
+            ClientOrderId::from("test-order-001"),
+            ModelOrderSide::Buy,
+            ModelOrderType::MarketIfTouched,
+            Quantity::from("1234"),
+            TimeInForce::Gtc,
+            None,
+            Some(Price::from("1880.4")),
+            Some(TriggerType::LastPrice),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.account_id, account_id);
+    assert_eq!(report.instrument_id, InstrumentId::from("PI_XBTUSD.KRAKEN"));
+    assert_eq!(
+        report.venue_order_id,
+        VenueOrderId::from("c8135f52-2a86-4e26-b629-43cc37da9dbf")
+    );
+    assert_eq!(report.order_side, ModelOrderSide::Buy);
+    assert_eq!(report.order_type, ModelOrderType::MarketIfTouched);
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(report.quantity, Quantity::from("1234"));
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+    assert_eq!(report.price, None);
+    assert_eq!(report.trigger_price, Some(Price::from("1880.4")));
+    assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+    assert!(report.reduce_only);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_futures_raw_get_order_events() {
     let state = Arc::new(TestServerState::default());
     let app = create_router(state);
@@ -2130,7 +2250,7 @@ async fn test_futures_raw_get_open_positions() {
 
     let first_position = &response.open_positions[0];
     assert_eq!(first_position.symbol, "PI_XBTUSD");
-    assert_eq!(first_position.size, 8000.0);
+    assert_eq!(first_position.size, dec!(8000));
 }
 
 #[rstest]

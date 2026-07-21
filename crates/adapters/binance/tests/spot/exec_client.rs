@@ -591,6 +591,7 @@ fn create_exec_test_router_with_fill_fixture(
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
+
                     let symbol = params
                         .get("symbol")
                         .cloned()
@@ -639,6 +640,7 @@ fn create_exec_test_router_with_fill_fixture(
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
+
                     let symbol = params
                         .get("symbol")
                         .cloned()
@@ -659,10 +661,19 @@ fn create_exec_test_router_with_fill_fixture(
         .route(
             "/api/v3/order",
             post(
-                |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| async move {
+                |State(state): State<FillFixtureState>,
+                 headers: HeaderMap,
+                 Query(params): Query<HashMap<String, String>>| async move {
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
+
+                    if let Some(captured_queries) = &state.captured_queries {
+                        captured_queries.lock().unwrap().push(CapturedQuery {
+                            query: params.clone(),
+                        });
+                    }
+
                     let symbol = params
                         .get("symbol")
                         .cloned()
@@ -702,6 +713,7 @@ fn create_exec_test_router_with_fill_fixture(
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
+
                     let symbol = params
                         .get("symbol")
                         .cloned()
@@ -759,6 +771,7 @@ async fn handle_account_trades(
     let from_id = query
         .get("fromId")
         .and_then(|value| value.parse::<i64>().ok());
+
     if let Some(captured_queries) = &state.captured_queries {
         captured_queries
             .lock()
@@ -885,6 +898,7 @@ async fn handle_order_submit(
     if !has_auth_headers(&headers) {
         return unauthorized_response().into_response();
     }
+
     state.request_count.fetch_add(1, Ordering::Relaxed);
     let symbol = params
         .get("symbol")
@@ -916,6 +930,7 @@ async fn handle_order_cancel(
     if !has_auth_headers(&headers) {
         return unauthorized_response().into_response();
     }
+
     state.request_count.fetch_add(1, Ordering::Relaxed);
     let symbol = params
         .get("symbol")
@@ -951,6 +966,7 @@ async fn handle_order_modify(
     if !has_auth_headers(&headers) {
         return unauthorized_response().into_response();
     }
+
     state.request_count.fetch_add(1, Ordering::Relaxed);
     let symbol = params
         .get("symbol")
@@ -1321,6 +1337,24 @@ fn create_test_execution_client_with_transport(
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     Rc<RefCell<Cache>>,
 ) {
+    create_test_execution_client_with_transport_and_gtd(
+        base_url_http,
+        use_ws_trading,
+        base_url_ws_trading,
+        true,
+    )
+}
+
+fn create_test_execution_client_with_transport_and_gtd(
+    base_url_http: String,
+    use_ws_trading: bool,
+    base_url_ws_trading: Option<String>,
+    use_gtd: bool,
+) -> (
+    BinanceSpotExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("BINANCE-001");
     let client_id = *BINANCE_CLIENT_ID;
@@ -1344,6 +1378,7 @@ fn create_test_execution_client_with_transport(
         base_url_http: Some(base_url_http),
         base_url_ws_trading,
         use_ws_trading,
+        use_gtd,
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
         ..Default::default()
@@ -1934,6 +1969,61 @@ async fn test_submit_order_generates_submitted_and_accepted_events() {
         Duration::from_secs(5),
     )
     .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_spot_locally_managed_gtd_encodes_gtc() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Empty).await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, cache) =
+        create_test_execution_client_with_transport_and_gtd(base_url, false, None, false);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let order = add_gtd_limit_order_to_cache(&cache, ClientOrderId::new("spot-local-gtd-test-001"));
+    client.submit_order(submit_order_command(&order)).unwrap();
+
+    wait_until_async(
+        || {
+            let captured_queries = captured_queries.clone();
+            async move { !captured_queries.lock().unwrap().is_empty() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let queries = captured_queries.lock().unwrap();
+    assert_eq!(
+        queries[0].query.get("timeInForce").map(String::as_str),
+        Some("GTC"),
+    );
+    assert!(!queries[0].query.contains_key("goodTillDate"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_spot_native_gtd_rejects_before_submission() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Empty).await;
+    let base_url = format!("http://{addr}");
+    let (mut client, mut rx, cache) = create_test_execution_client(base_url);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let order = add_gtd_limit_order_to_cache(&cache, ClientOrderId::new("spot-gtd-test-001"));
+    let error = client
+        .submit_order(submit_order_command(&order))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("does not support native GTD"));
+    assert!(captured_queries.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
 }
 
 #[rstest]
@@ -2880,6 +2970,46 @@ fn add_limit_order_for_instrument_to_cache(
         .add_order(order_any.clone(), None, None, false)
         .unwrap();
     order_any
+}
+
+fn add_gtd_limit_order_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    client_order_id: ClientOrderId,
+) -> OrderAny {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let order = LimitOrder::new(
+        test_trader_id(),
+        test_strategy_id(),
+        test_instrument_id(),
+        client_order_id,
+        OrderSide::Buy,
+        Quantity::from("0.001"),
+        Price::from("50000.00"),
+        TimeInForce::Gtd,
+        Some(UnixNanos::from_seconds(now.as_secs() + 1_200)),
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+    let order = OrderAny::Limit(order);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    order
 }
 
 fn add_open_order_to_cache(

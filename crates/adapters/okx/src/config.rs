@@ -106,6 +106,27 @@ pub struct OKXDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(OKXDataClientConfig {
+    instrument_types: Vec<OKXInstrumentType>,
+    environment: OKXEnvironment,
+    region: OKXRegion,
+    base_url_http: Option<String>,
+    base_url_ws_public: Option<String>,
+    base_url_ws_business: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    update_instruments_interval_mins: u64,
+    book_stale_check_interval_secs: u64,
+    book_stale_threshold_secs: u64,
+    book_snapshot_timeout_secs: u64,
+    vip_level: Option<OKXVipLevel>,
+    load_spreads: bool,
+    transport_backend: TransportBackend,
+});
+
 impl Default for OKXDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -239,6 +260,25 @@ pub struct OKXExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(OKXExecClientConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument_types: Vec<OKXInstrumentType>,
+    environment: OKXEnvironment,
+    region: OKXRegion,
+    base_url_http: Option<String>,
+    base_url_ws_private: Option<String>,
+    base_url_ws_business: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    margin_mode: Option<OKXMarginMode>,
+    load_spreads: bool,
+    transport_backend: TransportBackend,
+});
 
 impl Default for OKXExecClientConfig {
     fn default() -> Self {

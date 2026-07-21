@@ -542,7 +542,7 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
 
                     loop {
                         let params = GetGammaMarketsParams {
-                            condition_ids: Some(condition_id.clone()),
+                            condition_ids: Some(vec![condition_id.clone()]),
                             ..Default::default()
                         };
                         let fetch =
@@ -563,6 +563,7 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                                 }
 
                                 let transient_hit = transient.iter().any(|cid| cid == &condition_id);
+
                                 if attempt < NEW_MARKET_EMPTY_RECHECK_MAX_ATTEMPTS {
                                     attempt += 1;
                                     let reason = if transient_hit {
@@ -787,11 +788,11 @@ mod tests {
             upsert_resolve_watch_entry_from_instrument,
         },
         websocket::{
-            client::PolymarketWebSocketClient,
             messages::{
                 PolymarketBookLevel, PolymarketBookSnapshot, PolymarketMarketResolved,
                 PolymarketQuote, PolymarketTickSizeChange,
             },
+            pool::PolymarketMarketConnectionPool,
         },
     };
 
@@ -1286,6 +1287,14 @@ mod tests {
         Json(response)
     }
 
+    async fn handle_new_market_gamma_markets_keyset(
+        raw_query: RawQuery,
+        state: State<NewMarketFetchTestServerState>,
+    ) -> Json<Value> {
+        let Json(markets) = handle_new_market_gamma_markets(raw_query, state).await;
+        Json(serde_json::json!({"markets": markets}))
+    }
+
     async fn start_new_market_test_server(state: NewMarketFetchTestServerState) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1293,6 +1302,10 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let router = Router::new()
             .route("/markets", get(handle_new_market_gamma_markets))
+            .route(
+                "/markets/keyset",
+                get(handle_new_market_gamma_markets_keyset),
+            )
             .with_state(state);
 
         tokio::spawn(async move { axum::serve(listener, router).await.expect("serve failed") });
@@ -1921,6 +1934,11 @@ mod tests {
         Json(body)
     }
 
+    async fn handle_gamma_markets_keyset(State(state): State<TestServerState>) -> Json<Value> {
+        let Json(markets) = handle_gamma_markets(State(state)).await;
+        Json(serde_json::json!({"markets": markets}))
+    }
+
     async fn handle_clob_market(
         State(state): State<TestServerState>,
         Path(condition_id): Path<String>,
@@ -1943,6 +1961,7 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let router = Router::new()
             .route("/markets", get(handle_gamma_markets))
+            .route("/markets/keyset", get(handle_gamma_markets_keyset))
             .route("/markets/{condition_id}", get(handle_clob_market))
             .with_state(state);
 
@@ -1963,6 +1982,13 @@ mod tests {
         Json(state.response)
     }
 
+    async fn handle_expired_auto_load_markets_keyset(
+        state: State<ExpiredAutoLoadServerState>,
+    ) -> Json<Value> {
+        let Json(markets) = handle_expired_auto_load_markets(state).await;
+        Json(serde_json::json!({"markets": markets}))
+    }
+
     async fn start_expired_auto_load_test_server(state: ExpiredAutoLoadServerState) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1970,6 +1996,10 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let router = Router::new()
             .route("/markets", get(handle_expired_auto_load_markets))
+            .route(
+                "/markets/keyset",
+                get(handle_expired_auto_load_markets_keyset),
+            )
             .with_state(state);
 
         tokio::spawn(async move { axum::serve(listener, router).await.expect("serve failed") });
@@ -1993,10 +2023,11 @@ mod tests {
             PolymarketClobPublicClient::new(Some(base_url.clone()), 5).expect("clob client");
         let data_api =
             PolymarketDataApiHttpClient::new(Some(base_url.clone()), 5).expect("data api client");
-        let ws = PolymarketWebSocketClient::new_market(
+        let ws = PolymarketMarketConnectionPool::new(
             Some(format!("ws://{addr}/ws/market")),
             false,
             TransportBackend::default(),
+            crate::common::consts::WS_DEFAULT_SUBSCRIPTIONS,
         );
 
         let config = PolymarketDataClientConfig {
@@ -2034,10 +2065,11 @@ mod tests {
             .expect("clob client");
         let data_api = PolymarketDataApiHttpClient::new(Some("http://localhost".to_string()), 5)
             .expect("data api client");
-        let ws = PolymarketWebSocketClient::new_market(
+        let ws = PolymarketMarketConnectionPool::new(
             Some("ws://localhost/ws/market".to_string()),
             false,
             TransportBackend::default(),
+            crate::common::consts::WS_DEFAULT_SUBSCRIPTIONS,
         );
 
         PolymarketDataClient::new(

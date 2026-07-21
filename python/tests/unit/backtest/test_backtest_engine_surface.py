@@ -504,6 +504,11 @@ def test_importable_strategy_routes_orders_through_importable_execution_algorith
         str(orders[0].client_order_id),
     ]
     assert RoutedOrderExecutionAlgorithm.received_exec_algorithm_ids == [algo_id]
+    assert RoutedOrderExecutionAlgorithm.cache_instrument_ids == [str(instrument.id)]
+    assert RoutedOrderExecutionAlgorithm.greeks_types == ["GreeksCalculator"]
+    assert RoutedOrderExecutionAlgorithm.portfolio_initialized == [False]
+    assert RoutedOrderExecutionAlgorithm.running_states == [True]
+    assert RoutedOrderExecutionAlgorithm.signal_counts_after_unsubscribe == [1]
     assert RoutedOrderExecutionAlgorithm.signal_values == [str(orders[0].client_order_id)]
     engine.dispose()
 

@@ -16,8 +16,8 @@
 from dataclasses import dataclass
 
 from nautilus_trader.common import DataActor
-from nautilus_trader.common import DataActorConfig
 from nautilus_trader.common import LogColor
+from nautilus_trader.config import DataActorConfig
 from nautilus_trader.model import ActorId
 from nautilus_trader.model import Block
 from nautilus_trader.model import Chain

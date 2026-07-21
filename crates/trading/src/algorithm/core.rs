@@ -31,6 +31,7 @@ use nautilus_model::{
     orders::{OrderAny, OrderList},
     types::Quantity,
 };
+use nautilus_portfolio::portfolio::Portfolio;
 
 use super::config::ExecutionAlgorithmConfig;
 
@@ -70,6 +71,8 @@ pub struct ExecutionAlgorithmCore {
     subscribed_strategies: AHashSet<StrategyId>,
     /// Tracks pending spawn reductions for quantity restoration on denial/rejection.
     pending_spawn_reductions: AHashMap<ClientOrderId, Quantity>,
+    /// The portfolio shared by the trader.
+    portfolio: Option<Rc<RefCell<Portfolio>>>,
     /// Maps strategies to their event handlers for cleanup on reset.
     strategy_event_handlers: IndexMap<StrategyId, StrategyEventHandlers>,
 }
@@ -90,6 +93,19 @@ pub trait ExecutionAlgorithmNative: DataActorNative {
 
     /// Returns the mutable execution algorithm core.
     fn exec_algorithm_core_mut(&mut self) -> &mut ExecutionAlgorithmCore;
+
+    /// Returns a clone of the reference-counted portfolio.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the execution algorithm has not been registered.
+    fn portfolio_rc(&self) -> Rc<RefCell<Portfolio>> {
+        self.exec_algorithm_core()
+            .portfolio
+            .as_ref()
+            .expect("ExecutionAlgorithm not registered: Portfolio not initialized")
+            .clone()
+    }
 }
 
 impl Debug for ExecutionAlgorithmCore {
@@ -137,6 +153,7 @@ impl ExecutionAlgorithmCore {
             exec_spawn_ids: AHashMap::new(),
             subscribed_strategies: AHashSet::new(),
             pending_spawn_reductions: AHashMap::new(),
+            portfolio: None,
             strategy_event_handlers: IndexMap::new(),
         }
     }
@@ -159,6 +176,11 @@ impl ExecutionAlgorithmCore {
     #[must_use]
     pub fn id(&self) -> ExecAlgorithmId {
         self.exec_algorithm_id
+    }
+
+    /// Sets the portfolio shared by the trader.
+    pub fn set_portfolio(&mut self, portfolio: Rc<RefCell<Portfolio>>) {
+        self.portfolio = Some(portfolio);
     }
 
     /// Generates the next spawn client order ID for a primary order.

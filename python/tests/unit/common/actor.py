@@ -197,8 +197,8 @@ class OrderFactoryProbeStrategy(Strategy):
                 Quantity.from_str("100000"),
                 time_in_force=TimeInForce.GTD,
             )
-        except ValueError as exc:
-            type(self).observed_invalid_order_error = str(exc)
+        except ValueError as e:
+            type(self).observed_invalid_order_error = str(e)
 
         type(self).observed_order = order_factory.market(
             InstrumentId.from_str("AUD/USD.SIM"),
@@ -208,6 +208,25 @@ class OrderFactoryProbeStrategy(Strategy):
         type(self).observed_next_client_order_id = self.order_factory.generate_client_order_id()
         type(self).observed_client_order_id_count = order_factory.get_client_order_id_count()
         type(self).observed_order_list_id_count = order_factory.get_order_list_id_count()
+
+
+class OrderFactoryConfigProbeStrategy(Strategy):
+    observed_factory = None
+    observed_config = None
+    observed_client_order_id = None
+
+    @classmethod
+    def reset(cls):
+        cls.observed_factory = None
+        cls.observed_config = None
+        cls.observed_client_order_id = None
+
+    def on_start(self):
+        order_factory = self.order_factory
+
+        type(self).observed_factory = order_factory
+        type(self).observed_config = self.config
+        type(self).observed_client_order_id = order_factory.generate_client_order_id()
 
 
 def _market_order(

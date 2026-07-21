@@ -25,8 +25,8 @@ use crate::{
     indicator::{Indicator, MovingAverage},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl AdaptiveMovingAverage {
     /// An indicator which calculates an adaptive moving average (AMA) across a
     /// rolling window. Developed by Perry Kaufman, the AMA is a moving average
@@ -64,6 +64,54 @@ impl AdaptiveMovingAverage {
     #[pyo3(name = "name")]
     fn py_name(&self) -> String {
         self.name()
+    }
+
+    #[getter]
+    #[pyo3(name = "period_efficiency_ratio")]
+    const fn py_period_efficiency_ratio(&self) -> usize {
+        self.period_efficiency_ratio
+    }
+
+    #[getter]
+    #[pyo3(name = "period_fast")]
+    const fn py_period_fast(&self) -> usize {
+        self.period_fast
+    }
+
+    #[getter]
+    #[pyo3(name = "period_slow")]
+    const fn py_period_slow(&self) -> usize {
+        self.period_slow
+    }
+
+    #[getter]
+    #[pyo3(name = "alpha_fast")]
+    const fn py_alpha_fast(&self) -> f64 {
+        self.alpha_fast()
+    }
+
+    #[getter]
+    #[pyo3(name = "alpha_slow")]
+    const fn py_alpha_slow(&self) -> f64 {
+        self.alpha_slow()
+    }
+
+    #[getter]
+    #[pyo3(name = "alpha_diff")]
+    fn py_alpha_diff(&self) -> f64 {
+        self.alpha_diff()
+    }
+
+    #[getter]
+    #[pyo3(name = "price_type")]
+    const fn py_price_type(&self) -> PriceType {
+        self.price_type
+    }
+
+    #[getter]
+    #[pyo3(name = "value")]
+    const fn py_value(&self) -> f64 {
+        self.value
     }
 
     #[getter]

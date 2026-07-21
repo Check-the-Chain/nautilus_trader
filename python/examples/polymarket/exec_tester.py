@@ -34,9 +34,9 @@ from nautilus_trader.adapters.polymarket import PolymarketExecutionClientFactory
 from nautilus_trader.adapters.polymarket import PolymarketInstrumentProviderConfig
 from nautilus_trader.adapters.polymarket import SignatureType
 from nautilus_trader.common import Environment
-from nautilus_trader.live import LiveExecEngineConfig
+from nautilus_trader.config import LiveExecEngineConfig
+from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.live import LiveNode
-from nautilus_trader.live import LiveRiskEngineConfig
 from nautilus_trader.model import ClientId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Quantity

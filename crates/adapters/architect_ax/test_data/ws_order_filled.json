@@ -22,7 +22,7 @@
     "s": "EURUSD-PERP",
     "q": 100,
     "p": "50000.00",
-    "d": "B",
+    "d": "Buy",
     "agg": false
   }
 }

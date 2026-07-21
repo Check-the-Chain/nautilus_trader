@@ -46,7 +46,8 @@ pub const DERIVE_CANCEL_BY_LABEL_RATE_KEY: &str = "derive:cancel-by-label";
 
 /// Default matching-engine allowance for a Trader-tier account (requests per
 /// second). Market Maker accounts negotiate higher limits and raise this via
-/// [`crate::config::DeriveExecClientConfig::max_matching_requests_per_second`].
+/// [`crate::config::DeriveExecClientConfig`]'s
+/// `max_matching_requests_per_second` field.
 pub const DERIVE_DEFAULT_MATCHING_TPS: u32 = 1;
 
 /// Flat REST non-matching allowance per IP (requests per second).

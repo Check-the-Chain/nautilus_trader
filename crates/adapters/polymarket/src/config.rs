@@ -72,6 +72,14 @@ pub struct PolymarketUpDownEventSlugConfig {
     pub start_offset_periods: i64,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(PolymarketUpDownEventSlugConfig {
+    assets: Vec<String>,
+    interval_mins: u64,
+    periods: u64,
+    start_offset_periods: i64,
+});
+
 impl Default for PolymarketUpDownEventSlugConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -190,6 +198,18 @@ pub struct PolymarketInstrumentProviderConfig {
     pub use_gamma_markets: bool,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(PolymarketInstrumentProviderConfig {
+    load_all: bool,
+    load_ids: Option<Vec<InstrumentId>>,
+    filters: Option<HashMap<String, String>>,
+    event_slugs: Option<Vec<String>>,
+    market_slugs: Option<Vec<String>>,
+    event_slug_builder: Option<PolymarketUpDownEventSlugConfig>,
+    log_warnings: bool,
+    use_gamma_markets: bool,
+});
+
 impl Default for PolymarketInstrumentProviderConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -307,6 +327,33 @@ pub struct PolymarketDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(PolymarketDataClientConfig {
+    instrument_config: Option<PolymarketInstrumentProviderConfig>,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    base_url_gamma: Option<String>,
+    base_url_data_api: Option<String>,
+    http_timeout_secs: u64,
+    ws_timeout_secs: u64,
+    ws_max_subscriptions: usize,
+    update_instruments_interval_mins: Option<u64>,
+    subscribe_new_markets: bool,
+    auto_load_missing_instruments: bool,
+    auto_load_debounce_ms: u64,
+    auto_load_max_retries: u32,
+    auto_load_retry_delay_initial_secs: f64,
+    auto_load_retry_delay_max_secs: f64,
+    new_market_fetch_max_concurrency: usize,
+    resolve_poll_enabled: bool,
+    resolve_poll_interval_secs: u64,
+    resolve_poll_grace_secs: u64,
+    resolve_poll_max_wait_secs: u64,
+    base_url_rtds: Option<String>,
+    transport_backend: TransportBackend,
+    drop_quotes_missing_side: bool,
+});
+
 impl Default for PolymarketDataClientConfig {
     fn default() -> Self {
         Self {
@@ -410,6 +457,23 @@ pub struct PolymarketExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(PolymarketExecClientConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    funder: Option<String>,
+    signature_type: SignatureType,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    base_url_data_api: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    ack_timeout_secs: u64,
+    transport_backend: TransportBackend,
+});
 
 impl Debug for PolymarketExecClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

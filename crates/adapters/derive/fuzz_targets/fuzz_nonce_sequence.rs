@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use libfuzzer_sys::fuzz_target;
 use nautilus_derive::signing::nonce::NonceManager;
+use nautilus_live::fuzz::fuzz_target;
 
 const CHUNK_LEN: usize = 38;
 const MAX_DOMAIN_NOW_MS: u64 = 4_102_444_800_000;
@@ -14,7 +14,9 @@ fuzz_target!(|data: &[u8]| {
     let manager = NonceManager::new();
     let mut expected_last = BTreeMap::<(String, u64), u64>::new();
 
-    for chunk in data.chunks_exact(CHUNK_LEN).take(MAX_STEPS) {
+    let (chunks, _remainder) = data.as_chunks::<CHUNK_LEN>();
+
+    for chunk in chunks.iter().take(MAX_STEPS) {
         let wallet = wallet_from_chunk(&chunk[1..22]);
         let subaccount_id = read_u64(chunk, 22);
         let raw_value = read_u64(chunk, 30);

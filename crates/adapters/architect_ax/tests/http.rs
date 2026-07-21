@@ -17,16 +17,20 @@
 
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
 
-use axum::{Router, http::StatusCode, response::Json, routing::get};
+use axum::{Router, extract::Query, http::StatusCode, response::Json, routing::get};
 use nautilus_architect_ax::{
     common::enums::AxCandleWidth,
     http::{
         client::{AxHttpClient, AxRawHttpClient},
         error::AxHttpError,
+        query::GetFundingRatesParams,
     },
 };
 use nautilus_common::testing::wait_until_async;
-use nautilus_model::instruments::InstrumentAny;
+use nautilus_model::{
+    identifiers::{AccountId, ClientOrderId, InstrumentId},
+    instruments::InstrumentAny,
+};
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
 use rust_decimal::Decimal;
@@ -65,6 +69,72 @@ fn load_test_data(filename: &str) -> Value {
     let path = manifest_path().join("test_data").join(filename);
     let content = std::fs::read_to_string(path).unwrap();
     serde_json::from_str(&content).unwrap()
+}
+
+async fn handle_funding_rates(
+    Query(params): Query<GetFundingRatesParams>,
+) -> Json<serde_json::Value> {
+    let rates = (0..101)
+        .map(|index| {
+            json!({
+                "symbol": params.symbol,
+                "timestamp_ns": index,
+                "funding_rate": "0.0001",
+                "funding_amount": "0.10",
+                "benchmark_price": "1.0845",
+                "settlement_price": "1.0846"
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_count = rates.len();
+    let offset = params
+        .cursor
+        .as_deref()
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = params.limit.unwrap_or(100).max(0) as usize;
+    let page = rates
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_offset = offset + page.len();
+    let next_cursor = (next_offset < total_count).then(|| next_offset.to_string());
+
+    Json(json!({
+        "funding_rates": page,
+        "total_count": total_count,
+        "limit": limit,
+        "next_cursor": next_cursor,
+    }))
+}
+
+async fn handle_repeated_funding_cursor(
+    Query(params): Query<GetFundingRatesParams>,
+) -> Json<serde_json::Value> {
+    let timestamp_ns = i64::from(params.cursor.is_some());
+
+    Json(json!({
+        "funding_rates": [{
+            "symbol": params.symbol,
+            "timestamp_ns": timestamp_ns,
+            "funding_rate": "0.0001",
+            "funding_amount": "0.10",
+            "benchmark_price": "1.0845",
+            "settlement_price": "1.0846"
+        }],
+        "limit": 1,
+        "next_cursor": "same",
+    }))
+}
+
+async fn handle_empty_open_orders_page() -> Json<serde_json::Value> {
+    Json(json!({
+        "orders": [],
+        "total_count": 1,
+        "limit": 100,
+        "offset": 0,
+    }))
 }
 
 fn create_router() -> Router {
@@ -136,10 +206,16 @@ fn create_router() -> Router {
                 }))
             }),
         )
+        .route("/funding-rates", get(handle_funding_rates))
 }
 
 async fn start_test_server() -> SocketAddr {
-    let router = create_router();
+    let addr = start_server(create_router()).await;
+    wait_for_server(addr, "/instruments").await;
+    addr
+}
+
+async fn start_server(router: Router) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -149,7 +225,6 @@ async fn start_test_server() -> SocketAddr {
             .unwrap();
     });
 
-    wait_for_server(addr, "/instruments").await;
     addr
 }
 
@@ -344,8 +419,8 @@ async fn test_domain_http_request_instrument_returns_nautilus_type() {
             assert_eq!(perp.price_precision, 4);
             assert_eq!(perp.price_increment.as_decimal(), dec!(0.0001));
             assert_eq!(perp.quote_currency.code.as_str(), "USD");
-            assert_eq!(perp.margin_init, dec!(8.0));
-            assert_eq!(perp.margin_maint, dec!(4.0));
+            assert_eq!(perp.margin_init, dec!(0.08));
+            assert_eq!(perp.margin_maint, dec!(0.04));
         }
         _ => panic!("Expected PerpetualContract instrument"),
     }
@@ -395,6 +470,74 @@ async fn test_domain_http_get_cached_instrument() {
     let unknown_symbol = Ustr::from("UNKNOWN-PERP");
     let cached = client.get_instrument(&unknown_symbol);
     assert!(cached.is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_domain_http_request_funding_rates_reads_all_cursor_pages() {
+    let addr = start_test_server().await;
+    let base_url = format!("http://{addr}");
+    let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
+    client.set_session_token("test_session_token".to_string());
+
+    let updates = client
+        .request_funding_rates(InstrumentId::from("EURUSD-PERP.AX"), None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(updates.len(), 101);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_domain_http_request_funding_rates_rejects_repeated_cursor() {
+    let router = Router::new().route("/funding-rates", get(handle_repeated_funding_cursor));
+    let addr = start_server(router).await;
+    let base_url = format!("http://{addr}");
+    let client = AxHttpClient::new(Some(base_url), None, 60, 3, 1000, 10_000, None).unwrap();
+    client.set_session_token("test_session_token".to_string());
+
+    let error = client
+        .request_funding_rates(InstrumentId::from("EURUSD-PERP.AX"), None, None)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Parameter validation error: AX funding-rates pagination repeated cursor \"same\""
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_domain_http_request_open_orders_rejects_empty_page_before_total() {
+    let router = Router::new().route("/open-orders", get(handle_empty_open_orders_page));
+    let addr = start_server(router).await;
+    let base_url = format!("http://{addr}");
+    let client = AxHttpClient::new(
+        Some(base_url.clone()),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        None,
+    )
+    .unwrap();
+    client.set_session_token("test_session_token".to_string());
+
+    let error = client
+        .request_order_status_reports(
+            AccountId::from("AX-001"),
+            None::<fn(u64) -> Option<ClientOrderId>>,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "AX open-orders returned an empty page before offset 0 reached total 1"
+    );
 }
 
 // Error handling tests

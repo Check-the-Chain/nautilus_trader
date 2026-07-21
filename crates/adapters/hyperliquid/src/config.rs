@@ -95,6 +95,23 @@ pub struct HyperliquidDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(HyperliquidDataClientConfig {
+    environment: HyperliquidEnvironment,
+    base_url_ws: Option<String>,
+    base_url_http: Option<String>,
+    http_timeout_secs: u64,
+    ws_timeout_secs: u64,
+    update_instruments_interval_mins: u64,
+    transport_backend: TransportBackend,
+    stale_stream_receive_timeout_secs: u64,
+    stream_health_check_interval_secs: u64,
+    stale_stream_warning_cooldown_secs: u64,
+    stale_stream_recovery_enabled: bool,
+    stale_stream_recovery_cooldown_secs: u64,
+    stale_stream_max_targeted_resubscribes: u32,
+});
+
 impl Default for HyperliquidDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -216,6 +233,25 @@ pub struct HyperliquidExecClientConfig {
     #[builder(default = 0)]
     pub outcome_settlement_poll_secs: u64,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(HyperliquidExecClientConfig {
+    vault_address: Option<String>,
+    account_address: Option<String>,
+    environment: HyperliquidEnvironment,
+    base_url_ws: Option<String>,
+    base_url_http: Option<String>,
+    base_url_exchange: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    normalize_prices: bool,
+    market_order_slippage_bps: u32,
+    include_builder_attribution: bool,
+    ws_post_timeout_secs: u64,
+    transport_backend: TransportBackend,
+});
 
 impl Default for HyperliquidExecClientConfig {
     fn default() -> Self {

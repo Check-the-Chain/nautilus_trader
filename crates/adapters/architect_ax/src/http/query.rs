@@ -158,6 +158,15 @@ pub struct GetFundingRatesParams {
     pub start_timestamp_ns: i64,
     /// End timestamp in nanoseconds.
     pub end_timestamp_ns: i64,
+    /// Cursor for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
+    /// Timestamp sort direction (`asc` or `desc`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_ts: Option<String>,
 }
 
 impl GetFundingRatesParams {
@@ -168,6 +177,9 @@ impl GetFundingRatesParams {
             symbol,
             start_timestamp_ns,
             end_timestamp_ns,
+            cursor: None,
+            limit: None,
+            sort_ts: None,
         }
     }
 }
@@ -182,6 +194,21 @@ pub struct GetFillsParams {
     pub start_timestamp_ns: i64,
     /// End timestamp in nanoseconds.
     pub end_timestamp_ns: i64,
+    /// Optional account ID. AX uses the primary account when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// Optional symbol filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<Ustr>,
+    /// Cursor for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
+    /// Timestamp sort direction (`asc` or `desc`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_ts: Option<String>,
 }
 
 impl GetFillsParams {
@@ -191,6 +218,11 @@ impl GetFillsParams {
         Self {
             start_timestamp_ns,
             end_timestamp_ns,
+            account_id: None,
+            symbol: None,
+            cursor: None,
+            limit: None,
+            sort_ts: None,
         }
     }
 }
@@ -207,6 +239,14 @@ pub struct GetTransactionsParams {
     pub start_timestamp_ns: i64,
     /// End timestamp in nanoseconds.
     pub end_timestamp_ns: i64,
+    /// Optional account ID. AX uses the primary account when omitted.
+    pub account_id: Option<String>,
+    /// Cursor for the next page.
+    pub cursor: Option<String>,
+    /// Maximum number of records to return.
+    pub limit: Option<i32>,
+    /// Timestamp sort direction (`asc` or `desc`).
+    pub sort_ts: Option<String>,
 }
 
 impl Serialize for GetTransactionsParams {
@@ -214,7 +254,7 @@ impl Serialize for GetTransactionsParams {
     where
         S: Serializer,
     {
-        let mut query = Vec::with_capacity(3);
+        let mut query = Vec::with_capacity(7);
 
         if !self.transaction_types.is_empty() {
             query.push(("transaction_types", self.transaction_types.join(",")));
@@ -222,6 +262,22 @@ impl Serialize for GetTransactionsParams {
 
         query.push(("start_timestamp_ns", self.start_timestamp_ns.to_string()));
         query.push(("end_timestamp_ns", self.end_timestamp_ns.to_string()));
+
+        if let Some(account_id) = &self.account_id {
+            query.push(("account_id", account_id.clone()));
+        }
+
+        if let Some(cursor) = &self.cursor {
+            query.push(("cursor", cursor.clone()));
+        }
+
+        if let Some(limit) = self.limit {
+            query.push(("limit", limit.to_string()));
+        }
+
+        if let Some(sort_ts) = &self.sort_ts {
+            query.push(("sort_ts", sort_ts.clone()));
+        }
 
         query.serialize(serializer)
     }
@@ -239,6 +295,10 @@ impl GetTransactionsParams {
             transaction_types,
             start_timestamp_ns,
             end_timestamp_ns,
+            account_id: None,
+            cursor: None,
+            limit: None,
+            sort_ts: None,
         }
     }
 }
@@ -318,6 +378,34 @@ impl GetOrderStatusParams {
             order_id: None,
             client_order_id: Some(cid),
         }
+    }
+}
+
+/// Parameters for the GET /open-orders endpoint.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/order-management/get-open-orders>
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct GetOpenOrdersParams {
+    /// Optional account ID. AX uses the primary account when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// Maximum number of open orders to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
+    /// Number of sorted open orders to skip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<i32>,
+    /// Timestamp sort direction (`asc` or `desc`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_ts: Option<String>,
+}
+
+impl GetOpenOrdersParams {
+    /// Creates a new empty [`GetOpenOrdersParams`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -480,33 +568,58 @@ mod tests {
 
     #[rstest]
     fn test_get_funding_rates_params_serialization() {
-        let params = GetFundingRatesParams::new(Ustr::from("GBPUSD-PERP"), 1000000000, 2000000000);
+        let mut params =
+            GetFundingRatesParams::new(Ustr::from("GBPUSD-PERP"), 1000000000, 2000000000);
+        params.cursor = Some("opaque+/=".to_string());
+        params.limit = Some(100);
+        params.sort_ts = Some("desc".to_string());
         let qs = serde_urlencoded::to_string(&params).unwrap();
         assert!(qs.contains("symbol=GBPUSD-PERP"));
         assert!(qs.contains("start_timestamp_ns=1000000000"));
         assert!(qs.contains("end_timestamp_ns=2000000000"));
+        assert!(qs.contains("cursor=opaque%2B%2F%3D"));
+        assert!(qs.contains("limit=100"));
+        assert!(qs.contains("sort_ts=desc"));
     }
 
     #[rstest]
     fn test_get_fills_params_serialization() {
-        let params = GetFillsParams::new(1000000000, 2000000000);
+        let mut params = GetFillsParams::new(1000000000, 2000000000);
+        params.account_id = Some("account-1".to_string());
+        params.symbol = Some(Ustr::from("GBPUSD-PERP"));
+        params.cursor = Some("opaque+/=".to_string());
+        params.limit = Some(100);
+        params.sort_ts = Some("desc".to_string());
         let qs = serde_urlencoded::to_string(&params).unwrap();
         assert!(qs.contains("start_timestamp_ns=1000000000"));
         assert!(qs.contains("end_timestamp_ns=2000000000"));
+        assert!(qs.contains("account_id=account-1"));
+        assert!(qs.contains("symbol=GBPUSD-PERP"));
+        assert!(qs.contains("cursor=opaque%2B%2F%3D"));
+        assert!(qs.contains("limit=100"));
+        assert!(qs.contains("sort_ts=desc"));
     }
 
     #[rstest]
     fn test_get_transactions_params_serialization() {
-        let params = GetTransactionsParams::new(
+        let mut params = GetTransactionsParams::new(
             vec!["FUNDING".to_string(), "TRADE".to_string()],
             1000000000,
             2000000000,
         );
+        params.account_id = Some("account-1".to_string());
+        params.cursor = Some("opaque+/=".to_string());
+        params.limit = Some(100);
+        params.sort_ts = Some("desc".to_string());
         let qs = serde_urlencoded::to_string(&params).unwrap();
 
         assert!(qs.contains("transaction_types=FUNDING%2CTRADE"));
         assert!(qs.contains("start_timestamp_ns=1000000000"));
         assert!(qs.contains("end_timestamp_ns=2000000000"));
+        assert!(qs.contains("account_id=account-1"));
+        assert!(qs.contains("cursor=opaque%2B%2F%3D"));
+        assert!(qs.contains("limit=100"));
+        assert!(qs.contains("sort_ts=desc"));
     }
 
     #[rstest]
@@ -522,6 +635,22 @@ mod tests {
         let params = GetTradesParams::new(Ustr::from("BTC-PERP"), None);
         let qs = serde_urlencoded::to_string(&params).unwrap();
         assert_eq!(qs, "symbol=BTC-PERP");
+    }
+
+    #[rstest]
+    fn test_get_open_orders_params_serialization() {
+        let params = GetOpenOrdersParams {
+            account_id: Some("account-1".to_string()),
+            limit: Some(100),
+            offset: Some(200),
+            sort_ts: Some("desc".to_string()),
+        };
+        let qs = serde_urlencoded::to_string(&params).unwrap();
+
+        assert!(qs.contains("account_id=account-1"));
+        assert!(qs.contains("limit=100"));
+        assert!(qs.contains("offset=200"));
+        assert!(qs.contains("sort_ts=desc"));
     }
 
     #[rstest]

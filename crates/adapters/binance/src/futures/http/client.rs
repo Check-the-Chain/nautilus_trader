@@ -15,9 +15,15 @@
 
 //! Binance Futures HTTP client for USD-M and COIN-M markets.
 
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    num::NonZeroU32,
+    sync::{Arc, LazyLock, Mutex, Weak},
+    time::Duration,
+};
 
 use ahash::AHashMap;
+use aws_lc_rs::digest;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use nautilus_common::cache::InstrumentLookupError;
@@ -38,7 +44,7 @@ use nautilus_model::{
 };
 use nautilus_network::{
     http::{HttpClient, HttpResponse, Method, USER_AGENT},
-    ratelimiter::quota::Quota,
+    ratelimiter::{RateLimiter, clock::MonotonicClock, quota::Quota},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -95,6 +101,42 @@ use crate::{
 const BINANCE_GLOBAL_RATE_KEY: &str = "binance:global";
 const BINANCE_ORDERS_RATE_KEY: &str = "binance:orders";
 
+type BinanceFuturesLimiter = RateLimiter<Ustr, MonotonicClock>;
+type BinanceFuturesRateLimiter = Arc<BinanceFuturesLimiter>;
+type BinanceFuturesRateLimiterRegistry<S> = Mutex<AHashMap<S, Weak<BinanceFuturesLimiter>>>;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum BinanceFuturesEndpointScope {
+    Environment(BinanceEnvironment),
+    Custom {
+        environment: BinanceEnvironment,
+        base_url: String,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BinanceFuturesRequestScope {
+    endpoint: BinanceFuturesEndpointScope,
+    proxy_url: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct BinanceFuturesAccountScope([u8; 32]);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BinanceFuturesOrderScope {
+    endpoint: BinanceFuturesEndpointScope,
+    account: BinanceFuturesAccountScope,
+}
+
+static BINANCE_FUTURES_REQUEST_LIMITERS: LazyLock<
+    BinanceFuturesRateLimiterRegistry<BinanceFuturesRequestScope>,
+> = LazyLock::new(|| Mutex::new(AHashMap::new()));
+
+static BINANCE_FUTURES_ORDER_LIMITERS: LazyLock<
+    BinanceFuturesRateLimiterRegistry<BinanceFuturesOrderScope>,
+> = LazyLock::new(|| Mutex::new(AHashMap::new()));
+
 /// A Binance Futures Algo Service order with optional matching-engine details.
 #[derive(Debug)]
 pub struct BinanceFuturesAlgoOrderQueryResult {
@@ -149,8 +191,8 @@ impl BinanceRawFuturesHttpClient {
         proxy_url: Option<String>,
     ) -> BinanceFuturesHttpResult<Self> {
         let RateLimitConfig {
-            default_quota,
-            keyed_quotas,
+            request_quota,
+            order_quotas,
             order_keys,
         } = Self::rate_limit_config(product_type);
 
@@ -160,19 +202,26 @@ impl BinanceRawFuturesHttpClient {
             _ => return Err(BinanceFuturesHttpError::MissingCredentials),
         };
 
+        let account_scope = credential.as_ref().map(Self::account_scope);
+        let rate_limiters = Self::shared_rate_limiters(
+            environment,
+            base_url_override.as_deref(),
+            proxy_url.as_deref(),
+            account_scope,
+            request_quota,
+            order_quotas,
+        );
         let base_url = base_url_override
             .unwrap_or_else(|| get_http_base_url(product_type, environment).to_string());
-
         let api_path = Self::resolve_api_path(product_type);
         let headers = Self::default_headers(&credential);
 
-        let client = HttpClient::new(
+        let client = HttpClient::new_with_rate_limiters(
             headers,
             vec![BINANCE_API_KEY_HEADER.to_string()],
-            keyed_quotas,
-            default_quota,
             timeout_secs,
             proxy_url,
+            rate_limiters,
         )?;
 
         Ok(Self {
@@ -183,6 +232,104 @@ impl BinanceRawFuturesHttpClient {
             recv_window,
             order_rate_keys: order_keys,
         })
+    }
+
+    fn shared_rate_limiters(
+        environment: BinanceEnvironment,
+        base_url_override: Option<&str>,
+        proxy_url: Option<&str>,
+        account_scope: Option<BinanceFuturesAccountScope>,
+        request_quota: Quota,
+        order_quotas: Vec<(String, Quota)>,
+    ) -> Vec<BinanceFuturesRateLimiter> {
+        let endpoint = Self::endpoint_scope(environment, base_url_override);
+        let request_scope = BinanceFuturesRequestScope {
+            endpoint: endpoint.clone(),
+            proxy_url: proxy_url.map(ToOwned::to_owned),
+        };
+        let request_limiter = Self::request_rate_limiter(request_scope, request_quota);
+        let mut limiters = vec![request_limiter];
+
+        if let Some(account) = account_scope {
+            let order_scope = BinanceFuturesOrderScope { endpoint, account };
+            limiters.push(Self::order_rate_limiter(order_scope, order_quotas));
+        }
+
+        limiters
+    }
+
+    fn endpoint_scope(
+        environment: BinanceEnvironment,
+        base_url_override: Option<&str>,
+    ) -> BinanceFuturesEndpointScope {
+        let Some(base_url) = base_url_override else {
+            return BinanceFuturesEndpointScope::Environment(environment);
+        };
+
+        let normalized = base_url.trim_end_matches('/');
+        let official_urls = [
+            get_http_base_url(BinanceProductType::UsdM, environment),
+            get_http_base_url(BinanceProductType::CoinM, environment),
+        ];
+
+        if official_urls.contains(&normalized) {
+            BinanceFuturesEndpointScope::Environment(environment)
+        } else {
+            BinanceFuturesEndpointScope::Custom {
+                environment,
+                base_url: normalized.to_string(),
+            }
+        }
+    }
+
+    fn account_scope(credential: &SigningCredential) -> BinanceFuturesAccountScope {
+        let digest = digest::digest(&digest::SHA256, credential.api_key().as_bytes());
+        let bytes = digest
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 digest must contain 32 bytes");
+        BinanceFuturesAccountScope(bytes)
+    }
+
+    fn request_rate_limiter(
+        scope: BinanceFuturesRequestScope,
+        quota: Quota,
+    ) -> BinanceFuturesRateLimiter {
+        let mut registry = BINANCE_FUTURES_REQUEST_LIMITERS
+            .lock()
+            .expect("Binance Futures request rate limiter registry mutex poisoned");
+
+        if let Some(limiter) = registry.get(&scope).and_then(Weak::upgrade) {
+            return limiter;
+        }
+
+        let limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(Ustr::from(BINANCE_GLOBAL_RATE_KEY), quota)],
+        ));
+        registry.insert(scope, Arc::downgrade(&limiter));
+        limiter
+    }
+
+    fn order_rate_limiter(
+        scope: BinanceFuturesOrderScope,
+        quotas: Vec<(String, Quota)>,
+    ) -> BinanceFuturesRateLimiter {
+        let mut registry = BINANCE_FUTURES_ORDER_LIMITERS
+            .lock()
+            .expect("Binance Futures order rate limiter registry mutex poisoned");
+
+        if let Some(limiter) = registry.get(&scope).and_then(Weak::upgrade) {
+            return limiter;
+        }
+
+        let quotas = quotas
+            .into_iter()
+            .map(|(key, quota)| (Ustr::from(&key), quota))
+            .collect();
+        let limiter = Arc::new(RateLimiter::new_with_quota(None, quotas));
+        registry.insert(scope, Arc::downgrade(&limiter));
+        limiter
     }
 
     /// Performs a GET request and deserializes the response body.
@@ -533,15 +680,15 @@ impl BinanceRawFuturesHttpClient {
             _ => BINANCE_FAPI_RATE_LIMITS,
         };
 
-        let mut keyed = Vec::new();
+        let mut order_quotas = Vec::new();
         let mut order_keys = Vec::new();
-        let mut default = None;
+        let mut request_quota = None;
 
         for quota in quotas {
             if let Some(q) = Self::quota_from(quota) {
                 match quota.rate_limit_type {
-                    BinanceRateLimitType::RequestWeight if default.is_none() => {
-                        default = Some(q);
+                    BinanceRateLimitType::RequestWeight if request_quota.is_none() => {
+                        request_quota = Some(q);
                     }
                     BinanceRateLimitType::Orders => {
                         let key = format!(
@@ -549,22 +696,20 @@ impl BinanceRawFuturesHttpClient {
                             BINANCE_ORDERS_RATE_KEY, quota.interval_num, quota.interval
                         );
                         order_keys.push(key.clone());
-                        keyed.push((key, q));
+                        order_quotas.push((key, q));
                     }
                     _ => {}
                 }
             }
         }
 
-        let default_quota = default.unwrap_or_else(|| {
+        let request_quota = request_quota.unwrap_or_else(|| {
             Quota::per_second(NonZeroU32::new(10).expect("non-zero")).expect("valid constant")
         });
 
-        keyed.push((BINANCE_GLOBAL_RATE_KEY.to_string(), default_quota));
-
         RateLimitConfig {
-            default_quota: Some(default_quota),
-            keyed_quotas: keyed,
+            request_quota,
+            order_quotas,
             order_keys,
         }
     }
@@ -1156,8 +1301,8 @@ impl From<MarkPriceResponse> for Vec<BinanceFuturesMarkPrice> {
 }
 
 struct RateLimitConfig {
-    default_quota: Option<Quota>,
-    keyed_quotas: Vec<(String, Quota)>,
+    request_quota: Quota,
+    order_quotas: Vec<(String, Quota)>,
     order_keys: Vec<String>,
 }
 
@@ -1218,7 +1363,7 @@ impl BinanceFuturesInstrument {
     }
 }
 
-/// Binance Futures HTTP client for USD-M and COIN-M perpetuals.
+/// Binance Futures HTTP client for USD-M and COIN-M perpetuals and delivery contracts.
 #[derive(Debug, Clone)]
 pub struct BinanceFuturesHttpClient {
     inner: Arc<BinanceRawFuturesHttpClient>,
@@ -1488,7 +1633,7 @@ impl BinanceFuturesHttpClient {
                 }
 
                 log::debug!(
-                    "Loaded USD-M perpetual instruments: count={}",
+                    "Loaded USD-M Futures instruments: count={}",
                     instruments.len()
                 );
                 instruments
@@ -1519,7 +1664,7 @@ impl BinanceFuturesHttpClient {
                 }
 
                 log::debug!(
-                    "Loaded COIN-M perpetual instruments: count={}",
+                    "Loaded COIN-M Futures instruments: count={}",
                     instruments.len()
                 );
                 instruments
@@ -1724,6 +1869,7 @@ impl BinanceFuturesHttpClient {
         post_only: bool,
         position_side: Option<BinancePositionSide>,
         price_match: Option<BinancePriceMatch>,
+        good_till_date: Option<i64>,
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = format_binance_symbol(&instrument_id);
         let size_precision = self.get_size_precision(&symbol)?;
@@ -1786,7 +1932,7 @@ impl BinanceFuturesHttpClient {
             working_type: None,
             price_protect: None,
             new_order_resp_type: None,
-            good_till_date: None,
+            good_till_date,
             recv_window: None,
             price_match,
             self_trade_prevention_mode: None,
@@ -1834,6 +1980,7 @@ impl BinanceFuturesHttpClient {
         activation_price: Option<Price>,
         callback_rate: Option<String>,
         working_type: Option<BinanceWorkingType>,
+        good_till_date: Option<i64>,
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = format_binance_symbol(&instrument_id);
         let size_precision = self.get_size_precision(&symbol)?;
@@ -1891,7 +2038,7 @@ impl BinanceFuturesHttpClient {
                 activation_price: activation_price.map(|p| p.to_string()),
                 callback_rate,
                 client_algo_id: Some(client_id_str),
-                good_till_date: None,
+                good_till_date,
                 recv_window: None,
             }
         } else {
@@ -1917,7 +2064,7 @@ impl BinanceFuturesHttpClient {
                 activation_price: activation_price.map(|p| p.to_string()),
                 callback_rate,
                 client_algo_id: Some(client_id_str),
-                good_till_date: None,
+                good_till_date,
                 recv_window: None,
             }
         };
@@ -2475,11 +2622,8 @@ impl BinanceFuturesHttpClient {
         let mut reports = Vec::with_capacity(orders.len());
 
         for order in orders {
-            let order_instrument_id = instrument_id.unwrap_or_else(|| {
-                // Build instrument ID from order symbol
-                let suffix = self.product_type.suffix();
-                InstrumentId::from(format!("{}{}.BINANCE", order.symbol, suffix))
-            });
+            let order_instrument_id = instrument_id
+                .unwrap_or_else(|| format_instrument_id(&order.symbol, self.product_type));
 
             let price_precision = self.get_price_precision(&order.symbol).unwrap_or(8);
             let size_precision = self.get_size_precision(&order.symbol).unwrap_or(8);
@@ -2830,7 +2974,7 @@ mod tests {
     fn test_rate_limit_config_usdm_has_request_weight_and_orders() {
         let config = BinanceRawFuturesHttpClient::rate_limit_config(BinanceProductType::UsdM);
 
-        assert!(config.default_quota.is_some());
+        assert_eq!(config.request_quota.burst_size().get(), 2_400);
         assert_eq!(config.order_keys.len(), 2);
         assert!(
             config
@@ -2846,7 +2990,7 @@ mod tests {
         );
 
         let ten_second_quota = config
-            .keyed_quotas
+            .order_quotas
             .iter()
             .find(|(key, _)| key == "binance:orders:10:Second")
             .map(|(_, quota)| quota)
@@ -2862,13 +3006,13 @@ mod tests {
     fn test_rate_limit_config_coinm_has_request_weight_and_orders() {
         let config = BinanceRawFuturesHttpClient::rate_limit_config(BinanceProductType::CoinM);
 
-        assert!(config.default_quota.is_some());
+        assert_eq!(config.request_quota.burst_size().get(), 2_400);
         assert_eq!(config.order_keys.len(), 2);
         assert!(
             config
                 .order_keys
                 .iter()
-                .any(|key| key == "binance:orders:1:Second")
+                .any(|key| key == "binance:orders:10:Second")
         );
         assert!(
             config
@@ -2876,6 +3020,123 @@ mod tests {
                 .iter()
                 .any(|key| key == "binance:orders:1:Minute")
         );
+
+        let ten_second_quota = config
+            .order_quotas
+            .iter()
+            .find(|(key, _)| key == "binance:orders:10:Second")
+            .map(|(_, quota)| quota)
+            .expect("COIN-M 10-second order quota");
+        let minute_quota = config
+            .order_quotas
+            .iter()
+            .find(|(key, _)| key == "binance:orders:1:Minute")
+            .map(|(_, quota)| quota)
+            .expect("COIN-M one-minute order quota");
+
+        assert_eq!(ten_second_quota.burst_size().get(), 300);
+        assert_eq!(minute_quota.burst_size().get(), 1_200);
+    }
+
+    #[rstest]
+    fn test_rate_limiters_share_usdm_and_coinm_scopes() {
+        let account = Some(BinanceFuturesAccountScope([1; 32]));
+        let usdm_config = BinanceRawFuturesHttpClient::rate_limit_config(BinanceProductType::UsdM);
+        let coinm_config =
+            BinanceRawFuturesHttpClient::rate_limit_config(BinanceProductType::CoinM);
+
+        let usdm = BinanceRawFuturesHttpClient::shared_rate_limiters(
+            BinanceEnvironment::Live,
+            None,
+            None,
+            account,
+            usdm_config.request_quota,
+            usdm_config.order_quotas,
+        );
+        let coinm = BinanceRawFuturesHttpClient::shared_rate_limiters(
+            BinanceEnvironment::Live,
+            Some(get_http_base_url(
+                BinanceProductType::CoinM,
+                BinanceEnvironment::Live,
+            )),
+            None,
+            account,
+            coinm_config.request_quota,
+            coinm_config.order_quotas,
+        );
+        let public = create_test_rate_limiters(BinanceEnvironment::Live, None, None, None);
+
+        assert_eq!(usdm.len(), 2);
+        assert_eq!(coinm.len(), 2);
+        assert_eq!(public.len(), 1);
+        assert!(Arc::ptr_eq(&usdm[0], &coinm[0]));
+        assert!(Arc::ptr_eq(&usdm[0], &public[0]));
+        assert!(Arc::ptr_eq(&usdm[1], &coinm[1]));
+    }
+
+    #[rstest]
+    fn test_rate_limiters_isolate_unrelated_scopes() {
+        let account_a = Some(BinanceFuturesAccountScope([2; 32]));
+        let account_b = Some(BinanceFuturesAccountScope([3; 32]));
+
+        let live_direct =
+            create_test_rate_limiters(BinanceEnvironment::Live, None, None, account_a);
+        let testnet_direct =
+            create_test_rate_limiters(BinanceEnvironment::Testnet, None, None, account_a);
+        let demo_direct =
+            create_test_rate_limiters(BinanceEnvironment::Demo, None, None, account_a);
+        let custom_a = create_test_rate_limiters(
+            BinanceEnvironment::Live,
+            Some("http://127.0.0.1:41001"),
+            None,
+            account_a,
+        );
+        let custom_b = create_test_rate_limiters(
+            BinanceEnvironment::Live,
+            Some("http://127.0.0.1:41002"),
+            None,
+            account_a,
+        );
+        let proxy_a = create_test_rate_limiters(
+            BinanceEnvironment::Live,
+            None,
+            Some("http://127.0.0.1:42001"),
+            account_a,
+        );
+        let proxy_b = create_test_rate_limiters(
+            BinanceEnvironment::Live,
+            None,
+            Some("http://127.0.0.1:42002"),
+            account_a,
+        );
+        let other_account =
+            create_test_rate_limiters(BinanceEnvironment::Live, None, None, account_b);
+
+        assert!(!Arc::ptr_eq(&live_direct[0], &testnet_direct[0]));
+        assert!(!Arc::ptr_eq(&live_direct[0], &demo_direct[0]));
+        assert!(!Arc::ptr_eq(&live_direct[0], &custom_a[0]));
+        assert!(!Arc::ptr_eq(&custom_a[0], &custom_b[0]));
+        assert!(!Arc::ptr_eq(&proxy_a[0], &proxy_b[0]));
+        assert!(Arc::ptr_eq(&proxy_a[1], &proxy_b[1]));
+        assert!(Arc::ptr_eq(&live_direct[0], &other_account[0]));
+        assert!(!Arc::ptr_eq(&live_direct[1], &other_account[1]));
+    }
+
+    fn create_test_rate_limiters(
+        environment: BinanceEnvironment,
+        base_url_override: Option<&str>,
+        proxy_url: Option<&str>,
+        account_scope: Option<BinanceFuturesAccountScope>,
+    ) -> Vec<BinanceFuturesRateLimiter> {
+        let config = BinanceRawFuturesHttpClient::rate_limit_config(BinanceProductType::UsdM);
+        BinanceRawFuturesHttpClient::shared_rate_limiters(
+            environment,
+            base_url_override,
+            proxy_url,
+            account_scope,
+            config.request_quota,
+            config.order_quotas,
+        )
     }
 
     #[rstest]
@@ -3087,6 +3348,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
                 None,
                 None,
                 None,

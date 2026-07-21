@@ -85,6 +85,23 @@ pub struct BybitDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BybitDataClientConfig {
+    product_types: Vec<BybitProductType>,
+    environment: BybitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_public: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    update_instruments_interval_mins: Option<u64>,
+    transport_backend: TransportBackend,
+});
+
 impl Default for BybitDataClientConfig {
     fn default() -> Self {
         Self {
@@ -217,6 +234,25 @@ pub struct BybitExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BybitExecClientConfig {
+    product_types: Vec<BybitProductType>,
+    environment: BybitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_private: Option<String>,
+    base_url_ws_trade: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    account_id: Option<AccountId>,
+    use_spot_position_reports: bool,
+    margin_mode: Option<BybitMarginMode>,
+    transport_backend: TransportBackend,
+});
 
 impl Default for BybitExecClientConfig {
     fn default() -> Self {

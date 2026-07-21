@@ -84,13 +84,6 @@ TRIGGERABLE_ORDER_TYPES = {
     OrderType.LIMIT_IF_TOUCHED,
 }
 
-CANCELLABLE_ORDER_STATUSES = {
-    OrderStatus.ACCEPTED,
-    OrderStatus.TRIGGERED,
-    OrderStatus.PENDING_UPDATE,
-    OrderStatus.PARTIALLY_FILLED,
-}
-
 LOCAL_ACTIVE_ORDER_STATUSES =  {
     OrderStatus.INITIALIZED,
     OrderStatus.EMULATED,

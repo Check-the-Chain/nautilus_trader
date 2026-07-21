@@ -63,7 +63,7 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::BarType,
-    enums::{OrderSide, OrderType, TimeInForce},
+    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId},
     instruments::Instrument,
     types::Quantity,
@@ -398,6 +398,24 @@ async fn handle_delete_order(headers: axum::http::HeaderMap, body: String) -> Re
         .into_response()
 }
 
+async fn handle_delete_all_orders(headers: axum::http::HeaderMap) -> Response {
+    if !headers.contains_key("api-key") || !headers.contains_key("api-signature") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": { "message": "Invalid API Key.", "name": "HTTPError" }
+            })),
+        )
+            .into_response();
+    }
+
+    Json(vec![
+        load_test_data("http_cancel_all_close_race.json"),
+        load_test_data("http_cancel_all_canceled.json"),
+    ])
+    .into_response()
+}
+
 async fn handle_cancel_all_after(headers: axum::http::HeaderMap, body: String) -> Response {
     if !headers.contains_key("api-key") || !headers.contains_key("api-signature") {
         return (
@@ -435,6 +453,10 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/trade/bucketed", get(handle_get_trade_bucketed))
         .route("/order", axum::routing::post(handle_post_order))
         .route("/order", axum::routing::delete(handle_delete_order))
+        .route(
+            "/order/all",
+            axum::routing::delete(handle_delete_all_orders),
+        )
         .route(
             "/order/cancelAllAfter",
             axum::routing::post(handle_cancel_all_after),
@@ -925,6 +947,54 @@ async fn test_cancel_order() {
     let result_array = result.as_array().unwrap();
     assert_eq!(result_array.len(), 1);
     assert_eq!(result_array[0]["ordStatus"], "Canceled");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_all_orders_skips_invalid_order_rejection() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+    let instrument = client
+        .request_instrument(instrument_id)
+        .await
+        .unwrap()
+        .unwrap();
+    client.cache_instrument(instrument);
+
+    let reports = client.cancel_all_orders(instrument_id, None).await.unwrap();
+
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert_eq!(
+        report.venue_order_id.as_str(),
+        "550e8400-e29b-41d4-a716-446655440003"
+    );
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("cancel-control"))
+    );
+    assert_eq!(report.order_side, OrderSide::Buy);
+    assert_eq!(report.order_type, OrderType::Limit);
+    assert_eq!(report.time_in_force, TimeInForce::Gtc);
+    assert_eq!(report.order_status, OrderStatus::Canceled);
+    assert_eq!(report.quantity, Quantity::from("100"));
+    assert_eq!(report.filled_qty, Quantity::from("0"));
 }
 
 // Test that HTTP client correctly implements rate limiting per BitMEX API requirements.

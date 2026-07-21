@@ -105,13 +105,13 @@ def test_polymarket_runtime_configs_round_trip_transport_backend() -> None:
 
 
 @pytest.mark.parametrize(
-    ("module_name", "class_name", "kwargs", "assert_in_repr"),
+    ("module_name", "class_name", "kwargs"),
     [
-        ("coinbase", "CoinbaseDataClientConfig", {}, True),
-        ("coinbase", "CoinbaseExecClientConfig", {}, True),
-        ("derive", "DeriveDataClientConfig", {}, True),
-        ("derive", "DeriveExecClientConfig", {}, True),
-        ("lighter", "LighterDataClientConfig", {}, True),
+        ("coinbase", "CoinbaseDataClientConfig", {}),
+        ("coinbase", "CoinbaseExecClientConfig", {}),
+        ("derive", "DeriveDataClientConfig", {}),
+        ("derive", "DeriveExecClientConfig", {}),
+        ("lighter", "LighterDataClientConfig", {}),
         (
             "lighter",
             "LighterExecClientConfig",
@@ -119,24 +119,21 @@ def test_polymarket_runtime_configs_round_trip_transport_backend() -> None:
                 "trader_id": nautilus_pyo3.TraderId("TESTER-001"),
                 "account_id": nautilus_pyo3.AccountId("LIGHTER-001"),
             },
-            True,
         ),
-        ("polymarket", "PolymarketDataClientConfig", {}, True),
-        ("polymarket", "PolymarketExecClientConfig", {}, False),
+        ("polymarket", "PolymarketDataClientConfig", {}),
+        ("polymarket", "PolymarketExecClientConfig", {}),
     ],
 )
 def test_pyo3_configs_accept_transport_backend(
     module_name,
     class_name,
     kwargs,
-    assert_in_repr,
 ):
     cls = getattr(getattr(nautilus_pyo3, module_name), class_name)
     config = cls(transport_backend=TransportBackend.TUNGSTENITE, **kwargs)
 
     assert "transport_backend" in inspect.signature(cls).parameters
-    if assert_in_repr:
-        assert "transport_backend: Tungstenite" in repr(config)
+    assert config.transport_backend == TransportBackend.TUNGSTENITE
 
 
 def test_public_network_module_exposes_transport_backend() -> None:
@@ -163,5 +160,5 @@ def test_transport_backend_none_preserves_wrapper_and_pyo3_defaults() -> None:
 
     assert runtime_config.transport_backend is None
     assert parsed_runtime_config.transport_backend is None
-    assert "transport_backend: Sockudo" in repr(pyo3_config)
+    assert pyo3_config.transport_backend == TransportBackend.SOCKUDO
     assert WebSocketConfig("wss://example.invalid", [], backend=None) is not None

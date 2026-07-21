@@ -20,13 +20,15 @@ use std::{cell::UnsafeCell, collections::HashMap, fmt::Debug, rc::Rc};
 use chrono::{DateTime, Utc};
 use nautilus_common::{
     actor::{DataActor, DataActorNative, data_actor::DataActorCore},
+    component::Component,
     enums::ComponentState,
     python::{cache::PyCache, clock::PyClock, logging::PyLogger},
+    signal::Signal,
     timer::TimeEvent,
 };
 use nautilus_core::{
     UnixNanos,
-    python::{IntoPyObjectNautilusExt, to_pyruntime_err, to_pyvalue_err},
+    python::{to_pyruntime_err, to_pyvalue_err},
 };
 use nautilus_model::{
     data::{CustomData, DataType},
@@ -43,7 +45,9 @@ use nautilus_model::{
     python::{events::order::order_event_to_pyobject, orders::pyobject_to_order_any},
     types::{Price, Quantity},
 };
+use nautilus_portfolio::python::PyPortfolio;
 use pyo3::{
+    IntoPyObjectExt,
     prelude::*,
     types::{PyDict, PyList},
 };
@@ -192,7 +196,16 @@ impl PyExecutionAlgorithm {
     fn dispatch_time_event(&self, event: &TimeEvent) -> PyResult<()> {
         if let Some(ref py_self) = self.inner().py_self {
             Python::attach(|py| {
-                py_self.call_method1(py, "on_time_event", (event.clone().into_py_any_unwrap(py),))
+                py_self.call_method1(py, "on_time_event", (event.clone().into_py_any(py)?,))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_signal(&self, signal: &Signal) -> PyResult<()> {
+        if let Some(ref py_self) = self.inner().py_self {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_signal", (signal.clone().into_py_any(py)?,))
             })?;
         }
         Ok(())
@@ -211,7 +224,7 @@ impl PyExecutionAlgorithm {
     fn dispatch_on_order_list(&self, order_list: OrderList, orders: Vec<OrderAny>) -> PyResult<()> {
         if let Some(ref py_self) = self.inner().py_self {
             Python::attach(|py| -> PyResult<()> {
-                let py_order_list = order_list.into_py_any_unwrap(py);
+                let py_order_list = order_list.into_py_any(py)?;
                 let py_orders: Vec<_> = orders
                     .into_iter()
                     .map(|order| nautilus_model::python::orders::order_any_to_pyobject(py, order))
@@ -252,10 +265,10 @@ impl PyExecutionAlgorithm {
         if let Some(ref py_self) = self.inner().py_self {
             Python::attach(|py| {
                 let py_event = match event {
-                    PositionEvent::PositionOpened(event) => event.into_py_any_unwrap(py),
-                    PositionEvent::PositionChanged(event) => event.into_py_any_unwrap(py),
-                    PositionEvent::PositionClosed(event) => event.into_py_any_unwrap(py),
-                    PositionEvent::PositionAdjusted(event) => event.into_py_any_unwrap(py),
+                    PositionEvent::PositionOpened(event) => event.into_py_any(py)?,
+                    PositionEvent::PositionChanged(event) => event.into_py_any(py)?,
+                    PositionEvent::PositionClosed(event) => event.into_py_any(py)?,
+                    PositionEvent::PositionAdjusted(event) => event.into_py_any(py)?,
                 };
                 py_self.call_method1(py, method_name, (py_event,))
             })?;
@@ -534,6 +547,11 @@ impl DataActor for PyExecutionAlgorithm {
         self.dispatch_time_event(event)
             .map_err(|e| anyhow::anyhow!("Python on_time_event failed: {e}"))
     }
+
+    fn on_signal(&mut self, signal: &Signal) -> anyhow::Result<()> {
+        self.dispatch_on_signal(signal)
+            .map_err(|e| anyhow::anyhow!("Python on_signal failed: {e}"))
+    }
 }
 
 #[pyo3::pymethods]
@@ -612,6 +630,18 @@ impl PyExecutionAlgorithm {
     }
 
     #[getter]
+    #[pyo3(name = "portfolio")]
+    fn py_portfolio(&self) -> PyResult<PyPortfolio> {
+        if self.inner().core.actor.is_registered() {
+            Ok(PyPortfolio::from_rc(self.portfolio_rc()))
+        } else {
+            Err(to_pyruntime_err(
+                "ExecutionAlgorithm must be registered with a trader before accessing portfolio",
+            ))
+        }
+    }
+
+    #[getter]
     #[pyo3(name = "log")]
     fn py_log(&self) -> PyLogger {
         self.inner().logger.clone()
@@ -626,6 +656,85 @@ impl PyExecutionAlgorithm {
     #[pyo3(name = "is_registered")]
     fn py_is_registered(&self) -> bool {
         self.inner().core.actor.is_registered()
+    }
+
+    #[pyo3(name = "is_ready")]
+    fn py_is_ready(&self) -> bool {
+        Component::is_ready(self)
+    }
+
+    #[pyo3(name = "is_running")]
+    fn py_is_running(&self) -> bool {
+        Component::is_running(self)
+    }
+
+    #[pyo3(name = "is_stopped")]
+    fn py_is_stopped(&self) -> bool {
+        Component::is_stopped(self)
+    }
+
+    #[pyo3(name = "is_disposed")]
+    fn py_is_disposed(&self) -> bool {
+        Component::is_disposed(self)
+    }
+
+    #[pyo3(name = "is_degraded")]
+    fn py_is_degraded(&self) -> bool {
+        Component::is_degraded(self)
+    }
+
+    #[pyo3(name = "is_faulted")]
+    fn py_is_faulted(&self) -> bool {
+        Component::is_faulted(self)
+    }
+
+    #[pyo3(name = "start")]
+    fn py_start(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let mut exec_algorithm = slf.clone();
+        drop(slf);
+        Component::start(&mut exec_algorithm).map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "stop")]
+    fn py_stop(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let mut exec_algorithm = slf.clone();
+        drop(slf);
+        Component::stop(&mut exec_algorithm).map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "resume")]
+    fn py_resume(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let mut exec_algorithm = slf.clone();
+        drop(slf);
+        Component::resume(&mut exec_algorithm).map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "reset")]
+    fn py_reset(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let mut exec_algorithm = slf.clone();
+        drop(slf);
+        Component::reset(&mut exec_algorithm).map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "dispose")]
+    fn py_dispose(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let mut exec_algorithm = slf.clone();
+        drop(slf);
+        Component::dispose(&mut exec_algorithm).map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "degrade")]
+    fn py_degrade(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let mut exec_algorithm = slf.clone();
+        drop(slf);
+        Component::degrade(&mut exec_algorithm).map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "fault")]
+    fn py_fault(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let mut exec_algorithm = slf.clone();
+        drop(slf);
+        Component::fault(&mut exec_algorithm).map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "publish_data")]
@@ -649,6 +758,18 @@ impl PyExecutionAlgorithm {
         let value_str: String = value.bind(py).str()?.extract()?;
         DataActor::publish_signal(self, name, value_str, UnixNanos::from(ts_event));
         Ok(())
+    }
+
+    #[pyo3(name = "subscribe_signal")]
+    #[pyo3(signature = (name="", priority=None))]
+    fn py_subscribe_signal(&mut self, name: &str, priority: Option<u32>) {
+        DataActor::subscribe_signal(self, name, priority);
+    }
+
+    #[pyo3(name = "unsubscribe_signal")]
+    #[pyo3(signature = (name=""))]
+    fn py_unsubscribe_signal(&mut self, name: &str) {
+        DataActor::unsubscribe_signal(self, name);
     }
 
     #[pyo3(name = "on_start")]
@@ -675,6 +796,10 @@ impl PyExecutionAlgorithm {
     #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_time_event")]
     fn py_on_time_event(&mut self, event: TimeEvent) {}
+
+    #[allow(unused_variables)]
+    #[pyo3(name = "on_signal")]
+    fn py_on_signal(&mut self, signal: &Signal) {}
 
     #[allow(clippy::needless_pass_by_value)]
     #[pyo3(name = "execute")]

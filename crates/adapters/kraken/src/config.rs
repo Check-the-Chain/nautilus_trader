@@ -85,6 +85,19 @@ pub struct KrakenDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(KrakenDataClientConfig {
+    product_type: KrakenProductType,
+    environment: KrakenEnvironment,
+    base_url: Option<String>,
+    validate_l3_checksum: bool,
+    timeout_secs: u64,
+    heartbeat_interval_secs: u64,
+    ws_idle_timeout_ms: u64,
+    max_requests_per_second: Option<u32>,
+    transport_backend: TransportBackend,
+});
+
 impl Default for KrakenDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -225,6 +238,26 @@ pub struct KrakenExecClientConfig {
     #[builder(default = 5)]
     pub ws_request_timeout_secs: u64,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(KrakenExecClientConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    product_type: KrakenProductType,
+    environment: KrakenEnvironment,
+    base_url: Option<String>,
+    timeout_secs: u64,
+    heartbeat_interval_secs: u64,
+    max_requests_per_second: Option<u32>,
+    spot_account_type: AccountType,
+    default_leverage: Option<u16>,
+    use_spot_position_reports: bool,
+    spot_positions_quote_currency: String,
+    margin_balance_asset: Option<String>,
+    use_ws_trade: bool,
+    ws_request_timeout_secs: u64,
+    transport_backend: TransportBackend,
+});
 
 impl Default for KrakenExecClientConfig {
     fn default() -> Self {

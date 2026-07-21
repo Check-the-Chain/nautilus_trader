@@ -97,8 +97,13 @@ impl HyperliquidDataClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(HyperliquidDataClientConfig).to_string()
     }
 }
 
@@ -172,7 +177,12 @@ impl HyperliquidExecClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(HyperliquidExecClientConfig).to_string()
     }
 }

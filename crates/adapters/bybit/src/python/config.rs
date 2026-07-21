@@ -94,8 +94,18 @@ impl BybitDataClientConfig {
         }
     }
 
+    #[getter]
+    const fn instrument_status_poll_secs(&self) -> Option<u64> {
+        self.instrument_poll_interval_secs
+    }
+
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(BybitDataClientConfig).to_string()
     }
 }
 
@@ -173,7 +183,12 @@ impl BybitExecClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(BybitExecClientConfig).to_string()
     }
 }

@@ -89,8 +89,13 @@ impl DeribitDataClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DeribitDataClientConfig).to_string()
     }
 }
 
@@ -152,7 +157,12 @@ impl DeribitExecClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DeribitExecClientConfig).to_string()
     }
 }

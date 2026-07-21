@@ -233,7 +233,7 @@ class InteractiveBrokersDataClientConfig(LiveDataClientConfig, frozen=True):
         The timeout (seconds) to wait for the client connection to be established.
     request_timeout_secs : int, default 60
         The timeout (seconds) to wait for a historical data response. Also used for
-        contract detail lookups — increase this when requesting large option chains.
+        contract detail lookups - increase this when requesting large option chains.
 
     """
 

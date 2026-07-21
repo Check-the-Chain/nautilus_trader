@@ -4511,7 +4511,7 @@ async def test_position_check_stale_retries_pruned_when_position_closed(
     stale_key = (AUDUSD_SIM.id, TestIdStubs.account_id())
     live_exec_engine._position_recon_retries[stale_key] = 1  # Already maxed
 
-    # No open positions in cache, no venue reports — instrument disappeared
+    # No open positions in cache, no venue reports - instrument disappeared
     # Stub venue query to return nothing
     async def empty_reports(cmd):
         return []

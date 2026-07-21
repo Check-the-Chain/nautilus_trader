@@ -815,7 +815,6 @@ pub struct BacktestDataConfig {
     /// The client ID for the data configuration.
     client_id: Option<ClientId>,
     /// The metadata for the data catalog query.
-    #[allow(dead_code)]
     metadata: Option<AHashMap<String, String>>,
     /// The bar specification for the data catalog query.
     bar_spec: Option<BarSpecification>,
@@ -931,6 +930,11 @@ impl BacktestDataConfig {
     #[must_use]
     pub fn client_id(&self) -> Option<ClientId> {
         self.client_id
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> Option<&AHashMap<String, String>> {
+        self.metadata.as_ref()
     }
 
     #[must_use]

@@ -74,7 +74,7 @@ repos:
         types_or: [rust, python, cython, toml, yaml, rst, markdown]
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.4.2
+    rev: v2.4.3
     hooks:
       - id: codespell
         description: Checks for common misspellings
@@ -100,7 +100,7 @@ repos:
         description: Checks GitHub Actions workflow syntax and structural correctness
 
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.26.1
+    rev: v1.27.0
     hooks:
       - id: zizmor
         name: zizmor (security)
@@ -120,6 +120,21 @@ repos:
         language: system
         types_or: [rust, python, cython, toml, markdown, yaml, json, text]
         files: "\\.(rs|py|pyx|toml|md|yml|yaml|json|sh|dockerfile)$|Dockerfile.*"
+
+      - id: check-unicode-typography
+        name: check Unicode typography
+        description: Reject typographic dashes, curly quotes, and emoji-style check/cross marks
+        entry: bash .pre-commit-hooks/check_unicode_typography.sh
+        language: system
+        types: [text]
+
+      - id: test-unicode-typography
+        name: test Unicode typography hook
+        description: Verifies rejected characters, allowed characters, and exceptions
+        entry: bash .pre-commit-hooks/test_check_unicode_typography.sh
+        language: system
+        files: ^(\.pre-commit-config\.yaml|\.pre-commit-hooks/(check|test_check)_unicode_typography\.sh)$
+        pass_filenames: false
 
       - id: check-non-latin-text
         name: check non-Latin text
@@ -156,6 +171,22 @@ repos:
             rust-toolchain\.toml|
             scripts/(uv-version|rust-toolchain)\.sh|
             scripts/ci/check-docker-toolchain-pins\.bash
+          )$
+        pass_filenames: false
+
+      - id: check-miri-toolchain
+        name: check Miri toolchain
+        description: Ensures the pinned Miri compiler supports the workspace Rust version
+        entry: bash scripts/ci/test-check-miri-toolchain.bash
+        language: system
+        files: >-
+          (?x)^(
+            \.github/workflows/nightly-miri\.yml|
+            Cargo\.toml|
+            Makefile|
+            tools\.toml|
+            scripts/tool-version\.sh|
+            scripts/ci/(check-miri-toolchain|test-check-miri-toolchain)\.bash
           )$
         pass_filenames: false
 
@@ -361,7 +392,7 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.21
+    rev: v0.15.22
     hooks:
       - id: ruff
         name: ruff
@@ -408,7 +439,7 @@ repos:
         additional_dependencies: [msgspec, types-frozendict, types-pytz, types-redis, types-requests, types-toml]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.11.28 # Must match [tool.uv] required-version in pyproject.toml
+    rev: 0.11.29 # Must match [tool.uv] required-version in pyproject.toml
     hooks:
       - id: uv-lock
         files: ^(uv\.lock|python/uv\.lock)$
@@ -422,7 +453,7 @@ repos:
   #  Markdown formatting and linting
   ##############################################################################
   - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.23.0
+    rev: v0.23.1
     hooks:
       - id: markdownlint-cli2
         name: markdownlint

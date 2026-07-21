@@ -686,36 +686,6 @@ pub fn subtract_n_years_nanos(unix_nanos: UnixNanos, n: u32) -> anyhow::Result<U
     Ok(UnixNanos::from(nanos))
 }
 
-/// Returns the last valid day of `(year, month)`.
-///
-/// Returns `None` if `month` is not in the range 1..=12.
-#[must_use]
-pub const fn last_day_of_month(year: i32, month: u32) -> Option<u32> {
-    // Validate month range 1-12
-    if month < 1 || month > 12 {
-        return None;
-    }
-
-    // February leap-year logic
-    Some(match month {
-        2 => {
-            if is_leap_year(year) {
-                29
-            } else {
-                28
-            }
-        }
-        4 | 6 | 9 | 11 => 30,
-        _ => 31, // January, March, May, July, August, October, December
-    })
-}
-
-/// Basic leap-year check
-#[must_use]
-pub const fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
 /// Convert optional `DateTime` to optional `UnixNanos` timestamp.
 pub fn datetime_to_unix_nanos(value: Option<DateTime<Utc>>) -> Option<UnixNanos> {
     value
@@ -833,13 +803,6 @@ mod tests {
     fn test_secs_to_nanos_negative_infinity_errors() {
         let result = secs_to_nanos(f64::NEG_INFINITY);
         assert!(result.is_err());
-    }
-
-    #[rstest]
-    #[case(2024, 0)] // Month below range
-    #[case(2024, 13)] // Month above range
-    fn test_last_day_of_month_invalid_month(#[case] year: i32, #[case] month: u32) {
-        assert!(last_day_of_month(year, month).is_none());
     }
 
     #[rstest]
@@ -1125,26 +1088,6 @@ mod tests {
         let nanos = UnixNanos::from(0);
         let err = add_n_years_nanos(nanos, u32::MAX).unwrap_err();
         assert!(err.to_string().contains("month count overflow"));
-    }
-
-    #[rstest]
-    #[case(2024, 2, 29)] // Leap year February
-    #[case(2023, 2, 28)] // Non-leap year February
-    #[case(2024, 12, 31)] // December
-    #[case(2023, 11, 30)] // November
-    fn test_last_day_of_month(#[case] year: i32, #[case] month: u32, #[case] expected: u32) {
-        let result = last_day_of_month(year, month).unwrap();
-        assert_eq!(result, expected);
-    }
-
-    #[rstest]
-    #[case(2024, true)] // Leap year divisible by 4
-    #[case(1900, false)] // Not leap year, divisible by 100 but not 400
-    #[case(2000, true)] // Leap year, divisible by 400
-    #[case(2023, false)] // Non-leap year
-    fn test_is_leap_year(#[case] year: i32, #[case] expected: bool) {
-        let result = is_leap_year(year);
-        assert_eq!(result, expected);
     }
 
     #[rstest]

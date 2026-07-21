@@ -122,6 +122,10 @@ def test_account_state_construction(account_id, uuid):
     assert state.account_id == account_id
     assert state.account_type == AccountType.CASH
     assert len(state.balances) == 1
+    assert state.is_reported is True
+    assert state.event_id == uuid
+    assert state.ts_event == 0
+    assert state.ts_init == 0
 
 
 def test_account_state_to_dict_and_from_dict_roundtrip(account_id, uuid):

@@ -446,6 +446,7 @@ impl BitmexExecutionClient {
         let stream = self.ws_client.stream();
         let emitter = self.emitter.clone();
         let state = Arc::clone(&self.ws_dispatch_state);
+        state.order_rows_clear();
         let account_id = self.core.account_id;
         let clock = self.clock;
 
@@ -1397,7 +1398,10 @@ mod tests {
         },
         websocket::{
             enums::BitmexAction,
-            messages::{BitmexExecutionMsg, BitmexTableMessage, BitmexWalletMsg, BitmexWsMessage},
+            messages::{
+                BitmexExecutionMsg, BitmexOrderMsg, BitmexTableMessage, BitmexWalletMsg,
+                BitmexWsMessage, OrderData,
+            },
         },
     };
 
@@ -1659,6 +1663,121 @@ mod tests {
             }
             event => panic!("expected fill report, was {event:?}"),
         }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case::continuous(false)]
+    #[case::reconnected(true)]
+    fn test_dispatch_sparse_terminal_update_respects_cache_lifecycle(#[case] reconnect: bool) {
+        let (emitter, mut rx) = make_emitter();
+        let state = WsDispatchState::default();
+        let account_id = AccountId::from("BITMEX-1234567");
+        let client_order_id = ClientOrderId::from("mm_bitmex_1a/oemUeQ4CAJZgP3fjHsA");
+        let order: BitmexOrderMsg = serde_json::from_str(&load_test_json("ws_order.json")).unwrap();
+        let update: BitmexTableMessage =
+            serde_json::from_str(&load_test_json("ws_order_update_canceled.json")).unwrap();
+        let mut instruments_by_symbol = AHashMap::new();
+        instruments_by_symbol.insert(Ustr::from("XBTUSD"), test_perpetual_instrument());
+        let mut order_type_cache = AHashMap::new();
+        let mut order_symbol_cache = AHashMap::new();
+        state.order_identities.insert(
+            client_order_id,
+            OrderIdentity {
+                instrument_id: InstrumentId::from("XBTUSD.BITMEX"),
+                strategy_id: StrategyId::from("S-001"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+
+        dispatch::dispatch_ws_message(
+            UnixNanos::default(),
+            BitmexWsMessage::Table(BitmexTableMessage::Order {
+                action: BitmexAction::Partial,
+                data: vec![OrderData::Full(order)],
+            }),
+            &emitter,
+            &state,
+            &mut instruments_by_symbol,
+            &mut order_type_cache,
+            &mut order_symbol_cache,
+            account_id,
+        );
+
+        if reconnect {
+            dispatch::dispatch_ws_message(
+                UnixNanos::default(),
+                BitmexWsMessage::Reconnected,
+                &emitter,
+                &state,
+                &mut instruments_by_symbol,
+                &mut order_type_cache,
+                &mut order_symbol_cache,
+                account_id,
+            );
+        }
+        dispatch::dispatch_ws_message(
+            UnixNanos::default(),
+            BitmexWsMessage::Table(update),
+            &emitter,
+            &state,
+            &mut instruments_by_symbol,
+            &mut order_type_cache,
+            &mut order_symbol_cache,
+            account_id,
+        );
+
+        let events = drain_order_events(&mut rx);
+        match (reconnect, &events[..]) {
+            (false, [OrderEventAny::Accepted(_), OrderEventAny::Canceled(_)])
+            | (true, [OrderEventAny::Accepted(_)]) => {}
+            (_, events) => panic!("unexpected order lifecycle events: {events:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_dispatch_untracked_sparse_terminal_update_does_not_emit_report() {
+        let (emitter, mut rx) = make_emitter();
+        let state = WsDispatchState::default();
+        let account_id = AccountId::from("BITMEX-1234567");
+        let order: BitmexOrderMsg = serde_json::from_str(&load_test_json("ws_order.json")).unwrap();
+        let update: BitmexTableMessage =
+            serde_json::from_str(&load_test_json("ws_order_update_canceled.json")).unwrap();
+        let mut instruments_by_symbol = AHashMap::new();
+        instruments_by_symbol.insert(Ustr::from("XBTUSD"), test_perpetual_instrument());
+        let mut order_type_cache = AHashMap::new();
+        let mut order_symbol_cache = AHashMap::new();
+
+        dispatch::dispatch_ws_message(
+            UnixNanos::default(),
+            BitmexWsMessage::Table(BitmexTableMessage::Order {
+                action: BitmexAction::Partial,
+                data: vec![OrderData::Full(order)],
+            }),
+            &emitter,
+            &state,
+            &mut instruments_by_symbol,
+            &mut order_type_cache,
+            &mut order_symbol_cache,
+            account_id,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ExecutionEvent::Report(ExecutionReport::Order(_)))
+        ));
+
+        dispatch::dispatch_ws_message(
+            UnixNanos::default(),
+            BitmexWsMessage::Table(update),
+            &emitter,
+            &state,
+            &mut instruments_by_symbol,
+            &mut order_type_cache,
+            &mut order_symbol_cache,
+            account_id,
+        );
+
         assert!(rx.try_recv().is_err());
     }
 

@@ -44,7 +44,7 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{ContingencyType, LiquiditySide, OmsType, OrderStatus, OrderType},
+    enums::{ContingencyType, LiquiditySide, OmsType, OrderStatus, OrderType, TimeInForce},
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny,
         OrderExpired, OrderFilled, OrderModifyRejected, OrderRejected, OrderUpdated,
@@ -253,6 +253,7 @@ impl BinanceSpotExecutionClient {
         let is_post_only = order.is_post_only();
         let is_quote_quantity = order.is_quote_quantity();
         let display_qty = order.display_qty();
+        let use_gtd = self.config.use_gtd;
         let clock = self.clock;
         let ts_init = self.clock.get_time_ns();
 
@@ -272,8 +273,13 @@ impl BinanceSpotExecutionClient {
         if self.ws_trading_active() {
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
-            let params =
-                build_new_order_params(&order, client_order_id, is_post_only, is_quote_quantity)?;
+            let params = build_new_order_params(
+                &order,
+                client_order_id,
+                is_post_only,
+                is_quote_quantity,
+                use_gtd,
+            )?;
 
             // Pre-register before sending to avoid response racing the insert
             let request_id = ws_client.next_request_id();
@@ -319,6 +325,7 @@ impl BinanceSpotExecutionClient {
                         is_post_only,
                         is_quote_quantity,
                         display_qty,
+                        use_gtd,
                     )
                     .await;
 
@@ -1201,6 +1208,10 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
+        if order.time_in_force() == TimeInForce::Gtd && self.config.use_gtd {
+            time_in_force_to_binance_spot(order.time_in_force(), self.config.use_gtd)?;
+        }
+
         log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
         self.emitter.emit_order_submitted(&order);
 
@@ -1223,7 +1234,11 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
-        let params = match build_spot_order_list_params(cmd.order_list.id.as_ref(), &orders) {
+        let params = match build_spot_order_list_params(
+            cmd.order_list.id.as_ref(),
+            &orders,
+            self.config.use_gtd,
+        ) {
             Ok(request) => request,
             Err(reason) => {
                 for order in &orders {
@@ -1358,12 +1373,13 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         let order_type = order.order_type();
         let time_in_force = order.time_in_force();
         let quantity = cmd.quantity.unwrap_or_else(|| order.quantity());
+        let use_gtd = self.config.use_gtd;
 
         if self.ws_trading_active() {
             let command = cmd;
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
-            let params = build_cancel_replace_params(&command, &order, quantity)?;
+            let params = build_cancel_replace_params(&command, &order, quantity, use_gtd)?;
 
             // Pre-register before sending to avoid response racing the insert
             let request_id = ws_client.next_request_id();
@@ -1409,6 +1425,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                                 quantity,
                                 time_in_force,
                                 command.price,
+                                use_gtd,
                             )
                             .await
                     }
@@ -1980,6 +1997,7 @@ fn build_new_order_params(
     client_order_id: ClientOrderId,
     is_post_only: bool,
     is_quote_quantity: bool,
+    use_gtd: bool,
 ) -> anyhow::Result<NewOrderParams> {
     let binance_side = BinanceSide::try_from(order.order_side())?;
     let binance_order_type = order_type_to_binance_spot(order.order_type(), is_post_only)?;
@@ -2002,8 +2020,9 @@ fn build_new_order_params(
             | BinanceSpotOrderType::StopLossLimit
             | BinanceSpotOrderType::TakeProfitLimit
     );
+    let binance_tif = time_in_force_to_binance_spot(order.time_in_force(), use_gtd)?;
     let binance_tif = if supports_tif {
-        Some(time_in_force_to_binance_spot(order.time_in_force())?)
+        Some(binance_tif)
     } else {
         None
     };
@@ -2039,11 +2058,12 @@ fn build_new_order_params(
 fn build_spot_order_list_params(
     order_list_id: &str,
     orders: &[OrderAny],
+    use_gtd: bool,
 ) -> Result<NewOcoOrderListParams, String> {
     let has_grouped_order = orders.iter().any(is_grouped_order);
 
     if has_grouped_order {
-        return build_spot_oco_order_list_params(order_list_id, orders);
+        return build_spot_oco_order_list_params(order_list_id, orders, use_gtd);
     }
 
     Err("Binance Spot order-list submission currently supports only OCO lists".to_string())
@@ -2052,6 +2072,7 @@ fn build_spot_order_list_params(
 fn build_spot_oco_order_list_params(
     order_list_id: &str,
     orders: &[OrderAny],
+    use_gtd: bool,
 ) -> Result<NewOcoOrderListParams, String> {
     if orders.len() != 2 {
         return Err(format!(
@@ -2092,9 +2113,14 @@ fn build_spot_oco_order_list_params(
     let mut below = None;
 
     for order in orders {
-        let params =
-            build_new_order_params(order, order.client_order_id(), order.is_post_only(), false)
-                .map_err(|e| e.to_string())?;
+        let params = build_new_order_params(
+            order,
+            order.client_order_id(),
+            order.is_post_only(),
+            false,
+            use_gtd,
+        )
+        .map_err(|e| e.to_string())?;
 
         match spot_oco_leg_position(params.side, params.order_type)? {
             SpotOcoLegPosition::Above => {
@@ -2262,10 +2288,11 @@ fn build_cancel_replace_params(
     cmd: &ModifyOrder,
     order: &impl Order,
     quantity: Quantity,
+    use_gtd: bool,
 ) -> anyhow::Result<CancelReplaceOrderParams> {
     let binance_side = BinanceSide::try_from(order.order_side())?;
     let binance_order_type = order_type_to_binance_spot(order.order_type(), false)?;
-    let binance_tif = time_in_force_to_binance_spot(order.time_in_force())?;
+    let binance_tif = time_in_force_to_binance_spot(order.time_in_force(), use_gtd)?;
 
     let cancel_order_id: Option<i64> = cmd
         .venue_order_id

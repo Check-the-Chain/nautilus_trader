@@ -77,7 +77,7 @@ impl BinanceDataClientConfig {
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(BinanceDataClientConfig).to_string()
     }
 }
 
@@ -99,6 +99,7 @@ impl BinanceExecClientConfig {
         base_url_ws = None,
         base_url_ws_trading = None,
         use_ws_trading = true,
+        use_gtd = true,
         use_position_ids = true,
         oms_type = None,
         default_taker_fee = None,
@@ -121,6 +122,7 @@ impl BinanceExecClientConfig {
         base_url_ws: Option<String>,
         base_url_ws_trading: Option<String>,
         use_ws_trading: bool,
+        use_gtd: bool,
         use_position_ids: bool,
         oms_type: Option<OmsType>,
         default_taker_fee: Option<f64>,
@@ -143,6 +145,7 @@ impl BinanceExecClientConfig {
             base_url_ws: base_url_ws.or(defaults.base_url_ws),
             base_url_ws_trading: base_url_ws_trading.or(defaults.base_url_ws_trading),
             use_ws_trading,
+            use_gtd,
             use_position_ids,
             oms_type,
             default_taker_fee: default_taker_fee
@@ -160,7 +163,7 @@ impl BinanceExecClientConfig {
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(BinanceExecClientConfig).to_string()
     }
 }
 
@@ -225,8 +228,8 @@ mod tests {
         let trader_id = TraderId::from("TRADER-001");
         let account_id = AccountId::from("BINANCE-001");
         let config = BinanceExecClientConfig::py_new(
-            trader_id, account_id, None, None, None, None, None, true, true, None, None, None,
-            None, None, None, false, false, None, None,
+            trader_id, account_id, None, None, None, None, None, true, true, true, None, None,
+            None, None, None, None, false, false, None, None,
         );
         let defaults = BinanceExecClientConfig::default();
 
@@ -237,6 +240,7 @@ mod tests {
         assert_eq!(config.base_url_http, defaults.base_url_http);
         assert_eq!(config.base_url_ws, defaults.base_url_ws);
         assert_eq!(config.base_url_ws_trading, defaults.base_url_ws_trading);
+        assert!(config.use_gtd);
         assert_eq!(config.oms_type, defaults.oms_type);
         assert_eq!(config.default_taker_fee, defaults.default_taker_fee);
         assert_eq!(config.api_key, defaults.api_key);
@@ -270,6 +274,7 @@ mod tests {
             Some("wss://trade.example".to_string()),
             false,
             false,
+            false,
             Some(OmsType::Hedging),
             Some(0.0015),
             Some("api-key".to_string()),
@@ -294,6 +299,7 @@ mod tests {
             Some("wss://trade.example")
         );
         assert!(!config.use_ws_trading);
+        assert!(!config.use_gtd);
         assert!(!config.use_position_ids);
         assert_eq!(config.oms_type, Some(OmsType::Hedging));
         assert_eq!(config.default_taker_fee, Decimal::try_from(0.0015).unwrap());
@@ -317,6 +323,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
             true,
             None,

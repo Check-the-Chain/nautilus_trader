@@ -6,7 +6,7 @@ The following integrations are currently supported:
 
 | Name                                                                         | ID                    | Type                    | Status                                                  | Docs                     |
 | :--------------------------------------------------------------------------- | :-------------------- | :---------------------- | :------------------------------------------------------ | :----------------------- |
-| [AX Exchange](https://architect.exchange)                                    | `AX`                  | Perpetuals Exchange     | ![status](https://img.shields.io/badge/stable-green)    | [Guide](architect_ax.md) |
+| [AX Exchange](https://architect.exchange)                                    | `AX`                  | Derivatives Exchange    | ![status](https://img.shields.io/badge/stable-green)    | [Guide](architect_ax.md) |
 | [Betfair](https://betfair.com)                                               | `BETFAIR`             | Sports Betting Exchange | ![status](https://img.shields.io/badge/stable-green)    | [Guide](betfair.md)      |
 | [Binance](https://binance.com)                                               | `BINANCE`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](binance.md)      |
 | [Coinbase](https://coinbase.com)                                             | `COINBASE`            | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](coinbase.md)     |
@@ -64,7 +64,7 @@ some venues. Use TRACE only for local debugging, and redact TRACE logs before sh
 
 ## API unification
 
-All integrations must conform to NautilusTrader’s system API, requiring normalization and standardization:
+All integrations must conform to NautilusTrader's system API, requiring normalization and standardization:
 
-- Symbols should use the venue’s native symbol format unless disambiguation is required (e.g., Binance Spot vs. Binance Futures).
+- Symbols should use the venue's native symbol format unless disambiguation is required (e.g., Binance Spot vs. Binance Futures).
 - Timestamps must use UNIX epoch nanoseconds. If milliseconds are used, field/property names should explicitly end with `_ms`.

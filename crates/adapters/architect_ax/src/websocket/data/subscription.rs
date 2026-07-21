@@ -48,32 +48,19 @@ impl AxMdSubscriptionSpec {
 
     pub(crate) fn parse_topic(topic: &str) -> Option<(Ustr, Self)> {
         let mut parts = topic.rsplitn(4, ':');
-        let ticker_or_level = parts.next()?;
-        let trades = parts.next();
-        let level = parts.next();
-        let symbol = parts.next();
+        let ticker = Self::decode_bool(parts.next()?).ok()?;
+        let trades = Self::decode_bool(parts.next()?).ok()?;
+        let level = Self::parse_level(parts.next()?)?;
+        let symbol = Ustr::from(parts.next()?);
 
-        match (symbol, level, trades) {
-            (Some(symbol), Some(level), Some(trades)) => Some((
-                Ustr::from(symbol),
-                Self {
-                    level: Self::parse_level(level)?,
-                    trades: Self::decode_bool(trades).ok()?,
-                    ticker: Self::decode_bool(ticker_or_level).ok()?,
-                },
-            )),
-            _ => {
-                let (symbol, level) = topic.rsplit_once(':')?;
-                Some((
-                    Ustr::from(symbol),
-                    Self {
-                        level: Self::parse_level(level)?,
-                        trades: None,
-                        ticker: None,
-                    },
-                ))
-            }
-        }
+        Some((
+            symbol,
+            Self {
+                level,
+                trades,
+                ticker,
+            },
+        ))
     }
 
     fn encode_bool(value: Option<bool>) -> &'static str {
@@ -126,17 +113,6 @@ mod tests {
         assert_eq!(
             spec,
             AxMdSubscriptionSpec::new(AxMarketDataLevel::Level1, Some(false), None)
-        );
-    }
-
-    #[rstest]
-    fn test_parse_topic_legacy_format() {
-        let (symbol, spec) = AxMdSubscriptionSpec::parse_topic("EURUSD-PERP:Level3").unwrap();
-
-        assert_eq!(symbol, Ustr::from("EURUSD-PERP"));
-        assert_eq!(
-            spec,
-            AxMdSubscriptionSpec::new(AxMarketDataLevel::Level3, None, None)
         );
     }
 

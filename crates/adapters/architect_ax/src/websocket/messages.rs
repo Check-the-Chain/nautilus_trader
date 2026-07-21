@@ -18,16 +18,10 @@
 //! This module contains request and response message structures for both
 //! market data and order management WebSocket streams.
 
-use nautilus_core::{
-    UnixNanos,
-    serialization::{
-        deserialize_optional_decimal_str, serialize_decimal_as_str,
-        serialize_optional_decimal_as_str,
-    },
-};
+use nautilus_core::{UnixNanos, serialization::serialize_decimal_as_str};
 use nautilus_model::{
     identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
-    types::{Currency, Price},
+    types::Currency,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -39,7 +33,7 @@ use crate::{
         enums::{
             AxCancelReason, AxCancelRejectionReason, AxCandleWidth, AxInstrumentState,
             AxMarketDataLevel, AxMdRequestType, AxOrderRequestType, AxOrderSide, AxOrderStatus,
-            AxOrderType, AxOrderWsMessageType, AxTimeInForce,
+            AxOrderWsMessageType, AxTimeInForce, AxTradeSide,
         },
         parse::{
             deserialize_decimal_or_zero, deserialize_optional_decimal_from_str,
@@ -409,7 +403,7 @@ pub struct AxMdBookL3 {
 /// Place order request via WebSocket.
 ///
 /// # References
-/// - <https://docs.architect.exchange/sdk-reference/order-entry>
+/// - <https://docs.architect.exchange/api-reference/order-management/orders-ws>
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AxWsPlaceOrder {
     /// Request ID for correlation.
@@ -438,17 +432,6 @@ pub struct AxWsPlaceOrder {
     /// Optional order tag (max 10 alphanumeric characters).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
-    /// Order type (defaults to LIMIT if not specified).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub order_type: Option<AxOrderType>,
-    /// Trigger price for stop-loss orders.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_decimal_as_str",
-        deserialize_with = "deserialize_optional_decimal_str",
-        default
-    )]
-    pub trigger_price: Option<Decimal>,
 }
 
 /// Cancel order request via WebSocket.
@@ -523,8 +506,15 @@ pub struct AxWsCancelOrderResult {
 pub struct AxWsOpenOrdersResponse {
     /// Request ID matching the original request.
     pub rid: i64,
+    /// Open orders result.
+    pub res: AxWsOpenOrdersResult,
+}
+
+/// Result payload for an open orders response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxWsOpenOrdersResult {
     /// List of open orders.
-    pub res: Vec<AxWsOrder>,
+    pub orders: Vec<AxWsOrder>,
 }
 
 /// Error response from the Ax orders WebSocket.
@@ -650,7 +640,7 @@ pub struct AxWsTradeExecution {
     #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub p: Decimal,
     /// Trade direction.
-    pub d: AxOrderSide,
+    pub d: AxTradeSide,
     /// Whether this was an aggressor (taker) order.
     pub agg: bool,
 }
@@ -762,29 +752,12 @@ pub struct AxWsOrderReplaced {
     pub tn: i64,
     /// Event ID.
     pub eid: String,
-    /// Legacy order details shape.
-    #[serde(default)]
-    pub o: Option<Box<AxWsOrder>>,
     /// Replaced order details.
-    #[serde(default)]
-    pub ro: Option<Box<AxWsOrder>>,
+    pub ro: Box<AxWsOrder>,
     /// New order ID assigned to the replacement order.
-    #[serde(default)]
-    pub noid: Option<String>,
+    pub noid: String,
     /// New order details.
-    #[serde(default)]
-    pub no: Option<Box<AxWsOrder>>,
-}
-
-impl AxWsOrderReplaced {
-    /// Returns the order details representing the active replacement order.
-    #[must_use]
-    pub(crate) fn updated_order(&self) -> Option<&AxWsOrder> {
-        self.no
-            .as_deref()
-            .or(self.o.as_deref())
-            .or(self.ro.as_deref())
-    }
+    pub no: Box<AxWsOrder>,
 }
 
 /// Order done for day event.
@@ -870,7 +843,7 @@ pub(crate) enum AxWsOrderResponse {
     PlaceOrder(AxWsPlaceOrderResponse),
     /// Cancel order response (res has "cxl_rx").
     CancelOrder(AxWsCancelOrderResponse),
-    /// Open orders response (res is array).
+    /// Open orders response (res has "orders").
     OpenOrders(AxWsOpenOrdersResponse),
     /// List subscription response (res has "li").
     List(AxWsListResponse),
@@ -985,8 +958,6 @@ pub struct OrderMetadata {
     pub price_precision: u8,
     /// Quote currency for the instrument.
     pub quote_currency: Currency,
-    /// Pending trigger price from a modify command (WS does not carry this).
-    pub pending_trigger_price: Option<Price>,
 }
 
 #[cfg(test)]
@@ -1124,8 +1095,6 @@ mod tests {
             po: false,
             tag: Some("Nautilus".to_string()),
             cid: Some(1234567890),
-            order_type: None,
-            trigger_price: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -1143,31 +1112,6 @@ mod tests {
         assert_eq!(parsed["cid"], 1234567890);
         assert!(parsed.get("order_type").is_none());
         assert!(parsed.get("trigger_price").is_none());
-    }
-
-    #[rstest]
-    fn test_ws_place_stop_loss_order_serialization() {
-        let msg = AxWsPlaceOrder {
-            rid: 2,
-            t: AxOrderRequestType::PlaceOrder,
-            s: Ustr::from("EURUSD-PERP"),
-            d: AxOrderSide::Sell,
-            q: 50,
-            p: dec!(48000.00),
-            tif: AxTimeInForce::Gtc,
-            po: false,
-            tag: None,
-            cid: None,
-            order_type: Some(AxOrderType::StopLossLimit),
-            trigger_price: Some(dec!(49000.00)),
-        };
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["rid"], 2);
-        assert_eq!(parsed["order_type"], "STOP_LOSS_LIMIT");
-        assert_eq!(parsed["trigger_price"], "49000.00");
     }
 
     #[rstest]
@@ -1296,7 +1240,7 @@ mod tests {
     fn test_load_order_open_orders_response_from_file() {
         let json = include_str!("../../test_data/ws_order_open_orders_response.json");
         let msg: AxWsOpenOrdersResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.res.len(), 1);
+        assert_eq!(msg.res.orders.len(), 1);
     }
 
     #[rstest]
@@ -1318,6 +1262,7 @@ mod tests {
         let json = include_str!("../../test_data/ws_order_filled.json");
         let msg: AxWsOrderFilled = serde_json::from_str(json).unwrap();
         assert_eq!(msg.o.o, AxOrderStatus::Filled);
+        assert_eq!(msg.xs.d, AxTradeSide::Buy);
     }
 
     #[rstest]
@@ -1349,29 +1294,14 @@ mod tests {
     }
 
     #[rstest]
-    fn test_load_order_replaced_from_file() {
-        let json = include_str!("../../test_data/ws_order_replaced.json");
-        let msg: AxWsOrderReplaced = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.updated_order().unwrap().p, dec!(50500.00));
-    }
-
-    #[rstest]
     fn test_load_order_replaced_live_shape_from_file() {
         let json = include_str!("../../test_data/ws_order_replaced_live.json");
         let msg: AxWsOrderReplaced = serde_json::from_str(json).unwrap();
-        let order = msg.updated_order().unwrap();
 
-        assert_eq!(msg.noid.as_deref(), Some("O-01KWY01WX8JT4DABKC6FRS5NT4"));
-        assert_eq!(order.oid, "O-01KWY01WX8JT4DABKC6FRS5NT4");
-        assert_eq!(order.p, dec!(1.0926));
-    }
-
-    #[rstest]
-    fn test_load_order_replaced_without_order_from_file() {
-        let json = include_str!("../../test_data/ws_order_replaced_without_order.json");
-        let msg: AxWsOrderReplaced = serde_json::from_str(json).unwrap();
-
-        assert!(msg.updated_order().is_none());
+        assert_eq!(msg.noid, "O-01KWY01WX8JT4DABKC6FRS5NT4");
+        assert_eq!(msg.no.oid, "O-01KWY01WX8JT4DABKC6FRS5NT4");
+        assert_eq!(msg.no.p, dec!(1.0926));
+        assert_eq!(msg.ro.o, AxOrderStatus::Replaced);
     }
 
     #[rstest]

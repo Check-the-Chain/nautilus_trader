@@ -15,6 +15,7 @@
 
 //! Python bindings for the Ax HTTP client.
 
+use ahash::AHashMap;
 use chrono::{DateTime, Utc};
 use nautilus_core::{datetime::datetime_to_unix_nanos, python::to_pyvalue_err};
 use nautilus_model::{
@@ -30,7 +31,7 @@ use rust_decimal::Decimal;
 use crate::{
     common::{
         enums::{AxCandleWidth, AxOrderSide},
-        parse::quantity_to_contracts,
+        parse::{client_order_id_to_cid, quantity_to_contracts},
     },
     http::{client::AxHttpClient, error::AxHttpError, models::PreviewAggressiveLimitOrderRequest},
 };
@@ -342,7 +343,40 @@ impl AxHttpClient {
         })
     }
 
+    /// Requests an order book snapshot from Ax and builds a Nautilus `OrderBook`.
+    ///
+    /// Requires the instrument to be cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The instrument is not found in the cache.
+    /// - The HTTP request fails.
+    #[pyo3(name = "request_book_snapshot")]
+    #[pyo3(signature = (instrument_id, depth=None))]
+    fn py_request_book_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        depth: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let symbol = instrument_id.symbol.inner();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let book = client
+                .request_book_snapshot(symbol, depth.map(|value| value as usize))
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| book.into_py_any(py))
+        })
+    }
+
     /// Requests funding rates from Ax and parses them to Nautilus types.
+    ///
+    /// Traverses the provider's cursor chain. This is a best-effort historical
+    /// read, not an atomic snapshot if AX corrects rows during the traversal.
     ///
     /// # Errors
     ///
@@ -464,17 +498,24 @@ impl AxHttpClient {
     /// - The HTTP request fails.
     /// - An order's instrument is not found in the cache.
     /// - Order parsing fails.
-    #[pyo3(name = "request_order_status_reports")]
+    #[pyo3(name = "request_order_status_reports", signature = (account_id, client_order_ids=None))]
     fn py_request_order_status_reports<'py>(
         &self,
         py: Python<'py>,
         account_id: AccountId,
+        client_order_ids: Option<Vec<ClientOrderId>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
+        let cid_map = client_order_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|client_order_id| (client_order_id_to_cid(&client_order_id), client_order_id))
+            .collect::<AHashMap<_, _>>();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cid_resolver = move |cid: u64| cid_map.get(&cid).copied();
             let reports = client
-                .request_order_status_reports(account_id, None::<fn(u64) -> Option<ClientOrderId>>)
+                .request_order_status_reports(account_id, Some(cid_resolver))
                 .await
                 .map_err(to_pyvalue_err)?;
 
@@ -492,6 +533,8 @@ impl AxHttpClient {
     /// Requests fills from Ax and parses them to Nautilus `FillReport`.
     ///
     /// Requires instruments to be cached for parsing fill details.
+    /// Traverses the provider's cursor chain. This is a best-effort historical
+    /// read, not an atomic snapshot if AX corrects rows during the traversal.
     ///
     /// # Errors
     ///

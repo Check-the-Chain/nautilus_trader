@@ -25,8 +25,8 @@ use crate::{
     indicator::{Indicator, MovingAverage},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl DoubleExponentialMovingAverage {
     /// The Double Exponential Moving Average attempts to a smoother average with less
     /// lag than the normal Exponential Moving Average (EMA)
@@ -50,6 +50,12 @@ impl DoubleExponentialMovingAverage {
     #[pyo3(name = "period")]
     const fn py_period(&self) -> usize {
         self.period
+    }
+
+    #[getter]
+    #[pyo3(name = "price_type")]
+    const fn py_price_type(&self) -> PriceType {
+        self.price_type
     }
 
     #[getter]

@@ -377,7 +377,7 @@ cdef class DataEngine(Component):
 
         """
         # Avoid importing `BacktestMarketDataClient` from the `backtest` subpackage at
-        # module import time – doing so creates a circular import between
+        # module import time - doing so creates a circular import between
         # `nautilus_trader.data` and `nautilus_trader.backtest`.
         from nautilus_trader.backtest.data_client import BacktestMarketDataClient
 

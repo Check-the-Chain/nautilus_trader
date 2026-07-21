@@ -145,7 +145,7 @@ impl PolymarketDataClient {
         let pending_auto_loads = self.pending_auto_loads.clone();
         let ws_open_tokens = self.ws_open_tokens.clone();
         let ws_sub_mutex = self.ws_sub_mutex.clone();
-        let ws = self.ws_client.clone_subscription_handle();
+        let ws = self.ws_client.handle();
 
         let ctx = WsMessageContext {
             clock: self.clock,
@@ -365,7 +365,7 @@ impl PolymarketDataClient {
 
         if self.config.subscribe_new_markets {
             log::debug!("Subscribing to new markets...");
-            self.ws_client.subscribe_market(vec![]).await?;
+            self.ws_client.subscribe_new_markets_feed().await?;
         }
 
         let rx = self
@@ -440,7 +440,7 @@ mod tests {
 
     use super::{super::NEW_MARKET_FETCH_MAX_CONCURRENCY_CAP, *};
     use crate::{
-        common::consts::POLYMARKET_CLIENT_ID,
+        common::consts::{POLYMARKET_CLIENT_ID, WS_DEFAULT_SUBSCRIPTIONS},
         config::PolymarketDataClientConfig,
         data::{instruments::cache_instrument, runtime::retire_local_instrument_state},
         http::{
@@ -448,7 +448,7 @@ mod tests {
             gamma::PolymarketGammaHttpClient,
         },
         resolve::upsert_resolve_watch_entry_from_instrument,
-        websocket::{client::PolymarketWebSocketClient, messages::PolymarketWsMessage},
+        websocket::{messages::PolymarketWsMessage, pool::PolymarketMarketConnectionPool},
     };
 
     fn make_client_for_reset_test() -> PolymarketDataClient {
@@ -465,10 +465,11 @@ mod tests {
             .expect("clob client");
         let data_api = PolymarketDataApiHttpClient::new(Some("http://localhost".to_string()), 1)
             .expect("data api client");
-        let ws = PolymarketWebSocketClient::new_market(
+        let ws = PolymarketMarketConnectionPool::new(
             Some("ws://localhost/ws/market".to_string()),
             false,
             TransportBackend::default(),
+            WS_DEFAULT_SUBSCRIPTIONS,
         );
 
         PolymarketDataClient::new(
@@ -495,10 +496,11 @@ mod tests {
             .expect("clob client");
         let data_api = PolymarketDataApiHttpClient::new(Some("http://localhost".to_string()), 1)
             .expect("data api client");
-        let ws = PolymarketWebSocketClient::new_market(
+        let ws = PolymarketMarketConnectionPool::new(
             Some("ws://localhost/ws/market".to_string()),
             false,
             TransportBackend::default(),
+            WS_DEFAULT_SUBSCRIPTIONS,
         );
 
         let config = PolymarketDataClientConfig {
@@ -1030,7 +1032,7 @@ mod tests {
             &client.pending_auto_loads,
             &client.ws_open_tokens,
             &client.ws_sub_mutex,
-            &client.ws_client.clone_subscription_handle(),
+            &client.ws_client.handle(),
         )
         .await;
 

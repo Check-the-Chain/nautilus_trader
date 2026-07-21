@@ -393,7 +393,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// the parameters happen to iterate in. `serde_json`'s object backend is a
 /// sorted `BTreeMap` by default, but it silently becomes an insertion-ordered
 /// `IndexMap` if *any* crate anywhere in the build graph enables
-/// `serde_json/preserve_order` — a global Cargo feature-unification effect the
+/// `serde_json/preserve_order` - a global Cargo feature-unification effect the
 /// adapter cannot control (e.g. a transitive `mongodb`/`bson` dependency).
 /// Signing the object in its raw iteration order therefore breaks intermittently
 /// with `-1022 Signature for this request is not valid` depending on unrelated
@@ -449,7 +449,7 @@ mod tests {
 
     #[rstest]
     fn test_canonical_ws_query_string_is_key_sorted_regardless_of_input_order() {
-        // Parameters in a deliberately non-alphabetical order — exactly what a
+        // Parameters in a deliberately non-alphabetical order - exactly what a
         // `serde_json/preserve_order` (IndexMap) build yields, and what broke WS
         // signing with -1022 (issue #4410). Binance verifies the WS signature
         // over the *sorted* parameters, so the query string must come out
@@ -510,7 +510,7 @@ mod tests {
     ];
 
     #[rstest]
-    fn test_ed25519_accepts_pkcs8_wrapped_key() {
+    fn test_ed25519_matches_rfc_8032_vector() {
         let key_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             ED25519_PKCS8_TEST_VECTOR,
@@ -518,8 +518,12 @@ mod tests {
 
         let cred = Ed25519Credential::new("test_key".to_string(), &key_b64).unwrap();
 
-        let signature = cred.sign(b"hello");
-        assert!(!signature.is_empty());
+        let signature = cred.sign(b"");
+
+        assert_eq!(
+            signature,
+            "5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc+bRr0lv18FlbviRlUUFDjnoQCw=="
+        );
     }
 
     #[rstest]

@@ -1168,6 +1168,7 @@ mod serial_tests {
                 reconciliation: true,
                 ..Default::default()
             },
+            delay_post_stop: Duration::ZERO,
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
@@ -1179,19 +1180,15 @@ mod serial_tests {
         let handle = node.handle();
 
         let err = node.start().await.expect_err("start should fail");
+        let err = format!("{err:#}");
 
         assert!(
-            err.to_string().contains("No mass status available"),
-            "unexpected error: {err:#}"
+            err.contains("startup reconciliation returned no mass status for"),
+            "unexpected error: {err}"
         );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
-
-        node.dispose();
-
-        assert!(node.kernel().trader().borrow().is_disposed());
-        assert_eq!(node.kernel().trader().borrow().component_count(), 0);
     }
 
     #[rstest]
@@ -1299,6 +1296,7 @@ mod serial_tests {
                 reconciliation: true,
                 ..Default::default()
             },
+            delay_post_stop: Duration::ZERO,
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
@@ -1310,10 +1308,11 @@ mod serial_tests {
         let handle = node.handle();
 
         let err = node.run().await.expect_err("run should fail");
+        let err = format!("{err:#}");
 
         assert!(
-            err.to_string().contains("No mass status available"),
-            "unexpected error: {err:#}"
+            err.contains("startup reconciliation returned no mass status for"),
+            "unexpected error: {err}"
         );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);

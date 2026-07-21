@@ -89,8 +89,31 @@ impl KrakenDataClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
+    /// Returns the configured public WebSocket URL override.
+    #[getter]
+    fn get_ws_public_url(&self) -> Option<String> {
+        self.ws_public_url.clone()
+    }
+
+    /// Returns the configured private WebSocket URL override.
+    #[getter]
+    fn get_ws_private_url(&self) -> Option<String> {
+        self.ws_private_url.clone()
+    }
+
+    /// Returns the configured L3 WebSocket URL override.
+    #[getter]
+    fn get_ws_l3_url(&self) -> Option<String> {
+        self.ws_l3_url.clone()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(KrakenDataClientConfig).to_string()
     }
 }
 
@@ -179,7 +202,18 @@ impl KrakenExecClientConfig {
         })
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
+    /// Returns the configured WebSocket URL override.
+    #[getter]
+    fn get_ws_url(&self) -> Option<String> {
+        self.ws_url.clone()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(KrakenExecClientConfig).to_string()
     }
 }

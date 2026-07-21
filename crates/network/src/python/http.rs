@@ -165,14 +165,14 @@ impl HttpClient {
         timeout_secs: Option<u64>,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client.clone();
-        let rate_limiter = self.rate_limiter.clone();
+        let client = self.clone();
         let params = params_to_hashmap(params)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let keys = keys.map(into_ustr_vec);
-            rate_limiter.await_keys_ready(keys.as_deref()).await;
+            client.await_rate_limits(keys.as_deref()).await;
             client
+                .client
                 .send_request(
                     method.into(),
                     url,

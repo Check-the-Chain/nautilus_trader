@@ -510,15 +510,12 @@ security-audit: check-audit-installed check-deny-installed check-vet-installed c
 	$(info $(M) Running security audit...)
 	@$(call audit_step,cargo audit,cargo audit --color never)
 	@$(call audit_step,cargo audit lighter fuzz,cargo audit --color never --file crates/adapters/lighter/fuzz/Cargo.lock)
-	@$(call audit_step,cargo audit derive fuzz,cargo audit --color never --file crates/adapters/derive/fuzz/Cargo.lock)
 	@$(call audit_step,cargo deny,cargo deny --all-features check advisories licenses sources bans)
 	@$(call audit_step,cargo deny lighter fuzz,cargo deny --manifest-path crates/adapters/lighter/fuzz/Cargo.toml --config .cargo/deny-fuzz.toml --locked --all-features check advisories licenses sources bans)
-	@$(call audit_step,cargo deny derive fuzz,cargo deny --manifest-path crates/adapters/derive/fuzz/Cargo.toml --config .cargo/deny-fuzz.toml --locked --all-features check advisories licenses sources bans)
 	@$(call audit_step,cargo vet,cargo vet --locked)
 	@$(call audit_step,cargo vet lighter fuzz,cargo vet --locked --manifest-path crates/adapters/lighter/fuzz/Cargo.toml --store-path .supply-chain)
-	@$(call audit_step,cargo vet derive fuzz,cargo vet --locked --manifest-path crates/adapters/derive/fuzz/Cargo.toml --store-path .supply-chain)
 	@$(call audit_step,pip-audit,uv export --frozen | sed '/^-e /d' | uv run --no-project --with pip-audit -- pip-audit --disable-pip --require-hashes -r /dev/stdin $(PIP_AUDIT_IGNORE_FLAGS))
-	@$(call audit_step,osv-scanner,osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock --lockfile=crates/adapters/lighter/fuzz/Cargo.lock --lockfile=crates/adapters/derive/fuzz/Cargo.lock --lockfile=uv.lock --lockfile=python/uv.lock)
+	@$(call audit_step,osv-scanner,osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock --lockfile=crates/adapters/lighter/fuzz/Cargo.lock --lockfile=uv.lock --lockfile=python/uv.lock)
 
 .PHONY: cargo-deny
 cargo-deny: check-deny-installed  #-- Run cargo-deny checks (advisories, sources, bans, licenses)
@@ -894,12 +891,12 @@ cargo-test-coverage-crate-html-%:  #-- Run coverage for specific crate with HTML
 # -----------------------------------------------------------------------------
 
 # Override these on the command line if needed, e.g.:
-#   make cargo-miri-core MIRI_TOOLCHAIN=nightly-2026-04-16
+#   make cargo-miri-core MIRI_TOOLCHAIN=nightly
 #   make cargo-miri-core MIRI_CORE_FILTER=...
 #   make cargo-miri-core MIRI_CORE_ARC_SWAP_FILTER=...
 #   make cargo-miri-plugin MIRI_PLUGIN_FILTER=...
 #   make cargo-miri-plugin MIRI_PLUGIN_MANIFEST_FILTER=...
-MIRI_TOOLCHAIN ?= nightly
+MIRI_TOOLCHAIN ?= $(shell bash scripts/tool-version.sh miri)
 MIRI_FLAGS ?= -Zmiri-disable-isolation -Zmiri-strict-provenance
 MIRI_CORE_ARC_SWAP_FLAGS ?= -Zmiri-disable-isolation -Zmiri-permissive-provenance
 MIRI_PLUGIN_MANIFEST_FLAGS ?= $(MIRI_FLAGS) -Zmiri-ignore-leaks
@@ -914,6 +911,7 @@ MIRI_CORE_FILTER ?= -E 'test(/^(string::stack_str|nanos|uuid|hex|correctness|dat
 # arc-swap runs Miri with permissive provenance, so use the same provenance
 # policy for this slice while keeping strict provenance for in-tree pointer code.
 MIRI_CORE_ARC_SWAP_FILTER ?= -E 'test(/^collections::/)'
+MIRI_CORE_FFI_FILTER ?= ffi::cvec::tests
 # `test_price_to_order_id_{comprehensive_collision_check,realistic_orderbook_prices}`
 # iterate over the full price space to verify hash uniqueness. They run for
 # multiple hours under the Miri interpreter and exercise no unsafe, so we skip
@@ -925,8 +923,12 @@ MIRI_MODEL_FILTER ?= -E 'test(/^(types::|identifiers::|orderbook::)/) and not te
 MIRI_PLUGIN_FILTER ?= -E 'test(/^(boundary|panic)::/)'
 MIRI_PLUGIN_MANIFEST_FILTER ?= -E 'test(/^manifest::/)'
 
+.PHONY: check-miri-toolchain
+check-miri-toolchain:
+	$(Q)bash scripts/ci/check-miri-toolchain.bash
+
 .PHONY: check-miri-installed
-check-miri-installed:
+check-miri-installed: check-miri-toolchain
 	@if ! cargo +$(MIRI_TOOLCHAIN) miri --version >/dev/null 2>&1; then \
 		echo "cargo-miri is not installed for toolchain $(MIRI_TOOLCHAIN)"; \
 		echo "Install with: rustup toolchain install $(MIRI_TOOLCHAIN) --component miri"; \
@@ -942,6 +944,15 @@ cargo-miri-core:  #-- Run nautilus-core library tests under Miri to detect UB
 	MIRIFLAGS="$(MIRI_FLAGS)" cargo +$(MIRI_TOOLCHAIN) miri nextest run -p nautilus-core --no-default-features --lib $(MIRI_CORE_FILTER)
 	$(info $(M) Running nautilus-core collections tests under Miri with permissive provenance (filter: $(MIRI_CORE_ARC_SWAP_FILTER))...)
 	MIRIFLAGS="$(MIRI_CORE_ARC_SWAP_FLAGS)" cargo +$(MIRI_TOOLCHAIN) miri nextest run -p nautilus-core --no-default-features --lib $(MIRI_CORE_ARC_SWAP_FILTER)
+	$(info $(M) Running nautilus-core CVec FFI tests under Miri (filter: $(MIRI_CORE_FFI_FILTER))...)
+	MIRIFLAGS="$(MIRI_FLAGS)" cargo +$(MIRI_TOOLCHAIN) miri test -p nautilus-core --lib --features ffi $(MIRI_CORE_FFI_FILTER)
+
+.PHONY: cargo-miri-core-ffi
+cargo-miri-core-ffi: export RUST_BACKTRACE=1
+cargo-miri-core-ffi: export MIRIFLAGS=$(MIRI_FLAGS)
+cargo-miri-core-ffi: check-miri-installed
+cargo-miri-core-ffi:  #-- Run CVec FFI tests under Miri
+	cargo +$(MIRI_TOOLCHAIN) miri test -p nautilus-core --lib --features ffi $(MIRI_CORE_FFI_FILTER)
 
 .PHONY: cargo-miri-model
 cargo-miri-model: export RUST_BACKTRACE=1

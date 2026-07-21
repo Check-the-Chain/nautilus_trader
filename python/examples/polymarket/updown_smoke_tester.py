@@ -42,8 +42,8 @@ from nautilus_trader.adapters.polymarket import PolymarketInstrumentProviderConf
 from nautilus_trader.adapters.polymarket import PolymarketUpDownEventSlugConfig
 from nautilus_trader.adapters.polymarket import SignatureType
 from nautilus_trader.common import Environment
+from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.live import LiveNode
-from nautilus_trader.live import LiveRiskEngineConfig
 from nautilus_trader.model import ClientId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Quantity
@@ -298,8 +298,8 @@ def request_gamma_events_by_slug(
     try:
         with urllib.request.urlopen(request, timeout=timeout_secs) as response:  # noqa: S310
             payload = response.read().decode()
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Failed to fetch Polymarket event slug '{slug}': {exc}") from exc
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Failed to fetch Polymarket event slug '{slug}': {e}") from e
 
     data = json.loads(payload)
     if not isinstance(data, list):

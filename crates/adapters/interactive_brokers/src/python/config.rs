@@ -437,10 +437,9 @@ impl DockerizedIBGatewayConfig {
         self.username.clone()
     }
 
-    /// Returns the password (masked for security).
     #[getter]
-    fn password(&self) -> Option<String> {
-        self.password.as_ref().map(|_| "********".to_string())
+    const fn has_password(&self) -> bool {
+        self.password.is_some()
     }
 
     /// Returns the trading mode.

@@ -77,12 +77,12 @@ impl LighterDataClientConfig {
     }
 
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(LighterDataClientConfig).to_string()
     }
 }
 
@@ -151,11 +151,11 @@ impl LighterExecClientConfig {
     }
 
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(LighterExecClientConfig).to_string()
     }
 }

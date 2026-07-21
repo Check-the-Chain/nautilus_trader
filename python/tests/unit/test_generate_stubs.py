@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import inspect
+import keyword
 import os
 import re
 import sys
@@ -87,6 +89,69 @@ def test_python_libdir_env_does_not_mutate_os_environ(monkeypatch):
     assert "LD_LIBRARY_PATH" not in os.environ
 
 
+def test_write_config_stub_uses_runtime_exports(tmp_path):
+    # Arrange
+    runtime_path = tmp_path / "config" / "__init__.py"
+    runtime_path.parent.mkdir()
+    runtime_path.write_text(
+        """
+from __future__ import annotations
+
+from nautilus_trader.analysis import TearsheetConfig
+from nautilus_trader.common import CacheConfig
+
+__all__ = [
+    "CacheConfig",
+    "TearsheetConfig",
+]
+""".lstrip(),
+    )
+
+    # Act
+    generate_stubs.write_config_stub(tmp_path)
+
+    # Assert
+    stub = runtime_path.with_suffix(".pyi").read_text()
+    assert "from nautilus_trader.common import CacheConfig as CacheConfig" in stub
+    assert "from nautilus_trader.analysis import TearsheetConfig as TearsheetConfig" in stub
+    assert ast.literal_eval(
+        next(
+            node.value
+            for node in ast.parse(stub).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+            )
+        ),
+    ) == ["CacheConfig", "TearsheetConfig"]
+
+
+def test_write_config_stub_rejects_export_drift(tmp_path):
+    # Arrange
+    runtime_path = tmp_path / "config" / "__init__.py"
+    runtime_path.parent.mkdir()
+    runtime_path.write_text(
+        """
+from nautilus_trader.common import CacheConfig
+
+__all__ = ["TearsheetConfig"]
+""".lstrip(),
+    )
+
+    # Act
+    with pytest.raises(
+        ValueError,
+        match=r"^Config facade imports and __all__ differ",
+    ) as exc_info:
+        generate_stubs.write_config_stub(tmp_path)
+
+    # Assert
+    assert str(exc_info.value) == (
+        "Config facade imports and __all__ differ: missing imports ['TearsheetConfig'], "
+        "unexported imports ['CacheConfig']"
+    )
+
+
 def test_collect_rust_class_fixups_reads_pymethods_and_identifier_macros(tmp_path):
     # Arrange
     rust_file = tmp_path / "crates" / "model" / "src" / "python" / "sample.rs"
@@ -160,6 +225,31 @@ impl Currency {
     # Assert
     assert fixups["Currency"].staticmethods == {"is_commodity_backed", "is_commodidity_backed"}
     assert fixups["Currency"].renames == {"is_commodidity_backed": "is_commodity_backed"}
+
+
+def test_collect_rust_class_fixups_renames_get_prefixed_getter(tmp_path):
+    # Arrange
+    rust_file = tmp_path / "crates" / "adapter" / "src" / "python" / "config.rs"
+    rust_file.parent.mkdir(parents=True)
+    rust_file.write_text(
+        """
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl ClientConfig {
+    #[getter]
+    fn get_ws_url(&self) -> Option<String> {
+        todo!()
+    }
+}
+""".strip(),
+    )
+
+    # Act
+    fixups = generate_stubs.collect_rust_class_fixups(tmp_path)
+
+    # Assert
+    assert fixups["ClientConfig"].getters == {"get_ws_url", "ws_url"}
+    assert fixups["ClientConfig"].renames == {"get_ws_url": "ws_url"}
 
 
 def test_collect_rust_class_fixups_detects_classmethods(tmp_path):
@@ -1259,6 +1349,83 @@ AUTHORING_CONFIG_BINDINGS = {
     ),
 }
 
+CONFIG_READBACK_REPLACEMENTS = {
+    (
+        "nautilus_trader.backtest",
+        "BacktestDataConfig",
+        "catalog_fs_storage_options",
+    ): "catalog_fs_storage_option_keys",
+    (
+        "nautilus_trader.backtest",
+        "BacktestDataConfig",
+        "catalog_fs_rust_storage_options",
+    ): "catalog_fs_rust_storage_option_keys",
+    ("nautilus_trader.network", "SocketConfig", "handler"): "has_handler",
+    ("nautilus_trader.network", "WebSocketConfig", "headers"): "header_names",
+    ("nautilus_trader.network", "WebSocketConfig", "proxy_url"): "has_proxy_url",
+}
+
+WRITABLE_CONFIG_PROPERTIES = {
+    ("nautilus_trader.common", "DataActorConfig"): {
+        "actor_id",
+        "log_commands",
+        "log_events",
+    },
+    ("nautilus_trader.adapters.interactive_brokers", "InteractiveBrokersDataClientConfig"): {
+        "instrument_provider",
+    },
+    ("nautilus_trader.adapters.interactive_brokers", "InteractiveBrokersExecClientConfig"): {
+        "instrument_provider",
+    },
+    (
+        "nautilus_trader.adapters.interactive_brokers",
+        "InteractiveBrokersInstrumentProviderConfig",
+    ): {"cache_path"},
+}
+
+ADAPTER_CONFIG_SECRET_FIELDS = {
+    "api_key",
+    "api_secret",
+    "api_passphrase",
+    "app_key",
+    "password",
+    "passphrase",
+    "private_key",
+    "session_key",
+}
+ADAPTER_CONFIG_READBACK_REPLACEMENTS = {
+    "proxy_url": "has_proxy_url",
+    "submitter_proxy_urls": "has_submitter_proxy_urls",
+    "canceller_proxy_urls": "has_canceller_proxy_urls",
+}
+ADAPTER_CONFIG_FIELD_READBACK_REPLACEMENTS = {
+    (
+        "nautilus_trader.adapters.blockchain",
+        "BlockchainDataClientConfig",
+        "postgres_cache_database_config",
+    ): "has_postgres_cache_database_config",
+    (
+        "nautilus_trader.adapters.interactive_brokers",
+        "DockerizedIBGatewayConfig",
+        "password",
+    ): "has_password",
+}
+ADAPTER_CONFIG_CONSTRUCTOR_ONLY_FIELDS = {
+    (
+        "nautilus_trader.adapters.interactive_brokers",
+        "InteractiveBrokersDataClientConfig",
+        "dockerized_gateway",
+    ),
+    (
+        "nautilus_trader.adapters.interactive_brokers",
+        "InteractiveBrokersExecClientConfig",
+        "dockerized_gateway",
+    ),
+}
+ADAPTER_CONFIG_CONSTRUCTOR_INVENTORY_SHA256 = (
+    "439ae1684f7c67e0e9bc41e9814a25f151d89bf142b24a40d7295949f6614e78"
+)
+
 
 def _parse_stub_enum_variants(stub_root: Path) -> dict[str, list[str]]:
     """
@@ -1325,23 +1492,33 @@ def test_live_stub_exposes_builder_engine_config_methods():
     )
 
 
-def test_catalog_stub_constructor_matches_runtime():
-    from nautilus_trader.persistence import ParquetDataCatalog
-
-    stub_module = ast.parse((STUB_ROOT / "persistence" / "__init__.pyi").read_text())
-    catalog_class = next(
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    [
+        ("nautilus_trader.adapters.dydx", "DydxClientOrderIdEncoder"),
+        ("nautilus_trader.persistence", "DataBackendSession"),
+        ("nautilus_trader.persistence", "ParquetDataCatalog"),
+        ("nautilus_trader.persistence", "StreamingFeatherWriter"),
+    ],
+)
+def test_stub_constructor_matches_runtime(module_name, class_name):
+    runtime_class = getattr(importlib.import_module(module_name), class_name)
+    stub_path = STUB_ROOT.joinpath(*module_name.split(".")[1:], "__init__.pyi")
+    stub_module = ast.parse(stub_path.read_text())
+    stub_class = next(
         node
         for node in stub_module.body
-        if isinstance(node, ast.ClassDef) and node.name == "ParquetDataCatalog"
+        if isinstance(node, ast.ClassDef) and node.name == class_name
     )
-    methods = {node.name: node for node in catalog_class.body if isinstance(node, ast.FunctionDef)}
+    methods = {node.name: node for node in stub_class.body if isinstance(node, ast.FunctionDef)}
 
     assert "__init__" in methods
     assert "new" not in methods
+    assert "new_session" not in methods
 
     constructor = methods["__init__"]
     stub_parameters = [argument.arg for argument in constructor.args.args[1:]]
-    runtime_signature = inspect.signature(ParquetDataCatalog)
+    runtime_signature = inspect.signature(runtime_class)
     runtime_parameters = list(runtime_signature.parameters)
     stub_default_parameters = (
         stub_parameters[-len(constructor.args.defaults) :] if constructor.args.defaults else []
@@ -1368,6 +1545,272 @@ def test_catalog_stub_constructor_matches_runtime():
     assert stub_defaults == runtime_defaults
 
 
+def test_stub_members_match_runtime_names():
+    mismatches = []
+    raw_runtime_names = []
+
+    for stub_path in sorted(STUB_ROOT.rglob("__init__.pyi")):
+        relative_package = stub_path.relative_to(STUB_ROOT).parent
+        if any(part.startswith("_") for part in relative_package.parts):
+            continue
+
+        module_name = _module_name_from_stub_path(relative_package)
+        module = importlib.import_module(module_name)
+        stub_module = ast.parse(stub_path.read_text())
+        runtime_names = set(dir(module))
+        stub_names = {
+            node.name
+            for node in stub_module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        mismatches.extend(
+            f"{module_name}.{name}"
+            for name in sorted(_stub_names_missing_at_runtime(stub_names, runtime_names))
+        )
+        raw_runtime_names.extend(
+            f"{module_name}.{name}" for name in sorted(runtime_names) if name.startswith("py_")
+        )
+
+        for stub_class in (node for node in stub_module.body if isinstance(node, ast.ClassDef)):
+            runtime_class = getattr(module, stub_class.name, None)
+            if not isinstance(runtime_class, type):
+                mismatches.append(f"{module_name}.{stub_class.name}")
+                continue
+
+            runtime_names = set(dir(runtime_class))
+            stub_names = {
+                node.name
+                for node in stub_class.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and (not node.name.startswith("__") or node.name in {"__init__", "__new__"})
+            }
+            mismatches.extend(
+                f"{module_name}.{stub_class.name}.{name}"
+                for name in sorted(_stub_names_missing_at_runtime(stub_names, runtime_names))
+            )
+            raw_runtime_names.extend(
+                f"{module_name}.{stub_class.name}.{name}"
+                for name in sorted(runtime_names)
+                if name.startswith("py_")
+            )
+
+    assert not mismatches, (
+        "Stub members missing at runtime; register intended public APIs or remove stale stub "
+        "metadata:\n" + "\n".join(mismatches)
+    )
+    assert not raw_runtime_names, "Raw Rust names exposed at runtime:\n" + "\n".join(
+        raw_runtime_names,
+    )
+
+
+def _stub_names_missing_at_runtime(stub_names, runtime_names):
+    return {
+        name
+        for name in stub_names
+        if name not in runtime_names
+        and not (name.endswith("_") and keyword.iskeyword(name[:-1]) and name[:-1] in runtime_names)
+    }
+
+
+def test_pylist_construction_propagates_pyresult_collections():
+    violations = []
+    list_pattern = re.compile(r"PyList::new\(py,\s*(\w+)(\?)?\)")
+
+    for rust_path in sorted((WORKSPACE_ROOT / "crates").rglob("*.rs")):
+        lines = rust_path.read_text().splitlines()
+        for index, line in enumerate(lines):
+            match = list_pattern.search(line)
+            if match is None or match.group(2) is not None:
+                continue
+
+            binding = re.escape(match.group(1))
+            preceding_lines = "\n".join(lines[max(0, index - 12) : index])
+            if re.search(rf"let\s+{binding}\s*:\s*PyResult<Vec<_>>", preceding_lines):
+                relative_path = rust_path.relative_to(WORKSPACE_ROOT)
+                violations.append(f"{relative_path}:{index + 1}")
+
+    assert not violations, "PyResult collections passed to PyList without `?`:\n" + "\n".join(
+        violations,
+    )
+
+
+def test_stub_signatures_match_runtime():
+    parameter_mismatches = []
+    default_mismatches = []
+
+    for stub_path in sorted(STUB_ROOT.rglob("__init__.pyi")):
+        relative_package = stub_path.relative_to(STUB_ROOT).parent
+        if any(part.startswith("_") for part in relative_package.parts):
+            continue
+
+        module_name = _module_name_from_stub_path(relative_package)
+        module = importlib.import_module(module_name)
+        stub_module = ast.parse(stub_path.read_text())
+        parameter_errors, default_errors = _module_signature_mismatches(
+            module_name,
+            stub_module,
+            module,
+        )
+        parameter_mismatches.extend(parameter_errors)
+        default_mismatches.extend(default_errors)
+
+        for stub_class in (node for node in stub_module.body if isinstance(node, ast.ClassDef)):
+            runtime_class = getattr(module, stub_class.name, None)
+            if not isinstance(runtime_class, type):
+                continue
+
+            parameter_errors, default_errors = _method_signature_mismatches(
+                module_name,
+                stub_class,
+                runtime_class,
+            )
+            parameter_mismatches.extend(parameter_errors)
+            default_mismatches.extend(default_errors)
+
+    assert not parameter_mismatches, "Stub parameter mismatches:\n" + "\n".join(
+        parameter_mismatches,
+    )
+    assert not default_mismatches, "Stub default mismatches:\n" + "\n".join(default_mismatches)
+
+
+def _module_signature_mismatches(module_name, stub_module, module):
+    parameter_mismatches = []
+    default_mismatches = []
+
+    for function_name, functions in _stub_methods_by_name(stub_module).items():
+        if len(functions) != 1:
+            continue
+
+        function = functions[0]
+        runtime_function = getattr(module, function_name)
+        try:
+            runtime_signature = inspect.signature(runtime_function)
+        except (TypeError, ValueError):
+            continue
+
+        stub_parameters, runtime_parameters = _normalized_parameter_names(
+            _stub_parameter_names(function),
+            list(runtime_signature.parameters),
+        )
+        label = f"{module_name}.{function_name}"
+
+        if stub_parameters != runtime_parameters:
+            parameter_mismatches.append(
+                f"{label}: stub={stub_parameters}, runtime={runtime_parameters}",
+            )
+            continue
+
+        for name, stub_default in _concrete_stub_defaults(function).items():
+            runtime_default = runtime_signature.parameters[name].default
+            if runtime_default is Ellipsis:
+                continue
+            if runtime_default is inspect.Parameter.empty or stub_default != runtime_default:
+                default_mismatches.append(
+                    f"{label}.{name}: stub={stub_default!r}, runtime={runtime_default!r}",
+                )
+
+    return parameter_mismatches, default_mismatches
+
+
+def _method_signature_mismatches(module_name, stub_class, runtime_class):
+    parameter_mismatches = []
+    default_mismatches = []
+
+    for method_name, methods in _stub_methods_by_name(stub_class).items():
+        if len(methods) != 1 or (method_name.startswith("__") and method_name != "__init__"):
+            continue
+
+        method = methods[0]
+        decorators = {ast.unparse(decorator) for decorator in method.decorator_list}
+        if "property" in decorators or any(
+            decorator.endswith(".setter") for decorator in decorators
+        ):
+            continue
+
+        runtime_method = (
+            runtime_class
+            if method_name == "__init__"
+            else getattr(runtime_class, method_name, None)
+        )
+        try:
+            runtime_signature = inspect.signature(runtime_method)
+        except (TypeError, ValueError):
+            continue
+
+        stub_parameters, runtime_parameters = _normalized_parameter_names(
+            _stub_parameter_names(method),
+            list(runtime_signature.parameters),
+        )
+        label = f"{module_name}.{stub_class.name}.{method_name}"
+
+        if stub_parameters != runtime_parameters:
+            parameter_mismatches.append(
+                f"{label}: stub={stub_parameters}, runtime={runtime_parameters}",
+            )
+            continue
+
+        for name, stub_default in _concrete_stub_defaults(method).items():
+            runtime_default = runtime_signature.parameters[name].default
+            if runtime_default is Ellipsis:
+                continue
+            if runtime_default is inspect.Parameter.empty or stub_default != runtime_default:
+                default_mismatches.append(
+                    f"{label}.{name}: stub={stub_default!r}, runtime={runtime_default!r}",
+                )
+
+    return parameter_mismatches, default_mismatches
+
+
+def _stub_methods_by_name(stub_class: ast.ClassDef | ast.Module):
+    methods = {}
+
+    for node in stub_class.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods.setdefault(node.name, []).append(node)
+    return methods
+
+
+def _stub_parameter_names(method: ast.FunctionDef | ast.AsyncFunctionDef):
+    names = [argument.arg for argument in method.args.posonlyargs + method.args.args]
+    if method.args.vararg:
+        names.append(method.args.vararg.arg)
+    names.extend(argument.arg for argument in method.args.kwonlyargs)
+    if method.args.kwarg:
+        names.append(method.args.kwarg.arg)
+    return names
+
+
+def _normalized_parameter_names(stub_parameters, runtime_parameters):
+    if stub_parameters and stub_parameters[0] in {"self", "cls"}:
+        if not runtime_parameters or runtime_parameters[0] not in {"self", "cls"}:
+            stub_parameters = stub_parameters[1:]
+    elif runtime_parameters and runtime_parameters[0] in {"self", "cls"}:
+        runtime_parameters = runtime_parameters[1:]
+    return stub_parameters, runtime_parameters
+
+
+def _concrete_stub_defaults(method: ast.FunctionDef | ast.AsyncFunctionDef):
+    positional_arguments = method.args.posonlyargs + method.args.args
+    positional_defaults = [None] * (len(positional_arguments) - len(method.args.defaults)) + list(
+        method.args.defaults,
+    )
+    default_nodes = positional_defaults + list(method.args.kw_defaults)
+    default_names = [argument.arg for argument in positional_arguments + method.args.kwonlyargs]
+    defaults = {}
+
+    for name, default_node in zip(default_names, default_nodes, strict=True):
+        if default_node is None or (
+            isinstance(default_node, ast.Constant) and default_node.value is Ellipsis
+        ):
+            continue
+        try:
+            defaults[name] = ast.literal_eval(default_node)
+        except (TypeError, ValueError):
+            continue
+
+    return defaults
+
+
 def test_generated_config_stubs_include_signature_defaults():
     rust_fixups = generate_stubs.collect_rust_class_fixups(WORKSPACE_ROOT)
     renamed_enums = generate_stubs.collect_renamed_enums(WORKSPACE_ROOT)
@@ -1389,6 +1832,385 @@ def test_generated_config_stubs_include_signature_defaults():
     assert mismatches == [], "Run `make py-stubs-v2`; stale config defaults in " + ", ".join(
         mismatches,
     )
+
+
+def test_non_adapter_config_constructors_have_runtime_readback():
+    mismatches = []
+
+    for stub_file in sorted(STUB_ROOT.rglob("__init__.pyi")):
+        relative_package = stub_file.relative_to(STUB_ROOT).parent
+        module_name = _module_name_from_stub_path(relative_package)
+        if module_name.startswith("nautilus_trader.adapters."):
+            continue
+
+        module = importlib.import_module(module_name)
+        stub_module = ast.parse(stub_file.read_text())
+
+        for stub_class in (
+            node
+            for node in stub_module.body
+            if isinstance(node, ast.ClassDef) and node.name.endswith("Config")
+        ):
+            mismatches.extend(
+                _config_constructor_readback_mismatches(module_name, module, stub_class),
+            )
+
+    assert mismatches == [], "Non-adapter config readback drift:\n" + "\n".join(mismatches)
+
+
+def test_adapter_config_constructors_have_runtime_readback():
+    mismatches = []
+    inventory = []
+
+    for stub_file in sorted((STUB_ROOT / "adapters").glob("*/__init__.pyi")):
+        relative_package = stub_file.relative_to(STUB_ROOT).parent
+        module_name = _module_name_from_stub_path(relative_package)
+        module = importlib.import_module(module_name)
+        stub_module = ast.parse(stub_file.read_text())
+
+        for stub_class in (
+            node
+            for node in stub_module.body
+            if isinstance(node, ast.ClassDef) and node.name.endswith("Config")
+        ):
+            mismatches.extend(
+                _config_constructor_readback_mismatches(
+                    module_name,
+                    module,
+                    stub_class,
+                    adapter_inventory=inventory,
+                ),
+            )
+
+    inventory_digest = hashlib.sha256("\n".join(sorted(inventory)).encode()).hexdigest()
+    assert inventory_digest == ADAPTER_CONFIG_CONSTRUCTOR_INVENTORY_SHA256, (
+        "Adapter config constructor inventory changed. Review each new or renamed field's readback "
+        f"and secret policy, then update the approved digest to {inventory_digest}."
+    )
+    assert mismatches == [], "Adapter config readback drift:\n" + "\n".join(mismatches)
+
+
+def test_adapter_config_readback_returns_constructor_values(tmp_path):
+    from nautilus_trader.adapters.architect_ax import AxDataClientConfig
+    from nautilus_trader.adapters.betfair import BetfairDataConfig
+    from nautilus_trader.adapters.bitmex import BitmexExecClientConfig
+    from nautilus_trader.adapters.bitmex import BitmexExecFactoryConfig
+    from nautilus_trader.adapters.bybit import BybitDataClientConfig
+    from nautilus_trader.adapters.databento import DatabentoLiveClientConfig
+    from nautilus_trader.model import AccountId
+    from nautilus_trader.model import TraderId
+
+    ax_config = AxDataClientConfig(
+        base_url_http="https://ax.example.test",
+        proxy_url="http://user:password@proxy.example.test",
+        http_timeout_secs=17,
+    )
+    betfair_config = BetfairDataConfig(
+        username="readback-user",
+        password="readback-password",
+        app_key="readback-app-key",
+        proxy_url="http://user:password@proxy.example.test",
+        event_type_ids=[7, 9],
+        stream_heartbeat_ms=4321,
+    )
+    bitmex_config = BitmexExecClientConfig(
+        submitter_proxy_urls=["http://submitter.example.test"],
+        canceller_proxy_urls=["http://canceller.example.test"],
+        deadmans_switch_timeout_secs=45,
+    )
+    bybit_config = BybitDataClientConfig(instrument_status_poll_secs=23)
+    databento_config = DatabentoLiveClientConfig(
+        api_key="readback-api-key",
+        publishers_filepath=tmp_path / "publishers.json",
+        use_exchange_as_venue=True,
+        bars_timestamp_on_close=False,
+        venue_dataset_map={"XNAS": "XNAS.ITCH"},
+    )
+    factory_config = BitmexExecFactoryConfig(
+        trader_id=TraderId("TRADER-001"),
+        account_id=AccountId("BITMEX-001"),
+        config=bitmex_config,
+    )
+
+    assert ax_config.base_url_http == "https://ax.example.test"
+    assert ax_config.http_timeout_secs == 17
+    assert ax_config.has_proxy_url is True
+    assert betfair_config.username == "readback-user"
+    assert betfair_config.event_type_ids == ["7", "9"]
+    assert betfair_config.stream_heartbeat_ms == 4321
+    assert betfair_config.has_proxy_url is True
+    assert bitmex_config.deadmans_switch_timeout_secs == 45
+    assert bitmex_config.has_submitter_proxy_urls is True
+    assert bitmex_config.has_canceller_proxy_urls is True
+    assert bybit_config.instrument_status_poll_secs == 23
+    assert databento_config.publishers_filepath == tmp_path / "publishers.json"
+    assert databento_config.use_exchange_as_venue is True
+    assert databento_config.bars_timestamp_on_close is False
+    assert databento_config.venue_dataset_map == {"XNAS": "XNAS.ITCH"}
+    assert factory_config.trader_id == TraderId("TRADER-001")
+    assert factory_config.account_id == AccountId("BITMEX-001")
+    assert factory_config.config.deadmans_switch_timeout_secs == 45
+
+
+def test_adapter_config_runtime_setter_policy(tmp_path):
+    from nautilus_trader.adapters.architect_ax import AxDataClientConfig
+    from nautilus_trader.adapters.interactive_brokers import DockerizedIBGatewayConfig
+    from nautilus_trader.adapters.interactive_brokers import InteractiveBrokersDataClientConfig
+    from nautilus_trader.adapters.interactive_brokers import InteractiveBrokersExecClientConfig
+    from nautilus_trader.adapters.interactive_brokers import (
+        InteractiveBrokersInstrumentProviderConfig,
+    )
+
+    readonly_config = AxDataClientConfig(base_url_http="https://ax.example.test")
+    gateway_config = DockerizedIBGatewayConfig()
+    provider_config = InteractiveBrokersInstrumentProviderConfig()
+    data_config = InteractiveBrokersDataClientConfig()
+    exec_config = InteractiveBrokersExecClientConfig()
+
+    with pytest.raises(AttributeError):
+        readonly_config.base_url_http = "https://changed.example.test"
+    for config_class in (InteractiveBrokersDataClientConfig, InteractiveBrokersExecClientConfig):
+        with pytest.raises(ValueError, match="is not wired into the Rust/PyO3 IB"):
+            config_class(dockerized_gateway=gateway_config)
+
+    provider_config.cache_path = str(tmp_path)
+    data_config.instrument_provider = provider_config
+    exec_config.instrument_provider = provider_config
+
+    assert data_config.instrument_provider.cache_path == str(tmp_path)
+    assert exec_config.instrument_provider.cache_path == str(tmp_path)
+    assert provider_config.cache_path == str(tmp_path)
+
+
+def test_adapter_config_secret_values_are_not_exposed(tmp_path):
+    from nautilus_trader.model import AccountId
+    from nautilus_trader.model import TraderId
+
+    required_values = {
+        "account_id": AccountId("VENUE-001"),
+        "publishers_filepath": tmp_path / "publishers.json",
+        "trader_id": TraderId("TRADER-001"),
+    }
+    failures = []
+
+    for stub_file in sorted((STUB_ROOT / "adapters").glob("*/__init__.pyi")):
+        relative_package = stub_file.relative_to(STUB_ROOT).parent
+        module_name = _module_name_from_stub_path(relative_package)
+        module = importlib.import_module(module_name)
+
+        for stub_class in (
+            node
+            for node in ast.parse(stub_file.read_text()).body
+            if isinstance(node, ast.ClassDef) and node.name.endswith("Config")
+        ):
+            runtime_class = getattr(module, stub_class.name)
+            signature = inspect.signature(runtime_class)
+            secret_parameters = [
+                name for name in signature.parameters if name in ADAPTER_CONFIG_SECRET_FIELDS
+            ]
+
+            if not secret_parameters:
+                continue
+
+            kwargs = {name: f"raw-secret-{name}" for name in secret_parameters}
+            for parameter in signature.parameters.values():
+                if parameter.default is not inspect.Parameter.empty or parameter.name in kwargs:
+                    continue
+                if parameter.name not in required_values:
+                    failures.append(
+                        f"{module_name}.{stub_class.name}: no value for required {parameter.name}",
+                    )
+                    break
+                kwargs[parameter.name] = required_values[parameter.name]
+            else:
+                config = runtime_class(**kwargs)
+                representations = (repr(config), str(config))
+
+                for parameter_name in secret_parameters:
+                    secret_value = kwargs[parameter_name]
+                    if inspect.getattr_static(runtime_class, parameter_name, None) is not None:
+                        failures.append(
+                            f"{module_name}.{stub_class.name}.{parameter_name}: raw property exists",
+                        )
+                    if any(secret_value in representation for representation in representations):
+                        failures.append(
+                            f"{module_name}.{stub_class.name}.{parameter_name}: value in representation",
+                        )
+
+    assert failures == [], "Adapter config secret policy drift:\n" + "\n".join(failures)
+
+
+def test_adapter_config_sensitive_readback_values_are_not_represented():
+    from nautilus_trader.adapters.bitmex import BitmexExecClientConfig
+    from nautilus_trader.adapters.blockchain import BlockchainDataClientConfig
+    from nautilus_trader.adapters.derive import DeriveDataClientConfig
+    from nautilus_trader.adapters.dydx import DydxDataClientConfig
+    from nautilus_trader.infrastructure import PostgresConnectOptions
+    from nautilus_trader.model import Chain
+    from nautilus_trader.model import DexType
+
+    sentinel = "raw-sensitive-value"
+    configs = [
+        BitmexExecClientConfig(
+            submitter_proxy_urls=[f"http://{sentinel}@submitter.example.test"],
+            canceller_proxy_urls=[f"http://{sentinel}@canceller.example.test"],
+        ),
+        BlockchainDataClientConfig(
+            chain=Chain.ARBITRUM(),
+            dex_ids=[DexType.UNISWAP_V3],
+            http_rpc_url="https://arb1.arbitrum.io/rpc",
+            postgres_cache_database_config=PostgresConnectOptions(
+                host="localhost",
+                port=5432,
+                user="user",
+                password=sentinel,
+                database="database",
+            ),
+            proxy_url=f"http://{sentinel}@proxy.example.test",
+        ),
+        DeriveDataClientConfig(proxy_url=f"http://{sentinel}@proxy.example.test"),
+        DydxDataClientConfig(proxy_url=f"http://{sentinel}@proxy.example.test"),
+    ]
+
+    assert all(sentinel not in repr(config) for config in configs)
+    assert all(sentinel not in str(config) for config in configs)
+
+
+def _config_constructor_readback_mismatches(
+    module_name,
+    module,
+    stub_class,
+    adapter_inventory=None,
+):
+    constructor = next(
+        (
+            node
+            for node in stub_class.body
+            if isinstance(node, ast.FunctionDef) and node.name in {"__init__", "__new__"}
+        ),
+        None,
+    )
+
+    if constructor is None:
+        return []
+
+    mismatches = []
+    runtime_class = getattr(module, stub_class.name)
+    properties = {
+        node.name
+        for node in stub_class.body
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            isinstance(decorator, ast.Name) and decorator.id == "property"
+            for decorator in node.decorator_list
+        )
+    }
+    setters = {
+        node.name
+        for node in stub_class.body
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            isinstance(decorator, ast.Attribute) and decorator.attr == "setter"
+            for decorator in node.decorator_list
+        )
+    }
+    expected_setters = WRITABLE_CONFIG_PROPERTIES.get((module_name, stub_class.name), set())
+    if setters != expected_setters:
+        mismatches.append(
+            f"{module_name}.{stub_class.name}: setters {sorted(setters)}, "
+            f"expected {sorted(expected_setters)}",
+        )
+
+    positional_parameters = [*constructor.args.posonlyargs, *constructor.args.args]
+    parameters = [*positional_parameters[1:], *constructor.args.kwonlyargs]
+    for parameter in parameters:
+        if parameter.arg.startswith("_"):
+            continue
+
+        field_key = (module_name, stub_class.name, parameter.arg)
+
+        if adapter_inventory is not None:
+            inventory_entry, readback_name, policy_mismatches = _adapter_config_field_policy(
+                runtime_class,
+                properties,
+                field_key,
+            )
+            adapter_inventory.append(inventory_entry)
+            mismatches.extend(policy_mismatches)
+
+            if readback_name is None:
+                continue
+        else:
+            readback_name = CONFIG_READBACK_REPLACEMENTS.get(field_key, parameter.arg)
+
+        mismatches.extend(
+            _config_readback_descriptor_mismatches(
+                runtime_class,
+                properties,
+                field_key,
+                readback_name,
+            ),
+        )
+
+    return mismatches
+
+
+def _adapter_config_field_policy(runtime_class, properties, field_key):
+    module_name, class_name, field_name = field_key
+    raw_property_exists = (
+        field_name in properties
+        or inspect.getattr_static(runtime_class, field_name, None) is not None
+    )
+    mismatches = []
+
+    if field_key in ADAPTER_CONFIG_CONSTRUCTOR_ONLY_FIELDS:
+        if raw_property_exists:
+            mismatches.append(
+                f"{module_name}.{class_name}.{field_name}: constructor-only field exposed",
+            )
+        policy = "constructor-only"
+        readback_name = None
+    elif field_name in ADAPTER_CONFIG_SECRET_FIELDS:
+        if raw_property_exists:
+            mismatches.append(
+                f"{module_name}.{class_name}.{field_name}: raw secret property exposed",
+            )
+        readback_name = ADAPTER_CONFIG_FIELD_READBACK_REPLACEMENTS.get(field_key)
+        policy = f"secret:{readback_name or 'absent'}"
+    else:
+        readback_name = ADAPTER_CONFIG_FIELD_READBACK_REPLACEMENTS.get(
+            field_key,
+            ADAPTER_CONFIG_READBACK_REPLACEMENTS.get(field_name, field_name),
+        )
+
+        if readback_name != field_name and raw_property_exists:
+            mismatches.append(
+                f"{module_name}.{class_name}.{field_name}: "
+                f"raw property exposed alongside {readback_name}",
+            )
+        policy = f"readback:{readback_name}"
+
+    return "|".join((*field_key, policy)), readback_name, mismatches
+
+
+def _config_readback_descriptor_mismatches(
+    runtime_class,
+    properties,
+    field_key,
+    readback_name,
+):
+    module_name, class_name, field_name = field_key
+    if readback_name not in properties:
+        return [f"{module_name}.{class_name}.{field_name}: missing property {readback_name}"]
+
+    descriptor = inspect.getattr_static(runtime_class, readback_name, None)
+    if descriptor is None:
+        return [f"{module_name}.{class_name}.{readback_name}: missing at runtime"]
+    if not inspect.isdatadescriptor(descriptor):
+        return [f"{module_name}.{class_name}.{readback_name}: not a data descriptor"]
+    if callable(descriptor):
+        return [f"{module_name}.{class_name}.{readback_name}: exposed as method"]
+    return []
 
 
 def test_authoring_config_py_new_and_getters_match_rust_fields():

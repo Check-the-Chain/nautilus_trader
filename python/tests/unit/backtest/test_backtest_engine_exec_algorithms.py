@@ -19,6 +19,7 @@ import pytest
 
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.backtest import BacktestEngineConfig
+from nautilus_trader.common import ComponentState
 from nautilus_trader.common import DataActor
 from nautilus_trader.common import DataActorConfig
 from nautilus_trader.model import ExecAlgorithmId
@@ -124,12 +125,80 @@ class RequiredConfigBacktestExecAlgorithm(DataActor):
         ("modify_order", ["self", "order", "quantity", "price", "trigger_price", "client_id"]),
         ("modify_order_in_place", ["self", "order", "quantity", "price", "trigger_price"]),
         ("cancel_order", ["self", "order", "client_id"]),
+        ("subscribe_signal", ["self", "name", "priority"]),
+        ("unsubscribe_signal", ["self", "name"]),
+        ("on_signal", ["self", "signal"]),
+        ("is_ready", ["self"]),
+        ("is_running", ["self"]),
+        ("is_stopped", ["self"]),
+        ("is_disposed", ["self"]),
+        ("is_degraded", ["self"]),
+        ("is_faulted", ["self"]),
+        ("start", ["self"]),
+        ("stop", ["self"]),
+        ("resume", ["self"]),
+        ("reset", ["self"]),
+        ("dispose", ["self"]),
+        ("degrade", ["self"]),
+        ("fault", ["self"]),
     ],
 )
 def test_execution_algorithm_authoring_surface_parameters(method_name, parameter_names):
     method = getattr(ExecutionAlgorithm, method_name)
 
     assert list(inspect.signature(method).parameters) == parameter_names
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "greeks",
+        "msgbus",
+        "registered_indicators",
+        "register_indicator",
+        "subscribe_data",
+        "unsubscribe_data",
+        "on_data",
+        "subscribe_instruments",
+        "subscribe_quotes",
+        "subscribe_trades",
+        "subscribe_bars",
+        "register",
+    ],
+)
+def test_execution_algorithm_keeps_routed_order_surface(attribute):
+    assert not hasattr(ExecutionAlgorithm, attribute)
+
+
+def test_execution_algorithm_pre_registration_surface():
+    exec_algorithm = ExecutionAlgorithm(
+        ExecutionAlgorithmConfig(exec_algorithm_id=ExecAlgorithmId("PY-PRE-REGISTRATION")),
+    )
+
+    assert exec_algorithm.state == ComponentState.PRE_INITIALIZED
+    assert exec_algorithm.is_registered() is False
+    assert exec_algorithm.is_ready() is False
+    assert exec_algorithm.is_running() is False
+    assert exec_algorithm.is_stopped() is False
+    assert exec_algorithm.is_disposed() is False
+    assert exec_algorithm.is_degraded() is False
+    assert exec_algorithm.is_faulted() is False
+
+    with pytest.raises(RuntimeError, match="registered with a trader"):
+        _ = exec_algorithm.portfolio
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ["start", "stop", "resume", "reset", "dispose", "degrade", "fault"],
+)
+def test_execution_algorithm_lifecycle_methods_reject_pre_initialized_state(method_name):
+    exec_algorithm = ExecutionAlgorithm(
+        ExecutionAlgorithmConfig(exec_algorithm_id=ExecAlgorithmId("PY-LIFECYCLE")),
+    )
+
+    with pytest.raises(RuntimeError, match="Invalid state trigger PRE_INITIALIZED"):
+        getattr(exec_algorithm, method_name)()
 
 
 def test_execution_algorithm_config_defaults():
@@ -291,6 +360,22 @@ def test_add_exec_algorithm_from_config_registers_non_forwarding_subclass_under_
     with pytest.raises(RuntimeError, match="'BACKTEST-ALGO-NOFORWARD' is already registered"):
         engine.add_exec_algorithm_from_config(config)
 
+    engine.dispose()
+
+
+def test_add_exec_algorithm_registers_constructed_v2_instance():
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    exec_algorithm_id = ExecAlgorithmId("BACKTEST-V2-INSTANCE")
+    exec_algorithm = ExecutionAlgorithm(
+        ExecutionAlgorithmConfig(exec_algorithm_id=exec_algorithm_id),
+    )
+
+    engine.add_exec_algorithm(exec_algorithm)
+
+    assert exec_algorithm.exec_algorithm_id == exec_algorithm_id
+    assert exec_algorithm.is_registered() is True
+    assert exec_algorithm.is_ready() is True
+    assert exec_algorithm.portfolio.is_initialized() is False
     engine.dispose()
 
 

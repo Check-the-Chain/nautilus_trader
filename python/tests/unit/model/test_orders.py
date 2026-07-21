@@ -34,6 +34,7 @@ from nautilus_trader.model import OrderAccepted
 from nautilus_trader.model import OrderCanceled
 from nautilus_trader.model import OrderDenied
 from nautilus_trader.model import OrderFilled
+from nautilus_trader.model import OrderInitialized
 from nautilus_trader.model import OrderRejected
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
@@ -976,19 +977,87 @@ def _trailing_stop_limit_order(client_order_id="O-009"):
     )
 
 
+ORDER_FACTORIES = [
+    _market_order,
+    _limit_order,
+    _stop_market_order,
+    _stop_limit_order,
+    _market_if_touched_order,
+    _limit_if_touched_order,
+    _market_to_limit_order,
+    _trailing_stop_market_order,
+    _trailing_stop_limit_order,
+]
+
+
+@pytest.mark.parametrize("order_factory", ORDER_FACTORIES)
+def test_order_inspection_properties_are_consistent(order_factory):
+    order = order_factory()
+
+    assert order.avg_px is None
+    assert order.event_count == 1
+    assert order.is_buy is (order.side == OrderSide.BUY)
+    assert order.is_sell is (order.side == OrderSide.SELL)
+    assert order.is_canceled is False
+    assert order.is_inflight is False
+    assert order.is_open is False
+    assert order.is_closed is False
+    assert order.is_pending_cancel is False
+    assert order.is_pending_update is False
+    assert isinstance(order.init_event, OrderInitialized)
+    assert isinstance(order.last_event, OrderInitialized)
+    assert order.leaves_qty == order.quantity
+    assert order.filled_qty == Quantity.from_int(0)
+    assert order.overfill_qty == Quantity.from_int(0)
+    assert order.slippage is None
+    assert order.trade_ids == []
+    assert order.venue_order_ids == []
+    assert order.ts_submitted is None
+    assert order.ts_accepted is None
+    assert order.ts_closed is None
+    assert order.ts_last == order.ts_init
+    assert order.venue_order_id is None
+    assert order.position_id is None
+    assert order.account_id is None
+    assert order.last_trade_id is None
+    assert order.liquidity_side == LiquiditySide.NO_LIQUIDITY_SIDE
+    assert order.is_active_local is True
+    assert order.is_emulated is False
+    assert order.is_primary is False
+    assert order.is_spawned is False
+
+
 @pytest.mark.parametrize(
     "order_factory",
     [
-        _market_order,
-        _limit_order,
         _stop_market_order,
         _stop_limit_order,
         _market_if_touched_order,
         _limit_if_touched_order,
-        _market_to_limit_order,
         _trailing_stop_market_order,
         _trailing_stop_limit_order,
     ],
+)
+def test_trigger_order_inspection_properties_are_consistent(order_factory):
+    order = order_factory()
+
+    assert order.is_triggered is False
+    assert order.ts_triggered is None
+
+
+@pytest.mark.parametrize(
+    "order_factory",
+    [_trailing_stop_market_order, _trailing_stop_limit_order],
+)
+def test_trailing_order_activation_property_is_consistent(order_factory):
+    order = order_factory()
+
+    assert order.is_activated is False
+
+
+@pytest.mark.parametrize(
+    "order_factory",
+    ORDER_FACTORIES,
 )
 def test_apply_rejects_unsupported_event(order_factory):
     order = order_factory()
@@ -1194,6 +1263,16 @@ def test_apply_filled():
     assert order.status == OrderStatus.FILLED
     assert order.quantity == Quantity.from_int(100_000)
     assert len(order.events()) == 4
+    assert order.avg_px == 1.0
+    assert order.event_count == 4
+    assert isinstance(order.last_event, OrderFilled)
+    assert order.leaves_qty == Quantity.from_int(0)
+    assert order.filled_qty == Quantity.from_int(100_000)
+    assert order.trade_ids == [TradeId("T-001")]
+    assert order.venue_order_ids == [VenueOrderId("V-001")]
+    assert order.ts_submitted == 1
+    assert order.ts_accepted == 2
+    assert order.ts_closed == 3
 
 
 def test_apply_partial_fill():

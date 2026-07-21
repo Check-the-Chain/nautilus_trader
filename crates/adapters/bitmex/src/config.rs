@@ -97,6 +97,24 @@ pub struct BitmexDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BitmexDataClientConfig {
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: Option<u64>,
+    recv_window_ms: u64,
+    active_only: bool,
+    update_instruments_interval_mins: Option<u64>,
+    environment: BitmexEnvironment,
+    max_requests_per_second: u32,
+    max_requests_per_minute: u32,
+    transport_backend: TransportBackend,
+});
+
 impl Default for BitmexDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -230,6 +248,27 @@ pub struct BitmexExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BitmexExecClientConfig {
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    active_only: bool,
+    environment: BitmexEnvironment,
+    account_id: Option<AccountId>,
+    max_requests_per_second: u32,
+    max_requests_per_minute: u32,
+    submitter_pool_size: Option<usize>,
+    canceller_pool_size: Option<usize>,
+    deadmans_switch_timeout_secs: Option<u64>,
+    transport_backend: TransportBackend,
+});
 
 impl Default for BitmexExecClientConfig {
     fn default() -> Self {

@@ -77,6 +77,20 @@ pub struct LighterDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(LighterDataClientConfig {
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    environment: LighterEnvironment,
+    account_index: Option<u64>,
+    api_key_index: Option<u8>,
+    http_timeout_secs: u64,
+    ws_timeout_secs: u64,
+    update_instruments_interval_mins: u64,
+    rest_quota_per_min: Option<u32>,
+    transport_backend: TransportBackend,
+});
+
 impl Default for LighterDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -234,6 +248,23 @@ pub struct LighterExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(LighterExecClientConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    account_index: Option<u64>,
+    api_key_index: Option<u8>,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    environment: LighterEnvironment,
+    http_timeout_secs: u64,
+    ws_timeout_secs: u64,
+    market_order_slippage_bps: u32,
+    rest_quota_per_min: Option<u32>,
+    sendtx_quota_per_min: Option<u32>,
+    transport_backend: TransportBackend,
+});
 
 impl Default for LighterExecClientConfig {
     fn default() -> Self {

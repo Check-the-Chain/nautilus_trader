@@ -122,7 +122,18 @@ You can do this by running the provided script located at `nautilus_trader/adapt
 This script is adapted from a [gist](https://gist.github.com/poly-rodr/44313920481de58d5a3f6d1f8226bd5e) created by @poly-rodr.
 
 :::note
-You only need to run this script **once** per EOA wallet that you intend to use for trading on Polymarket.
+Run the relevant allowance command once per EOA wallet, then rerun it when Polymarket changes
+the required contracts.
+:::
+
+:::warning
+[Polymarket retires the CLOB v1 Neg Risk Adapter](https://docs.polymarket.com/changelog)
+on July 17, 2026 at 00:00 UTC (10:00 AEST).
+Existing wallets do not approve its v2 replacement automatically. For every existing wallet,
+run the Python script or Rust binary used by your deployment before the deadline. These commands
+do not revoke the old v1 approvals;
+handle revocation as a separate on-chain operation after reviewing any remaining legacy flows.
+Run only one allowance command at a time for a given wallet.
 :::
 
 This script automates the process of approving the necessary allowances for the Polymarket contracts.
@@ -139,11 +150,11 @@ Before running the script, ensure the following prerequisites are met:
 
 Once you have these in place, the script will:
 
-- Approve the maximum possible amount of pUSD (using the `MAX_INT` value) for the Polymarket collateral token contract.
+- Approve the maximum possible amount of pUSD (using the `MAX_UINT256` value) for the Polymarket collateral token contract.
 - Set the approval for the CTF contract, allowing it to interact with your account for trading purposes.
 
 :::note
-You can also adjust the approval amount in the script instead of using `MAX_INT`,
+You can also adjust the approval amount in the script instead of using `MAX_UINT256`,
 with the amount specified in *fractional units* of **pUSD**, though this has not been tested.
 :::
 
@@ -161,14 +172,24 @@ Run the script using:
 python nautilus_trader/adapters/polymarket/scripts/set_allowances.py
 ```
 
+For the Rust v2 adapter, set `POLYMARKET_PK` and run:
+
+```bash
+cargo run -p nautilus-polymarket --bin polymarket-set-allowances
+```
+
+Both commands approve the current Neg Risk Adapter at
+`0xadA2005600Dec949baf300f4C6120000bDB6eAab`. Both commands use
+`https://polygon.drpc.org` by default; set `POLYGON_RPC_URL` to use another Polygon RPC endpoint.
+
 ### Script breakdown
 
 The script performs the following actions:
 
-- Connects to the Polygon network via an RPC URL (<https://polygon-rpc.com/>).
+- Connects to the Polygon network via an RPC URL (<https://polygon.drpc.org>).
 - Signs and sends a transaction to approve the maximum pUSD allowance for Polymarket contracts.
 - Sets approval for the CTF contract to manage Conditional Tokens on your behalf.
-- Repeats the approval process for specific addresses like the Polymarket CLOB Exchange and Neg Risk adapter.
+- Repeats the approval process for the Polymarket CLOB Exchange, Neg Risk CTF Exchange, and current Neg Risk adapter.
 
 This allows Polymarket to interact with your funds when executing trades and ensures smooth integration with the CLOB Exchange.
 
@@ -199,7 +220,7 @@ These can then be used for Polymarket client configurations:
 
 ## Configuration
 
-When setting up NautilusTrader to work with Polymarket, it’s crucial to properly configure the necessary parameters, particularly the private key.
+When setting up NautilusTrader to work with Polymarket, it's crucial to properly configure the necessary parameters, particularly the private key.
 
 **Key parameters**:
 
@@ -414,9 +435,17 @@ Polymarket enforces different precision constraints based on tick size and `orde
 precision requirements**:
 
 - **Market order types (`FAK` and `FOK`):**
-  - Sell orders: maker amount limited to **2 decimal places**.
-  - Taker amount: limited to **4 decimal places**.
-  - The product `size × price` must not exceed **2 decimal places**.
+  - The direct maker amount is limited to **2 decimal places**.
+  - The computed taker amount uses the market tick precision plus two size decimals.
+  - A limit order submitted with `FAK` or `FOK` must also satisfy the stricter market-order amount
+    validation. The venue rejects values that are valid for a resting order but not for that
+    market-order type.
+  - For a limit BUY, `quantity` is the nominal share quantity at the limit price. With `FAK` or
+    `FOK`, Polymarket spends the resulting pUSD maker budget, so price improvement can return more
+    shares; the adapter updates the order quantity to the actual fill.
+  - The adapter denies the order before signing when `quantity * price` is not an exact cent amount.
+    It does not round and recompute the nominal share quantity because that would change the signed
+    price/amount ratio.
 
 - **Resting limit order types (`GTC` and `GTD`):** More flexible precision based on
   market tick size.
@@ -432,7 +461,9 @@ precision requirements**:
 
 :::note
 
-- The adapter validates tick-size and market-order precision before signing.
+- The adapter validates tick size before signing. It also denies limit `FAK` or `FOK` BUYs whose
+  maker amount has more than two decimal places. This applies to single and batch submissions.
+- Resting `GTC` and `GTD` limit orders and all SELL orders keep their tick-derived amount precision.
 - The adapter rejects limit prices outside the current market's `tick_size` to `1 - tick_size`
   range before signing.
 - Market-order precision limits include two decimals for the sell size plus tick-derived bounds
@@ -604,28 +635,29 @@ recovers the settled quantity from confirmed trade history.
 
 ## Fill quantity normalization
 
-Polymarket reports fill quantities that drift slightly from the submitted
-order quantity due to protocol-level rounding: the CLOB rounds matched fills
-to integer cent ticks (underfill) and the V2 SDK truncates `takerAmount` to
-USDC scale on market-BUY quote-quantity orders (overfill, a few microshares).
-Both drift sources are fixed in absolute share terms, so the adapter
-normalizes them with a single threshold of `DUST_SNAP_THRESHOLD = 0.01`
-shares. Anything beyond that surfaces to the engine as a real partial fill or
-overfill.
+Polymarket wire amounts use six-decimal fixed-point mantissas. Market SELL signing truncates the
+share-denominated `makerAmount` to two decimal places, while market BUY quote conversion can leave
+a few microshares of drift between the registered and filled quantities. Both effects are fixed in
+absolute share terms, so the adapter uses `DUST_SNAP_THRESHOLD = 0.01` shares. Anything at or above
+that threshold remains a real partial fill or overfill.
 
-| Direction | Source                                 | Adapter behaviour                                       |
-|-----------|----------------------------------------|---------------------------------------------------------|
-| Overfill  | V2 USDC‑scale truncation (microshares) | Snap fill DOWN to `submitted_qty`                       |
-| Underfill | CLOB cent‑tick truncation (`< 0.01`)   | Synthetic dust fill once associated trades all confirm  |
+| Direction | Source                                         | Adapter behavior                              |
+|-----------|------------------------------------------------|-----------------------------------------------|
+| Overfill  | Market BUY quote conversion (microshares)      | Snap fill down to `submitted_qty`              |
+| Underfill | Signed or venue quantity truncation (`< 0.01`)  | Normalize atomic FOK; cancel a FAK remainder  |
 
-Dust convergence triggers from the `MATCHED` order update for resting maker orders, or directly
-on the confirming taker trade for one-shot taker orders. FOK orders always qualify because any
-fill implies full completion. IOC maps to fill-and-kill, whose remainder can be genuine, so IOC
-qualifies only for quote-quantity market BUY orders, whose registered quantity derives from the
-venue-computed size; an IOC remainder on a limit or market SELL order is never synthesized. The
-same convergence runs after buffered fills drain when a confirmed trade arrives before the
-submit response. A buffered `Canceled`, `Expired`, or `Rejected` report takes precedence and
-preserves the remaining quantity.
+Terminal quantity normalization triggers from the `MATCHED` order update for resting maker
+orders, or directly on the confirming taker trade for atomic FOK orders. It emits a reconciliation
+`OrderUpdated` which lowers the order quantity to the cumulative venue fill. It does not emit a
+fill and does not change positions, balances, or commissions.
+
+IOC maps to venue FAK. Once a taker trade confirms, every positive difference between
+`original_size` and `size_matched` is an unfilled remainder which the venue has killed. The adapter
+therefore emits `OrderCanceled` after the real fills instead of normalizing quantity or leaving the
+order partially filled. REST reports apply the same rule when a `MATCHED` FAK has
+`size_matched < original_size`. The same terminal handling runs after buffered fills drain when a
+confirmed trade arrives before the submit response. A buffered `Canceled`, `Expired`, or
+`Rejected` report takes precedence.
 
 `FillReport.commission` always reflects the venue-reported size, not the
 snapped quantity. The few-ulp difference is sub-microcent in pUSD.
@@ -641,9 +673,11 @@ The `PolymarketWebSocketClient` is built on top of the high-performance Nautilus
 
 ### Data
 
-The data adapter opens `market` subscriptions dynamically as instruments are requested. It currently
-uses one market WebSocket connection. The `ws_max_subscriptions` configuration field is present,
-but V2 does not yet enforce it or shard subscriptions across connections.
+The data adapter opens `market` subscriptions dynamically as instruments are requested. It spreads
+those subscriptions across a pool of market WebSocket connections so that no single connection
+carries more than `ws_max_subscriptions` assets. The pool grows lazily (a universe below the cap
+stays on one connection) and closes a secondary connection once it owns no assets. Each connection
+replays only its own assets on reconnect.
 
 A single `price_change` payload can contain interleaved updates for several assets. The adapter
 groups updates by instrument and publishes one atomic order book delta batch per instrument, while
@@ -789,22 +823,21 @@ Matched WebSocket fills and their corrections are restored from cached order his
 deduplicated across reconnects. If a trade arrives before its instrument is available, the adapter
 leaves it out of the dedup state. A redelivered event or later REST reconciliation can apply it after
 instrument loading completes.
-For a fully matched order, dust convergence waits for every trade ID in the order's
-`associate_trades` list to confirm before emitting a synthetic residual fill. If a confirmed trade
-is recovered through REST after a WebSocket gap, reconciliation also snaps a terminal residual
-within `DUST_SNAP_THRESHOLD` to the submitted quantity. If a `MATCHED` WebSocket update omits
-`associate_trades`, the adapter does not infer that settlement is final; the next REST
-reconciliation recovers the residual after the trade reaches `CONFIRMED`.
+For a fully matched order, terminal quantity normalization waits for every trade ID in the order's
+`associate_trades` list to confirm before lowering the order quantity to its actual fills. If a
+confirmed trade is recovered through REST after a WebSocket gap, reconciliation applies the same
+order-only normalization. If a `MATCHED` WebSocket update omits `associate_trades`, the adapter does
+not infer that settlement is final; the next REST reconciliation recovers the residual after the
+trade reaches `CONFIRMED`.
 
 ### Subscription limits
 
 Polymarket does not publish a WebSocket subscription cap in its current rate-limit documentation.
-The V2 configuration exposes `ws_max_subscriptions` with a default of 200, but the Rust client does
-not currently enforce that value or create additional connections. It sends the supplied asset IDs
-in one `subscribe` request on one market connection.
-
-Do not rely on this setting for subscription sharding. Keep large-universe strategies below an
-operationally verified venue limit until connection sharding is implemented.
+`ws_max_subscriptions` (default 200) is therefore a conservative, self-chosen per-connection
+reliability bound rather than a venue-enforced limit: high per-connection subscription counts have
+been observed to silently stall a connection. The adapter enforces the bound by sharding asset
+subscriptions across a pool of market connections, opening a new connection only when the existing
+ones are full and closing a secondary connection once it owns no assets.
 
 ## Rate limiting
 
@@ -838,30 +871,14 @@ Polymarket changes these quotas over time. As of 2026-07-10, the official limits
 
 ### WebSocket limits
 
-The WebSocket quotas are not part of the published REST rate-limits table. The V2 adapter exposes
-`ws_max_subscriptions` (default 200), but it does not yet enforce that cap or shard connections.
+The WebSocket quotas are not part of the published REST rate-limits table. The V2 adapter enforces
+`ws_max_subscriptions` (default 200) by sharding subscriptions across a pool of market connections.
 
 :::warning
 Exceeding Polymarket rate limits triggers Cloudflare throttling. Requests are queued
 using sliding windows rather than rejected immediately, but sustained overshoot can
 result in HTTP 429 responses or temporary blocking.
 :::
-
-### Legacy V1 loader rate limiting
-
-The Python `PolymarketDataLoader` described below belongs to the legacy V1 adapter and is not part
-of the V2 integration. This material remains only as a migration reference.
-
-The `PolymarketDataLoader` includes built-in rate limiting when using the default HTTP client.
-Requests are automatically throttled to 100 requests per minute by default.
-That is a NautilusTrader default, not Polymarket's current published limit.
-The current Rust HTTP clients also ship with conservative 100 requests per minute quotas.
-
-When fetching large date ranges across multiple markets:
-
-- Multiple loaders sharing the same `http_client` instance will coordinate rate limiting automatically.
-- For higher throughput, pass a custom `http_client` with adjusted quotas.
-- The loader does not implement automatic retry on 429 errors, so implement backoff if needed.
 
 :::info
 For the latest rate limit details, see the official Polymarket documentation:
@@ -878,7 +895,8 @@ The following limitations are currently known:
 - The adapter does not implement Polymarket's authenticated heartbeat auto-cancel endpoint.
 - Position reports omit balances below 0.01 shares. Do not treat an omitted report as proof that a
   dust position is flat; a sub-minimum residual cannot be exited through the CLOB's five-share
-  minimum order size.
+  minimum order size. Position reconciliation therefore tolerates differences through 0.009999
+  shares and reconciles differences of 0.01 shares or more.
 
 ## Configuration
 
@@ -897,7 +915,7 @@ Class/struct: `PolymarketDataClientConfig`.
 | `base_url_gamma`, `base_url_data_api`         | `None`    | Override the Gamma or Data API endpoint. |
 | `base_url_rtds`                               | `None`    | Override the RTDS endpoint. |
 | `http_timeout_secs`, `ws_timeout_secs`        | `60`, `30` | HTTP and WebSocket timeout in seconds. |
-| `ws_max_subscriptions`                        | `200`     | Configured cap; V2 does not currently enforce or shard it. |
+| `ws_max_subscriptions`                        | `200`     | Per‑connection subscription cap; the market pool shards across connections at this bound. |
 | `update_instruments_interval_mins`            | `60`      | Instrument catalogue refresh interval; pass `None` to disable it. |
 | `subscribe_new_markets`                       | `false`   | Subscribe to new‑market discovery events. |
 | `drop_quotes_missing_side`                    | `true`    | Drop quotes that do not contain both a bid and an ask. |
@@ -945,12 +963,58 @@ Pass `PolymarketInstrumentProviderConfig` as `instrument_config` on the data cli
 |----------------------|---------|-------------|
 | `load_all`           | `false` | Load the full venue catalogue at startup. |
 | `load_ids`           | `None`  | Load exact Nautilus instrument IDs. |
-| `filters`            | `None`  | Gamma query key/value filters. |
+| `filters`            | `None`  | Validated Gamma market keyset filters. |
 | `event_slugs`        | `None`  | Resolve all markets for the listed events at bootstrap. |
 | `market_slugs`       | `None`  | Load the listed Gamma market slugs at bootstrap. |
 | `event_slug_builder` | `None`  | Rust‑backed Up/Down event‑slug generator. |
 | `log_warnings`       | `true`  | Emit provider warnings. |
 | `use_gamma_markets`  | `false` | Compatibility field with no additional V2 behavior. |
+
+#### Gamma query filters
+
+The Rust v2 adapter uses the Gamma market and event keyset endpoints. It validates filters before
+the first HTTP request, follows `next_cursor`, and applies the endpoint page ceilings of 100 markets
+and 500 events.
+
+Market keyset fields:
+
+| Class         | Fields |
+|---------------|--------|
+| Scalar        | `limit`, `order`, `ascending`, `closed`, `decimalized`, `liquidity_num_min`, `liquidity_num_max`, `volume_num_min`, `volume_num_max`, `start_date_min`, `start_date_max`, `end_date_min`, `end_date_max`, `related_tags`, `tag_match`, `cyom`, `rfq_enabled`, `uma_resolution_status`, `game_id`, `include_tag`, `locale` |
+| Repeated      | `id`, `slug`, `clob_token_ids`, `condition_ids`, `question_ids`, `market_maker_address`, `tag_id`, `sports_market_types` |
+| Compatibility | `active`, `archived` |
+| Alias         | `is_active` |
+| Client only   | `offset`, `max_markets` |
+
+The provider `filters` dictionary accepts only market fields. Rust callers configure event
+discovery with `EventParamsFilter` and `GetGammaEventsParams`; event-only fields such as `live` or
+`tag_slug` are not valid provider dictionary keys.
+
+Event keyset fields:
+
+| Class         | Fields |
+|---------------|--------|
+| Scalar        | `limit`, `order`, `ascending`, `closed`, `live`, `featured`, `cyom`, `title_search`, `liquidity_min`, `liquidity_max`, `volume_min`, `volume_max`, `start_date_min`, `start_date_max`, `end_date_min`, `end_date_max`, `start_time_min`, `start_time_max`, `tag_slug`, `related_tags`, `tag_match`, `event_date`, `event_week`, `featured_order`, `recurrence`, `parent_event_id`, `include_children`, `partner_slug`, `include_chat`, `include_template`, `include_best_lines`, `locale` |
+| Repeated      | `id`, `slug`, `tag_id`, `exclude_tag_id`, `series_id`, `game_id`, `created_by` |
+| Compatibility | `active`, `archived` |
+| Client only   | `offset`, `max_events` |
+
+Repeated fields are sent as repeated query keys. `offset` is applied across returned keyset pages
+and is never sent to Gamma. `max_markets` caps markets locally, with each binary market normally
+producing two instruments. `max_events` caps events locally; each event can contain many markets.
+`condition_ids` accepts at most 100 values, and event `tag_id` values cannot overlap `exclude_tag_id`
+values.
+
+The provider `filters` dictionary accepts strings in the native Rust config and also accepts Python
+`bool`, `int`, finite `float`, string, or lists of those scalar values when converting a legacy
+Python-shaped config. The legacy-shaped conversion ignores `None` entries; native config entries
+must be strings. `is_active=true` supplies `active=true`, `archived=false`, and `closed=false`;
+explicit values override those defaults. Unknown keys, malformed values, empty lists, invalid date
+or numeric bounds, and invalid combinations raise `ValueError` during Python config conversion.
+
+See the official [market keyset](https://docs.polymarket.com/api-reference/markets/list-markets-keyset-pagination)
+and [event keyset](https://docs.polymarket.com/api-reference/events/list-events-keyset-pagination)
+references for the venue contract.
 
 #### Event slug builder
 
@@ -980,273 +1044,117 @@ For custom event patterns, pass explicit `event_slugs`, pass direct `market_slug
 filter or builder. The Rust v2 adapter rejects Python callable `event_slug_builder` values so adapter
 operations do not cross into Python during live trading.
 
-## Legacy V1 historical data loading
+## Python v2 discovery and historical data
 
-:::warning
-The following `PolymarketDataLoader` API, scripts, and backtest examples belong to the legacy V1
-Python adapter. They are outside the V2 integration's supported scope and have not been validated
-by the V2 adapter tests. Their imported symbols are not exported by the V2 PyO3 package, so these
-examples cannot run in a V2-only installation.
-:::
+The Python v2 package exports a Rust-backed `PolymarketDataLoader` for public discovery,
+instrument construction, and historical trades. It uses the Rust Gamma, CLOB, and Data API clients,
+so it does not require trading credentials or run networking in Python.
 
-The `PolymarketDataLoader` provides methods for fetching and parsing historical market data
-for research and backtesting purposes. The loader integrates with multiple Polymarket APIs to provide the required data.
-
-:::note
-All data fetching methods are **asynchronous** and must be called with `await`. The loader can optionally accept an `http_client` parameter for dependency injection (useful for testing).
-:::
-
-### Data sources
-
-The loader fetches data from three primary sources:
-
-1. **Polymarket Gamma API** - Market metadata, instrument details, and active market listings.
-2. **Polymarket CLOB API** - Market details for instrument construction.
-3. **Polymarket Data API** - Historical trades and current user positions.
-
-The current loader does **not** expose helpers for CLOB price history timeseries or order book
-history snapshots.
-
-### Method naming conventions
-
-The loader provides two ways to access the Polymarket APIs:
-
-| Prefix    | Type             | Use case                                                               |
-|-----------|------------------|------------------------------------------------------------------------|
-| `query_*` | Static methods   | API exploration without an instrument. No loader instance needed.      |
-| `fetch_*` | Instance methods | Data fetching with a configured loader. Uses the loader's HTTP client. |
-
-**Use `query_*` when** you want to explore markets, discover events, or fetch metadata
-before committing to a specific instrument:
+All network methods are asynchronous. Build a loader from a market slug and select its outcome token
+by index:
 
 ```python
-# No loader needed: query the API directly
-market = await PolymarketDataLoader.query_market_by_slug("some-market")
-event = await PolymarketDataLoader.query_event_by_slug("some-event")
-```
-
-**Use `fetch_*` when** you have a loader instance and want to fetch data using its
-configured HTTP client (for coordinated rate limiting across multiple calls):
-
-```python
-loader = await PolymarketDataLoader.from_market_slug("some-market")
-
-# All fetch calls share the loader's HTTP client
-markets = await loader.fetch_markets(active=True, limit=100)
-events = await loader.fetch_events(active=True)
-details = await loader.fetch_market_details(condition_id)
-```
-
-### Finding markets
-
-Use the provided utility scripts to discover active markets:
-
-```bash
-# List all active markets
-python nautilus_trader/adapters/polymarket/scripts/active_markets.py
-
-# List BTC and ETH UpDown markets specifically
-python nautilus_trader/adapters/polymarket/scripts/list_updown_markets.py
-```
-
-### Basic usage
-
-The recommended way to create a loader is using the factory classmethods, which handle
-all the API calls and instrument creation automatically:
-
-```python
-import asyncio
-
 from nautilus_trader.adapters.polymarket import PolymarketDataLoader
 
-async def main():
-    # Create loader from market slug (recommended)
-    loader = await PolymarketDataLoader.from_market_slug("gta-vi-released-before-june-2026")
-
-    # Loader is ready to use with instrument and token_id set
-    print(loader.instrument)
-    print(loader.token_id)
-
-asyncio.run(main())
-```
-
-For events with multiple markets (e.g., temperature buckets), use `from_event_slug`:
-
-```python
-# Returns a list of loaders, one per market in the event
-loaders = await PolymarketDataLoader.from_event_slug("highest-temperature-in-nyc-on-january-26")
-```
-
-#### Look-ahead protection for resolved markets
-
-When constructing a loader for a market that has already resolved at backtest
-build time, the venue payload includes the answer (`closed`, `closedTime`,
-`umaResolutionStatus`, per-token `winner`). A strategy that reads
-`cache.instrument(...).info` from `on_start` can therefore see the outcome
-before the simulation runs.
-
-Pass `sanitize_info=True` to either factory to redact those fields from
-`instrument.info` before the instrument is constructed. The redacted slice is
-stashed on the loader as `resolution_metadata` for post-hoc analytics
-(settlement PnL, Brier scoring) without leaking it into the simulation:
-
-```python
 loader = await PolymarketDataLoader.from_market_slug(
-    "some-resolved-market",
-    sanitize_info=True,
+    "gta-vi-released-before-june-2026",
+    token_index=0,
 )
 
-assert "closed" not in loader.instrument.info
-assert loader.resolution_metadata["closed"] is True
+instrument = loader.instrument
+token_id = loader.token_id
+condition_id = loader.condition_id
 ```
 
-### Discovering markets and events
-
-Use `fetch_markets()` and `fetch_events()` to discover available markets programmatically:
+`instrument` is a normalized `BinaryOption`. Resolution-bearing fields never enter
+`instrument.info`. Read them separately after a backtest or simulation:
 
 ```python
-loader = await PolymarketDataLoader.from_market_slug("any-market")
-
-# List active markets
-markets = await loader.fetch_markets(active=True, closed=False, limit=100)
-for market in markets:
-    print(f"{market['slug']}: {market['question']}")
-
-# List active events
-events = await loader.fetch_events(active=True, limit=50)
-for event in events:
-    print(f"{event['slug']}: {event['title']}")
-
-# Get all markets within a specific event
-event_markets = await loader.get_event_markets("highest-temperature-in-nyc-on-january-26")
+metadata = loader.resolution_metadata
+winner = next(
+    (token["outcome"] for token in metadata["tokens"] if token["winner"]),
+    None,
+)
 ```
 
-For quick exploration without creating a loader, use the static `query_*` methods
-(see [Method naming conventions](#method-naming-conventions) above).
-
-### Fetching trade history
-
-The `load_trades()` convenience method fetches and parses historical trades in one step:
+An event factory returns one loader for each market in the event:
 
 ```python
-import pandas as pd
+loaders = await PolymarketDataLoader.from_event_slug(
+    "highest-temperature-in-nyc-on-january-26",
+    token_index=1,
+)
+```
 
-# Load all available trades
-trades = await loader.load_trades()
+A negative token index or an index outside a market's token list raises `ValueError`. Construction
+also fails clearly when Gamma has no matching slug or CLOB has not populated usable token IDs.
 
-# Or filter by time range (client-side filtering)
-end = pd.Timestamp.now(tz="UTC")
-start = end - pd.Timedelta(hours=24)
+### Public discovery
+
+Static query methods return stable Python mappings and lists while Rust owns validation and
+pagination:
+
+```python
+market = await PolymarketDataLoader.query_market_by_slug("some-market")
+details = await PolymarketDataLoader.query_market_details(market["conditionId"])
+event = await PolymarketDataLoader.query_event_by_slug("some-event")
+
+markets = await PolymarketDataLoader.query_markets(
+    filters={
+        "is_active": True,
+        "tag_id": [21, 42],
+        "order": "volume",
+        "max_markets": 200,
+    },
+)
+events = await PolymarketDataLoader.query_events(
+    filters={
+        "active": True,
+        "closed": False,
+        "max_events": 100,
+    },
+)
+tags = await PolymarketDataLoader.query_tags()
+results = await PolymarketDataLoader.query_search(
+    "bitcoin",
+    events_status="active",
+    limit_per_type=20,
+)
+```
+
+Market and event filter dictionaries use the fields listed under
+[Gamma query filters](#gamma-query-filters). The provider config accepts only the market fields,
+while `query_events` accepts the event fields. Unknown or malformed filters raise `ValueError`
+before any request.
+
+### Historical trades
+
+`load_trades` returns normalized `TradeTick` objects in chronological order:
+
+```python
+from datetime import UTC, datetime, timedelta
+
+end = datetime.now(UTC)
+start = end - timedelta(days=1)
 
 trades = await loader.load_trades(
     start=start,
     end=end,
+    limit=1_000,
 )
 ```
 
-Alternatively, you can fetch and parse separately using the lower-level methods:
+The window is inclusive. The Data API records trade timestamps in whole seconds, so Rust keeps all
+trades in the `start` and `end` boundary seconds. With `start`, `limit` keeps the earliest matching
+trades in the window. Without `start`, it keeps the most recent matching trades. The public API caps
+offset-based pagination at 10,000; if that ceiling is reached, an unanchored request returns the
+available partial result and logs a warning. A start-anchored request raises an error at the ceiling
+because Rust cannot guarantee complete results from the requested start; narrow the time window and
+retry.
 
-```python
-condition_id = loader.condition_id
-
-# Fetch raw trades from the Polymarket Data API
-raw_trades = await loader.fetch_trades(condition_id=condition_id)
-
-# Parse to NautilusTrader TradeTicks
-trades = loader.parse_trades(raw_trades)
-```
-
-Trade data is sourced from the [Polymarket Data API](https://data-api.polymarket.com/trades),
-which provides real execution data including price, size, side, and on-chain transaction hash.
-
-:::note
-The public Data API caps offset-based pagination on high-activity markets. When
-this ceiling is hit the loader emits a `RuntimeWarning` and returns the trades
-fetched up to the cap rather than aborting the load. Use another historical
-data source if you need full coverage of a heavily traded market.
-:::
-
-### Complete backtest example
-
-See `examples/backtest/polymarket_simple_quoter.py` for a full example:
-
-```python
-import asyncio
-from decimal import Decimal
-
-from nautilus_trader.adapters.polymarket import POLYMARKET_VENUE
-from nautilus_trader.adapters.polymarket import PolymarketDataLoader
-from nautilus_trader.backtest.config import BacktestEngineConfig
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.examples.strategies.ema_cross_long_only import EMACrossLongOnly
-from nautilus_trader.examples.strategies.ema_cross_long_only import EMACrossLongOnlyConfig
-from nautilus_trader.model.currencies import pUSD
-from nautilus_trader.model.data import BarType
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.model.identifiers import TraderId
-from nautilus_trader.model.objects import Money
-
-async def run_backtest():
-    # Initialize loader and fetch market data
-    loader = await PolymarketDataLoader.from_market_slug("gta-vi-released-before-june-2026")
-    instrument = loader.instrument
-
-    # Load historical trades from the Polymarket Data API
-    trades = await loader.load_trades()
-
-    # Configure and run backtest
-    config = BacktestEngineConfig(trader_id=TraderId("BACKTESTER-001"))
-    engine = BacktestEngine(config=config)
-
-    engine.add_venue(
-        venue=POLYMARKET_VENUE,
-        oms_type=OmsType.NETTING,
-        account_type=AccountType.CASH,
-        base_currency=pUSD,
-        starting_balances=[Money(10_000, pUSD)],
-    )
-
-    engine.add_instrument(instrument)
-    engine.add_data(trades)
-
-    bar_type = BarType.from_str(f"{instrument.id}-100-TICK-LAST-INTERNAL")
-    strategy_config = EMACrossLongOnlyConfig(
-        instrument_id=instrument.id,
-        bar_type=bar_type,
-        trade_size=Decimal("20"),
-    )
-
-    strategy = EMACrossLongOnly(config=strategy_config)
-    engine.add_strategy(strategy=strategy)
-    engine.run()
-
-    # Display results
-    print(engine.trader.generate_account_report(POLYMARKET_VENUE))
-
-# Run the backtest
-asyncio.run(run_backtest())
-```
-
-**Run the complete example**:
-
-```bash
-python examples/backtest/polymarket_simple_quoter.py
-```
-
-### Helper functions
-
-The adapter provides utility functions for working with Polymarket identifiers:
-
-```python
-from nautilus_trader.adapters.polymarket import get_polymarket_instrument_id
-
-# Create NautilusTrader InstrumentId from Polymarket identifiers
-instrument_id = get_polymarket_instrument_id(
-    condition_id="0xcccb7e7613a087c132b69cbf3a02bece3fdcb824c1da54ae79acc8d4a562d902",
-    token_id="8441400852834915183759801017793514978104486628517653995211751018945988243154"
-)
-```
+The legacy v1 loader also exposes lower-level raw fetch and parse methods, Python HTTP injection,
+and convenience scripts. Those v1-only APIs remain under the top-level legacy package and are not
+part of the Python v2 facade.
 
 ## Contributing
 

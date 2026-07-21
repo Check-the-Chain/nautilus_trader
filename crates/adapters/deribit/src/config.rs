@@ -82,6 +82,22 @@ pub struct DeribitDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeribitDataClientConfig {
+    product_types: Vec<DeribitProductType>,
+    environment: DeribitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    update_instruments_interval_mins: u64,
+    auto_load_missing_instruments: bool,
+    transport_backend: TransportBackend,
+});
+
 impl Default for DeribitDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -171,6 +187,21 @@ pub struct DeribitExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeribitExecClientConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    product_types: Vec<DeribitProductType>,
+    environment: DeribitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    transport_backend: TransportBackend,
+});
 
 impl Default for DeribitExecClientConfig {
     fn default() -> Self {

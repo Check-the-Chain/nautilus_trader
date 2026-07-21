@@ -172,6 +172,7 @@ impl DydxWebSocketClient {
 
     /// Returns the URL of this WebSocket client.
     #[getter]
+    #[pyo3(name = "url")]
     fn py_url(&self) -> String {
         self.url().to_string()
     }
@@ -1220,6 +1221,7 @@ fn handle_markets_trading_data(
                 .status
                 .as_ref()
                 .is_none_or(|s| matches!(s, crate::common::enums::DydxMarketStatus::Active));
+
             if instrument_cache.get_by_market(ticker).is_some() {
                 seen_tickers.insert(ticker_ustr);
             } else if is_active {

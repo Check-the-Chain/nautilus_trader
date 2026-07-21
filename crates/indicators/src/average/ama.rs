@@ -156,6 +156,16 @@ impl AdaptiveMovingAverage {
         self.alpha_fast - self.alpha_slow
     }
 
+    #[must_use]
+    pub const fn alpha_fast(&self) -> f64 {
+        self.alpha_fast
+    }
+
+    #[must_use]
+    pub const fn alpha_slow(&self) -> f64 {
+        self.alpha_slow
+    }
+
     pub const fn reset(&mut self) {
         self.value = 0.0;
         self.prior_value = None;

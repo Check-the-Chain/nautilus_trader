@@ -223,7 +223,7 @@ class TestBacktestAcceptanceTestsUSDJPY:
             self.usdjpy,
             bid_csv="fxcm/usdjpy-m1-bid-2013.csv",
             ask_csv="fxcm/usdjpy-m1-ask-2013.csv",
-            max_rows=2_000,  # ~8k ticks (4 ticks/bar) — keeps suite under a minute
+            max_rows=2_000,  # ~8k ticks (4 ticks/bar) - keeps suite under a minute
         )
         self.engine.add_data(ticks)
 
@@ -384,7 +384,7 @@ class TestBacktestAcceptanceTestsGBPUSDBarsInternal:
                     "atr_period": 20,
                     "trailing_atr_multiple": 0.01,
                     "trailing_offset_type": "PRICE",
-                    "trigger_type": "LAST_PRICE",
+                    "trigger_type": "BID_ASK",
                 },
             ),
         )

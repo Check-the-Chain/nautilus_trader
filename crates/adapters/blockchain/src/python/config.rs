@@ -135,10 +135,14 @@ impl BlockchainDataClientConfig {
         self.from_block
     }
 
-    /// Returns the optional proxy URL for HTTP and WebSocket transports.
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_postgres_cache_database_config(&self) -> bool {
+        self.postgres_cache_database_config.is_some()
+    }
+
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     /// Returns a string representation of the configuration.

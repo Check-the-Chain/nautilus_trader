@@ -16,7 +16,6 @@ __all__ = [
     "TardisDepth10StreamIterator",
     "TardisFundingRateStreamIterator",
     "TardisHttpClient",
-    "TardisInstrumentKey",
     "TardisInstrumentMiniInfo",
     "TardisMachineClient",
     "TardisOptionsChainStreamIterator",
@@ -68,6 +67,16 @@ class TardisBatchedDeltasStreamIterator:
 
 @typing.final
 class TardisDataClientConfig:
+    @property
+    def tardis_ws_url(self) -> str | None: ...
+    @property
+    def normalize_symbols(self) -> bool: ...
+    @property
+    def extract_bbo_as_quotes(self) -> bool: ...
+    @property
+    def options(self) -> list[ReplayNormalizedRequestOptions]: ...
+    @property
+    def stream_options(self) -> list[StreamNormalizedRequestOptions]: ...
     def __init__(
         self,
         api_key: str | None = None,
@@ -78,6 +87,8 @@ class TardisDataClientConfig:
         stream_options: typing.Sequence[StreamNormalizedRequestOptions] | None = None,
         extract_bbo_as_quotes: bool | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class TardisDataClientFactory:
@@ -128,9 +139,6 @@ class TardisHttpClient:
         effective: int | None = None,
         ts_init: int | None = None,
     ) -> typing.Any: ...
-
-@typing.final
-class TardisInstrumentKey: ...
 
 @typing.final
 class TardisInstrumentMiniInfo:

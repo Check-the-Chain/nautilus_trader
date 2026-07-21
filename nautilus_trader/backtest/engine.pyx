@@ -2361,8 +2361,8 @@ cdef class BacktestDataIterator:
             Data instances to add. Must be pre-sorted by `ts_init` if ``presorted=True``.
         append_data : bool, default ``True``
             Controls stream priority for timestamp ties:
-            ``True`` – lower priority (appended).
-            ``False`` – higher priority (prepended).
+            ``True`` - lower priority (appended).
+            ``False`` - higher priority (prepended).
         presorted : bool, default ``False``
             If ``True``, assumes the data is already sorted by `ts_init` and
             skips internal sorting for better performance. If ``False`` (default),
@@ -2407,8 +2407,8 @@ cdef class BacktestDataIterator:
             A Python generator that yields lists of ``Data`` instances sorted ascending by `ts_init`.
         append_data : bool, default ``True``
             Controls stream priority for timestamp ties:
-            ``True`` – lower priority (appended).
-            ``False`` – higher priority (prepended).
+            ``True`` - lower priority (appended).
+            ``False`` - higher priority (prepended).
 
         Raises
         ------

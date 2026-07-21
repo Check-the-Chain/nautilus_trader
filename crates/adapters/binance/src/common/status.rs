@@ -141,6 +141,14 @@ mod tests {
     #[case(BinanceTradingStatus::Halt, MarketStatusAction::Halt)]
     #[case(BinanceTradingStatus::AuctionMatch, MarketStatusAction::Cross)]
     #[case(BinanceTradingStatus::Break, MarketStatusAction::Pause)]
+    #[case(BinanceTradingStatus::PreDelivering, MarketStatusAction::PreClose)]
+    #[case(BinanceTradingStatus::Delivering, MarketStatusAction::Close)]
+    #[case(BinanceTradingStatus::Delivered, MarketStatusAction::Close)]
+    #[case(BinanceTradingStatus::PreSettle, MarketStatusAction::PreClose)]
+    #[case(BinanceTradingStatus::Settling, MarketStatusAction::Close)]
+    #[case(BinanceTradingStatus::Close, MarketStatusAction::Close)]
+    #[case(BinanceTradingStatus::TradingHalt, MarketStatusAction::Halt)]
+    #[case(BinanceTradingStatus::TradingCancelOnly, MarketStatusAction::Halt)]
     #[case(
         BinanceTradingStatus::Unknown,
         MarketStatusAction::NotAvailableForTrading
@@ -158,6 +166,11 @@ mod tests {
     #[case(BinanceContractStatus::PreDelivering, MarketStatusAction::PreClose)]
     #[case(BinanceContractStatus::Delivering, MarketStatusAction::Close)]
     #[case(BinanceContractStatus::Delivered, MarketStatusAction::Close)]
+    #[case(BinanceContractStatus::PreSettle, MarketStatusAction::PreClose)]
+    #[case(BinanceContractStatus::Settling, MarketStatusAction::Close)]
+    #[case(BinanceContractStatus::Close, MarketStatusAction::Close)]
+    #[case(BinanceContractStatus::TradingHalt, MarketStatusAction::Halt)]
+    #[case(BinanceContractStatus::TradingCancelOnly, MarketStatusAction::Halt)]
     #[case(BinanceContractStatus::PreDelisting, MarketStatusAction::PreClose)]
     #[case(BinanceContractStatus::Delisting, MarketStatusAction::Suspend)]
     #[case(

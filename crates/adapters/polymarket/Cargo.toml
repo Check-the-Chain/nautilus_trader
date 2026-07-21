@@ -41,6 +41,7 @@ python = [
   "nautilus-network/python",
   "nautilus-system/python",
   "pyo3",
+  "pyo3-async-runtimes",
   "pyo3-stub-gen",
 ]
 high-precision = ["nautilus-model/high-precision"]
@@ -91,6 +92,7 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -153,6 +155,12 @@ test = false
 [[bin]]
 name = "polymarket-create-api-key"
 path = "bin/create_api_key.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "polymarket-set-allowances"
+path = "bin/set_allowances.rs"
 doc = false
 test = false
 

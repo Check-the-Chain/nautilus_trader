@@ -863,6 +863,7 @@ pub fn parse_futures_order_status_report(
     order: &FuturesOpenOrder,
     instrument: &InstrumentAny,
     account_id: AccountId,
+    fallback_quantity: Option<Decimal>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
     let instrument_id = instrument.id();
@@ -877,12 +878,14 @@ pub fn parse_futures_order_status_report(
     };
     let order_status = order.status.into();
 
-    let quantity = Quantity::new(
-        order.unfilled_size + order.filled_size,
-        instrument.size_precision(),
-    );
+    let quantity_value = order
+        .unfilled_size
+        .map(|unfilled_size| unfilled_size + order.filled_size)
+        .or(fallback_quantity)
+        .context("missing unfilled size and fallback quantity")?;
+    let quantity = Quantity::from_decimal_dp(quantity_value, instrument.size_precision())?;
 
-    let filled_qty = Quantity::new(order.filled_size, instrument.size_precision());
+    let filled_qty = Quantity::from_decimal_dp(order.filled_size, instrument.size_precision())?;
 
     let ts_accepted = parse_rfc3339_timestamp(&order.received_time, "order.received_time")?;
     let ts_last = parse_rfc3339_timestamp(&order.last_update_time, "order.last_update_time")?;
@@ -1121,11 +1124,10 @@ pub fn parse_futures_position_status_report(
         KrakenPositionSide::Short => PositionSideSpecified::Short,
     };
 
-    let quantity = Quantity::new(position.size, instrument.size_precision());
-    let size_decimal = Decimal::from_str(&position.size.to_string()).unwrap_or(dec!(0));
+    let quantity = Quantity::from_decimal_dp(position.size, instrument.size_precision())?;
     let signed_decimal_qty = match position_side {
-        PositionSideSpecified::Long => size_decimal,
-        PositionSideSpecified::Short => -size_decimal,
+        PositionSideSpecified::Long => position.size,
+        PositionSideSpecified::Short => -position.size,
         PositionSideSpecified::Flat => dec!(0),
     };
 
@@ -1739,10 +1741,10 @@ mod tests {
             order_type: KrakenFuturesOrderType::TakeProfit,
             limit_price: None,
             stop_price: Some(36000.0),
-            unfilled_size: 500.0,
+            unfilled_size: Some(dec!(500)),
             received_time: "2023-11-14T22:13:20.000Z".to_string(),
-            status: KrakenFuturesOrderStatus::Untouched,
-            filled_size: 0.0,
+            status: KrakenFuturesOrderStatus::PartiallyFilled,
+            filled_size: dec!(25),
             reduce_only: Some(true),
             last_update_time: "2023-11-14T22:13:20.000Z".to_string(),
             trigger_signal: None,
@@ -1752,13 +1754,15 @@ mod tests {
         let account_id = AccountId::new("KRAKEN-001");
 
         let report =
-            parse_futures_order_status_report(&order, &instrument, account_id, TS).unwrap();
+            parse_futures_order_status_report(&order, &instrument, account_id, None, TS).unwrap();
 
         assert_eq!(report.order_type, OrderType::MarketIfTouched);
-        assert_eq!(report.trigger_price.unwrap().as_f64(), 36000.0);
+        assert_eq!(report.quantity.as_decimal(), dec!(525));
+        assert_eq!(report.filled_qty.as_decimal(), dec!(25));
+        assert_eq!(report.trigger_price.unwrap().as_decimal(), dec!(36000));
         assert!(report.price.is_none());
         assert!(report.reduce_only);
-        assert_eq!(report.order_status, OrderStatus::Accepted);
+        assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
     }
 
     #[rstest]
@@ -1770,10 +1774,10 @@ mod tests {
             order_type: KrakenFuturesOrderType::TakeProfit,
             limit_price: Some(35500.0),
             stop_price: Some(36000.0),
-            unfilled_size: 500.0,
+            unfilled_size: Some(dec!(500)),
             received_time: "2023-11-14T22:13:20.000Z".to_string(),
             status: KrakenFuturesOrderStatus::Untouched,
-            filled_size: 0.0,
+            filled_size: dec!(0),
             reduce_only: None,
             last_update_time: "2023-11-14T22:13:20.000Z".to_string(),
             trigger_signal: None,
@@ -1783,11 +1787,11 @@ mod tests {
         let account_id = AccountId::new("KRAKEN-001");
 
         let report =
-            parse_futures_order_status_report(&order, &instrument, account_id, TS).unwrap();
+            parse_futures_order_status_report(&order, &instrument, account_id, None, TS).unwrap();
 
         assert_eq!(report.order_type, OrderType::LimitIfTouched);
-        assert_eq!(report.trigger_price.unwrap().as_f64(), 36000.0);
-        assert_eq!(report.price.unwrap().as_f64(), 35500.0);
+        assert_eq!(report.trigger_price.unwrap().as_decimal(), dec!(36000));
+        assert_eq!(report.price.unwrap().as_decimal(), dec!(35500));
         assert_eq!(report.order_side, OrderSide::Sell);
         assert!(!report.reduce_only);
     }

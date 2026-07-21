@@ -54,6 +54,8 @@ class AxDataClientConfig(LiveDataClientConfig, frozen=True):
         The interval (minutes) between reloading instruments from the venue.
     funding_rate_poll_interval_mins : PositiveInt, optional
         The interval (minutes) between polling for funding rate updates.
+    heartbeat_interval_secs : PositiveInt, default 20
+        The WebSocket heartbeat interval in seconds.
 
     """
 
@@ -70,6 +72,7 @@ class AxDataClientConfig(LiveDataClientConfig, frozen=True):
     retry_delay_max_ms: PositiveInt | None = 10_000
     update_instruments_interval_mins: PositiveInt | None = 60
     funding_rate_poll_interval_mins: PositiveInt | None = 15
+    heartbeat_interval_secs: PositiveInt = 20
 
 
 class AxExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -89,6 +92,9 @@ class AxExecClientConfig(LiveExecClientConfig, frozen=True):
     base_url_http : str, optional
         The base URL for the AX Exchange HTTP API.
         If ``None`` then will use the URL for the configured environment.
+    base_url_orders : str, optional
+        The base URL for the AX Exchange orders HTTP API.
+        If ``None`` then will use the URL for the configured environment.
     base_url_ws : str, optional
         The base URL for the AX Exchange WebSocket API.
         If ``None`` then will use the URL for the configured environment.
@@ -102,6 +108,10 @@ class AxExecClientConfig(LiveExecClientConfig, frozen=True):
         Initial delay (milliseconds) between retries.
     retry_delay_max_ms : PositiveInt, optional
         Maximum delay (milliseconds) between retries.
+    heartbeat_interval_secs : PositiveInt, default 30
+        The WebSocket heartbeat interval in seconds.
+    cancel_on_disconnect : bool, default False
+        If open orders from this WebSocket session should be canceled on disconnect.
 
     """
 
@@ -109,6 +119,7 @@ class AxExecClientConfig(LiveExecClientConfig, frozen=True):
     api_secret: str | None = None
     environment: AxEnvironment = AxEnvironment.SANDBOX
     base_url_http: str | None = None
+    base_url_orders: str | None = None
     base_url_ws: str | None = None
     proxy_url: str | None = None
     transport_backend: TransportBackend | None = None
@@ -116,3 +127,5 @@ class AxExecClientConfig(LiveExecClientConfig, frozen=True):
     max_retries: PositiveInt | None = 3
     retry_delay_initial_ms: PositiveInt | None = 1_000
     retry_delay_max_ms: PositiveInt | None = 10_000
+    heartbeat_interval_secs: PositiveInt = 30
+    cancel_on_disconnect: bool = False

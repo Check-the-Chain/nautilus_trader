@@ -82,6 +82,23 @@ pub struct AxDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(AxDataClientConfig {
+    environment: AxEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_public: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    update_instruments_interval_mins: u64,
+    funding_rate_poll_interval_mins: u64,
+    transport_backend: TransportBackend,
+});
+
 impl Default for AxDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -192,6 +209,24 @@ pub struct AxExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(AxExecClientConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    environment: AxEnvironment,
+    base_url_http: Option<String>,
+    base_url_orders: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    cancel_on_disconnect: bool,
+    transport_backend: TransportBackend,
+});
 
 impl Default for AxExecClientConfig {
     fn default() -> Self {

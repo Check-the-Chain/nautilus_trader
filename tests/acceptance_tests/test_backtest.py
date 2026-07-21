@@ -3186,7 +3186,7 @@ class TestBacktestContinuousFuture:
         assert live_closes[:5] == [120.0, 121.0, 122.0, 123.0, 124.0]
 
         # Seam check: the last historical close (adjusted ESM26) joins the first live close
-        # (unadjusted ESU26) at 120.0 — both phases share the same adjusted frame.
+        # (unadjusted ESU26) at 120.0 - both phases share the same adjusted frame.
         assert historical_closes[-1] == live_closes[0] == 120.0
 
         # Every bar must carry the continuous (target) standard bar type, not a segment contract.

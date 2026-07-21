@@ -48,14 +48,14 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::identifiers::InstrumentId;
 use nautilus_network::{retry::RetryConfig, websocket::TransportBackend};
 use nautilus_polymarket::{
-    common::consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE},
+    common::consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE, WS_DEFAULT_SUBSCRIPTIONS},
     config::PolymarketDataClientConfig,
     data::PolymarketDataClient,
     http::{
         clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
         gamma::PolymarketGammaHttpClient,
     },
-    websocket::client::PolymarketWebSocketClient,
+    websocket::pool::PolymarketMarketConnectionPool,
 };
 use rstest::rstest;
 use serde_json::Value;
@@ -122,6 +122,11 @@ async fn handle_gamma_markets(State(state): State<TestServerState>) -> Json<Valu
     Json(body)
 }
 
+async fn handle_gamma_markets_keyset(State(state): State<TestServerState>) -> Json<Value> {
+    let Json(markets) = handle_gamma_markets(State(state)).await;
+    Json(serde_json::json!({"markets": markets}))
+}
+
 async fn handle_book(State(state): State<TestServerState>) -> Json<Value> {
     let body = state
         .book_response
@@ -174,6 +179,7 @@ async fn handle_market_socket(mut socket: WebSocket, state: TestServerState) {
 fn create_router(state: TestServerState) -> Router {
     Router::new()
         .route("/markets", get(handle_gamma_markets))
+        .route("/markets/keyset", get(handle_gamma_markets_keyset))
         .route("/book", get(handle_book))
         .route("/trades", get(handle_trades))
         .route("/ws/market", get(handle_market_upgrade))
@@ -206,10 +212,11 @@ fn create_test_data_client(
         .expect("gamma client");
     let clob_public = PolymarketClobPublicClient::new(Some(base_url.clone()), 5).expect("clob");
     let data_api = PolymarketDataApiHttpClient::new(Some(base_url.clone()), 5).expect("data_api");
-    let ws = PolymarketWebSocketClient::new_market(
+    let ws = PolymarketMarketConnectionPool::new(
         Some(format!("ws://{addr}/ws/market")),
         false,
         TransportBackend::default(),
+        WS_DEFAULT_SUBSCRIPTIONS,
     );
 
     let config = PolymarketDataClientConfig {
@@ -568,6 +575,67 @@ async fn test_request_trades_returns_trades_response() {
         !prices.contains(&0.45),
         "response leaked sibling-token trade: {prices:?}",
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_trades_returns_empty_response_at_offset_ceiling() {
+    let first_timestamp = (Utc::now() - ChronoDuration::days(100)).timestamp();
+    let trades = (0..10_000)
+        .map(|index| {
+            serde_json::json!({
+                "asset": TEST_TOKEN_ID_YES,
+                "conditionId": TEST_CONDITION_ID,
+                "side": "BUY",
+                "price": 0.55,
+                "size": 1.0,
+                "timestamp": first_timestamp + index,
+                "transactionHash": format!("0x{index:064x}"),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let state = TestServerState::default();
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
+    *state.trades_response.lock().await = Some(Value::Array(trades));
+    let addr = start_mock_server(state).await;
+    let (client, mut rx) = create_test_data_client(addr);
+    let instrument_id = yes_instrument_id();
+
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("prime cache");
+    let _prime_events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+
+    client
+        .request_trades(RequestTrades::new(
+            instrument_id,
+            Some(Utc::now() - ChronoDuration::days(365)),
+            None,
+            None,
+            Some(*POLYMARKET_CLIENT_ID),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("request_trades");
+
+    let events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let trades_response = events.iter().find_map(|event| match event {
+        DataEvent::Response(DataResponse::Trades(response)) => Some(response),
+        _ => None,
+    });
+
+    assert!(trades_response.is_some());
+    assert!(trades_response.unwrap().data.is_empty());
 }
 
 #[rstest]

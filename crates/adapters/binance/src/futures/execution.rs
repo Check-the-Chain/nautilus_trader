@@ -42,14 +42,14 @@ use nautilus_common::{
 };
 use nautilus_core::{
     AtomicSet, MUTEX_POISONED, Params, UUID4, UnixNanos,
-    datetime::{NANOSECONDS_IN_MILLISECOND, mins_to_nanos},
+    datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND, mins_to_nanos},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        AccountType, ContingencyType, OmsType, OrderType, PositionSideSpecified,
+        AccountType, ContingencyType, OmsType, OrderType, PositionSideSpecified, TimeInForce,
         TrailingOffsetType, TriggerType,
     },
     events::{
@@ -136,6 +136,10 @@ const USER_TRADES_MAX_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
 const USER_TRADES_PAGE_LIMIT: u32 = 1_000;
 
+const BINANCE_GTD_MIN_LEAD_SECS: u64 = 600;
+
+const BINANCE_GTD_MAX_MILLIS: u64 = 253_402_300_799_000;
+
 /// Query parameter declaring that the command's venue order ID is a Binance Algo Service
 /// `algoId`, rather than a regular matching-engine `orderId` or triggered `actualOrderId`.
 pub const BINANCE_VENUE_ORDER_ID_IS_ALGO_ID_PARAM: &str = "venue_order_id_is_algo_id";
@@ -145,6 +149,12 @@ enum BinanceFuturesAlgoLookup {
     Skip,
     AlgoId,
     ClientAlgoId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FuturesOrderLifetime {
+    time_in_force: TimeInForce,
+    good_till_date: Option<i64>,
 }
 
 fn create_algo_order_status_report(
@@ -474,7 +484,11 @@ impl BinanceFuturesExecutionClient {
             .is_some_and(|c| c.is_active())
     }
 
-    fn submit_order_internal(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+    fn submit_order_internal(
+        &self,
+        cmd: &SubmitOrder,
+        lifetime: FuturesOrderLifetime,
+    ) -> anyhow::Result<()> {
         let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
         let emitter = self.emitter.clone();
@@ -487,7 +501,8 @@ impl BinanceFuturesExecutionClient {
         let order_side = order.order_side();
         let order_type = order.order_type();
         let quantity = order.quantity();
-        let time_in_force = order.time_in_force();
+        let time_in_force = lifetime.time_in_force;
+        let good_till_date = lifetime.good_till_date;
         let price = order.price();
         let trigger_price = order.trigger_price();
         let reduce_only = order.is_reduce_only();
@@ -584,7 +599,7 @@ impl BinanceFuturesExecutionClient {
                 working_type,
                 price_protect: None,
                 new_order_resp_type: None,
-                good_till_date: None,
+                good_till_date,
                 recv_window: None,
                 price_match,
                 self_trade_prevention_mode: None,
@@ -637,6 +652,7 @@ impl BinanceFuturesExecutionClient {
                         activation_price,
                         callback_rate,
                         working_type,
+                        good_till_date,
                     )
                     .await
             } else {
@@ -655,6 +671,7 @@ impl BinanceFuturesExecutionClient {
                         post_only,
                         position_side,
                         price_match,
+                        good_till_date,
                     )
                     .await
             };
@@ -971,6 +988,9 @@ fn build_futures_order_list_batch(
     is_hedge_mode: bool,
     close_position: bool,
     price_match: Option<BinancePriceMatch>,
+    product_type: BinanceProductType,
+    use_gtd: bool,
+    ts_now: UnixNanos,
 ) -> Result<Vec<BatchOrderItem>, String> {
     if orders.len() > 5 {
         return Err(format!(
@@ -1019,10 +1039,20 @@ fn build_futures_order_list_batch(
         let binance_side = BinanceSide::try_from(order.order_side()).map_err(|e| e.to_string())?;
         let binance_order_type =
             order_type_to_binance_futures(order.order_type()).map_err(|e| e.to_string())?;
+        let lifetime = determine_futures_order_lifetime(
+            product_type,
+            order.order_type(),
+            order.time_in_force(),
+            order.expire_time(),
+            order.is_post_only(),
+            use_gtd,
+            ts_now,
+        )
+        .map_err(|e| e.to_string())?;
         let binance_tif = if order.is_post_only() {
             BinanceTimeInForce::Gtx
         } else {
-            BinanceTimeInForce::try_from(order.time_in_force()).map_err(|e| e.to_string())?
+            BinanceTimeInForce::try_from(lifetime.time_in_force).map_err(|e| e.to_string())?
         };
         let position_side =
             determine_position_side(is_hedge_mode, order.order_side(), order.is_reduce_only());
@@ -1055,7 +1085,7 @@ fn build_futures_order_list_batch(
             working_type: None,
             price_protect: None,
             close_position: None,
-            good_till_date: None,
+            good_till_date: lifetime.good_till_date,
             price_match: price_match
                 .and_then(binance_price_match_wire)
                 .map(str::to_string),
@@ -1064,6 +1094,74 @@ fn build_futures_order_list_batch(
     }
 
     Ok(batch_items)
+}
+
+fn determine_futures_order_lifetime(
+    product_type: BinanceProductType,
+    order_type: OrderType,
+    time_in_force: TimeInForce,
+    expire_time: Option<UnixNanos>,
+    post_only: bool,
+    use_gtd: bool,
+    ts_now: UnixNanos,
+) -> anyhow::Result<FuturesOrderLifetime> {
+    if time_in_force != TimeInForce::Gtd {
+        return Ok(FuturesOrderLifetime {
+            time_in_force,
+            good_till_date: None,
+        });
+    }
+
+    if !use_gtd {
+        log::warn!(
+            "Binance Futures GTD submitted as GTC because use_gtd=false. Enable manage_gtd_expiry on the submitting strategy"
+        );
+        return Ok(FuturesOrderLifetime {
+            time_in_force: TimeInForce::Gtc,
+            good_till_date: None,
+        });
+    }
+
+    anyhow::ensure!(
+        matches!(
+            order_type,
+            OrderType::Limit | OrderType::StopLimit | OrderType::LimitIfTouched
+        ),
+        "Binance Futures does not support GTD for order type {order_type:?}"
+    );
+    anyhow::ensure!(!post_only, "Binance Futures GTD cannot be post-only");
+
+    anyhow::ensure!(
+        product_type == BinanceProductType::UsdM,
+        "Binance {product_type:?} Futures does not support native GTD"
+    );
+
+    let expire_time = expire_time.context("Binance Futures GTD requires an expire_time")?;
+    let expire_ns = expire_time.as_u64();
+    anyhow::ensure!(
+        expire_ns.is_multiple_of(NANOSECONDS_IN_SECOND),
+        "Binance Futures goodTillDate requires whole-second precision"
+    );
+
+    let minimum_ns = ts_now
+        .as_u64()
+        .checked_add(BINANCE_GTD_MIN_LEAD_SECS * NANOSECONDS_IN_SECOND)
+        .context("Binance Futures GTD minimum timestamp overflow")?;
+    anyhow::ensure!(
+        expire_ns > minimum_ns,
+        "Binance Futures goodTillDate must be strictly greater than current time plus {BINANCE_GTD_MIN_LEAD_SECS} seconds"
+    );
+
+    let good_till_date = expire_ns / NANOSECONDS_IN_MILLISECOND;
+    anyhow::ensure!(
+        good_till_date < BINANCE_GTD_MAX_MILLIS,
+        "Binance Futures goodTillDate must be smaller than {BINANCE_GTD_MAX_MILLIS}"
+    );
+
+    Ok(FuturesOrderLifetime {
+        time_in_force,
+        good_till_date: Some(i64::try_from(good_till_date)?),
+    })
 }
 
 fn is_grouped_order(order: &OrderAny) -> bool {
@@ -2396,10 +2494,20 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             );
         }
 
+        let lifetime = determine_futures_order_lifetime(
+            self.product_type,
+            order.order_type(),
+            order.time_in_force(),
+            order.expire_time(),
+            order.is_post_only(),
+            self.config.use_gtd,
+            self.clock.get_time_ns(),
+        )?;
+
         log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
         self.emitter.emit_order_submitted(&order);
 
-        self.submit_order_internal(&cmd)
+        self.submit_order_internal(&cmd, lifetime)
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
@@ -2444,6 +2552,9 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             self.is_hedge_mode(),
             close_position,
             price_match,
+            self.product_type,
+            self.config.use_gtd,
+            self.clock.get_time_ns(),
         ) {
             Ok(batch_items) => batch_items,
             Err(reason) => {
@@ -2928,10 +3039,16 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 fn is_instrument_for_product(instrument: &InstrumentAny, product_type: BinanceProductType) -> bool {
     match product_type {
         BinanceProductType::UsdM => {
-            matches!(instrument, InstrumentAny::CryptoPerpetual(_)) && !instrument.is_inverse()
+            matches!(
+                instrument,
+                InstrumentAny::CryptoFuture(_) | InstrumentAny::CryptoPerpetual(_)
+            ) && !instrument.is_inverse()
         }
         BinanceProductType::CoinM => {
-            matches!(instrument, InstrumentAny::CryptoPerpetual(_)) && instrument.is_inverse()
+            matches!(
+                instrument,
+                InstrumentAny::CryptoFuture(_) | InstrumentAny::CryptoPerpetual(_)
+            ) && instrument.is_inverse()
         }
         _ => false,
     }
@@ -2939,8 +3056,11 @@ fn is_instrument_for_product(instrument: &InstrumentAny, product_type: BinancePr
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::instruments::stubs::{
-        crypto_perpetual_ethusdt, currency_pair_btcusdt, xbtusd_bitmex,
+    use nautilus_model::{
+        instruments::stubs::{
+            crypto_future_btcusdt, crypto_perpetual_ethusdt, currency_pair_btcusdt, xbtusd_bitmex,
+        },
+        types::Price,
     };
     use rstest::rstest;
 
@@ -2957,6 +3077,130 @@ mod tests {
     fn test_classify_submit_order_error_gtx_is_post_only() {
         let err = http_error(BINANCE_GTX_ORDER_REJECT_CODE);
         assert!(classify_submit_order_error(&err));
+    }
+
+    #[rstest]
+    fn test_futures_order_lifetime_encodes_valid_usdm_gtd() {
+        let ts_now = UnixNanos::from_seconds(1_700_000_000);
+        let expire_time = UnixNanos::from_seconds(1_700_000_601);
+
+        let lifetime = determine_futures_order_lifetime(
+            BinanceProductType::UsdM,
+            OrderType::Limit,
+            TimeInForce::Gtd,
+            Some(expire_time),
+            false,
+            true,
+            ts_now,
+        )
+        .unwrap();
+
+        assert_eq!(lifetime.time_in_force, TimeInForce::Gtd);
+        assert_eq!(lifetime.good_till_date, Some(1_700_000_601_000));
+    }
+
+    #[rstest]
+    #[case::minimum(
+        BinanceProductType::UsdM,
+        OrderType::Limit,
+        UnixNanos::from_seconds(1_700_000_600),
+        false,
+        "strictly greater"
+    )]
+    #[case::subsecond(
+        BinanceProductType::UsdM,
+        OrderType::Limit,
+        UnixNanos::from(1_700_000_601_000_000_001),
+        false,
+        "whole-second precision"
+    )]
+    #[case::coin_m(
+        BinanceProductType::CoinM,
+        OrderType::Limit,
+        UnixNanos::from_seconds(1_700_000_601),
+        false,
+        "does not support native GTD"
+    )]
+    #[case::market(
+        BinanceProductType::UsdM,
+        OrderType::Market,
+        UnixNanos::from_seconds(1_700_000_601),
+        false,
+        "does not support GTD for order type Market"
+    )]
+    #[case::post_only(
+        BinanceProductType::UsdM,
+        OrderType::Limit,
+        UnixNanos::from_seconds(1_700_000_601),
+        true,
+        "cannot be post-only"
+    )]
+    fn test_futures_order_lifetime_rejects_invalid_gtd(
+        #[case] product_type: BinanceProductType,
+        #[case] order_type: OrderType,
+        #[case] expire_time: UnixNanos,
+        #[case] post_only: bool,
+        #[case] expected: &str,
+    ) {
+        let error = determine_futures_order_lifetime(
+            product_type,
+            order_type,
+            TimeInForce::Gtd,
+            Some(expire_time),
+            post_only,
+            true,
+            UnixNanos::from_seconds(1_700_000_000),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(expected));
+    }
+
+    #[rstest]
+    #[case::coin_m_limit(BinanceProductType::CoinM, OrderType::Limit, false)]
+    #[case::usd_m_market(BinanceProductType::UsdM, OrderType::Market, false)]
+    #[case::usd_m_post_only(BinanceProductType::UsdM, OrderType::Limit, true)]
+    fn test_futures_order_lifetime_maps_locally_managed_gtd_to_gtc(
+        #[case] product_type: BinanceProductType,
+        #[case] order_type: OrderType,
+        #[case] post_only: bool,
+    ) {
+        let lifetime = determine_futures_order_lifetime(
+            product_type,
+            order_type,
+            TimeInForce::Gtd,
+            Some(UnixNanos::from_seconds(1_700_000_601)),
+            post_only,
+            false,
+            UnixNanos::from_seconds(1_700_000_000),
+        )
+        .unwrap();
+
+        assert_eq!(lifetime.time_in_force, TimeInForce::Gtc);
+        assert_eq!(lifetime.good_till_date, None);
+    }
+
+    #[rstest]
+    fn test_futures_order_lifetime_requires_expire_time() {
+        let error = determine_futures_order_lifetime(
+            BinanceProductType::UsdM,
+            OrderType::Limit,
+            TimeInForce::Gtd,
+            None,
+            false,
+            true,
+            UnixNanos::from_seconds(1_700_000_000),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires an expire_time"));
+    }
+
+    #[rstest]
+    fn test_futures_order_lifetime_maximum_exceeds_unix_nanos_range() {
+        let maximum_unix_nanos_millis = u64::MAX / NANOSECONDS_IN_MILLISECOND;
+
+        assert!(maximum_unix_nanos_millis < BINANCE_GTD_MAX_MILLIS);
     }
 
     #[rstest]
@@ -2999,12 +3243,34 @@ mod tests {
     fn test_instrument_product_matching_distinguishes_futures_products_from_spot() {
         let usdm = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let coinm = InstrumentAny::CryptoPerpetual(xbtusd_bitmex());
+        let delivery =
+            || crypto_future_btcusdt(2, 6, Price::from("0.01"), Quantity::from("0.000001"));
+        let usdm_delivery = InstrumentAny::CryptoFuture(delivery());
+        let mut coinm_delivery = delivery();
+        coinm_delivery.is_inverse = true;
+        let coinm_delivery = InstrumentAny::CryptoFuture(coinm_delivery);
         let spot = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
 
         assert!(is_instrument_for_product(&usdm, BinanceProductType::UsdM));
         assert!(!is_instrument_for_product(&usdm, BinanceProductType::CoinM));
         assert!(is_instrument_for_product(&coinm, BinanceProductType::CoinM));
         assert!(!is_instrument_for_product(&coinm, BinanceProductType::UsdM));
+        assert!(is_instrument_for_product(
+            &usdm_delivery,
+            BinanceProductType::UsdM
+        ));
+        assert!(!is_instrument_for_product(
+            &usdm_delivery,
+            BinanceProductType::CoinM
+        ));
+        assert!(is_instrument_for_product(
+            &coinm_delivery,
+            BinanceProductType::CoinM
+        ));
+        assert!(!is_instrument_for_product(
+            &coinm_delivery,
+            BinanceProductType::UsdM
+        ));
         assert!(!is_instrument_for_product(&spot, BinanceProductType::UsdM));
         assert!(!is_instrument_for_product(&spot, BinanceProductType::CoinM));
     }

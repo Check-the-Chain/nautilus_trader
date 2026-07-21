@@ -69,6 +69,20 @@ pub struct DeriveDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeriveDataClientConfig {
+    base_url_rest: Option<String>,
+    base_url_ws: Option<String>,
+    environment: DeriveEnvironment,
+    http_timeout_secs: u64,
+    ws_timeout_secs: u64,
+    update_instruments_interval_mins: u64,
+    currencies: Vec<String>,
+    include_expired: bool,
+    auto_load_missing_instruments: bool,
+    transport_backend: TransportBackend,
+});
+
 impl Default for DeriveDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -178,6 +192,27 @@ pub struct DeriveExecClientConfig {
     /// negotiated limits. See <https://docs.derive.xyz/reference/rate-limits>.
     pub max_matching_requests_per_second: Option<u32>,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeriveExecClientConfig {
+    wallet_address: Option<String>,
+    subaccount_id: Option<u64>,
+    base_url_rest: Option<String>,
+    base_url_ws: Option<String>,
+    environment: DeriveEnvironment,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    max_fee_per_contract: Option<Decimal>,
+    domain_separator: Option<String>,
+    action_typehash: Option<String>,
+    trade_module_address: Option<String>,
+    signature_expiry_secs: u64,
+    market_order_slippage_bps: u32,
+    max_matching_requests_per_second: Option<u32>,
+    transport_backend: TransportBackend,
+});
 
 impl Default for DeriveExecClientConfig {
     fn default() -> Self {

@@ -109,8 +109,13 @@ impl OKXDataClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(OKXDataClientConfig).to_string()
     }
 }
 
@@ -192,8 +197,13 @@ impl OKXExecClientConfig {
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(OKXExecClientConfig).to_string()
     }
 }
 

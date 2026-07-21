@@ -85,6 +85,18 @@ impl OrderFactory {
         }
     }
 
+    /// Returns the trader ID.
+    #[must_use]
+    pub const fn trader_id(&self) -> TraderId {
+        self.trader_id
+    }
+
+    /// Returns the strategy ID.
+    #[must_use]
+    pub const fn strategy_id(&self) -> StrategyId {
+        self.strategy_id
+    }
+
     /// Sets the client order ID generator count.
     pub const fn set_client_order_id_count(&mut self, count: usize) {
         self.order_id_generator.set_count(count);
@@ -1774,6 +1786,12 @@ pub mod tests {
             false, // use_uuids_for_client_order_ids
             true,  // use_hyphens_in_client_order_ids
         )
+    }
+
+    #[rstest]
+    fn test_order_factory_identity(order_factory: OrderFactory) {
+        assert_eq!(order_factory.trader_id(), trader_id());
+        assert_eq!(order_factory.strategy_id(), strategy_id_ema_cross());
     }
 
     #[rstest]

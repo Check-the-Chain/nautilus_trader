@@ -224,22 +224,22 @@ pub const BINANCE_FAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     },
 ];
 
-/// COIN-M Futures REST limits (default IP weights).
+/// COIN-M Futures REST limits (shared with USD-M Futures).
 ///
 /// References:
-/// - <https://developers.binance.com/docs/derivatives/coin-margined-futures/general-info#limits>
+/// - <https://developers.binance.com/docs/derivatives/coin-margined-futures/Important-CM-UM-Integration-Notice#a3-um-and-cm-share-the-same-rate-limit-pools>
 pub const BINANCE_DAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::RequestWeight,
         interval: BinanceRateLimitInterval::Minute,
         interval_num: 1,
-        limit: 1_200,
+        limit: 2_400,
     },
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,
         interval: BinanceRateLimitInterval::Second,
-        interval_num: 1,
-        limit: 20,
+        interval_num: 10,
+        limit: 300,
     },
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,

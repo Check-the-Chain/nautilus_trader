@@ -68,7 +68,7 @@ use crate::{
         enums::{BitmexAction, BitmexWsTopic},
         messages::{
             BitmexExecutionMsg, BitmexInstrumentMsg, BitmexQuoteMsg, BitmexTableMessage,
-            BitmexWsMessage, OrderData,
+            BitmexWsMessage, OrderRowCache, ResolvedOrderData,
         },
         parse::{
             ParsedOrderEvent, parse_book_msg_vec, parse_book10_msg_vec, parse_execution_msg,
@@ -263,6 +263,7 @@ impl PyBitmexWebSocketClient {
                 tokio::pin!(stream);
 
                 let mut quote_cache = QuoteCache::new();
+                let mut order_row_cache = OrderRowCache::default();
                 let mut order_type_cache: AHashMap<ClientOrderId, OrderType> = AHashMap::new();
                 let mut order_symbol_cache: AHashMap<ClientOrderId, Ustr> = AHashMap::new();
 
@@ -275,6 +276,7 @@ impl PyBitmexWebSocketClient {
                                 table_msg,
                                 &cache,
                                 &mut quote_cache,
+                                &mut order_row_cache,
                                 &mut order_type_cache,
                                 &mut order_symbol_cache,
                                 &dispatch_state,
@@ -287,6 +289,7 @@ impl PyBitmexWebSocketClient {
                         }
                         BitmexWsMessage::Reconnected => {
                             quote_cache.clear();
+                            order_row_cache.clear();
                             order_type_cache.clear();
                             order_symbol_cache.clear();
                         }
@@ -797,6 +800,7 @@ fn handle_table_message(
     table_msg: BitmexTableMessage,
     instruments_cache: &Arc<AtomicMap<Ustr, InstrumentAny>>,
     quote_cache: &mut QuoteCache,
+    order_row_cache: &mut OrderRowCache,
     order_type_cache: &mut AHashMap<ClientOrderId, OrderType>,
     order_symbol_cache: &mut AHashMap<ClientOrderId, Ustr>,
     dispatch_state: &WsDispatchState,
@@ -894,9 +898,9 @@ fn handle_table_message(
                 send_to_python(parse_funding_msg(&msg, ts_init), call_soon, callback);
             }
         }
-        BitmexTableMessage::Order { data, .. } => {
+        BitmexTableMessage::Order { action, data } => {
             handle_order_messages(
-                data,
+                order_row_cache.apply(action, data),
                 &instruments,
                 order_type_cache,
                 order_symbol_cache,
@@ -1084,7 +1088,7 @@ fn handle_instrument_messages(
 
 #[expect(clippy::too_many_arguments)]
 fn handle_order_messages(
-    data: Vec<OrderData>,
+    data: Vec<ResolvedOrderData>,
     instruments: &AHashMap<Ustr, InstrumentAny>,
     order_type_cache: &mut AHashMap<ClientOrderId, OrderType>,
     order_symbol_cache: &mut AHashMap<ClientOrderId, Ustr>,
@@ -1096,8 +1100,28 @@ fn handle_order_messages(
     callback: &Py<PyAny>,
 ) {
     for order_data in data {
+        let order_data = match order_data {
+            ResolvedOrderData::Terminal(order_msg) => {
+                let tracked = order_msg.cl_ord_id.as_ref().is_some_and(|cl_ord_id| {
+                    dispatch_state
+                        .order_identities
+                        .contains_key(&ClientOrderId::new(cl_ord_id))
+                });
+
+                if !tracked {
+                    log::debug!(
+                        "Skipping terminal update for untracked order: order_id={}",
+                        order_msg.order_id,
+                    );
+                    continue;
+                }
+                ResolvedOrderData::Full(order_msg)
+            }
+            order_data => order_data,
+        };
+
         match order_data {
-            OrderData::Full(order_msg) => {
+            ResolvedOrderData::Full(order_msg) => {
                 let Some(instrument) = instruments.get(&order_msg.symbol) else {
                     log::warn!(
                         "Instrument cache miss for order symbol={}",
@@ -1177,17 +1201,22 @@ fn handle_order_messages(
                     }
                 }
             }
-            OrderData::Update(msg) => {
+            ResolvedOrderData::Update(msg) => {
+                let Some(symbol) = msg.symbol else {
+                    log::warn!(
+                        "Order update missing cached symbol: order_id={}",
+                        msg.order_id,
+                    );
+                    continue;
+                };
+
                 if let Some(cl_ord_id) = &msg.cl_ord_id {
                     let cid = ClientOrderId::new(cl_ord_id);
-                    order_symbol_cache.insert(cid, msg.symbol);
+                    order_symbol_cache.insert(cid, symbol);
                 }
 
-                let Some(instrument) = instruments.get(&msg.symbol) else {
-                    log::warn!(
-                        "Instrument cache miss for order update symbol={}",
-                        msg.symbol,
-                    );
+                let Some(instrument) = instruments.get(&symbol) else {
+                    log::warn!("Instrument cache miss for order update symbol={symbol}");
                     continue;
                 };
 
@@ -1243,6 +1272,7 @@ fn handle_order_messages(
                     );
                 }
             }
+            ResolvedOrderData::Terminal(_) => unreachable!("terminal order update was normalized"),
         }
     }
 }

@@ -26,7 +26,7 @@ use crate::common::{
     enums::{
         HyperliquidFillDirection, HyperliquidLeverageType,
         HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidPositionType,
-        HyperliquidSide,
+        HyperliquidSide, HyperliquidTimeInForce,
     },
     parse::{
         deserialize_decimal_from_str, deserialize_optional_decimal_from_str,
@@ -557,10 +557,14 @@ pub struct HyperliquidRecentTrade {
         deserialize_with = "deserialize_decimal_from_str"
     )]
     pub sz: Decimal,
+    /// Hyperliquid trade hash.
+    pub hash: String,
     /// Trade timestamp in milliseconds.
     pub time: u64,
     /// Venue trade identifier.
     pub tid: u64,
+    /// Buyer and seller wallet addresses, in that order.
+    pub users: [String; 2],
 }
 
 /// Represents an individual fill from user fills.
@@ -685,6 +689,22 @@ pub struct HyperliquidOrderInfo {
     /// Optional client order ID (hex representation of the venue CLOID).
     #[serde(default)]
     pub cloid: Option<String>,
+    /// Time in force used by the order.
+    #[serde(default)]
+    pub tif: Option<HyperliquidTimeInForce>,
+    /// Whether the order reduces an existing position.
+    #[serde(rename = "reduceOnly", default)]
+    pub reduce_only: Option<bool>,
+    /// Trigger price for conditional orders.
+    #[serde(
+        rename = "triggerPx",
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str"
+    )]
+    pub trigger_px: Option<Decimal>,
+    /// Venue order type label.
+    #[serde(rename = "orderType", default)]
+    pub order_type: Option<String>,
 }
 
 /// ECC signature components for Hyperliquid exchange requests.

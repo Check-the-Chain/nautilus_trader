@@ -553,7 +553,7 @@ fn create_reconciliation_fill_voids(
         });
         let prior_qty = previous.map_or_else(
             || Quantity::zero(fill.last_qty.precision),
-            |voided| voided.voided_qty,
+            |voided| voided.voided_qty.min(fill.last_qty),
         );
         let effective = fill.last_qty - prior_qty;
         if effective.is_zero() {
@@ -935,7 +935,7 @@ pub(super) fn create_reconciliation_updated(
 ) -> OrderEventAny {
     // Only pass trigger_price for order types that support it.
     // Limit, Market, and MarketToLimit orders assert trigger_price.is_none()
-    // in their update() methods — passing a spurious trigger_price from the
+    // in their update() methods - passing a spurious trigger_price from the
     // venue report (e.g. Bybit sends "0.00" for non-conditional orders)
     // causes a panic. Positive list ensures new order types without
     // trigger_price support won't accidentally receive one.

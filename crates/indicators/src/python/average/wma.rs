@@ -25,8 +25,8 @@ use crate::{
     indicator::{Indicator, MovingAverage},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl WeightedMovingAverage {
     /// An indicator which calculates a weighted moving average across a rolling window.
     #[new]
@@ -53,6 +53,24 @@ impl WeightedMovingAverage {
     #[pyo3(name = "period")]
     const fn py_period(&self) -> usize {
         self.period
+    }
+
+    #[getter]
+    #[pyo3(name = "price_type")]
+    const fn py_price_type(&self) -> PriceType {
+        self.price_type
+    }
+
+    #[getter]
+    #[pyo3(name = "value")]
+    const fn py_value(&self) -> f64 {
+        self.value
+    }
+
+    #[getter]
+    #[pyo3(name = "weights")]
+    fn py_weights(&self) -> Vec<f64> {
+        self.weights.clone()
     }
 
     #[getter]

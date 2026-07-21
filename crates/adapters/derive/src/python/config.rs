@@ -75,12 +75,12 @@ impl DeriveDataClientConfig {
     }
 
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DeriveDataClientConfig).to_string()
     }
 }
 
@@ -159,11 +159,11 @@ impl DeriveExecClientConfig {
     }
 
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DeriveExecClientConfig).to_string()
     }
 }

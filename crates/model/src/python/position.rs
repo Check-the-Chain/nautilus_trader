@@ -23,19 +23,19 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 
 use super::common::commissions_from_vec;
 use crate::{
-    enums::{OrderSide, PositionSide},
+    enums::{InstrumentClass, OrderSide, PositionSide},
     events::{OrderFilled, PositionAdjusted},
     identifiers::{
-        ClientOrderId, InstrumentId, PositionId, StrategyId, Symbol, TradeId, TraderId, Venue,
-        VenueOrderId,
+        AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, Symbol, TradeId, TraderId,
+        Venue, VenueOrderId,
     },
     position::{self, Position},
     python::instruments::pyobject_to_instrument_any,
     types::{Currency, Money, Price, Quantity},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl Position {
     /// Represents a position in a market.
     ///
@@ -87,6 +87,12 @@ impl Position {
     #[pyo3(name = "id")]
     fn py_id(&self) -> PositionId {
         self.id
+    }
+
+    #[getter]
+    #[pyo3(name = "account_id")]
+    fn py_account_id(&self) -> AccountId {
+        self.account_id
     }
 
     /// Returns the instrument symbol.
@@ -170,6 +176,18 @@ impl Position {
     }
 
     #[getter]
+    #[pyo3(name = "instrument_class")]
+    fn py_instrument_class(&self) -> InstrumentClass {
+        self.instrument_class
+    }
+
+    #[getter]
+    #[pyo3(name = "is_spot_currency")]
+    fn py_is_spot_currency(&self) -> bool {
+        self.is_currency_pair
+    }
+
+    #[getter]
     #[pyo3(name = "base_currency")]
     fn py_base_currency(&self) -> Option<Currency> {
         self.base_currency
@@ -197,6 +215,12 @@ impl Position {
     #[pyo3(name = "ts_opened")]
     fn py_ts_opened(&self) -> u64 {
         self.ts_opened.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_last")]
+    fn py_ts_last(&self) -> u64 {
+        self.ts_last.as_u64()
     }
 
     #[getter]
@@ -465,11 +489,9 @@ impl Position {
             None => dict.set_item("realized_pnl", py.None())?,
         }
         let venue_order_ids_list =
-            PyList::new(py, self.venue_order_ids().iter().map(ToString::to_string))
-                .expect("Invalid `ExactSizeIterator`");
+            PyList::new(py, self.venue_order_ids().iter().map(ToString::to_string))?;
         dict.set_item("venue_order_ids", venue_order_ids_list)?;
-        let trade_ids_list = PyList::new(py, self.trade_ids().iter().map(ToString::to_string))
-            .expect("Invalid `ExactSizeIterator`");
+        let trade_ids_list = PyList::new(py, self.trade_ids().iter().map(ToString::to_string))?;
         dict.set_item("trade_ids", trade_ids_list)?;
         dict.set_item("buy_qty", self.buy_qty.to_string())?;
         dict.set_item("sell_qty", self.sell_qty.to_string())?;

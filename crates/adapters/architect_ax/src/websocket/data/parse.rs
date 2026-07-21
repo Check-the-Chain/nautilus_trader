@@ -53,28 +53,98 @@ pub fn parse_book_l1_quote(
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
 ) -> anyhow::Result<QuoteTick> {
+    parse_top_of_book_quote(
+        book.ts,
+        book.tn,
+        book.b.first().map(|level| (level.p, level.q)),
+        book.a.first().map(|level| (level.p, level.q)),
+        instrument,
+        ts_init,
+    )
+}
+
+/// Parses the top levels of an Ax L2 book message into a [`QuoteTick`].
+///
+/// # Errors
+///
+/// Returns an error if price or quantity parsing fails.
+pub fn parse_book_l2_quote(
+    book: &AxMdBookL2,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<QuoteTick> {
+    parse_top_of_book_quote(
+        book.ts,
+        book.tn,
+        book.b
+            .iter()
+            .max_by_key(|level| level.p)
+            .map(|level| (level.p, level.q)),
+        book.a
+            .iter()
+            .min_by_key(|level| level.p)
+            .map(|level| (level.p, level.q)),
+        instrument,
+        ts_init,
+    )
+}
+
+/// Parses the top levels of an Ax L3 book message into a [`QuoteTick`].
+///
+/// # Errors
+///
+/// Returns an error if price or quantity parsing fails.
+pub fn parse_book_l3_quote(
+    book: &AxMdBookL3,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<QuoteTick> {
+    parse_top_of_book_quote(
+        book.ts,
+        book.tn,
+        book.b
+            .iter()
+            .max_by_key(|level| level.p)
+            .map(|level| (level.p, level.q)),
+        book.a
+            .iter()
+            .min_by_key(|level| level.p)
+            .map(|level| (level.p, level.q)),
+        instrument,
+        ts_init,
+    )
+}
+
+fn parse_top_of_book_quote(
+    ts: i64,
+    tn: i64,
+    bid: Option<(Decimal, u64)>,
+    ask: Option<(Decimal, u64)>,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<QuoteTick> {
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
-    let (bid_price, bid_size) = if let Some(bid) = book.b.first() {
+    let (bid_price, bid_size) = if let Some((price, quantity)) = bid {
         (
-            decimal_to_price_dp(bid.p, price_precision, "book.bid.price")?,
-            Quantity::new(bid.q as f64, size_precision),
+            decimal_to_price_dp(price, price_precision, "book.bid.price")?,
+            Quantity::new(quantity as f64, size_precision),
         )
     } else {
         (Price::zero(price_precision), Quantity::zero(size_precision))
     };
 
-    let (ask_price, ask_size) = if let Some(ask) = book.a.first() {
+    let (ask_price, ask_size) = if let Some((price, quantity)) = ask {
         (
-            decimal_to_price_dp(ask.p, price_precision, "book.ask.price")?,
-            Quantity::new(ask.q as f64, size_precision),
+            decimal_to_price_dp(price, price_precision, "book.ask.price")?,
+            Quantity::new(quantity as f64, size_precision),
         )
     } else {
         (Price::zero(price_precision), Quantity::zero(size_precision))
     };
 
-    let ts_event = ax_timestamp_stn_to_unix_nanos(book.ts, book.tn)?;
+    let ts_event = ax_timestamp_stn_to_unix_nanos(ts, tn)?;
 
     QuoteTick::new_checked(
         instrument.id(),
@@ -474,6 +544,80 @@ mod tests {
         assert_eq!(quote.ask_price.as_f64(), 50001.00);
         assert_eq!(quote.bid_size.as_f64(), 100.0);
         assert_eq!(quote.ask_size.as_f64(), 150.0);
+    }
+
+    #[rstest]
+    fn test_parse_book_quotes_select_best_unsorted_levels() {
+        let l2 = AxMdBookL2 {
+            ts: 1700000000,
+            tn: 12345,
+            s: Ustr::from("BTC-PERP"),
+            b: vec![
+                AxBookLevel {
+                    p: dec!(50000.00),
+                    q: 200,
+                },
+                AxBookLevel {
+                    p: dec!(50000.50),
+                    q: 100,
+                },
+            ],
+            a: vec![
+                AxBookLevel {
+                    p: dec!(50001.50),
+                    q: 250,
+                },
+                AxBookLevel {
+                    p: dec!(50001.00),
+                    q: 150,
+                },
+            ],
+            st: false,
+        };
+        let l3 = AxMdBookL3 {
+            ts: 1700000000,
+            tn: 12345,
+            s: Ustr::from("BTC-PERP"),
+            b: vec![
+                AxBookLevelL3 {
+                    p: dec!(50000.00),
+                    q: 200,
+                    o: vec![200],
+                },
+                AxBookLevelL3 {
+                    p: dec!(50000.50),
+                    q: 100,
+                    o: vec![100],
+                },
+            ],
+            a: vec![
+                AxBookLevelL3 {
+                    p: dec!(50001.50),
+                    q: 250,
+                    o: vec![250],
+                },
+                AxBookLevelL3 {
+                    p: dec!(50001.00),
+                    q: 150,
+                    o: vec![150],
+                },
+            ],
+            st: false,
+        };
+        let instrument = create_test_instrument();
+        let ts_init = UnixNanos::default();
+
+        let l2_quote = parse_book_l2_quote(&l2, &instrument, ts_init).unwrap();
+        let l3_quote = parse_book_l3_quote(&l3, &instrument, ts_init).unwrap();
+
+        assert_eq!(l2_quote.bid_price.as_f64(), 50000.50);
+        assert_eq!(l2_quote.bid_size.as_f64(), 100.0);
+        assert_eq!(l2_quote.ask_price.as_f64(), 50001.00);
+        assert_eq!(l2_quote.ask_size.as_f64(), 150.0);
+        assert_eq!(l3_quote.bid_price.as_f64(), 50000.50);
+        assert_eq!(l3_quote.bid_size.as_f64(), 100.0);
+        assert_eq!(l3_quote.ask_price.as_f64(), 50001.00);
+        assert_eq!(l3_quote.ask_size.as_f64(), 150.0);
     }
 
     #[rstest]

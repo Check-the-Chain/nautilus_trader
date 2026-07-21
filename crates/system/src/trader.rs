@@ -22,6 +22,7 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use ahash::AHashMap;
+use indexmap::IndexMap;
 #[cfg(feature = "python")]
 use nautilus_common::{actor::data_actor::ImportableActorConfig, python::actor::PyDataActor};
 use nautilus_common::{
@@ -119,7 +120,7 @@ pub struct Trader {
     /// Registered exec algorithm IDs (algorithms stored in global registry).
     exec_algorithm_ids: Vec<ExecAlgorithmId>,
     /// Component clocks for individual components.
-    clocks: AHashMap<ComponentId, Rc<RefCell<dyn Clock>>>,
+    clocks: IndexMap<ComponentId, Rc<RefCell<dyn Clock>>>,
     /// Timestamp when the trader was created.
     ts_created: UnixNanos,
     /// Timestamp when the trader was last started.
@@ -161,7 +162,7 @@ impl Trader {
             strategy_stop_fns: AHashMap::new(),
             strategy_handler_ids: AHashMap::new(),
             exec_algorithm_ids: Vec::new(),
-            clocks: AHashMap::new(),
+            clocks: IndexMap::new(),
             ts_created,
             ts_started: None,
             ts_stopped: None,
@@ -807,6 +808,128 @@ impl Trader {
         Ok(strategy_id)
     }
 
+    /// Adds a constructed Python strategy instance to the trader.
+    ///
+    /// This is the instance-based counterpart to [`Self::add_strategy_from_importable_config`]:
+    /// the strategy is already constructed in Python, avoiding the `dict`-to-JSON round trip of
+    /// the importable-config path. The strategy ID, order ID tag, and logging flags are sourced
+    /// from the instance's retained `.config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy cannot be configured, registered, or tracked.
+    #[cfg(feature = "python")]
+    pub fn add_python_strategy_instance(
+        &mut self,
+        strategy: &Py<PyAny>,
+    ) -> anyhow::Result<StrategyId> {
+        self.prepare_python_strategy_instance(strategy)?;
+        self.commit_python_strategy_instance(strategy)
+    }
+
+    /// Prepares a constructed Python strategy instance for registration without committing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy cannot be configured, or its ID or order ID tag is
+    /// already registered.
+    #[cfg(feature = "python")]
+    pub fn prepare_python_strategy_instance(
+        &mut self,
+        strategy: &Py<PyAny>,
+    ) -> anyhow::Result<StrategyId> {
+        self.validate_actor_or_strategy_registration()?;
+
+        let strategy_id = Python::attach(|py| -> anyhow::Result<StrategyId> {
+            let bound = strategy.bind(py);
+
+            let config_instance = bound
+                .getattr("config")
+                .ok()
+                .filter(|config| !config.is_none());
+
+            let mut py_strategy_ref = bound
+                .extract::<PyRefMut<PyStrategy>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+
+            if let Some(config_obj) = config_instance.as_ref() {
+                configure_py_strategy(&mut py_strategy_ref, config_obj)?;
+            }
+
+            py_strategy_ref.set_python_instance(strategy.clone_ref(py));
+            Ok(py_strategy_ref.strategy_id())
+        })?;
+
+        if self.strategy_ids.contains(&strategy_id) {
+            anyhow::bail!("Strategy {strategy_id} is already registered");
+        }
+
+        let existing_order_id_tags: Vec<&str> =
+            self.strategy_ids.iter().map(StrategyId::get_tag).collect();
+        ensure_unique_order_id_tag(&existing_order_id_tags, strategy_id.get_tag())?;
+
+        Ok(strategy_id)
+    }
+
+    /// Commits a previously prepared Python strategy instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy cannot be registered or its subscriptions cannot be
+    /// installed.
+    #[cfg(feature = "python")]
+    pub fn commit_python_strategy_instance(
+        &mut self,
+        strategy: &Py<PyAny>,
+    ) -> anyhow::Result<StrategyId> {
+        let strategy_id = Python::attach(|py| -> anyhow::Result<StrategyId> {
+            Ok(strategy
+                .bind(py)
+                .extract::<PyRef<PyStrategy>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?
+                .strategy_id())
+        })?;
+
+        let component_id = ComponentId::new(strategy_id.inner().as_str());
+        let clock = self.create_component_clock(component_id);
+        let trader_id = self.trader_id;
+        let cache = self.cache.clone();
+        let portfolio = self.portfolio.clone();
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_strategy = strategy.bind(py);
+            let mut py_strategy_ref = py_strategy
+                .extract::<PyRefMut<PyStrategy>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+
+            py_strategy_ref
+                .register(trader_id, clock, cache, portfolio)
+                .map_err(|e| anyhow::anyhow!("Failed to register PyStrategy: {e}"))?;
+
+            Ok(())
+        })?;
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_strategy = strategy.bind(py);
+            let py_strategy_ref = py_strategy
+                .cast::<PyStrategy>()
+                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyStrategy: {e}"))?;
+            py_strategy_ref.borrow().register_in_global_registries();
+            Ok(())
+        })?;
+
+        self.add_strategy_id_with_subscriptions::<PyStrategyInner>(strategy_id)?;
+
+        log::info!(
+            "Registered Python strategy {strategy_id} with trader {}",
+            self.trader_id
+        );
+        Ok(strategy_id)
+    }
+
     /// Adds an execution algorithm to the trader.
     ///
     /// Execution algorithms are registered in both the component registry (for lifecycle
@@ -834,6 +957,9 @@ impl Trader {
         let clock = self.create_component_clock(component_id);
 
         exec_algorithm.register(self.trader_id, clock, self.cache.clone())?;
+        exec_algorithm
+            .exec_algorithm_core_mut()
+            .set_portfolio(self.portfolio.clone());
 
         register_component_actor(exec_algorithm);
 
@@ -1157,7 +1283,7 @@ impl Trader {
             if let Some(clock) = self.clocks.get(&component_id) {
                 clock.borrow_mut().cancel_timers();
             }
-            self.clocks.remove(&component_id);
+            self.clocks.shift_remove(&component_id);
 
             // Remove only this strategy's own msgbus handlers
             if let Some((order_hid, position_hid)) = self.strategy_handler_ids.get(strategy_id) {
@@ -1196,7 +1322,7 @@ impl Trader {
             if let Some(clock) = self.clocks.get(&component_id) {
                 clock.borrow_mut().cancel_timers();
             }
-            self.clocks.remove(&component_id);
+            self.clocks.shift_remove(&component_id);
         }
 
         self.actor_ids.clear();
@@ -1219,7 +1345,7 @@ impl Trader {
             if let Some(clock) = self.clocks.get(&component_id) {
                 clock.borrow_mut().cancel_timers();
             }
-            self.clocks.remove(&component_id);
+            self.clocks.shift_remove(&component_id);
         }
 
         self.exec_algorithm_ids.clear();
@@ -1277,7 +1403,7 @@ impl Trader {
         if let Some(clock) = self.clocks.get(&component_id) {
             clock.borrow_mut().cancel_timers();
         }
-        self.clocks.remove(&component_id);
+        self.clocks.shift_remove(&component_id);
 
         log::info!("Removed actor {actor_id} from trader {}", self.trader_id);
         Ok(())
@@ -1297,7 +1423,7 @@ impl Trader {
 
     /// Stops the strategy with the given `strategy_id`.
     ///
-    /// Respects the `manage_stop` behavior — if the strategy's stop function
+    /// Respects the `manage_stop` behavior - if the strategy's stop function
     /// returns `false`, the component stop is deferred until market exit completes.
     ///
     /// # Errors
@@ -1403,7 +1529,7 @@ impl Trader {
         if let Some(clock) = self.clocks.get(&component_id) {
             clock.borrow_mut().cancel_timers();
         }
-        self.clocks.remove(&component_id);
+        self.clocks.shift_remove(&component_id);
 
         log::info!(
             "Removed strategy {strategy_id} from trader {}",
@@ -2678,6 +2804,32 @@ mod tests {
             primary_clock.as_ptr() as *const _
         );
         assert_ne!(clock_a.as_ptr() as *const _, clock_b.as_ptr() as *const _);
+    }
+
+    #[rstest]
+    fn test_get_component_clocks_returns_registration_order() {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache,
+            portfolio,
+        );
+        let mut registered = Vec::new();
+
+        for index in 0..32 {
+            let component_id = ComponentId::new(format!("ACTOR-{index:02}").as_str());
+            registered.push(trader.create_component_clock(component_id));
+        }
+
+        let returned = trader.get_component_clocks();
+        assert_eq!(returned.len(), registered.len());
+        for (actual, expected) in returned.iter().zip(&registered) {
+            assert!(Rc::ptr_eq(actual, expected));
+        }
     }
 
     #[rstest]

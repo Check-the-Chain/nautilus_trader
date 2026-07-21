@@ -26,6 +26,7 @@ This script can be used as:
 from __future__ import annotations
 
 import argparse
+import ast
 import keyword
 import os
 import re
@@ -336,6 +337,7 @@ def generate_stubs() -> bool:
     workspace_root = Path(__file__).parent.parent
     root = dest_dir / "nautilus_trader"
     if root.exists():
+        write_config_stub(root)
         post_process_stubs(root)
         relocate_classes_from_libnautilus(root)
         inject_module_constants(root, workspace_root)
@@ -365,6 +367,58 @@ def generate_stubs() -> bool:
         print(f"...and {remaining} more stub files")
 
     return True
+
+
+def write_config_stub(root: Path) -> None:
+    """
+    Generate the config facade stub from its runtime module.
+    """
+    runtime_path = root / "config" / "__init__.py"
+    stub_path = runtime_path.with_suffix(".pyi")
+    tree = ast.parse(runtime_path.read_text())
+    imports: dict[str, tuple[str, str]] = {}
+    exports: list[str] | None = None
+
+    for node in tree.body:
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.startswith("nautilus_trader.")
+        ):
+            for alias in node.names:
+                public_name = alias.asname or alias.name
+                imports[public_name] = (node.module, alias.name)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+                raise ValueError("Config facade __all__ must be a static list of strings")
+            exports = value
+
+    if exports is None:
+        raise ValueError("Config facade must define __all__")
+
+    imported_names = set(imports)
+    exported_names = set(exports)
+    if imported_names != exported_names or len(exports) != len(exported_names):
+        missing = sorted(exported_names - imported_names)
+        unexported = sorted(imported_names - exported_names)
+        raise ValueError(
+            f"Config facade imports and __all__ differ: missing imports {missing}, "
+            f"unexported imports {unexported}",
+        )
+
+    lines = [STUB_HEADER.rstrip(), ""]
+
+    for name in exports:
+        module, imported_name = imports[name]
+        lines.append(f"from {module} import {imported_name} as {name}")
+
+    lines.extend(["", "__all__ = ["])
+    lines.extend(f'    "{name}",' for name in exports)
+    lines.extend(["]", ""])
+    stub_path.write_text("\n".join(lines))
 
 
 def inject_reexports(content: str, stub_path: Path) -> str:
@@ -1368,7 +1422,7 @@ def register_rust_method_fixup(
     if not python_name:
         return
 
-    fallback_name = _python_exposed_name(rust_name, [], is_getter)
+    fallback_name = _python_exposed_name(rust_name, [], False)
     method_names = {python_name}
     if fallback_name and fallback_name != python_name:
         method_names.add(fallback_name)

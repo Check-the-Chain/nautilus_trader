@@ -19,8 +19,8 @@ use pyo3::prelude::*;
 
 use crate::{indicator::Indicator, ratio::spread_analyzer::SpreadAnalyzer};
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl SpreadAnalyzer {
     /// An indicator which calculates the efficiency ratio across a rolling window.
     ///
@@ -45,6 +45,12 @@ impl SpreadAnalyzer {
     #[pyo3(name = "capacity")]
     const fn py_capacity(&self) -> usize {
         self.capacity
+    }
+
+    #[getter]
+    #[pyo3(name = "instrument_id")]
+    const fn py_instrument_id(&self) -> InstrumentId {
+        self.instrument_id
     }
 
     #[getter]

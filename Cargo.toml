@@ -51,7 +51,7 @@ members = [
 [workspace.package]
 version = "0.61.0"
 edition = "2024"
-rust-version = "1.97.0"
+rust-version = "1.97.1"
 authors = ["Nautech Systems <info@nautechsystems.io>"]
 license = "LGPL-3.0-or-later"
 readme = "README.md"
@@ -124,11 +124,12 @@ nautilus-tardis = { path = "crates/adapters/tardis", version = "0.61.0", default
 # - object_store must stay in line with datafusion (pre-1.0: minor bumps can break)
 # -----------------------------------------------------------------------------
 ahash = { version = "0.8.12", features = ["serde"] }
-alloy-primitives = { version = "1.6.0", default-features = false, features = [
+alloy-primitives = { version = "1.6.1", default-features = false, features = [
   "std",
   "serde",
 ] }
-anyhow = "1.0.103"
+anyhow = "1.0.104"
+arc-swap = "1.9.2"
 arraydeque = "0.5.1"
 arrow = { version = "58.3.0", default-features = false, features = [
   "csv",
@@ -138,8 +139,8 @@ arrow = { version = "58.3.0", default-features = false, features = [
 ] }
 arrow-row = "58.3.0"
 async-stream = "0.3.6"
-async-trait = "0.1.89"
-aws-lc-rs = { version = "1.17.1", default-features = false, features = [
+async-trait = "0.1.91"
+aws-lc-rs = { version = "1.17.3", default-features = false, features = [
   "non-fips", # FIPS 140-3 mode blocked: aws-lc-fips-sys requires Go toolchain
 ] }
 base64 = "0.22.1"
@@ -153,7 +154,7 @@ chrono = { version = "0.4.45", default-features = false, features = [
   "clock",
 ] }
 chrono-tz = "0.10.4"
-clap = { version = "4.6.1", features = ["derive", "env"] }
+clap = { version = "4.6.2", features = ["derive", "env"] }
 dashmap = "6.2.1"
 datafusion = { version = "54.0.0", default-features = false, features = [
   "parquet",
@@ -165,13 +166,13 @@ derive_builder = { version = "0.20.2", default-features = false, features = [
   "alloc",
 ] }
 dotenvy = "0.15.7"
-ed25519-dalek = "2.2.0"
+ed25519-dalek = "3.0.0"
 enum_dispatch = "0.3.13"
-futures = { version = "0.3.32", default-features = false, features = [
+futures = { version = "0.3.33", default-features = false, features = [
   "std",
   "async-await",
 ] }
-futures-util = { version = "0.3.32", default-features = false, features = [
+futures-util = { version = "0.3.33", default-features = false, features = [
   "std",
   "async-await",
   "sink",
@@ -180,6 +181,8 @@ http = "1.4.2"
 implied-vol = { version = "2.0.0" }
 indexmap = { version = "2.14.0", features = ["serde"] }
 itchy = "0.3"
+itoa = "1.0.18"
+libfuzzer-sys = "0.4.13"
 log = { version = "0.4.33", features = [
   "std",
   "kv_unstable",
@@ -220,7 +223,7 @@ rand = { version = "0.10.2", default-features = false, features = [
   "thread_rng",
 ] }
 redb = { version = "4.1.0", default-features = false }
-redis = { version = "1.4.0", default-features = false, features = [
+redis = { version = "1.4.1", default-features = false, features = [
   "connection-manager",
   "sentinel",
   "streams",
@@ -229,7 +232,7 @@ redis = { version = "1.4.0", default-features = false, features = [
   "tls-rustls",
   "tls-rustls-webpki-roots",
 ] }
-regex = { version = "1.13.0", default-features = false, features = [
+regex = { version = "1.13.1", default-features = false, features = [
   "std",
   "perf",
   "unicode-perl",
@@ -251,12 +254,12 @@ rustls = { version = "0.23.42", default-features = false, features = [
   "tls12",
 ] }
 rustls-pemfile = "2.2.0"
-serde = { version = "1.0.228", default-features = false, features = [
+serde = { version = "1.0.229", default-features = false, features = [
   "derive",
   "std",
   "rc",
 ] }
-serde_json = { version = "1.0.150", default-features = false, features = [
+serde_json = { version = "1.0.151", default-features = false, features = [
   "raw_value",
   "std",
 ] }
@@ -280,8 +283,8 @@ sysinfo = { version = "0.39.6", default-features = false, features = [
   "system",
 ] }
 tabled = { version = "0.21.0", default-features = false, features = ["std"] }
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", default-features = false, features = [
+thiserror = "2.0.19"
+tokio = { version = "1.53.0", default-features = false, features = [
   "rt-multi-thread",
   "sync",
   "fs",
@@ -310,19 +313,18 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 unbounded-interval-tree = { version = "1.1.2", default-features = false }
 url = { version = "2.5.8", default-features = false }
 ustr = { version = "1.1.0", features = ["serde"] }
-uuid = { version = "1.23.5", features = ["v4", "serde"] }
-webpki-roots = "1.0.8"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+webpki-roots = "1.0.9"
 
 # -----------------------------------------------------------------------------
 # Adapter dependencies
 # -----------------------------------------------------------------------------
-alloy = { version = "2.1.1", default-features = false, features = [
+alloy = { version = "2.2.0", default-features = false, features = [
   "sol-types",
   "contract",
   "signers",
   "signer-local",
 ] }
-arc-swap = "1.9.2"
 bollard = { version = "0.21.0", default-features = false, features = [
   "http",
   "pipe",
@@ -339,9 +341,8 @@ fallible-streaming-iterator = "0.1.9"
 flate2 = "1.1.9"
 hypersync-client = { version = "1.4.0" }
 ibapi = "=3.2.0"
-itoa = "1.0.18"
 ryu = "1.0.23"
-serde_repr = "0.1.20"
+serde_repr = "0.1.21"
 time = { version = "0.3.53", default-features = false, features = [
   "macros",
   "parsing",
@@ -397,7 +398,7 @@ pyo3-stub-gen = { path = "patches/pyo3-stub-gen" }
 [workspace.metadata.tools]
 cargo-audit = "0.22.2"
 cargo-deny = "0.20.2"
-cargo-edit = "0.13.12"
+cargo-edit = "0.13.13"
 cargo-fuzz = "0.13.2"
 cargo-llvm-cov = "0.8.7"
 cargo-machete = "0.9.2"
@@ -589,7 +590,6 @@ unnecessary_wraps = "warn"
 unnecessary_box_returns = "warn"
 unnecessary_join = "warn"
 unnecessary_literal_bound = "warn"
-from_iter_instead_of_collect = "warn"
 map_identity = "warn"
 if_same_then_else = "warn"
 get_first = "warn"

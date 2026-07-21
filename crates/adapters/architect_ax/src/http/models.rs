@@ -24,8 +24,7 @@ use ustr::Ustr;
 
 use crate::common::{
     enums::{
-        AxCandleWidth, AxCategory, AxInstrumentState, AxOrderSide, AxOrderStatus, AxOrderType,
-        AxTimeInForce,
+        AxCandleWidth, AxCategory, AxInstrumentState, AxOrderSide, AxOrderStatus, AxTimeInForce,
     },
     parse::{
         deserialize_decimal_or_zero, deserialize_optional_decimal,
@@ -79,6 +78,9 @@ pub struct AxWhoAmI {
 pub struct AxInstrument {
     /// Trading symbol for the instrument.
     pub symbol: Ustr,
+    /// Umbrella product shared by sibling contracts.
+    #[serde(default)]
+    pub product: Option<Ustr>,
     /// Current trading state of the instrument (defaults to Open if not provided).
     #[serde(default = "default_instrument_state")]
     pub state: AxInstrumentState,
@@ -96,8 +98,7 @@ pub struct AxInstrument {
     /// Funding settlement currency.
     pub funding_settlement_currency: Ustr,
     /// Instrument category (e.g. fx, equities, metals).
-    #[serde(default)]
-    pub category: Option<AxCategory>,
+    pub category: AxCategory,
     /// Maintenance margin percentage.
     #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub maintenance_margin_pct: Decimal,
@@ -113,6 +114,9 @@ pub struct AxInstrument {
     /// Instrument description (optional).
     #[serde(default)]
     pub description: Option<String>,
+    /// Contract expiration; absent for perpetual contracts.
+    #[serde(default)]
+    pub expiration: Option<DateTime<Utc>>,
     /// Funding calendar schedule (optional).
     #[serde(default)]
     pub funding_calendar_schedule: Option<String>,
@@ -220,63 +224,57 @@ pub struct AxPositionsResponse {
 #[serde(rename_all = "snake_case")]
 pub struct AxTicker {
     /// Instrument symbol.
-    #[serde(alias = "s")]
+    #[serde(rename = "s")]
     pub symbol: Ustr,
     /// Best bid price.
     #[serde(
         default,
-        alias = "bp",
+        rename = "bp",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub bid: Option<Decimal>,
     /// Best ask price.
     #[serde(
         default,
-        alias = "ap",
+        rename = "ap",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub ask: Option<Decimal>,
     /// Last trade price.
     #[serde(
         default,
-        alias = "p",
+        rename = "p",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub last: Option<Decimal>,
     /// Mark price.
     #[serde(
         default,
-        alias = "m",
+        rename = "m",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub mark: Option<Decimal>,
-    /// Index price.
-    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
-    pub index: Option<Decimal>,
     /// 24-hour volume.
     #[serde(
         default,
-        alias = "v",
+        rename = "v",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub volume_24h: Option<Decimal>,
     /// 24-hour high price.
     #[serde(
         default,
-        alias = "h",
+        rename = "h",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub high_24h: Option<Decimal>,
     /// 24-hour low price.
     #[serde(
         default,
-        alias = "l",
+        rename = "l",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub low_24h: Option<Decimal>,
-    /// Ticker timestamp.
-    #[serde(default)]
-    pub timestamp: Option<DateTime<Utc>>,
     /// Timestamp seconds.
     #[serde(default)]
     pub ts: Option<i64>,
@@ -284,37 +282,37 @@ pub struct AxTicker {
     #[serde(default)]
     pub tn: Option<i64>,
     /// Last trade quantity.
-    #[serde(default, alias = "q")]
+    #[serde(default, rename = "q")]
     pub last_quantity: Option<u64>,
     /// Open interest.
-    #[serde(default, alias = "oi")]
+    #[serde(default, rename = "oi")]
     pub open_interest: Option<i64>,
     /// Instrument state.
-    #[serde(default, alias = "i")]
+    #[serde(default, rename = "i")]
     pub instrument_state: Option<AxInstrumentState>,
     /// Price band lower limit.
     #[serde(
         default,
-        alias = "pl",
+        rename = "pl",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub price_band_lower: Option<Decimal>,
     /// Price band upper limit.
     #[serde(
         default,
-        alias = "pu",
+        rename = "pu",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub price_band_upper: Option<Decimal>,
     /// Last settlement price.
     #[serde(
         default,
-        alias = "lsp",
+        rename = "lsp",
         deserialize_with = "deserialize_optional_decimal"
     )]
     pub last_settlement_price: Option<Decimal>,
     /// Last settlement time as epoch seconds.
-    #[serde(default, alias = "lst")]
+    #[serde(default, rename = "lst")]
     pub last_settlement_time: Option<i64>,
 }
 
@@ -649,6 +647,12 @@ pub struct AxOpenOrder {
 pub struct AxOpenOrdersResponse {
     /// List of open orders.
     pub orders: Vec<AxOpenOrder>,
+    /// Total matching records.
+    pub total_count: i64,
+    /// Applied limit.
+    pub limit: i32,
+    /// Applied offset.
+    pub offset: i32,
 }
 
 /// Individual fill/trade entry.
@@ -661,12 +665,16 @@ pub struct AxFill {
     /// Trade ID (execution identifier).
     pub trade_id: String,
     /// Order ID.
-    pub order_id: String,
+    pub order_id: Option<String>,
     /// Fee amount.
     #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub fee: Decimal,
     /// Whether this was a taker order.
     pub is_taker: bool,
+    /// Whether this fill was generated by an off-book block trade.
+    pub is_block_trade: Option<bool>,
+    /// Whether this fill was generated by final contract settlement.
+    pub is_final_settlement: Option<bool>,
     /// Execution price.
     #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub price: Decimal,
@@ -694,6 +702,15 @@ pub struct AxFill {
 pub struct AxFillsResponse {
     /// List of fills.
     pub fills: Vec<AxFill>,
+    /// Total matching records, when supplied by AX.
+    #[serde(default)]
+    pub total_count: Option<i64>,
+    /// Applied limit, when supplied by AX.
+    #[serde(default)]
+    pub limit: Option<i32>,
+    /// Cursor for the next page, when one exists.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// Individual candle/OHLCV entry.
@@ -786,6 +803,15 @@ pub struct AxFundingRate {
 pub struct AxFundingRatesResponse {
     /// List of funding rates.
     pub funding_rates: Vec<AxFundingRate>,
+    /// Total matching records, when supplied by AX.
+    #[serde(default)]
+    pub total_count: Option<i64>,
+    /// Applied limit, when supplied by AX.
+    #[serde(default)]
+    pub limit: Option<i32>,
+    /// Cursor for the next page, when one exists.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// Per-symbol risk metrics.
@@ -801,20 +827,26 @@ pub struct AxPerSymbolRisk {
     #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub signed_notional: Decimal,
     /// Average entry price.
-    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
-    pub average_price: Decimal,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub average_price: Option<Decimal>,
     /// Liquidation price.
     #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
     pub liquidation_price: Option<Decimal>,
-    /// Initial margin required.
-    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
-    pub initial_margin_required: Option<Decimal>,
+    /// Initial margin required for the position.
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub initial_margin_required_position: Decimal,
+    /// Initial margin required for open orders.
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub initial_margin_required_open_orders: Decimal,
+    /// Total initial margin required.
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub initial_margin_required_total: Decimal,
     /// Maintenance margin required.
-    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
-    pub maintenance_margin_required: Option<Decimal>,
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub maintenance_margin_required: Decimal,
     /// Unrealized P&L.
-    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
-    pub unrealized_pnl: Option<Decimal>,
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
+    pub unrealized_pnl: Decimal,
 }
 
 /// Risk snapshot data.
@@ -853,8 +885,8 @@ pub struct AxRiskSnapshot {
     pub unrealized_pnl: Decimal,
     /// Snapshot timestamp.
     pub timestamp_ns: DateTime<Utc>,
-    /// User identifier.
-    pub user_id: String,
+    /// Account identifier.
+    pub account_id: Ustr,
     /// Per-symbol risk data.
     #[serde(default)]
     pub per_symbol: AHashMap<String, AxPerSymbolRisk>,
@@ -879,8 +911,7 @@ pub struct AxRiskSnapshotResponse {
 #[serde(rename_all = "snake_case")]
 pub struct AxTransaction {
     /// Account identifier.
-    #[serde(default)]
-    pub account_id: Option<Ustr>,
+    pub account_id: Ustr,
     /// Transaction amount.
     #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub amount: Decimal,
@@ -895,9 +926,6 @@ pub struct AxTransaction {
     /// User who initiated the transaction, when available.
     #[serde(default)]
     pub initiated_by_user_id: Option<String>,
-    /// Legacy user identifier.
-    #[serde(default)]
-    pub user_id: Option<String>,
     /// Optional reference identifier.
     #[serde(default)]
     pub reference_id: Option<String>,
@@ -954,37 +982,6 @@ impl AuthenticateApiKeyRequest {
     }
 }
 
-/// Request body for `POST /authenticate` using username and password.
-///
-/// # References
-/// - <https://docs.architect.exchange/api-reference/user-management/get-user-token>
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct AuthenticateUserRequest {
-    /// Username.
-    pub username: String,
-    /// Password.
-    pub password: String,
-    /// Token expiration in seconds.
-    pub expiration_seconds: i32,
-}
-
-impl AuthenticateUserRequest {
-    /// Creates a new [`AuthenticateUserRequest`].
-    #[must_use]
-    pub fn new(
-        username: impl Into<String>,
-        password: impl Into<String>,
-        expiration_seconds: i32,
-    ) -> Self {
-        Self {
-            username: username.into(),
-            password: password.into(),
-            expiration_seconds,
-        }
-    }
-}
-
 /// Request body for `POST /place-order`.
 ///
 /// # References
@@ -1007,19 +1004,10 @@ pub struct PlaceOrderRequest {
     /// Optional order tag (max 10 alphanumeric characters).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
-    /// Order type (defaults to LIMIT if not specified).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub order_type: Option<AxOrderType>,
-    /// Trigger price for stop-loss orders (required for STOP_LOSS_LIMIT).
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_decimal_as_str"
-    )]
-    pub trigger_price: Option<Decimal>,
 }
 
 impl PlaceOrderRequest {
-    /// Creates a new [`PlaceOrderRequest`] for a limit order.
+    /// Creates a new [`PlaceOrderRequest`] for the AX priced order shape.
     #[must_use]
     pub fn new(
         side: AxOrderSide,
@@ -1037,31 +1025,6 @@ impl PlaceOrderRequest {
             s: symbol,
             tif: time_in_force,
             tag: None,
-            order_type: None,
-            trigger_price: None,
-        }
-    }
-
-    /// Creates a new [`PlaceOrderRequest`] for a stop-loss limit order.
-    #[must_use]
-    pub fn new_stop_loss(
-        side: AxOrderSide,
-        limit_price: Decimal,
-        trigger_price: Decimal,
-        quantity: u64,
-        symbol: Ustr,
-        time_in_force: AxTimeInForce,
-    ) -> Self {
-        Self {
-            d: side,
-            p: limit_price,
-            po: false,
-            q: quantity,
-            s: symbol,
-            tif: time_in_force,
-            tag: None,
-            order_type: Some(AxOrderType::StopLossLimit),
-            trigger_price: Some(trigger_price),
         }
     }
 
@@ -1069,20 +1032,6 @@ impl PlaceOrderRequest {
     #[must_use]
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tag = Some(tag.into());
-        self
-    }
-
-    /// Sets the order type.
-    #[must_use]
-    pub fn with_order_type(mut self, order_type: AxOrderType) -> Self {
-        self.order_type = Some(order_type);
-        self
-    }
-
-    /// Sets the trigger price for stop orders.
-    #[must_use]
-    pub fn with_trigger_price(mut self, trigger_price: Decimal) -> Self {
-        self.trigger_price = Some(trigger_price);
         self
     }
 }
@@ -1177,12 +1126,6 @@ pub struct ReplaceOrderRequest {
     /// New time-in-force (optional, inherits from original if omitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tif: Option<AxTimeInForce>,
-    /// New trigger price for stop orders (optional).
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_decimal_as_str"
-    )]
-    pub trigger_price: Option<Decimal>,
 }
 
 impl ReplaceOrderRequest {
@@ -1197,7 +1140,6 @@ impl ReplaceOrderRequest {
             q: None,
             po: None,
             tif: None,
-            trigger_price: None,
         }
     }
 
@@ -1212,13 +1154,6 @@ impl ReplaceOrderRequest {
     #[must_use]
     pub fn with_quantity(mut self, quantity: u64) -> Self {
         self.q = Some(quantity);
-        self
-    }
-
-    /// Sets the new trigger price.
-    #[must_use]
-    pub fn with_trigger_price(mut self, trigger_price: Decimal) -> Self {
-        self.trigger_price = Some(trigger_price);
         self
     }
 }
@@ -1239,12 +1174,12 @@ pub struct AxReplaceOrderResponse {
 /// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CancelAllOrdersRequest {
+    /// Optional account ID. AX infers the session account when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<Ustr>,
     /// Optional symbol filter - only cancel orders for this symbol.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<Ustr>,
-    /// Optional execution venue filter.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_venue: Option<Ustr>,
 }
 
 impl CancelAllOrdersRequest {
@@ -1254,17 +1189,17 @@ impl CancelAllOrdersRequest {
         Self::default()
     }
 
+    /// Sets the account filter.
+    #[must_use]
+    pub fn with_account_id(mut self, account_id: Ustr) -> Self {
+        self.account_id = Some(account_id);
+        self
+    }
+
     /// Sets the symbol filter.
     #[must_use]
     pub fn with_symbol(mut self, symbol: Ustr) -> Self {
         self.symbol = Some(symbol);
-        self
-    }
-
-    /// Sets the execution venue filter.
-    #[must_use]
-    pub fn with_venue(mut self, venue: Ustr) -> Self {
-        self.execution_venue = Some(venue);
         self
     }
 }
@@ -1287,6 +1222,19 @@ mod tests {
         let json = include_str!("../../test_data/http_authenticate.json");
         let response: AxAuthenticateResponse = serde_json::from_str(json).unwrap();
         assert!(response.token.starts_with("test-token"));
+    }
+
+    #[rstest]
+    fn test_serialize_cancel_all_orders_request() {
+        let request = CancelAllOrdersRequest::new()
+            .with_account_id(Ustr::from("account-1"))
+            .with_symbol(Ustr::from("XAU-PERP"));
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["account_id"], "account-1");
+        assert_eq!(value["symbol"], "XAU-PERP");
+        assert!(value.get("execution_venue").is_none());
     }
 
     #[rstest]
@@ -1352,6 +1300,9 @@ mod tests {
         assert_eq!(response.orders[0].d, AxOrderSide::Buy);
         assert_eq!(response.orders[0].o, AxOrderStatus::Accepted);
         assert_eq!(response.orders[1].xq, 300);
+        assert_eq!(response.total_count, 2);
+        assert_eq!(response.limit, 100);
+        assert_eq!(response.offset, 0);
     }
 
     #[rstest]
@@ -1362,6 +1313,11 @@ mod tests {
         assert_eq!(response.fills[0].side, AxOrderSide::Buy);
         assert!(response.fills[0].is_taker);
         assert!(!response.fills[1].is_taker);
+        assert_eq!(response.fills[0].is_block_trade, Some(false));
+        assert_eq!(response.fills[0].is_final_settlement, Some(false));
+        assert_eq!(response.total_count, Some(2));
+        assert_eq!(response.limit, Some(100));
+        assert_eq!(response.next_cursor, None);
     }
 
     #[rstest]
@@ -1386,8 +1342,8 @@ mod tests {
         let json = include_str!("../../test_data/http_get_risk_snapshot.json");
         let response: AxRiskSnapshotResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            response.risk_snapshot.user_id,
-            "3c90c3cc-0d44-4b50-8888-8dd25736052a"
+            response.risk_snapshot.account_id,
+            Ustr::from("3c90c3cc-0d44-4b50-8888-8dd25736052a")
         );
         assert_eq!(response.risk_snapshot.per_symbol.len(), 2);
         assert!(
@@ -1395,6 +1351,10 @@ mod tests {
                 .risk_snapshot
                 .per_symbol
                 .contains_key("EURUSD-PERP")
+        );
+        assert_eq!(
+            response.risk_snapshot.per_symbol["GBPUSD-PERP"].average_price,
+            None
         );
     }
 
@@ -1405,10 +1365,7 @@ mod tests {
         assert_eq!(response.transactions.len(), 2);
         assert_eq!(response.total_count, Some(2));
         assert_eq!(response.limit, Some(100));
-        assert_eq!(
-            response.transactions[0].account_id,
-            Some(Ustr::from("account-1"))
-        );
+        assert_eq!(response.transactions[0].account_id, Ustr::from("account-1"));
         assert_eq!(response.transactions[0].transaction_type, "deposit");
         assert!(response.transactions[0].initiated_by_user_id.is_some());
         assert!(response.transactions[1].reference_id.is_none());
@@ -1529,16 +1486,6 @@ mod tests {
         let request = ReplaceOrderRequest::new("O-TEST");
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["oid"], "O-TEST");
-        assert!(json.get("p").is_none());
-        assert!(json.get("q").is_none());
-    }
-
-    #[rstest]
-    fn test_replace_order_request_with_trigger_price() {
-        let request = ReplaceOrderRequest::new("O-STOP").with_trigger_price(Decimal::new(49000, 0));
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["oid"], "O-STOP");
-        assert_eq!(json["trigger_price"], "49000");
         assert!(json.get("p").is_none());
         assert!(json.get("q").is_none());
     }

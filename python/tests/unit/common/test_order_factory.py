@@ -44,6 +44,22 @@ EXEC_ALGORITHM_ID = ExecAlgorithmId("VWAP")
 EXEC_ALGORITHM_PARAMS = {"speed": "fast"}
 
 
+def test_order_factory_exposes_read_only_identity():
+    factory = _factory()
+
+    trader_id = factory.trader_id
+    strategy_id = factory.strategy_id
+
+    with pytest.raises(AttributeError):
+        factory.trader_id = TraderId("TRADER-999")
+
+    with pytest.raises(AttributeError):
+        factory.strategy_id = StrategyId("S-999")
+
+    assert trader_id == TraderId("TRADER-001")
+    assert strategy_id == StrategyId("S-001")
+
+
 def test_order_factory_generates_and_resets_ids():
     factory = _factory()
 

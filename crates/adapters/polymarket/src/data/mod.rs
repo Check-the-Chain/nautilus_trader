@@ -84,7 +84,7 @@ use crate::{
     providers::PolymarketInstrumentProvider,
     resolve::ResolveWatchEntry,
     rtds::{PolymarketRtdsFeed, is_supported_rtds_data_type},
-    websocket::client::PolymarketWebSocketClient,
+    websocket::pool::PolymarketMarketConnectionPool,
 };
 
 const NEW_MARKET_FETCH_MAX_CONCURRENCY_CAP: usize = 64;
@@ -110,7 +110,7 @@ pub struct PolymarketDataClient {
     provider: PolymarketInstrumentProvider,
     clob_public_client: PolymarketClobPublicClient,
     data_api_client: PolymarketDataApiHttpClient,
-    ws_client: PolymarketWebSocketClient,
+    ws_client: PolymarketMarketConnectionPool,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
@@ -143,7 +143,7 @@ impl PolymarketDataClient {
         gamma_client: PolymarketGammaHttpClient,
         clob_public_client: PolymarketClobPublicClient,
         data_api_client: PolymarketDataApiHttpClient,
-        ws_client: PolymarketWebSocketClient,
+        ws_client: PolymarketMarketConnectionPool,
     ) -> Self {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
@@ -290,7 +290,7 @@ impl PolymarketDataClient {
         let active_trade_subs = self.active_trade_subs.clone();
         let ws_open_tokens = self.ws_open_tokens.clone();
         let ws_sub_mutex = self.ws_sub_mutex.clone();
-        let ws = self.ws_client.clone_subscription_handle();
+        let ws = self.ws_client.handle();
 
         get_runtime().spawn(sync_ws_subscription_async(
             instrument_id,

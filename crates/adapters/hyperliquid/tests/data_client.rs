@@ -46,9 +46,10 @@ use nautilus_common::{
     messages::{
         DataEvent, DataResponse,
         data::{
-            RequestBookSnapshot, RequestFundingRates, RequestInstrument, RequestInstruments,
-            RequestTrades, SubscribeBookDeltas, SubscribeCustomData, SubscribeMarkPrices,
-            SubscribeQuotes, SubscribeTrades, UnsubscribeCustomData, UnsubscribeMarkPrices,
+            RequestBookSnapshot, RequestCustomData, RequestFundingRates, RequestInstrument,
+            RequestInstruments, RequestTrades, SubscribeBookDeltas, SubscribeCustomData,
+            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, UnsubscribeCustomData,
+            UnsubscribeMarkPrices,
         },
     },
     testing::wait_until_async,
@@ -61,14 +62,14 @@ use nautilus_hyperliquid::{
     },
     config::HyperliquidDataClientConfig,
     data::HyperliquidDataClient,
-    data_types::{HyperliquidAllDexsAssetCtxs, HyperliquidOpenInterest},
+    data_types::{HyperliquidAllDexsAssetCtxs, HyperliquidOpenInterest, HyperliquidPublicTrade},
     http::{
         models::{HyperliquidL2Book, PerpMeta},
         query::InfoRequest,
     },
 };
 use nautilus_model::{
-    data::{Data, DataType},
+    data::{CustomData, Data, DataType},
     enums::BookType,
     identifiers::InstrumentId,
     instruments::Instrument,
@@ -130,6 +131,14 @@ impl Log for CapturingWarnLogger {
 }
 
 static CAPTURING_WARN_LOGGER: OnceLock<CapturingWarnLogger> = OnceLock::new();
+static STALE_LOG_CAPTURE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn lock_stale_log_capture() -> tokio::sync::MutexGuard<'static, ()> {
+    STALE_LOG_CAPTURE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 fn install_capturing_warn_logger() -> &'static CapturingWarnLogger {
     let logger = CAPTURING_WARN_LOGGER.get_or_init(CapturingWarnLogger::default);
@@ -660,6 +669,19 @@ fn open_interest_data_type(instrument_id: InstrumentId) -> DataType {
     )
 }
 
+fn public_trade_data_type(instrument_id: InstrumentId) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "instrument_id".to_string(),
+        serde_json::Value::String(instrument_id.to_string()),
+    );
+    DataType::new(
+        "HyperliquidPublicTrade",
+        Some(metadata),
+        Some(instrument_id.to_string()),
+    )
+}
+
 async fn drain_initial_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>) {
     wait_until_async(
         || {
@@ -685,6 +707,23 @@ async fn wait_for_open_interest_event(
             let found = rx
                 .try_recv()
                 .is_ok_and(|event| is_open_interest_event(event, instrument_id, &data_type));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+async fn wait_for_public_trade_event(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    instrument_id: InstrumentId,
+    data_type: DataType,
+) {
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|event| is_public_trade_event(event, instrument_id, &data_type));
             async move { found }
         },
         Duration::from_secs(5),
@@ -731,6 +770,26 @@ fn is_open_interest_event(
         .is_some_and(|open_interest| {
             open_interest.instrument_id == instrument_id
                 && open_interest.open_interest.to_string() == "1500.0"
+                && custom.data_type == *data_type
+        })
+}
+
+fn is_public_trade_event(
+    event: DataEvent,
+    instrument_id: InstrumentId,
+    data_type: &DataType,
+) -> bool {
+    let DataEvent::Data(Data::Custom(custom)) = event else {
+        return false;
+    };
+
+    custom
+        .data
+        .as_any()
+        .downcast_ref::<HyperliquidPublicTrade>()
+        .is_some_and(|trade| {
+            trade.instrument_id == instrument_id
+                && trade.trade_id == "100001"
                 && custom.data_type == *data_type
         })
 }
@@ -1393,6 +1452,7 @@ async fn test_data_client_subscribe_book_deltas() {
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_data_client_reports_stale_book_deltas_while_quotes_flow() {
+    let _capture_guard = lock_stale_log_capture().await;
     let logger = install_capturing_warn_logger();
     let state = TestServerState::default();
     *state.withhold_l2_book.lock().await = true;
@@ -1506,6 +1566,7 @@ async fn test_data_client_reports_stale_book_deltas_while_quotes_flow() {
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_data_client_stale_book_recovery_escalates_to_reconnect() {
+    let _capture_guard = lock_stale_log_capture().await;
     let logger = install_capturing_warn_logger();
     let state = TestServerState::default();
     *state.withhold_l2_book.lock().await = true;
@@ -1612,6 +1673,7 @@ async fn test_data_client_stale_book_recovery_escalates_to_reconnect() {
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_data_client_stale_quote_recovery_heals_without_reconnect() {
+    let _capture_guard = lock_stale_log_capture().await;
     let logger = install_capturing_warn_logger();
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
@@ -1941,6 +2003,136 @@ async fn test_data_client_request_trades() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_request_public_trades() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    let mut metadata = Params::new();
+    metadata.insert(
+        "instrument_id".to_string(),
+        serde_json::Value::String(instrument_id.to_string()),
+    );
+    let data_type = DataType::new("HyperliquidPublicTrade", Some(metadata), None);
+    client
+        .request_data(RequestCustomData::new(
+            *HYPERLIQUID_CLIENT_ID,
+            data_type.clone(),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout waiting for public trades response")
+        .expect("channel closed");
+
+    let DataEvent::Response(DataResponse::Data(response)) = event else {
+        panic!("Expected custom data response");
+    };
+    let trades = response
+        .data
+        .as_ref()
+        .downcast_ref::<Vec<CustomData>>()
+        .expect("expected Vec<CustomData> payload");
+    let trade = trades
+        .first()
+        .expect("expected public trade")
+        .data
+        .as_any()
+        .downcast_ref::<HyperliquidPublicTrade>()
+        .expect("expected HyperliquidPublicTrade");
+    let expected_identifier = instrument_id.to_string();
+
+    assert_eq!(data_type.identifier(), None);
+    assert_eq!(response.data_type.type_name(), data_type.type_name());
+    assert_eq!(response.data_type.metadata(), data_type.metadata());
+    assert_eq!(
+        response.data_type.identifier(),
+        Some(expected_identifier.as_str()),
+    );
+
+    for custom in trades {
+        assert_eq!(custom.data_type.type_name(), data_type.type_name());
+        assert_eq!(custom.data_type.metadata(), data_type.metadata());
+        assert_eq!(
+            custom.data_type.identifier(),
+            Some(expected_identifier.as_str()),
+        );
+    }
+    assert_eq!(trades.len(), 3);
+    assert_eq!(trade.trade_id, "300001");
+    assert_eq!(trade.buyer, "0xbuyer1");
+    assert_eq!(trade.seller, "0xseller1");
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_client_request_public_trades_endpoint_unavailable() {
+    // `request_public_trades` is shared by the Rust data client and the PyO3
+    // HTTP surface. A 422 from a node without the indexer must still complete
+    // the custom-data request with an empty response.
+    let state = TestServerState::default();
+    *state.recent_trades_unavailable.lock().await = true;
+    let addr = start_mock_server(state).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+
+    let config = create_data_client_config(addr);
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    client
+        .request_data(RequestCustomData::new(
+            *HYPERLIQUID_CLIENT_ID,
+            public_trade_data_type(instrument_id),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout waiting for public trades response")
+        .expect("channel closed");
+
+    let DataEvent::Response(DataResponse::Data(response)) = event else {
+        panic!("Expected custom data response");
+    };
+    let trades = response
+        .data
+        .as_ref()
+        .downcast_ref::<Vec<CustomData>>()
+        .expect("expected Vec<CustomData> payload");
+    assert!(trades.is_empty(), "422 should yield an empty response");
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_data_client_request_trades_endpoint_unavailable() {
     // A node without the indexer returns HTTP 422 for `recentTrades`; the
     // client must still emit an empty `TradesResponse` rather than erroring.
@@ -2211,56 +2403,51 @@ async fn test_data_client_disconnect_stops_event_flow() {
     );
 }
 
-// `reset()` on a connected client with a live ws stream and an in-flight
-// subscribe handle must succeed without panic and leave the client in a
-// state where `connect()` is permitted again (matching the pre-existing
-// `reset()` contract). The existing `test_data_client_reset_clears_state`
-// never spawns the ws task before reset and so leaves the new branches
-// (`abort_pending_tasks` + `ws_stream_handle.take().abort()`) untested.
-//
-// Note: full data-flow restart after reset is not asserted because
-// `reset()` does not currently disconnect the inner `HyperliquidWebSocketClient`;
-// `disconnect()` is the supported path for that.
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_data_client_reset_after_subscribe_clears_state() {
+async fn test_data_client_reset_recreates_public_trade_stream() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
     set_data_event_sender(tx);
 
     let config = create_data_client_config(addr);
     let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
-    client.connect().await.unwrap();
-
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+    let data_type = public_trade_data_type(instrument_id);
+
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
     client
-        .subscribe_trades(SubscribeTrades::new(
-            instrument_id,
+        .subscribe(SubscribeCustomData::new(
             Some(*HYPERLIQUID_CLIENT_ID),
             None,
+            data_type.clone(),
             UUID4::new(),
             UnixNanos::default(),
             None,
             None,
         ))
         .unwrap();
+    wait_for_public_trade_event(&mut rx, instrument_id, data_type.clone()).await;
 
-    // Reset must succeed even with a live ws stream handle and an
-    // in-flight pending subscribe task outstanding. This exercises both
-    // `abort_pending_tasks()` and the `ws_stream_handle.take().abort()`
-    // branch added in `reset()`.
     client.reset().unwrap();
     assert!(!client.is_connected());
 
-    // The client must be willing to accept a fresh connect after reset;
-    // a stale cancellation token or undropped stream handle would surface
-    // here as a hang or error.
-    let reconnect = tokio::time::timeout(Duration::from_secs(5), client.connect())
-        .await
-        .expect("connect after reset must complete promptly");
-    reconnect.unwrap();
-    assert!(client.is_connected());
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    wait_for_public_trade_event(&mut rx, instrument_id, data_type).await;
 
     client.disconnect().await.unwrap();
 }

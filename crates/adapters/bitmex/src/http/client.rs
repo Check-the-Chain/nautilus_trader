@@ -1937,6 +1937,10 @@ impl BitmexHttpClient {
         let mut reports = Vec::new();
 
         for order in orders {
+            if is_cancel_all_rejection(&order) {
+                continue;
+            }
+
             reports.push(parse_order_status_report(
                 &order,
                 &instrument,
@@ -2718,6 +2722,15 @@ impl BitmexHttpClient {
     }
 }
 
+fn is_cancel_all_rejection(order: &BitmexOrder) -> bool {
+    order.ord_status == Some(BitmexOrderStatus::Rejected)
+        && order.ord_rej_reason.as_deref() == Some("Invalid orderID")
+        && order.cl_ord_id.is_none()
+        && order.order_qty.is_none()
+        && order.leaves_qty.is_none()
+        && order.cum_qty.is_none()
+}
+
 fn parse_order_book_l2_snapshot(
     rows: &[BitmexOrderBookL2],
     instrument: &InstrumentAny,
@@ -2955,6 +2968,38 @@ mod tests {
         let err = account_id_from_margins(&margins).unwrap_err();
 
         assert!(err.to_string().contains("inconsistent margin account IDs"));
+    }
+
+    #[rstest]
+    fn test_cancel_all_rejection_requires_unavailable_order_shape() {
+        let unavailable: BitmexOrder = serde_json::from_str(include_str!(
+            "../../test_data/http_cancel_all_close_race.json"
+        ))
+        .unwrap();
+        let mut with_client_id = unavailable.clone();
+        with_client_id.cl_ord_id = Some(Ustr::from("tracked-rejection"));
+        let mut with_order_qty = unavailable.clone();
+        with_order_qty.order_qty = Some(100);
+        let mut with_leaves_qty = unavailable.clone();
+        with_leaves_qty.leaves_qty = Some(0);
+        let mut with_cum_qty = unavailable.clone();
+        with_cum_qty.cum_qty = Some(0);
+        let mut with_other_reason = unavailable.clone();
+        with_other_reason.ord_rej_reason = Some(Ustr::from("Insufficient margin"));
+
+        let unavailable_result = is_cancel_all_rejection(&unavailable);
+        let preserved = [
+            ("client order ID", with_client_id),
+            ("order quantity", with_order_qty),
+            ("leaves quantity", with_leaves_qty),
+            ("cumulative quantity", with_cum_qty),
+            ("different rejection reason", with_other_reason),
+        ];
+
+        assert!(unavailable_result);
+        for (case, order) in preserved {
+            assert!(!is_cancel_all_rejection(&order), "preserved {case}");
+        }
     }
 
     #[rstest]
