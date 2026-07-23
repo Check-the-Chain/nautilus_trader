@@ -14,6 +14,7 @@ __all__ = [
     "TardisDataClientFactory",
     "TardisDeltaStreamIterator",
     "TardisDepth10StreamIterator",
+    "TardisDerivativeTickerStreamIterator",
     "TardisFundingRateStreamIterator",
     "TardisHttpClient",
     "TardisInstrumentMiniInfo",
@@ -26,6 +27,7 @@ __all__ = [
     "load_tardis_deltas",
     "load_tardis_depth10_from_snapshot5",
     "load_tardis_depth10_from_snapshot25",
+    "load_tardis_derivative_ticker",
     "load_tardis_funding_rates",
     "load_tardis_options_chain",
     "load_tardis_quotes",
@@ -35,6 +37,7 @@ __all__ = [
     "stream_tardis_deltas",
     "stream_tardis_depth10_from_snapshot5",
     "stream_tardis_depth10_from_snapshot25",
+    "stream_tardis_derivative_ticker",
     "stream_tardis_funding_rates",
     "stream_tardis_options_chain",
     "stream_tardis_quotes",
@@ -104,6 +107,11 @@ class TardisDeltaStreamIterator:
 class TardisDepth10StreamIterator:
     def __iter__(self) -> TardisDepth10StreamIterator: ...
     def __next__(self) -> list[model.OrderBookDepth10] | None: ...
+
+@typing.final
+class TardisDerivativeTickerStreamIterator:
+    def __iter__(self) -> TardisDerivativeTickerStreamIterator: ...
+    def __next__(self) -> list[typing.Any] | None: ...
 
 @typing.final
 class TardisFundingRateStreamIterator:
@@ -237,6 +245,12 @@ def load_tardis_depth10_from_snapshot5(
     instrument_id: model.InstrumentId | None = None,
     limit: int | None = None,
 ) -> list[model.OrderBookDepth10]: ...
+def load_tardis_derivative_ticker(
+    filepath: str | os.PathLike | pathlib.Path,
+    price_precision: int,
+    instrument_id: model.InstrumentId,
+    limit: int | None = None,
+) -> list[typing.Any]: ...
 def load_tardis_funding_rates(
     filepath: str | os.PathLike | pathlib.Path,
     instrument_id: model.InstrumentId | None = None,
@@ -296,6 +310,13 @@ def stream_tardis_depth10_from_snapshot5(
     instrument_id: model.InstrumentId | None = None,
     limit: int | None = None,
 ) -> TardisDepth10StreamIterator: ...
+def stream_tardis_derivative_ticker(
+    filepath: str | os.PathLike | pathlib.Path,
+    price_precision: int,
+    instrument_id: model.InstrumentId,
+    chunk_size: int = 100000,
+    limit: int | None = None,
+) -> TardisDerivativeTickerStreamIterator: ...
 def stream_tardis_funding_rates(
     filepath: str | os.PathLike | pathlib.Path,
     chunk_size: int = 100000,

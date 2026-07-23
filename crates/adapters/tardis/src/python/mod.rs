@@ -96,6 +96,7 @@ pub fn tardis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<csv::TardisBatchedDeltasStreamIterator>()?;
     m.add_class::<csv::TardisDeltaStreamIterator>()?;
     m.add_class::<csv::TardisDepth10StreamIterator>()?;
+    m.add_class::<csv::TardisDerivativeTickerStreamIterator>()?;
     m.add_class::<csv::TardisFundingRateStreamIterator>()?;
     m.add_class::<csv::TardisOptionsChainStreamIterator>()?;
     m.add_class::<csv::TardisQuoteStreamIterator>()?;
@@ -134,6 +135,7 @@ pub fn tardis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_quotes, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_trades, m)?)?;
+    m.add_function(wrap_pyfunction!(csv::py_load_tardis_derivative_ticker, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_options_chain, m)?)?;
     m.add_function(wrap_pyfunction!(
         csv::py_convert_tardis_options_chain_csv,
@@ -142,6 +144,10 @@ pub fn tardis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_deltas, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_batched_deltas, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_quotes, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        csv::py_stream_tardis_derivative_ticker,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_options_chain, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_trades, m)?)?;
     m.add_function(wrap_pyfunction!(

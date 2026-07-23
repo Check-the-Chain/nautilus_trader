@@ -25,13 +25,13 @@ use pyo3::prelude::*;
 use crate::csv::{
     convert::{TardisOptionsChainCSVConverterConfig, convert_options_chain_csv},
     load::{
-        load_deltas, load_depth10_from_snapshot5, load_depth10_from_snapshot25, load_funding_rates,
-        load_options_chain, load_quotes, load_trades,
+        load_deltas, load_depth10_from_snapshot5, load_depth10_from_snapshot25,
+        load_derivative_ticker, load_funding_rates, load_options_chain, load_quotes, load_trades,
     },
     stream::{
         stream_batched_deltas, stream_deltas, stream_depth10_from_snapshot5,
-        stream_depth10_from_snapshot25, stream_funding_rates, stream_options_chain, stream_quotes,
-        stream_trades,
+        stream_depth10_from_snapshot25, stream_derivative_ticker, stream_funding_rates,
+        stream_options_chain, stream_quotes, stream_trades,
     },
 };
 
@@ -73,6 +73,17 @@ fn options_chain_data_to_pyobject(py: Python<'_>, data: Data) -> PyResult<Py<PyA
         Data::OptionGreeks(greeks) => Py::new(py, greeks).map(|value| value.into_any()),
         data => Err(to_pyvalue_err(format!(
             "Unsupported options_chain data type: {data:?}"
+        ))),
+    }
+}
+
+fn derivative_ticker_data_to_pyobject(py: Python<'_>, data: Data) -> PyResult<Py<PyAny>> {
+    match data {
+        Data::FundingRateUpdate(update) => Py::new(py, update).map(|value| value.into_any()),
+        Data::MarkPriceUpdate(update) => Py::new(py, update).map(|value| value.into_any()),
+        Data::IndexPriceUpdate(update) => Py::new(py, update).map(|value| value.into_any()),
+        data => Err(to_pyvalue_err(format!(
+            "Unsupported derivative ticker data type: {data:?}"
         ))),
     }
 }
@@ -204,6 +215,29 @@ pub fn py_load_tardis_funding_rates(
     limit: Option<usize>,
 ) -> PyResult<Vec<FundingRateUpdate>> {
     load_funding_rates(filepath, instrument_id, limit).map_err(to_pyvalue_err)
+}
+
+/// Loads native funding rate, mark price, and index price updates from a Tardis derivative ticker
+/// CSV file.
+///
+/// # Errors
+///
+/// Returns a Python error if loading or parsing the CSV file fails.
+#[pyfunction(name = "load_tardis_derivative_ticker")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.tardis")]
+#[pyo3(signature = (filepath, price_precision, instrument_id, limit=None))]
+pub fn py_load_tardis_derivative_ticker(
+    py: Python<'_>,
+    filepath: PathBuf,
+    price_precision: u8,
+    instrument_id: InstrumentId,
+    limit: Option<usize>,
+) -> PyResult<Vec<Py<PyAny>>> {
+    load_derivative_ticker(filepath, price_precision, instrument_id, limit)
+        .map_err(to_pyvalue_err)?
+        .into_iter()
+        .map(|data| derivative_ticker_data_to_pyobject(py, data))
+        .collect()
 }
 
 /// # Errors
@@ -463,6 +497,63 @@ pub fn py_stream_tardis_options_chain(
     .map_err(to_pyvalue_err)?;
 
     Ok(TardisOptionsChainStreamIterator {
+        stream: Box::new(stream),
+    })
+}
+
+#[pyclass(unsendable)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.tardis")]
+pub struct TardisDerivativeTickerStreamIterator {
+    stream: Box<dyn Iterator<Item = anyhow::Result<Vec<Data>>>>,
+}
+
+impl Debug for TardisDerivativeTickerStreamIterator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TardisDerivativeTickerStreamIterator {{ stream: ... }}")
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl TardisDerivativeTickerStreamIterator {
+    const fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyAny>>>> {
+        match self.stream.next() {
+            Some(Ok(chunk)) => chunk
+                .into_iter()
+                .map(|data| derivative_ticker_data_to_pyobject(py, data))
+                .collect::<PyResult<Vec<_>>>()
+                .map(Some),
+            Some(Err(e)) => Err(to_pyvalue_err(e)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Streams native funding rate, mark price, and index price updates from a Tardis derivative
+/// ticker CSV file.
+///
+/// # Errors
+///
+/// Returns a Python error if loading or parsing the CSV file fails.
+#[pyfunction(name = "stream_tardis_derivative_ticker")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.tardis")]
+#[pyo3(signature = (filepath, price_precision, instrument_id, chunk_size=100_000, limit=None))]
+pub fn py_stream_tardis_derivative_ticker(
+    filepath: PathBuf,
+    price_precision: u8,
+    instrument_id: InstrumentId,
+    chunk_size: usize,
+    limit: Option<usize>,
+) -> PyResult<TardisDerivativeTickerStreamIterator> {
+    let stream =
+        stream_derivative_ticker(filepath, chunk_size, price_precision, instrument_id, limit)
+            .map_err(to_pyvalue_err)?;
+
+    Ok(TardisDerivativeTickerStreamIterator {
         stream: Box::new(stream),
     })
 }

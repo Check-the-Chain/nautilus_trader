@@ -29,13 +29,13 @@ use std::{
 use csv::{Reader, ReaderBuilder};
 use flate2::read::GzDecoder;
 pub use load::{
-    load_deltas, load_depth10_from_snapshot5, load_depth10_from_snapshot25, load_funding_rates,
-    load_options_chain, load_quotes, load_trades,
+    load_deltas, load_depth10_from_snapshot5, load_depth10_from_snapshot25, load_derivative_ticker,
+    load_funding_rates, load_options_chain, load_quotes, load_trades,
 };
 use nautilus_model::{
     data::{
-        BookOrder, FundingRateUpdate, NULL_ORDER, OptionGreekValues, OptionGreeks, OrderBookDelta,
-        QuoteTick, TradeTick,
+        BookOrder, Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, NULL_ORDER,
+        OptionGreekValues, OptionGreeks, OrderBookDelta, QuoteTick, TradeTick,
     },
     enums::{BookAction, GreeksConvention, OrderSide},
     identifiers::{InstrumentId, TradeId},
@@ -44,7 +44,8 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 pub use stream::{
     stream_deltas, stream_depth10_from_snapshot5, stream_depth10_from_snapshot25,
-    stream_funding_rates, stream_options_chain, stream_quotes, stream_trades,
+    stream_derivative_ticker, stream_funding_rates, stream_options_chain, stream_quotes,
+    stream_trades,
 };
 
 use super::csv::record::{
@@ -316,11 +317,7 @@ fn parse_derivative_ticker_record(
     };
 
     let rate = Decimal::try_from(funding_rate).ok()?;
-    let next_funding_ns = if data.predicted_funding_rate.is_some() {
-        data.funding_timestamp.map(parse_timestamp)
-    } else {
-        None
-    };
+    let next_funding_ns = data.funding_timestamp.map(parse_timestamp);
     let ts_event = parse_timestamp(data.timestamp);
     let ts_init = parse_timestamp(data.local_timestamp);
 
@@ -332,6 +329,40 @@ fn parse_derivative_ticker_record(
         ts_event,
         ts_init,
     ))
+}
+
+fn parse_derivative_ticker_record_data(
+    data: &TardisDerivativeTickerRecord,
+    price_precision: u8,
+    instrument_id: InstrumentId,
+) -> Vec<Data> {
+    let ts_event = parse_timestamp(data.timestamp);
+    let ts_init = parse_timestamp(data.local_timestamp);
+    let mut output = Vec::with_capacity(3);
+
+    if let Some(funding) = parse_derivative_ticker_record(data, Some(instrument_id)) {
+        output.push(Data::FundingRateUpdate(funding));
+    }
+
+    if let Some(mark_price) = data.mark_price {
+        output.push(Data::MarkPriceUpdate(MarkPriceUpdate::new(
+            instrument_id,
+            parse_price(mark_price, price_precision),
+            ts_event,
+            ts_init,
+        )));
+    }
+
+    if let Some(index_price) = data.index_price {
+        output.push(Data::IndexPriceUpdate(IndexPriceUpdate::new(
+            instrument_id,
+            parse_price(index_price, price_precision),
+            ts_event,
+            ts_init,
+        )));
+    }
+
+    output
 }
 
 fn parse_options_chain_record(

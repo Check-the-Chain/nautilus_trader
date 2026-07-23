@@ -33,8 +33,8 @@ use crate::{
     csv::{
         create_book_order, create_csv_reader, infer_precision, matches_underlying_filter,
         normalize_underlying_filters, parse_delta_record, parse_derivative_ticker_record,
-        parse_options_chain_record, parse_options_chain_record_as_quote, parse_quote_record,
-        parse_trade_record,
+        parse_derivative_ticker_record_data, parse_options_chain_record,
+        parse_options_chain_record_as_quote, parse_quote_record, parse_trade_record,
         record::{
             TardisBookUpdateRecord, TardisDerivativeTickerRecord, TardisOptionsChainRecord,
             TardisOrderBookSnapshot5Record, TardisOrderBookSnapshot25Record, TardisQuoteRecord,
@@ -795,6 +795,41 @@ pub fn load_funding_rates<P: AsRef<Path>>(
     Ok(funding_rates)
 }
 
+/// Loads funding rate, mark price, and index price updates from a Tardis format derivative ticker
+/// CSV at the given `filepath`, automatically applying `GZip` decompression for files ending in
+/// ".gz".
+///
+/// The `limit` counts input CSV rows. Each row can emit up to three [`Data`] objects, ordered as
+/// funding rate, mark price, then index price.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, read, or parsed as CSV.
+pub fn load_derivative_ticker<P: AsRef<Path>>(
+    filepath: P,
+    price_precision: u8,
+    instrument_id: InstrumentId,
+    limit: Option<usize>,
+) -> Result<Vec<Data>, Box<dyn Error>> {
+    let estimated_rows = limit.unwrap_or(100_000).min(1_000_000);
+    let mut output = Vec::with_capacity(estimated_rows.saturating_mul(3));
+    let mut reader = create_csv_reader(filepath)?;
+    let mut record = StringRecord::new();
+    let mut rows_processed = 0;
+
+    while limit.is_none_or(|limit| rows_processed < limit) && reader.read_record(&mut record)? {
+        let data: TardisDerivativeTickerRecord = record.deserialize(None)?;
+        output.extend(parse_derivative_ticker_record_data(
+            &data,
+            price_precision,
+            instrument_id,
+        ));
+        rows_processed += 1;
+    }
+
+    Ok(output)
+}
+
 /// Loads option chain rows from a Tardis `options_chain` CSV file.
 ///
 /// Returns quote ticks before option greeks for rows with a complete best bid/offer. Rows missing
@@ -1135,6 +1170,55 @@ binance-futures,BTCUSDT,1640995204000000,1640995204100000,false,ask,50000.1234,0
         assert_eq!(greeks.greeks.delta, -0.61752);
         assert_eq!(greeks.mark_iv, Some(62.89));
         assert_eq!(greeks.underlying_price, Some(9756.36));
+    }
+
+    #[rstest]
+    fn test_load_derivative_ticker_emits_native_updates_in_row_order() {
+        let filepath = get_test_data_path("csv/derivative_ticker_1.csv");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.TEST");
+        let data = load_derivative_ticker(filepath, 2, instrument_id, None).unwrap();
+
+        assert_eq!(data.len(), 6);
+        for row in data.chunks_exact(3) {
+            let Data::FundingRateUpdate(funding) = &row[0] else {
+                panic!("Expected FundingRateUpdate, was {:?}", row[0]);
+            };
+            let Data::MarkPriceUpdate(mark) = &row[1] else {
+                panic!("Expected MarkPriceUpdate, was {:?}", row[1]);
+            };
+            let Data::IndexPriceUpdate(index) = &row[2] else {
+                panic!("Expected IndexPriceUpdate, was {:?}", row[2]);
+            };
+
+            assert_eq!(funding.instrument_id, instrument_id);
+            assert_eq!(mark.instrument_id, instrument_id);
+            assert_eq!(index.instrument_id, instrument_id);
+        }
+
+        let Data::MarkPriceUpdate(first_mark) = &data[1] else {
+            unreachable!();
+        };
+        let Data::IndexPriceUpdate(first_index) = &data[2] else {
+            unreachable!();
+        };
+        assert_eq!(first_mark.value, Price::from("9500.25"));
+        assert_eq!(first_index.value, Price::from("9500.00"));
+    }
+
+    #[rstest]
+    fn test_load_funding_rates_preserves_timestamp_without_prediction() {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let csv_data = "exchange,symbol,timestamp,local_timestamp,funding_timestamp,funding_rate,predicted_funding_rate,open_interest,last_price,index_price,mark_price
+binance-futures,BTCUSDT,1583020803145000,1583020803307160,1583024400000000,0.0001,,,,9500.0,9500.25";
+        fs::write(temp_file.path(), csv_data).unwrap();
+
+        let updates = load_funding_rates(temp_file.path(), None, None).unwrap();
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].next_funding_ns,
+            Some(UnixNanos::from(1_583_024_400_000_000_000))
+        );
     }
 
     #[rstest]

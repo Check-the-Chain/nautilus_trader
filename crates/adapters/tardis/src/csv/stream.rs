@@ -38,11 +38,13 @@ use crate::{
         create_book_order, create_csv_reader, infer_precision,
         load::OptionsChainPrecision,
         matches_underlying_filter, normalize_underlying_filters, parse_delta_record,
-        parse_derivative_ticker_record, parse_options_chain_record,
-        parse_options_chain_record_as_quote, parse_quote_record, parse_trade_record,
+        parse_derivative_ticker_record, parse_derivative_ticker_record_data,
+        parse_options_chain_record, parse_options_chain_record_as_quote, parse_quote_record,
+        parse_trade_record,
         record::{
-            TardisBookUpdateRecord, TardisOptionsChainRecord, TardisOrderBookSnapshot5Record,
-            TardisOrderBookSnapshot25Record, TardisQuoteRecord, TardisTradeRecord,
+            TardisBookUpdateRecord, TardisDerivativeTickerRecord, TardisOptionsChainRecord,
+            TardisOrderBookSnapshot5Record, TardisOrderBookSnapshot25Record, TardisQuoteRecord,
+            TardisTradeRecord,
         },
     },
 };
@@ -1583,12 +1585,131 @@ pub fn stream_depth10_from_snapshot25<P: AsRef<Path>>(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Derivative ticker streaming
+////////////////////////////////////////////////////////////////////////////////
+
+/// An iterator over Tardis derivative ticker rows that yields native data in chunks.
+struct DerivativeTickerStreamIterator {
+    reader: Reader<Box<dyn Read>>,
+    record: StringRecord,
+    buffer: Vec<Data>,
+    chunk_size: usize,
+    price_precision: u8,
+    instrument_id: InstrumentId,
+    limit: Option<usize>,
+    rows_processed: usize,
+}
+
+impl DerivativeTickerStreamIterator {
+    /// Creates a new [`DerivativeTickerStreamIterator`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `chunk_size` is zero or the file cannot be opened or read.
+    fn new<P: AsRef<Path>>(
+        filepath: P,
+        chunk_size: usize,
+        price_precision: u8,
+        instrument_id: InstrumentId,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(chunk_size > 0, "chunk_size must be positive");
+
+        Ok(Self {
+            reader: create_csv_reader(filepath)?,
+            record: StringRecord::new(),
+            buffer: Vec::with_capacity(chunk_size.saturating_mul(3)),
+            chunk_size,
+            price_precision,
+            instrument_id,
+            limit,
+            rows_processed: 0,
+        })
+    }
+}
+
+impl Iterator for DerivativeTickerStreamIterator {
+    type Item = anyhow::Result<Vec<Data>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.limit.is_some_and(|limit| self.rows_processed >= limit) {
+                return None;
+            }
+
+            self.buffer.clear();
+            let mut rows_read = 0;
+
+            while rows_read < self.chunk_size
+                && self.limit.is_none_or(|limit| self.rows_processed < limit)
+            {
+                match self.reader.read_record(&mut self.record) {
+                    Ok(true) => {
+                        let data = match self
+                            .record
+                            .deserialize::<TardisDerivativeTickerRecord>(None)
+                        {
+                            Ok(data) => data,
+                            Err(e) => {
+                                return Some(Err(anyhow::anyhow!(
+                                    "Failed to deserialize derivative ticker record: {e}"
+                                )));
+                            }
+                        };
+
+                        self.buffer.extend(parse_derivative_ticker_record_data(
+                            &data,
+                            self.price_precision,
+                            self.instrument_id,
+                        ));
+                        rows_read += 1;
+                        self.rows_processed += 1;
+                    }
+                    Ok(false) => {
+                        return if self.buffer.is_empty() {
+                            None
+                        } else {
+                            Some(Ok(std::mem::take(&mut self.buffer)))
+                        };
+                    }
+                    Err(e) => {
+                        return Some(Err(anyhow::anyhow!(
+                            "Failed to read derivative ticker record: {e}"
+                        )));
+                    }
+                }
+            }
+
+            if !self.buffer.is_empty() {
+                return Some(Ok(std::mem::take(&mut self.buffer)));
+            }
+        }
+    }
+}
+
+/// Streams funding rate, mark price, and index price updates from a Tardis derivative ticker CSV.
+///
+/// The `chunk_size` and `limit` count input CSV rows. Each row can emit up to three [`Data`]
+/// objects, ordered as funding rate, mark price, then index price.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, read, or parsed as CSV.
+pub fn stream_derivative_ticker<P: AsRef<Path>>(
+    filepath: P,
+    chunk_size: usize,
+    price_precision: u8,
+    instrument_id: InstrumentId,
+    limit: Option<usize>,
+) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Vec<Data>>>> {
+    DerivativeTickerStreamIterator::new(filepath, chunk_size, price_precision, instrument_id, limit)
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // FundingRateUpdate Streaming
 ////////////////////////////////////////////////////////////////////////////////
 
 use nautilus_model::data::FundingRateUpdate;
-
-use crate::csv::record::TardisDerivativeTickerRecord;
 
 /// An iterator for streaming [`FundingRateUpdate`]s from a Tardis CSV file in chunks.
 struct FundingRateStreamIterator {
@@ -2091,6 +2212,34 @@ binance,BTCUSDT,1640995204000000,1640995204100000,0.5,50000.1234,49999.1234,0.8"
         let second_chunk = chunks[1].as_ref().unwrap();
         assert_eq!(second_chunk.len(), 1);
         assert!(matches!(second_chunk[0], Data::OptionGreeks(_)));
+    }
+
+    #[rstest]
+    pub fn test_stream_derivative_ticker_chunks_by_input_row() {
+        let filepath = get_test_data_path("csv/derivative_ticker_1.csv");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.TEST");
+        let stream = stream_derivative_ticker(filepath, 1, 2, instrument_id, None).unwrap();
+        let chunks: Vec<_> = stream.collect();
+
+        assert_eq!(chunks.len(), 2);
+        for chunk in &chunks {
+            let chunk = chunk.as_ref().unwrap();
+            assert_eq!(chunk.len(), 3);
+            assert!(matches!(chunk[0], Data::FundingRateUpdate(_)));
+            assert!(matches!(chunk[1], Data::MarkPriceUpdate(_)));
+            assert!(matches!(chunk[2], Data::IndexPriceUpdate(_)));
+        }
+    }
+
+    #[rstest]
+    pub fn test_stream_derivative_ticker_limit_counts_input_rows() {
+        let filepath = get_test_data_path("csv/derivative_ticker_1.csv");
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.TEST");
+        let stream = stream_derivative_ticker(filepath, 10, 2, instrument_id, Some(1)).unwrap();
+        let chunks: Vec<_> = stream.collect();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].as_ref().unwrap().len(), 3);
     }
 
     #[rstest]
