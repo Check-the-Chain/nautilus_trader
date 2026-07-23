@@ -69,6 +69,7 @@ impl DataTesterConfig {
         book_levels_to_print = None,
         manage_book = None,
         log_data = None,
+        log_latency = None,
         stats_interval_secs = None,
         log_events = None,
         log_commands = None,
@@ -104,6 +105,7 @@ impl DataTesterConfig {
         book_levels_to_print: Option<usize>,
         manage_book: Option<bool>,
         log_data: Option<bool>,
+        log_latency: Option<bool>,
         stats_interval_secs: Option<u64>,
         log_events: Option<bool>,
         log_commands: Option<bool>,
@@ -153,6 +155,7 @@ impl DataTesterConfig {
             book_levels_to_print: book_levels_to_print.unwrap_or(defaults.book_levels_to_print),
             manage_book: manage_book.unwrap_or(defaults.manage_book),
             log_data: log_data.unwrap_or(defaults.log_data),
+            log_latency: log_latency.unwrap_or(defaults.log_latency),
             stats_interval_secs: stats_interval_secs.unwrap_or(defaults.stats_interval_secs),
         };
         config.validate().map_err(config_error_to_pyvalue_err)?;
@@ -337,6 +340,12 @@ impl DataTesterConfig {
     #[pyo3(name = "log_data")]
     const fn py_log_data(&self) -> bool {
         self.log_data
+    }
+
+    #[getter]
+    #[pyo3(name = "log_latency")]
+    const fn py_log_latency(&self) -> bool {
+        self.log_latency
     }
 
     #[getter]

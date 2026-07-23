@@ -45,6 +45,7 @@ class DataTesterConfig:
         book_levels_to_print: int | None = None,
         manage_book: bool | None = None,
         log_data: bool | None = None,
+        log_latency: bool | None = None,
         stats_interval_secs: int | None = None,
         log_events: bool | None = None,
         log_commands: bool | None = None,
@@ -109,6 +110,8 @@ class DataTesterConfig:
     def manage_book(self) -> bool: ...
     @property
     def log_data(self) -> bool: ...
+    @property
+    def log_latency(self) -> bool: ...
     @property
     def stats_interval_secs(self) -> int: ...
     @property
