@@ -63,6 +63,56 @@ pub enum LighterEnvironment {
     Mainnet,
     /// Testnet environment.
     Testnet,
+    /// Robinhood Chain mainnet trading environment.
+    #[serde(rename = "robinhood-mainnet")]
+    #[strum(serialize = "robinhood-mainnet")]
+    RobinhoodMainnet,
+    /// Robinhood Chain testnet environment.
+    #[serde(rename = "robinhood-testnet")]
+    #[strum(serialize = "robinhood-testnet")]
+    RobinhoodTestnet,
+}
+
+/// Integrator attribution policy for Lighter execution clients.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.lighter",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.lighter")
+)]
+pub enum LighterIntegratorMode {
+    /// Use the selected deployment's default attribution policy.
+    #[default]
+    Default,
+    /// Require Nautilus integrator attribution.
+    Enabled,
+    /// Disable approval and order attribution.
+    Disabled,
 }
 
 /// Lighter product type. Markets on the venue are either perpetual futures or spot.
@@ -842,6 +892,18 @@ mod tests {
     #[rstest]
     fn test_environment_default_is_mainnet() {
         assert_eq!(LighterEnvironment::default(), LighterEnvironment::Mainnet);
+    }
+
+    #[rstest]
+    fn test_robinhood_environment_serde() {
+        assert_eq!(
+            serde_json::to_string(&LighterEnvironment::RobinhoodMainnet).unwrap(),
+            r#""robinhood-mainnet""#,
+        );
+        assert_eq!(
+            serde_json::from_str::<LighterEnvironment>(r#""robinhood-testnet""#).unwrap(),
+            LighterEnvironment::RobinhoodTestnet,
+        );
     }
 
     #[rstest]

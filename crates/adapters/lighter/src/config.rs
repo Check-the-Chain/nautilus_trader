@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{
     credential::credential_env_vars,
-    enums::LighterEnvironment,
+    enums::{LighterEnvironment, LighterIntegratorMode},
     urls::{lighter_http_base_url, lighter_ws_url},
 };
 
@@ -52,13 +52,13 @@ pub struct LighterDataClientConfig {
     #[builder(default)]
     pub environment: LighterEnvironment,
     /// Lighter account index for authenticated REST data requests. Falls back
-    /// to `LIGHTER_ACCOUNT_INDEX` / `LIGHTER_TESTNET_ACCOUNT_INDEX`.
+    /// to the credential environment variable for the selected deployment.
     pub account_index: Option<u64>,
     /// API key index for authenticated REST data requests. Falls back to
-    /// `LIGHTER_API_KEY_INDEX` / `LIGHTER_TESTNET_API_KEY_INDEX`.
+    /// the credential environment variable for the selected deployment.
     pub api_key_index: Option<u8>,
     /// Hex-encoded private key for REST auth tokens. Falls back to
-    /// `LIGHTER_API_SECRET` / `LIGHTER_TESTNET_API_SECRET`.
+    /// the credential environment variable for the selected deployment.
     pub private_key: Option<String>,
     /// HTTP request timeout in seconds.
     #[builder(default = 60)]
@@ -207,18 +207,14 @@ pub struct LighterExecClientConfig {
     #[builder(default = AccountId::from("LIGHTER-001"))]
     pub account_id: AccountId,
     /// Lighter account index (numeric, assigned at registration). Falls back
-    /// to `LIGHTER_ACCOUNT_INDEX` / `LIGHTER_TESTNET_ACCOUNT_INDEX` when
-    /// resolved through `common::credential`.
+    /// to the credential environment variable for the selected deployment.
     pub account_index: Option<u64>,
     /// API key index for a user-created Lighter key. Low indexes are reserved
     /// for Lighter clients; 255 is the `apikeys` all-keys sentinel. Falls back
-    /// to `LIGHTER_API_KEY_INDEX` /
-    /// `LIGHTER_TESTNET_API_KEY_INDEX` when resolved through
-    /// `common::credential`.
+    /// to the credential environment variable for the selected deployment.
     pub api_key_index: Option<u8>,
     /// Hex-encoded private key for the API key (Schnorr / ecgfp5). Falls back
-    /// to `LIGHTER_API_SECRET` / `LIGHTER_TESTNET_API_SECRET` when resolved
-    /// through `common::credential`.
+    /// to the credential environment variable for the selected deployment.
     pub private_key: Option<String>,
     /// Optional REST URL override.
     pub base_url_http: Option<String>,
@@ -229,6 +225,10 @@ pub struct LighterExecClientConfig {
     /// Target environment.
     #[builder(default)]
     pub environment: LighterEnvironment,
+    /// Integrator attribution policy. The deployment default enables attribution on standard
+    /// Lighter and disables it on Robinhood Chain Lighter.
+    #[builder(default)]
+    pub integrator_mode: LighterIntegratorMode,
     /// HTTP request timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -258,6 +258,7 @@ nautilus_core::impl_pyo3_config_getters!(LighterExecClientConfig {
     base_url_http: Option<String>,
     base_url_ws: Option<String>,
     environment: LighterEnvironment,
+    integrator_mode: LighterIntegratorMode,
     http_timeout_secs: u64,
     ws_timeout_secs: u64,
     market_order_slippage_bps: u32,
@@ -284,6 +285,7 @@ impl Debug for LighterExecClientConfig {
             .field("base_url_ws", &self.base_url_ws)
             .field("proxy_url", &self.proxy_url)
             .field("environment", &self.environment)
+            .field("integrator_mode", &self.integrator_mode)
             .field("http_timeout_secs", &self.http_timeout_secs)
             .field("ws_timeout_secs", &self.ws_timeout_secs)
             .field("market_order_slippage_bps", &self.market_order_slippage_bps)
@@ -295,6 +297,29 @@ impl Debug for LighterExecClientConfig {
 }
 
 impl LighterExecClientConfig {
+    /// Resolves the integrator account for this execution client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when attribution is explicitly enabled for a deployment without a
+    /// configured Nautilus integrator account.
+    pub fn integrator_account_index(&self) -> anyhow::Result<Option<u64>> {
+        use LighterIntegratorMode::{Default, Disabled, Enabled};
+
+        let deployment_default =
+            crate::common::urls::lighter_default_integrator_account_index(self.environment);
+        match self.integrator_mode {
+            Default => Ok(deployment_default),
+            Disabled => Ok(None),
+            Enabled => deployment_default.map(Some).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Nautilus integrator attribution is not configured for {:?}",
+                    self.environment,
+                )
+            }),
+        }
+    }
+
     /// Returns `true` when all fields required to sign and submit
     /// authenticated transactions are configured.
     ///
@@ -421,6 +446,7 @@ mod tests {
             base_url_ws: None,
             proxy_url: None,
             environment: LighterEnvironment::Mainnet,
+            integrator_mode: LighterIntegratorMode::Default,
             http_timeout_secs: 60,
             ws_timeout_secs: 30,
             market_order_slippage_bps: 50,
@@ -445,6 +471,34 @@ mod tests {
         };
 
         assert_eq!(config.ws_url(), "wss://mainnet.zklighter.elliot.ai/stream");
+    }
+
+    #[rstest]
+    fn integrator_mode_resolves_deployment_defaults_and_override() {
+        let standard = LighterExecClientConfig::default();
+        assert_eq!(
+            standard.integrator_account_index().unwrap(),
+            Some(crate::common::consts::LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX),
+        );
+
+        let robinhood = LighterExecClientConfig {
+            environment: LighterEnvironment::RobinhoodMainnet,
+            ..Default::default()
+        };
+        assert_eq!(robinhood.integrator_account_index().unwrap(), None);
+
+        let disabled = LighterExecClientConfig {
+            integrator_mode: LighterIntegratorMode::Disabled,
+            ..Default::default()
+        };
+        assert_eq!(disabled.integrator_account_index().unwrap(), None);
+
+        let required = LighterExecClientConfig {
+            environment: LighterEnvironment::RobinhoodMainnet,
+            integrator_mode: LighterIntegratorMode::Enabled,
+            ..Default::default()
+        };
+        assert!(required.integrator_account_index().is_err());
     }
 
     // Tests that observe the `env_var_is_set` fallback live in the workspace

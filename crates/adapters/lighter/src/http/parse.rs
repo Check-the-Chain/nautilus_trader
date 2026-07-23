@@ -36,7 +36,7 @@ use crate::{
             funding_rate_decimal_from_percent, parse_millis_to_nanos, parse_secs_to_nanos,
             price_from_decimal, quantity_from_decimal,
         },
-        symbol::{MarketRegistry, format_instrument_id},
+        symbol::MarketRegistry,
     },
     http::models::{
         LighterCandle, LighterFunding, LighterFundingDirection, LighterOrderBook,
@@ -449,9 +449,13 @@ fn parse_perp_instrument(
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
     let order_book = &detail.order_book;
-    let instrument_id = format_instrument_id(order_book.symbol.as_str(), order_book.market_type);
+    let instrument_id =
+        registry.format_instrument_id(order_book.symbol.as_str(), order_book.market_type);
     let raw_symbol = Symbol::from_ustr_unchecked(order_book.symbol);
-    let (base_currency, quote_currency) = symbol_currencies(order_book.symbol.as_str(), "USDC");
+    let (base_currency, quote_currency) = symbol_currencies(
+        order_book.symbol.as_str(),
+        registry.collateral_currency().code.as_str(),
+    );
     let settlement_currency = quote_currency;
     let price_increment = price_increment(detail.price_decimals)?;
     let size_increment = quantity_increment(detail.size_decimals)?;
@@ -501,7 +505,8 @@ fn parse_spot_instrument(
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
     let order_book = &detail.order_book;
-    let instrument_id = format_instrument_id(order_book.symbol.as_str(), order_book.market_type);
+    let instrument_id =
+        registry.format_instrument_id(order_book.symbol.as_str(), order_book.market_type);
     let raw_symbol = Symbol::from_ustr_unchecked(order_book.symbol);
     let (base_currency, quote_currency) = spot_symbol_currencies(order_book.symbol.as_str())?;
     let price_increment = price_increment(detail.price_decimals)?;
@@ -1439,6 +1444,29 @@ mod tests {
         assert_eq!(instruments[0].id(), instrument_id("BTC-PERP"));
         assert_eq!(registry.market_index(&instrument_id("BTC-PERP")), Some(1));
         assert_eq!(registry.market_index(&instrument_id("ETH-PERP")), None);
+    }
+
+    #[rstest]
+    fn test_parse_robinhood_perpetual_uses_usdg_collateral() {
+        let registry = MarketRegistry::for_environment(
+            crate::common::enums::LighterEnvironment::RobinhoodMainnet,
+        );
+        let instruments = parse_order_book_details_instruments(
+            &registry,
+            &[stub_perp_detail("ETH", 0)],
+            &[],
+            UnixNanos::from(1),
+        )
+        .unwrap();
+
+        match &instruments[0] {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.id.to_string(), "ETH-PERP.LIGHTER_RH");
+                assert_eq!(perp.quote_currency, Currency::from("USDG"));
+                assert_eq!(perp.settlement_currency, Currency::from("USDG"));
+            }
+            other => panic!("expected crypto perpetual, was {other:?}"),
+        }
     }
 
     #[rstest]

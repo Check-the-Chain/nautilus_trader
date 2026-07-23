@@ -28,6 +28,7 @@ import argparse
 from decimal import Decimal
 
 from nautilus_trader.adapters.lighter import LIGHTER
+from nautilus_trader.adapters.lighter import LIGHTER_RH
 from nautilus_trader.adapters.lighter import LighterDataClientConfig
 from nautilus_trader.adapters.lighter import LighterDataClientFactory
 from nautilus_trader.adapters.lighter import LighterEnvironment
@@ -50,9 +51,10 @@ from nautilus_trader.testkit import ExecTesterConfig
 def main() -> None:
     args = parse_args()
     lighter_environment = lighter_environment_from_name(args.lighter_environment)
+    venue = LIGHTER_RH if args.lighter_environment.startswith("robinhood-") else LIGHTER
     trader_id = TraderId.from_str(args.trader_id)
-    account_id = AccountId.from_str(args.account_id)
-    instrument_id = InstrumentId.from_str(args.instrument)
+    account_id = AccountId.from_str(args.account_id or f"{venue}-001")
+    instrument_id = InstrumentId.from_str(args.instrument or f"BTC-PERP.{venue}")
     order_qty = Quantity.from_str(args.quantity)
 
     builder = (
@@ -111,10 +113,14 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build or run the Lighter Python v2 exec tester.")
-    parser.add_argument("--lighter-environment", choices=["testnet", "mainnet"], default="testnet")
+    parser.add_argument(
+        "--lighter-environment",
+        choices=["testnet", "mainnet", "robinhood-mainnet", "robinhood-testnet"],
+        default="testnet",
+    )
     parser.add_argument("--trader-id", default="TESTER-001")
-    parser.add_argument("--account-id", default="LIGHTER-001")
-    parser.add_argument("--instrument", default=f"DOGE-PERP.{LIGHTER}")
+    parser.add_argument("--account-id", help="Defaults to an account ID for the selected venue")
+    parser.add_argument("--instrument", help="Defaults to BTC-PERP on the selected deployment")
     parser.add_argument("--quantity", default="200")
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--live-orders", action="store_true")
@@ -122,10 +128,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def lighter_environment_from_name(name: str) -> LighterEnvironment:
-    if name == "mainnet":
-        return LighterEnvironment.MAINNET
-
-    return LighterEnvironment.TESTNET
+    return {
+        "mainnet": LighterEnvironment.MAINNET,
+        "testnet": LighterEnvironment.TESTNET,
+        "robinhood-mainnet": LighterEnvironment.ROBINHOOD_MAINNET,
+        "robinhood-testnet": LighterEnvironment.ROBINHOOD_TESTNET,
+    }[name]
 
 
 if __name__ == "__main__":

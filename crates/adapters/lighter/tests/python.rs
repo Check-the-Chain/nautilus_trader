@@ -24,7 +24,10 @@ use nautilus_common::{
     messages::{DataEvent, ExecutionEvent},
 };
 use nautilus_lighter::{
-    common::{consts::LIGHTER, enums::LighterEnvironment},
+    common::{
+        consts::LIGHTER,
+        enums::{LighterEnvironment, LighterIntegratorMode},
+    },
     config::{LighterDataClientConfig, LighterExecClientConfig},
     factories::{LighterDataClientFactory, LighterExecutionClientFactory},
     python,
@@ -120,6 +123,7 @@ fn assert_exec_factory_extracts_from_python_object(py: Python<'_>) {
             .trader_id(trader_id)
             .account_id(account_id)
             .environment(LighterEnvironment::Testnet)
+            .integrator_mode(LighterIntegratorMode::Disabled)
             .rest_quota_per_min(24_000)
             .sendtx_quota_per_min(4_000)
             .build(),
@@ -152,6 +156,10 @@ fn assert_exec_factory_extracts_from_python_object(py: Python<'_>) {
     assert_eq!(lighter_config.trader_id, trader_id);
     assert_eq!(lighter_config.account_id, account_id);
     assert_eq!(lighter_config.environment, LighterEnvironment::Testnet);
+    assert_eq!(
+        lighter_config.integrator_mode,
+        LighterIntegratorMode::Disabled,
+    );
     assert_eq!(lighter_config.rest_quota_per_min, Some(24_000));
     assert_eq!(lighter_config.sendtx_quota_per_min, Some(4_000));
     assert_eq!(client.client_id(), ClientId::from("LIGHTER-EXEC-EXTRACTED"));

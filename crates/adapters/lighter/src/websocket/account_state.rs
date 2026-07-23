@@ -35,7 +35,8 @@
 //!   `account_all_assets`, with `total = balance + margin_balance` and
 //!   `locked = locked_balance` (spot-order reservations only; perp margin
 //!   in use is reported via `margins`, not `locked`).
-//! - `margins`: one cross-margin `MarginBalance(currency=USDC, instrument_id=None)`
+//! - `margins`: one cross-margin balance in the deployment collateral currency
+//!   (`USDC` on standard Lighter, `USDG` on Robinhood Chain Lighter)
 //!   with `initial = max(collateral - available_balance, 0)`.
 //!
 //! Emission gate: the reconciler refuses to emit until BOTH streams have
@@ -47,7 +48,7 @@ use std::sync::Mutex;
 
 use ahash::AHashMap;
 use nautilus_core::UnixNanos;
-use nautilus_model::{events::AccountState, identifiers::AccountId};
+use nautilus_model::{events::AccountState, identifiers::AccountId, types::Currency};
 use ustr::Ustr;
 
 use super::{
@@ -57,12 +58,15 @@ use super::{
         margin_balance_from_user_stats,
     },
 };
+use crate::common::consts::{
+    LIGHTER_COLLATERAL_CURRENCY, LIGHTER_RH_COLLATERAL_CURRENCY, LIGHTER_RH_VENUE,
+};
 
 /// In-handler snapshot store for the two account-state input streams.
 ///
 /// `assets` is keyed by the venue's asset-id string (matches the wire's
 /// outer map key in `account_all_assets`). Updates upsert per-key so a
-/// delta-style frame that touches only USDC doesn't wipe out a previously
+/// delta-style frame that touches only the collateral asset doesn't wipe out a previously
 /// known ETH entry. Lighter sends full snapshots in practice today, but
 /// the upsert semantics keep us correct if that ever changes.
 #[derive(Debug, Default)]
@@ -136,10 +140,15 @@ impl LighterAccountStateReconciler {
             }
         }
 
+        let collateral_currency = if account_id.get_issuer() == *LIGHTER_RH_VENUE {
+            Currency::get_or_create_crypto(LIGHTER_RH_COLLATERAL_CURRENCY)
+        } else {
+            Currency::get_or_create_crypto(LIGHTER_COLLATERAL_CURRENCY)
+        };
         let margin = match inner
             .user_stats
             .as_ref()
-            .map(margin_balance_from_user_stats)
+            .map(|stats| margin_balance_from_user_stats(stats, collateral_currency))
         {
             Some(Ok(m)) => Some(m),
             Some(Err(e)) => return Some(Err(e)),
@@ -230,6 +239,33 @@ mod tests {
             .expect("ready")
             .expect("ok");
         assert_eq!(state.account_type, AccountType::Margin);
+    }
+
+    #[rstest]
+    fn reconciler_uses_robinhood_usdg_margin_currency() {
+        let r = LighterAccountStateReconciler::new();
+        let asset = LighterAsset {
+            symbol: Ustr::from("USDG"),
+            asset_id: 3,
+            balance: Decimal::from_str("10.0").unwrap(),
+            locked_balance: Decimal::ZERO,
+            margin_balance: Decimal::from_str("40.0").unwrap(),
+            margin_mode: Ustr::from("disabled"),
+        };
+        r.update_assets(&asset_map(asset));
+        r.update_user_stats(&user_stats("40.0", "35.0", "12.5"));
+
+        let state = r
+            .build_state(
+                AccountId::from("LIGHTER_RH-728422"),
+                UnixNanos::default(),
+                UnixNanos::default(),
+            )
+            .expect("ready")
+            .expect("ok");
+
+        assert_eq!(state.margins[0].currency, Currency::from("USDG"));
+        assert_eq!(state.margins[0].initial, Money::from("5.000000 USDG"));
     }
 
     #[rstest]

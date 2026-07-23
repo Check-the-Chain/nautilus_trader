@@ -62,7 +62,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        consts::{DISCONNECT_TIMEOUT, LIGHTER_VENUE},
+        consts::DISCONNECT_TIMEOUT,
         credential::Credential,
         enums::{LighterCandleResolution, LighterMarketStatus},
         rate_limit::resolve_quota,
@@ -142,7 +142,7 @@ impl LighterDataClient {
             None
         };
 
-        let registry = Arc::new(MarketRegistry::new());
+        let registry = Arc::new(MarketRegistry::for_environment(config.environment));
 
         let raw_http = LighterRawHttpClient::new_with_quotas(
             config.environment,
@@ -180,7 +180,7 @@ impl LighterDataClient {
     }
 
     fn venue(&self) -> Venue {
-        *LIGHTER_VENUE
+        self.registry.venue()
     }
 
     /// Returns `true` when the data client holds resolved Lighter credentials.
@@ -1727,6 +1727,7 @@ mod tests {
         *,
     };
     use crate::{
+        common::consts::LIGHTER_VENUE,
         common::enums::{LighterFundingResolution, LighterProductType},
         http::query::{LighterFundingsQuery, LighterRecentTradesQuery},
     };

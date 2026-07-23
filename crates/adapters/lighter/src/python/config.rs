@@ -20,7 +20,7 @@ use nautilus_network::websocket::TransportBackend;
 use pyo3::pymethods;
 
 use crate::{
-    common::enums::LighterEnvironment,
+    common::enums::{LighterEnvironment, LighterIntegratorMode},
     config::{LighterDataClientConfig, LighterExecClientConfig},
 };
 
@@ -101,6 +101,7 @@ impl LighterExecClientConfig {
         base_url_ws = None,
         proxy_url = None,
         environment = None,
+        integrator_mode = None,
         http_timeout_secs = None,
         ws_timeout_secs = None,
         market_order_slippage_bps = None,
@@ -119,6 +120,7 @@ impl LighterExecClientConfig {
         base_url_ws: Option<String>,
         proxy_url: Option<String>,
         environment: Option<LighterEnvironment>,
+        integrator_mode: Option<LighterIntegratorMode>,
         http_timeout_secs: Option<u64>,
         ws_timeout_secs: Option<u64>,
         market_order_slippage_bps: Option<u32>,
@@ -140,6 +142,7 @@ impl LighterExecClientConfig {
             base_url_ws,
             proxy_url,
             environment: environment.unwrap_or(defaults.environment),
+            integrator_mode: integrator_mode.unwrap_or(defaults.integrator_mode),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
             market_order_slippage_bps: market_order_slippage_bps

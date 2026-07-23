@@ -36,10 +36,10 @@ use pyo3::prelude::*;
 
 use crate::{
     common::{
-        consts::{LIGHTER, LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX},
+        consts::{LIGHTER, LIGHTER_RH},
         credential::Credential,
-        enums::LighterEnvironment,
-        urls::lighter_chain_id,
+        enums::{LighterEnvironment, LighterIntegratorMode},
+        urls::{lighter_chain_id, lighter_default_integrator_account_index},
     },
     config::{LighterDataClientConfig, LighterExecClientConfig},
     factories::{LighterDataClientFactory, LighterExecutionClientFactory},
@@ -108,6 +108,8 @@ fn extract_lighter_exec_config(
 }
 
 async fn submit_integrator_revocation(environment: LighterEnvironment) -> anyhow::Result<String> {
+    let integrator_account_index = lighter_default_integrator_account_index(environment)
+        .ok_or_else(|| anyhow::anyhow!("no Nautilus integrator configured for {environment}"))?;
     let credential = Credential::resolve(None, None, None, environment)?
         .ok_or_else(|| anyhow::anyhow!("no Lighter L2 credentials in env"))?;
     let chain_id = lighter_chain_id(environment);
@@ -127,7 +129,7 @@ async fn submit_integrator_revocation(environment: LighterEnvironment) -> anyhow
             nonce: next_nonce,
             expired_at: now_ms.saturating_add(TX_EXPIRY_MS),
         },
-        integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX as i64,
+        integrator_account_index: integrator_account_index as i64,
         max_perps_taker_fee: 0,
         max_perps_maker_fee: 0,
         max_spot_taker_fee: 0,
@@ -142,7 +144,7 @@ async fn submit_integrator_revocation(environment: LighterEnvironment) -> anyhow
     let response = http.send_tx(&request).await?;
 
     Ok(format!(
-        "integrator={LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX} account_index={} tx_hash={}",
+        "integrator={integrator_account_index} account_index={} tx_hash={}",
         credential.account_index(),
         response.tx_hash,
     ))
@@ -150,9 +152,10 @@ async fn submit_integrator_revocation(environment: LighterEnvironment) -> anyhow
 
 /// Revoke the Nautilus integrator approval when leaving the adapter.
 ///
-/// This cleanup call is not a trading-mode toggle. Live trading through this
-/// adapter requires the approval; the next execution-client startup records a
-/// fresh zero-fee approval.
+/// This cleanup call is not a trading-mode toggle. Standard Lighter orders with
+/// integrator attribution enabled require the approval; the next attributed
+/// execution-client startup records a fresh zero-fee approval. Robinhood Chain
+/// Lighter and explicitly disabled attribution do not require it.
 ///
 /// See:
 /// <https://nautilustrader.io/docs/nightly/integrations/lighter.html#integrator-attribution>.
@@ -180,7 +183,9 @@ fn py_revoke_lighter_integrator(
 #[pymodule]
 pub fn lighter(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(stringify!(LIGHTER), LIGHTER)?;
+    m.add(stringify!(LIGHTER_RH), LIGHTER_RH)?;
     m.add_class::<LighterEnvironment>()?;
+    m.add_class::<LighterIntegratorMode>()?;
     m.add_class::<LighterDataClientConfig>()?;
     m.add_class::<LighterExecClientConfig>()?;
     m.add_class::<LighterDataClientFactory>()?;

@@ -41,6 +41,12 @@ const LIGHTER_ACCOUNT_INDEX_VAR: &str = "LIGHTER_ACCOUNT_INDEX";
 const LIGHTER_TESTNET_API_KEY_INDEX_VAR: &str = "LIGHTER_TESTNET_API_KEY_INDEX";
 const LIGHTER_TESTNET_API_SECRET_VAR: &str = "LIGHTER_TESTNET_API_SECRET";
 const LIGHTER_TESTNET_ACCOUNT_INDEX_VAR: &str = "LIGHTER_TESTNET_ACCOUNT_INDEX";
+const LIGHTER_RH_API_KEY_INDEX_VAR: &str = "LIGHTER_RH_API_KEY_INDEX";
+const LIGHTER_RH_API_SECRET_VAR: &str = "LIGHTER_RH_API_SECRET";
+const LIGHTER_RH_ACCOUNT_INDEX_VAR: &str = "LIGHTER_RH_ACCOUNT_INDEX";
+const LIGHTER_RH_TESTNET_API_KEY_INDEX_VAR: &str = "LIGHTER_RH_TESTNET_API_KEY_INDEX";
+const LIGHTER_RH_TESTNET_API_SECRET_VAR: &str = "LIGHTER_RH_TESTNET_API_SECRET";
+const LIGHTER_RH_TESTNET_ACCOUNT_INDEX_VAR: &str = "LIGHTER_RH_TESTNET_ACCOUNT_INDEX";
 
 /// Environment variable names for Lighter credentials.
 ///
@@ -62,6 +68,16 @@ pub const fn credential_env_vars(
             LIGHTER_TESTNET_API_KEY_INDEX_VAR,
             LIGHTER_TESTNET_API_SECRET_VAR,
             LIGHTER_TESTNET_ACCOUNT_INDEX_VAR,
+        ),
+        LighterEnvironment::RobinhoodMainnet => (
+            LIGHTER_RH_API_KEY_INDEX_VAR,
+            LIGHTER_RH_API_SECRET_VAR,
+            LIGHTER_RH_ACCOUNT_INDEX_VAR,
+        ),
+        LighterEnvironment::RobinhoodTestnet => (
+            LIGHTER_RH_TESTNET_API_KEY_INDEX_VAR,
+            LIGHTER_RH_TESTNET_API_SECRET_VAR,
+            LIGHTER_RH_TESTNET_ACCOUNT_INDEX_VAR,
         ),
     }
 }
@@ -308,6 +324,26 @@ mod tests {
                 "LIGHTER_TESTNET_API_KEY_INDEX",
                 "LIGHTER_TESTNET_API_SECRET",
                 "LIGHTER_TESTNET_ACCOUNT_INDEX"
+            ),
+        );
+    }
+
+    #[rstest]
+    fn test_credential_env_vars_robinhood() {
+        assert_eq!(
+            credential_env_vars(LighterEnvironment::RobinhoodMainnet),
+            (
+                "LIGHTER_RH_API_KEY_INDEX",
+                "LIGHTER_RH_API_SECRET",
+                "LIGHTER_RH_ACCOUNT_INDEX"
+            ),
+        );
+        assert_eq!(
+            credential_env_vars(LighterEnvironment::RobinhoodTestnet),
+            (
+                "LIGHTER_RH_TESTNET_API_KEY_INDEX",
+                "LIGHTER_RH_TESTNET_API_SECRET",
+                "LIGHTER_RH_TESTNET_ACCOUNT_INDEX"
             ),
         );
     }

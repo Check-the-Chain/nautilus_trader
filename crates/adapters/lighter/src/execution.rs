@@ -73,10 +73,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        consts::{
-            DISCONNECT_TIMEOUT, LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX,
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_VENUE,
-        },
+        consts::{DISCONNECT_TIMEOUT, LIGHTER_ERROR_CODE_INVALID_NONCE, LIGHTER_MAX_BATCH_TX},
         credential::{Credential, scrub_auth},
         enums::{
             LighterAccountTier, LighterOrderKind, LighterPositionMarginMode, LighterProductType,
@@ -84,7 +81,7 @@ use crate::{
         },
         rate_limit::{LighterTxRateLimiter, await_tx_quota, build_tx_rate_limiter, resolve_quota},
         symbol::{MarketRegistry, product_type_from_instrument_id},
-        urls::lighter_chain_id,
+        urls::{lighter_chain_id, lighter_venue},
     },
     config::LighterExecClientConfig,
     http::{
@@ -197,6 +194,9 @@ pub struct LighterExecutionClient {
     /// Coalesces reconnect bursts into an immediate authenticated
     /// subscription refresh by the single rotation task.
     auth_refresh_notify: Arc<tokio::sync::Notify>,
+    signing_chain_id: u32,
+    integrator_account_index: Option<i64>,
+    order_l2_tx_attributes: L2TxAttributes,
 }
 
 impl LighterExecutionClient {
@@ -213,6 +213,32 @@ impl LighterExecutionClient {
     /// Returns an error if the HTTP client fails to initialize or if any
     /// supplied credential value cannot be parsed.
     pub fn new(core: ExecutionClientCore, config: LighterExecClientConfig) -> anyhow::Result<Self> {
+        let venue = lighter_venue(config.environment);
+        anyhow::ensure!(
+            core.venue == venue,
+            "Lighter execution core venue {} does not match {:?} venue {venue}",
+            core.venue,
+            config.environment,
+        );
+        anyhow::ensure!(
+            core.account_id.get_issuer() == venue,
+            "Lighter execution account {} issuer does not match {:?} venue {venue}",
+            core.account_id,
+            config.environment,
+        );
+        let signing_chain_id = lighter_chain_id(config.environment);
+        let integrator_account_index = config
+            .integrator_account_index()?
+            .map(i64::try_from)
+            .transpose()
+            .context("Lighter integrator account index exceeds signed 64-bit range")?;
+        let order_l2_tx_attributes =
+            integrator_account_index.map_or_else(L2TxAttributes::default, |index| L2TxAttributes {
+                integrator_account_index: index as u64,
+                integrator_taker_fee: 0,
+                integrator_maker_fee: 0,
+                skip_nonce: 0,
+            });
         let credential = Credential::resolve(
             config.private_key.clone(),
             config.account_index,
@@ -221,7 +247,7 @@ impl LighterExecutionClient {
         )
         .context("failed to resolve Lighter credentials")?;
 
-        let registry = Arc::new(MarketRegistry::new());
+        let registry = Arc::new(MarketRegistry::for_environment(config.environment));
 
         // One transaction limiter shared across the HTTP and WebSocket sendTx
         // paths so their combined rate honours the single per-account venue bucket.
@@ -273,6 +299,9 @@ impl LighterExecutionClient {
             dispatch: WsDispatchState::new(),
             nonce_recovery_inflight: Arc::new(AtomicBool::new(false)),
             auth_refresh_notify: Arc::new(tokio::sync::Notify::new()),
+            signing_chain_id,
+            integrator_account_index,
+            order_l2_tx_attributes,
         })
     }
 
@@ -492,6 +521,9 @@ impl LighterExecutionClient {
     }
 
     async fn submit_integrator_auto_approval(&self) -> anyhow::Result<()> {
+        let Some(integrator_account_index) = self.integrator_account_index else {
+            return Ok(());
+        };
         let Some(credential) = &self.credential else {
             return Ok(());
         };
@@ -517,7 +549,8 @@ impl LighterExecutionClient {
             }
         }
 
-        let mut approval = self.prepare_integrator_auto_approval(credential)?;
+        let mut approval =
+            self.prepare_integrator_auto_approval(credential, integrator_account_index)?;
 
         let request = LighterSendTxRequest::new(
             LighterTxType::ApproveIntegrator as u8,
@@ -559,7 +592,7 @@ impl LighterExecutionClient {
         log::debug!(
             "Submitted Lighter integrator approval: integrator={}, nonce={}, \
              api_key_index={}, approval_expiry={}, tx_hash={}",
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+            integrator_account_index,
             approval.nonce,
             approval.api_key_index,
             approval.approval_expiry,
@@ -571,6 +604,7 @@ impl LighterExecutionClient {
     fn prepare_integrator_auto_approval(
         &self,
         credential: &Credential,
+        integrator_account_index: i64,
     ) -> anyhow::Result<PreparedIntegratorApproval> {
         let ReservedTxContext {
             context,
@@ -584,7 +618,7 @@ impl LighterExecutionClient {
 
         let tx = ApproveIntegratorTxInfo {
             context,
-            integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX as i64,
+            integrator_account_index,
             max_perps_taker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
             max_perps_maker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
             max_spot_taker_fee: INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK,
@@ -595,7 +629,7 @@ impl LighterExecutionClient {
 
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.config.environment),
+            self.signing_chain_id,
             &credential.private_key()?,
             fresh_k(),
         );
@@ -1344,7 +1378,8 @@ impl LighterExecutionClient {
     fn fanout_dispatch_context(&self, credential: &Credential) -> FanoutDispatchContext {
         FanoutDispatchContext {
             clock: self.clock,
-            environment: self.config.environment,
+            signing_chain_id: self.signing_chain_id,
+            order_l2_tx_attributes: self.order_l2_tx_attributes,
             emitter: self.emitter.clone(),
             credential: credential.clone(),
             http_client: self.http_client.clone(),
@@ -1635,12 +1670,12 @@ impl LighterExecutionClient {
             base_amount,
             price: price_ticks,
             trigger_price: trigger_price_ticks,
-            attributes: integrator_attributes(),
+            attributes: self.order_l2_tx_attributes,
         };
 
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.config.environment),
+            self.signing_chain_id,
             &credential.private_key()?,
             fresh_k(),
         );
@@ -1719,7 +1754,7 @@ impl LighterExecutionClient {
 
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.config.environment),
+            self.signing_chain_id,
             &credential.private_key()?,
             fresh_k(),
         );
@@ -2107,7 +2142,8 @@ struct CancelOrderPlan {
 #[derive(Clone)]
 struct FanoutDispatchContext {
     clock: &'static AtomicTime,
-    environment: crate::common::enums::LighterEnvironment,
+    signing_chain_id: u32,
+    order_l2_tx_attributes: L2TxAttributes,
     emitter: ExecutionEventEmitter,
     credential: Credential,
     http_client: LighterHttpClient,
@@ -2242,11 +2278,11 @@ impl FanoutDispatchContext {
                 trigger_price: plan.trigger_price,
                 order_expiry: plan.order_expiry,
             },
-            attributes: integrator_attributes(),
+            attributes: self.order_l2_tx_attributes,
         };
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.environment),
+            self.signing_chain_id,
             &self.credential.private_key()?,
             fresh_k(),
         );
@@ -2338,7 +2374,7 @@ impl FanoutDispatchContext {
         };
         let signed = sign_tx(
             &tx,
-            lighter_chain_id(self.environment),
+            self.signing_chain_id,
             &self.credential.private_key()?,
             fresh_k(),
         );
@@ -2942,15 +2978,6 @@ fn rollback_tx_dispatch_indices(
     }
 }
 
-fn integrator_attributes() -> L2TxAttributes {
-    L2TxAttributes {
-        integrator_account_index: LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
-        integrator_taker_fee: 0,
-        integrator_maker_fee: 0,
-        skip_nonce: 0,
-    }
-}
-
 /// Format a `start_secs-end_secs` window for Lighter's `between_timestamps`
 /// query parameter. Returns `None` when neither bound is set; an unset end
 /// defaults to the current time so the venue scopes pagination to the
@@ -2986,7 +3013,7 @@ impl ExecutionClient for LighterExecutionClient {
     }
 
     fn venue(&self) -> Venue {
-        *LIGHTER_VENUE
+        self.core.venue
     }
 
     fn oms_type(&self) -> OmsType {
@@ -3063,7 +3090,7 @@ impl ExecutionClient for LighterExecutionClient {
             anyhow::bail!(
                 "Lighter execution client requires credentials; \
                  set private_key, account_index, and api_key_index in the config \
-                 (or the LIGHTER_{{MAINNET,TESTNET}}_* environment variables)"
+                 (or the credential environment variables for the selected deployment)"
             );
         }
 
@@ -3106,13 +3133,15 @@ impl ExecutionClient for LighterExecutionClient {
             if is_unapproved {
                 return Err(e.context(
                     "Lighter account is not integrator-approved (venue 21149); \
-                     orders cannot be placed",
+                         orders cannot be placed",
                 ));
             }
             log::error!("Lighter integrator approval failed; continuing startup: {e:?}");
         }
 
-        if let Err(e) = self.sync_nonce_from_venue().await {
+        if self.integrator_account_index.is_some()
+            && let Err(e) = self.sync_nonce_from_venue().await
+        {
             log::debug!(
                 "Failed to sync Lighter nonce after integrator approval; continuing startup: {e:?}"
             );
@@ -4012,7 +4041,7 @@ impl ExecutionClient for LighterExecutionClient {
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
             self.core.account_id,
-            *LIGHTER_VENUE,
+            self.core.venue,
             ts_init,
             None,
         );
@@ -4724,7 +4753,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::enums::{LighterEnvironment, LighterProductType},
+        common::{
+            consts::LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+            enums::{LighterEnvironment, LighterIntegratorMode, LighterProductType},
+        },
         http::models::LighterNextNonce,
         signing::tx::TX_HASH_BYTES,
     };
@@ -4768,6 +4800,7 @@ mod tests {
             base_url_ws: Some("ws://127.0.0.1:1/stream".to_string()),
             proxy_url: None,
             environment: LighterEnvironment::Testnet,
+            integrator_mode: LighterIntegratorMode::Default,
             http_timeout_secs: 1,
             ws_timeout_secs: 1,
             market_order_slippage_bps: 50,
@@ -4817,7 +4850,7 @@ mod tests {
         let core = ExecutionClientCore::new(
             trader_id(),
             client_id(),
-            *LIGHTER_VENUE,
+            lighter_venue(config.environment),
             OmsType::Netting,
             account_id(),
             AccountType::Margin,
@@ -7635,7 +7668,8 @@ mod tests {
 
     #[rstest]
     fn integrator_attributes_tags_nautilus_account_at_zero_fees() {
-        let attrs = integrator_attributes();
+        let (client, _, _) = create_execution_client();
+        let attrs = client.order_l2_tx_attributes;
         assert_eq!(
             attrs.integrator_account_index,
             LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,

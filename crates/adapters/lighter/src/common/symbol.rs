@@ -21,10 +21,20 @@
 //! on every WebSocket frame and outbound transaction.
 
 use dashmap::DashMap;
-use nautilus_model::identifiers::{InstrumentId, Symbol};
+use nautilus_model::{
+    identifiers::{InstrumentId, Symbol},
+    types::Currency,
+};
 use ustr::Ustr;
 
-use super::{consts::LIGHTER_VENUE, enums::LighterProductType};
+use super::{
+    consts::{
+        LIGHTER_COLLATERAL_CURRENCY, LIGHTER_RH_COLLATERAL_CURRENCY, LIGHTER_RH_VENUE,
+        LIGHTER_VENUE,
+    },
+    enums::{LighterEnvironment, LighterProductType},
+    urls::lighter_venue,
+};
 
 /// Suffix applied to perpetual instrument symbols on the Nautilus side.
 pub const PERP_SUFFIX: &str = "-PERP";
@@ -38,11 +48,21 @@ pub const SPOT_SUFFIX: &str = "-SPOT";
 /// (`-PERP` or `-SPOT`) before being qualified by the Lighter venue.
 #[must_use]
 pub fn format_instrument_id(venue_symbol: &str, product_type: LighterProductType) -> InstrumentId {
+    format_instrument_id_for_venue(venue_symbol, product_type, *LIGHTER_VENUE)
+}
+
+/// Builds a Nautilus [`InstrumentId`] for a specific Lighter venue.
+#[must_use]
+pub fn format_instrument_id_for_venue(
+    venue_symbol: &str,
+    product_type: LighterProductType,
+    venue: nautilus_model::identifiers::Venue,
+) -> InstrumentId {
     let suffix = product_suffix(product_type);
     let trimmed = venue_symbol.trim();
     let upper = trimmed.to_ascii_uppercase();
     let symbol = format!("{upper}{suffix}");
-    InstrumentId::new(Symbol::from_str_unchecked(&symbol), *LIGHTER_VENUE)
+    InstrumentId::new(Symbol::from_str_unchecked(&symbol), venue)
 }
 
 /// Returns the venue-native symbol for an instrument id by stripping any
@@ -96,8 +116,10 @@ fn canonical_symbol_key(venue_symbol: &str) -> Ustr {
 /// as relists must be coordinated by the caller (e.g. quiesce consumers
 /// before reinserting) to avoid concurrent readers observing partial
 /// state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MarketRegistry {
+    venue: nautilus_model::identifiers::Venue,
+    collateral_currency: Currency,
     by_index: DashMap<i16, InstrumentId>,
     by_id: DashMap<InstrumentId, i16>,
     by_raw_symbol: DashMap<(Ustr, LighterProductType), InstrumentId>,
@@ -107,7 +129,52 @@ impl MarketRegistry {
     /// Returns a new empty registry.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_venue(*LIGHTER_VENUE)
+    }
+
+    /// Returns an empty registry for a selected Lighter deployment.
+    #[must_use]
+    pub fn for_environment(environment: LighterEnvironment) -> Self {
+        Self::with_venue(lighter_venue(environment))
+    }
+
+    /// Returns an empty registry for a specific Nautilus venue.
+    #[must_use]
+    pub fn with_venue(venue: nautilus_model::identifiers::Venue) -> Self {
+        let collateral_currency = if venue == *LIGHTER_RH_VENUE {
+            Currency::get_or_create_crypto(LIGHTER_RH_COLLATERAL_CURRENCY)
+        } else {
+            Currency::get_or_create_crypto(LIGHTER_COLLATERAL_CURRENCY)
+        };
+        Self {
+            venue,
+            collateral_currency,
+            by_index: DashMap::new(),
+            by_id: DashMap::new(),
+            by_raw_symbol: DashMap::new(),
+        }
+    }
+
+    /// Returns the venue assigned to instruments created by this registry.
+    #[must_use]
+    pub const fn venue(&self) -> nautilus_model::identifiers::Venue {
+        self.venue
+    }
+
+    /// Returns the deployment's collateral and perpetual quote currency.
+    #[must_use]
+    pub const fn collateral_currency(&self) -> Currency {
+        self.collateral_currency
+    }
+
+    /// Formats an instrument ID using this registry's venue.
+    #[must_use]
+    pub fn format_instrument_id(
+        &self,
+        venue_symbol: &str,
+        product_type: LighterProductType,
+    ) -> InstrumentId {
+        format_instrument_id_for_venue(venue_symbol, product_type, self.venue)
     }
 
     /// Registers a market and returns the resulting [`InstrumentId`].
@@ -122,7 +189,7 @@ impl MarketRegistry {
         venue_symbol: &str,
         product_type: LighterProductType,
     ) -> InstrumentId {
-        let instrument_id = format_instrument_id(venue_symbol, product_type);
+        let instrument_id = self.format_instrument_id(venue_symbol, product_type);
         let canonical = canonical_symbol_key(venue_symbol);
 
         // Evict any prior mapping that shared this market_index but pointed
@@ -210,6 +277,12 @@ impl MarketRegistry {
     }
 }
 
+impl Default for MarketRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -284,6 +357,21 @@ mod tests {
         );
         assert_eq!(registry.len(), 1);
         assert!(!registry.is_empty());
+    }
+
+    #[rstest]
+    fn registries_keep_standard_and_robinhood_instruments_distinct() {
+        let standard = MarketRegistry::for_environment(LighterEnvironment::Mainnet);
+        let robinhood = MarketRegistry::for_environment(LighterEnvironment::RobinhoodMainnet);
+
+        let standard_id = standard.insert(0, "ETH", LighterProductType::Perp);
+        let robinhood_id = robinhood.insert(0, "ETH", LighterProductType::Perp);
+
+        assert_eq!(standard_id.to_string(), "ETH-PERP.LIGHTER");
+        assert_eq!(robinhood_id.to_string(), "ETH-PERP.LIGHTER_RH");
+        assert_eq!(standard.collateral_currency(), Currency::from("USDC"));
+        assert_eq!(robinhood.collateral_currency(), Currency::from("USDG"));
+        assert_ne!(standard_id, robinhood_id);
     }
 
     #[rstest]

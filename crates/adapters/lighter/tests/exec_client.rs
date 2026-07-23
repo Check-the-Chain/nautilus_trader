@@ -74,8 +74,9 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_lighter::{
     common::{
-        consts::{LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_VENUE},
-        enums::LighterEnvironment,
+        consts::LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+        enums::{LighterEnvironment, LighterIntegratorMode},
+        urls::lighter_venue,
     },
     config::LighterExecClientConfig,
     execution::LighterExecutionClient,
@@ -666,6 +667,7 @@ fn build_config(addr: SocketAddr) -> LighterExecClientConfig {
         base_url_ws: Some(format!("ws://{addr}/stream")),
         proxy_url: None,
         environment: LighterEnvironment::Testnet,
+        integrator_mode: LighterIntegratorMode::Default,
         http_timeout_secs: 5,
         ws_timeout_secs: 5,
         market_order_slippage_bps: 50,
@@ -815,9 +817,9 @@ fn build_client_with_cache(
     let core = ExecutionClientCore::new(
         trader_id(),
         client_id(),
-        *LIGHTER_VENUE,
+        lighter_venue(config.environment),
         OmsType::Netting,
-        account_id(),
+        config.account_id,
         AccountType::Margin,
         None,
         cache.clone(),
@@ -1325,6 +1327,28 @@ async fn connect_skips_integrator_auto_approval_for_maker_only_api_key() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
+async fn robinhood_connect_performs_no_integrator_work_by_default() {
+    let (addr, state) = start_server().await;
+    let config = LighterExecClientConfig {
+        environment: LighterEnvironment::RobinhoodMainnet,
+        account_id: AccountId::from("LIGHTER_RH-001"),
+        ..build_config(addr)
+    };
+    let (mut client, _rx, _cache) = build_client_with(config);
+
+    client.connect().await.expect("connect");
+
+    assert_eq!(client.venue().as_str(), "LIGHTER_RH");
+    assert_eq!(client.account_id().as_str(), "LIGHTER_RH-001");
+    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(state.maker_only_authorizations().await.len(), 0);
+    assert_eq!(state.rest_send_txs().await.len(), 0);
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
 async fn connect_bails_when_integrator_auto_approval_reports_unapproved() {
     let (addr, state) = start_server().await;
     *state.next_rest_send_tx_response.lock().await = Some(json!({
@@ -1643,6 +1667,42 @@ async fn test_submit_limit_order_emits_submitted_and_signs_sendtx() {
     assert_eq!(info["IsAsk"], 0); // buys serialize as 0
     assert_eq!(info["Price"], 236_131); // 2361.31 * 100
     assert_eq!(info["BaseAmount"], 50); // 0.0050 * 10_000
+    assert_eq!(
+        info["L2TxAttributes"]["1"],
+        LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+    );
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_integrator_submits_orders_with_empty_attributes() {
+    let (addr, state) = start_server().await;
+    let config = LighterExecClientConfig {
+        integrator_mode: LighterIntegratorMode::Disabled,
+        ..build_config(addr)
+    };
+    let (mut client, _rx, cache) = build_client_with(config);
+    client.connect().await.expect("connect");
+
+    let order = make_limit_order(
+        "O-NO-INTEGRATOR",
+        OrderSide::Buy,
+        Quantity::from("0.0050"),
+        Price::from("2361.31"),
+        TimeInForce::Gtc,
+        false,
+        false,
+    );
+    cache_order(&cache, order.clone());
+    client.submit_order(submit_command(&order)).expect("submit");
+
+    await_send_tx_count(&state, 1).await;
+    let frames = state.send_txs().await;
+    assert!(send_tx_info(&frames[0])["L2TxAttributes"].is_null());
+    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(state.rest_send_txs().await.len(), 0);
 
     client.disconnect().await.expect("disconnect");
 }

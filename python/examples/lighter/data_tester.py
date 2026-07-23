@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 
 from nautilus_trader.adapters.lighter import LIGHTER
+from nautilus_trader.adapters.lighter import LIGHTER_RH
 from nautilus_trader.adapters.lighter import LighterDataClientConfig
 from nautilus_trader.adapters.lighter import LighterDataClientFactory
 from nautilus_trader.adapters.lighter import LighterEnvironment
@@ -41,8 +42,10 @@ from nautilus_trader.testkit import DataTesterConfig
 def main() -> None:
     args = parse_args()
     lighter_environment = lighter_environment_from_name(args.lighter_environment)
-    instrument_id = InstrumentId.from_str(args.instrument)
-    request_funding_rates = args.subscribe_funding_rates and "-SPOT." not in args.instrument.upper()
+    venue = LIGHTER_RH if args.lighter_environment.startswith("robinhood-") else LIGHTER
+    instrument = args.instrument or f"BTC-PERP.{venue}"
+    instrument_id = InstrumentId.from_str(instrument)
+    request_funding_rates = args.subscribe_funding_rates and "-SPOT." not in instrument.upper()
 
     builder = LiveNode.builder(
         "LIGHTER-DATA-TESTER-001",
@@ -60,7 +63,7 @@ def main() -> None:
         DataTesterConfig(
             client_id=ClientId.from_str(LIGHTER),
             instrument_ids=[instrument_id],
-            bar_types=[BarType.from_str(f"{args.instrument}-1-MINUTE-LAST-EXTERNAL")],
+            bar_types=[BarType.from_str(f"{instrument}-1-MINUTE-LAST-EXTERNAL")],
             subscribe_book_deltas=True,
             subscribe_quotes=True,
             subscribe_trades=True,
@@ -82,9 +85,13 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build or run the Lighter Python v2 data tester.")
-    parser.add_argument("--lighter-environment", choices=["testnet", "mainnet"], default="testnet")
+    parser.add_argument(
+        "--lighter-environment",
+        choices=["testnet", "mainnet", "robinhood-mainnet", "robinhood-testnet"],
+        default="testnet",
+    )
     parser.add_argument("--trader-id", default="TESTER-001")
-    parser.add_argument("--instrument", default=f"BTC-PERP.{LIGHTER}")
+    parser.add_argument("--instrument", help="Defaults to BTC-PERP on the selected deployment")
     parser.add_argument(
         "--subscribe-funding-rates",
         action=argparse.BooleanOptionalAction,
@@ -95,10 +102,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def lighter_environment_from_name(name: str) -> LighterEnvironment:
-    if name == "mainnet":
-        return LighterEnvironment.MAINNET
-
-    return LighterEnvironment.TESTNET
+    return {
+        "mainnet": LighterEnvironment.MAINNET,
+        "testnet": LighterEnvironment.TESTNET,
+        "robinhood-mainnet": LighterEnvironment.ROBINHOOD_MAINNET,
+        "robinhood-testnet": LighterEnvironment.ROBINHOOD_TESTNET,
+    }[name]
 
 
 if __name__ == "__main__":

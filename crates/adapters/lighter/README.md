@@ -49,8 +49,9 @@ ongoing maintenance. Maker and taker integrator fees are set to zero, so attribu
 cost.
 
 Lighter requires an `ApproveIntegrator` approval before these attributes can be attached to orders.
-During startup, the execution client submits the required **zero-fee** approval for the configured
-L2 account. See the
+Standard Lighter deployments submit the required **zero-fee** approval at startup unless attribution
+is disabled in the execution config. Robinhood Chain deployments disable attribution by default and
+perform no integrator setup. See the
 [Lighter integration guide](https://nautilustrader.io/docs/nightly/integrations/lighter.html#integrator-attribution)
 for approval and revocation details.
 

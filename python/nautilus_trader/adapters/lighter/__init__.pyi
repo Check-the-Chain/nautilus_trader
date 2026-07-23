@@ -8,15 +8,18 @@ from nautilus_trader import network
 
 __all__ = [
     "LIGHTER",
+    "LIGHTER_RH",
     "LighterDataClientConfig",
     "LighterDataClientFactory",
     "LighterEnvironment",
     "LighterExecClientConfig",
     "LighterExecutionClientFactory",
+    "LighterIntegratorMode",
     "revoke_lighter_integrator",
 ]
 
 LIGHTER: str
+LIGHTER_RH: str
 
 @typing.final
 class LighterDataClientConfig:
@@ -80,6 +83,8 @@ class LighterExecClientConfig:
     @property
     def environment(self) -> LighterEnvironment: ...
     @property
+    def integrator_mode(self) -> LighterIntegratorMode: ...
+    @property
     def http_timeout_secs(self) -> int: ...
     @property
     def ws_timeout_secs(self) -> int: ...
@@ -102,6 +107,7 @@ class LighterExecClientConfig:
         base_url_ws: str | None = None,
         proxy_url: str | None = None,
         environment: LighterEnvironment | None = None,
+        integrator_mode: LighterIntegratorMode | None = None,
         http_timeout_secs: int | None = None,
         ws_timeout_secs: int | None = None,
         market_order_slippage_bps: int | None = None,
@@ -121,6 +127,14 @@ class LighterExecutionClientFactory:
 class LighterEnvironment(enum.Enum):
     MAINNET = ...
     TESTNET = ...
+    ROBINHOOD_MAINNET = ...
+    ROBINHOOD_TESTNET = ...
+
+@typing.final
+class LighterIntegratorMode(enum.Enum):
+    DEFAULT = ...
+    ENABLED = ...
+    DISABLED = ...
 
 def revoke_lighter_integrator(
     environment: LighterEnvironment = LighterEnvironment.MAINNET,

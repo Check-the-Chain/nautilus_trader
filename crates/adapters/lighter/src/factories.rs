@@ -26,11 +26,16 @@ use nautilus_common::{
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType},
-    identifiers::ClientId,
+    identifiers::{AccountId, ClientId},
 };
 
 use crate::{
-    common::consts::{LIGHTER, LIGHTER_VENUE},
+    common::{
+        consts::{
+            LIGHTER, LIGHTER_DEFAULT_ACCOUNT_ID, LIGHTER_RH_DEFAULT_ACCOUNT_ID, LIGHTER_RH_VENUE,
+        },
+        urls::lighter_venue,
+    },
     config::{LighterDataClientConfig, LighterExecClientConfig},
     data::LighterDataClient,
     execution::LighterExecutionClient,
@@ -85,7 +90,6 @@ impl DataClientFactory for LighterDataClientFactory {
                 )
             })?
             .clone();
-
         let client_id = ClientId::from(name);
         let client = LighterDataClient::new(client_id, lighter_config)?;
         Ok(Box::new(client))
@@ -127,7 +131,7 @@ impl ExecutionClientFactory for LighterExecutionClientFactory {
         config: &dyn ClientConfig,
         cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
-        let lighter_config = config
+        let mut lighter_config = config
             .as_any()
             .downcast_ref::<LighterExecClientConfig>()
             .ok_or_else(|| {
@@ -136,13 +140,19 @@ impl ExecutionClientFactory for LighterExecutionClientFactory {
                 )
             })?
             .clone();
+        let venue = lighter_venue(lighter_config.environment);
+        if lighter_config.account_id == AccountId::from(LIGHTER_DEFAULT_ACCOUNT_ID)
+            && venue == *LIGHTER_RH_VENUE
+        {
+            lighter_config.account_id = AccountId::from(LIGHTER_RH_DEFAULT_ACCOUNT_ID);
+        }
 
         // Lighter is a perpetual futures DEX with margin accounts and one
         // position per market on the L2.
         let core = ExecutionClientCore::new(
             lighter_config.trader_id,
             ClientId::from(name),
-            *LIGHTER_VENUE,
+            venue,
             OmsType::Netting,
             lighter_config.account_id,
             AccountType::Margin,
@@ -238,6 +248,28 @@ mod tests {
             .expect("expected client to construct without credentials");
 
         assert!(!client.is_connected());
+    }
+
+    #[rstest]
+    fn execution_factory_assigns_distinct_deployment_venues() {
+        let factory = LighterExecutionClientFactory::new();
+        let standard_cache = Rc::new(RefCell::new(Cache::default()));
+        let robinhood_cache = Rc::new(RefCell::new(Cache::default()));
+        let robinhood_config = LighterExecClientConfig::builder()
+            .environment(crate::common::enums::LighterEnvironment::RobinhoodMainnet)
+            .build();
+
+        let standard = factory
+            .create("LIGHTER-MAIN", &exec_config(), standard_cache.into())
+            .unwrap();
+        let robinhood = factory
+            .create("LIGHTER-RH", &robinhood_config, robinhood_cache.into())
+            .unwrap();
+
+        assert_eq!(standard.venue().as_str(), "LIGHTER");
+        assert_eq!(robinhood.venue().as_str(), "LIGHTER_RH");
+        assert_eq!(standard.account_id().as_str(), "LIGHTER-001");
+        assert_eq!(robinhood.account_id().as_str(), "LIGHTER_RH-001");
     }
 
     #[rstest]

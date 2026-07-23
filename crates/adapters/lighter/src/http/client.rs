@@ -676,7 +676,8 @@ impl LighterHttpClient {
     /// Wraps an existing raw HTTP client.
     #[must_use]
     pub fn from_raw(raw_client: LighterRawHttpClient) -> Self {
-        Self::from_raw_with_registry(raw_client, Arc::new(MarketRegistry::new()))
+        let registry = Arc::new(MarketRegistry::for_environment(raw_client.environment()));
+        Self::from_raw_with_registry(raw_client, registry)
     }
 
     /// Wraps an existing raw HTTP client and shared market registry.

@@ -23,8 +23,26 @@ use ustr::Ustr;
 /// Venue name string for Lighter.
 pub const LIGHTER: &str = "LIGHTER";
 
+/// Venue name string for the Robinhood Chain Lighter deployment.
+pub const LIGHTER_RH: &str = "LIGHTER_RH";
+
+/// Standard Lighter collateral and perpetual quote currency.
+pub const LIGHTER_COLLATERAL_CURRENCY: &str = "USDC";
+
+/// Robinhood Chain Lighter collateral and perpetual quote currency.
+pub const LIGHTER_RH_COLLATERAL_CURRENCY: &str = "USDG";
+
+/// Default standard Lighter account identifier.
+pub const LIGHTER_DEFAULT_ACCOUNT_ID: &str = "LIGHTER-001";
+
+/// Default Robinhood Chain Lighter account identifier.
+pub const LIGHTER_RH_DEFAULT_ACCOUNT_ID: &str = "LIGHTER_RH-001";
+
 /// Lighter venue identifier.
 pub static LIGHTER_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(LIGHTER)));
+
+/// Robinhood Chain Lighter venue identifier.
+pub static LIGHTER_RH_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(LIGHTER_RH)));
 
 /// L2 chain id for Lighter mainnet.
 ///
@@ -37,6 +55,9 @@ pub const LIGHTER_MAINNET_CHAIN_ID: u32 = 304;
 /// Mirrors `lighter-go`'s testnet chain id and matches the value the oracle
 /// generator emits.
 pub const LIGHTER_TESTNET_CHAIN_ID: u32 = 300;
+
+/// L2 signing domain for Robinhood Chain Lighter mainnet.
+pub const LIGHTER_ROBINHOOD_MAINNET_CHAIN_ID: u32 = 466_324;
 
 /// Nautilus integrator account index on Lighter.
 pub const LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX: u64 = 727_418;

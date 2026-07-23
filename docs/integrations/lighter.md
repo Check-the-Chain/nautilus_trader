@@ -107,23 +107,37 @@ The current adapter scope is deliberately narrower than the venue's full transac
 Lighter identifies markets by numeric `market_index` values. The adapter bootstraps the mapping from
 `GET /api/v1/orderBookDetails`, then converts the raw venue symbol into a Nautilus `InstrumentId`.
 
-| Venue product      | Nautilus symbol format        | Example                 | Notes                        |
-|--------------------|-------------------------------|-------------------------|------------------------------|
-| Perpetual futures  | `{BASE}-PERP.LIGHTER`         | `BTC-PERP.LIGHTER`      | Raw venue symbol `BTC`.      |
-| Spot               | `{BASE}/{QUOTE}-SPOT.LIGHTER` | `ETH/USDC-SPOT.LIGHTER` | Raw venue symbol `ETH/USDC`. |
+| Deployment | Venue product | Nautilus symbol format | Example | Notes |
+|---|---|---|---|---|
+| Standard Lighter | Perpetual futures | `{BASE}-PERP.LIGHTER` | `BTC-PERP.LIGHTER` | Quoted and settled in USDC. |
+| Standard Lighter | Spot | `{BASE}/{QUOTE}-SPOT.LIGHTER` | `ETH/USDC-SPOT.LIGHTER` | Keeps the raw venue pair. |
+| Robinhood Chain | Perpetual futures | `{BASE}-PERP.LIGHTER_RH` | `BTC-PERP.LIGHTER_RH` | Quoted and settled in USDG. |
+| Robinhood Chain | Spot | `{BASE}/{QUOTE}-SPOT.LIGHTER_RH` | `AMD/USDG-SPOT.LIGHTER_RH` | Keeps the raw venue pair. |
 
 The suffix disambiguates spot and perpetual listings. Spot symbols keep the quoted venue pair, while
 outbound requests strip the suffix and use the cached `market_index`.
 
 ## Environments
 
-| Environment | REST URL                              | WebSocket URL                              | Chain ID |
-|-------------|---------------------------------------|--------------------------------------------|----------|
-| Mainnet     | `https://mainnet.zklighter.elliot.ai` | `wss://mainnet.zklighter.elliot.ai/stream` | 304      |
-| Testnet     | `https://testnet.zklighter.elliot.ai` | `wss://testnet.zklighter.elliot.ai/stream` | 300      |
+| Environment       | Venue        | REST URL                              | WebSocket URL                              | Signing ID |
+|-------------------|--------------|---------------------------------------|--------------------------------------------|------------|
+| Mainnet           | `LIGHTER`    | `https://mainnet.zklighter.elliot.ai` | `wss://mainnet.zklighter.elliot.ai/stream` | 304        |
+| Testnet           | `LIGHTER`    | `https://testnet.zklighter.elliot.ai` | `wss://testnet.zklighter.elliot.ai/stream` | 300        |
+| Robinhood mainnet | `LIGHTER_RH` | `https://api.rh.lighter.xyz`          | `wss://api.rh.lighter.xyz/stream`          | 466324     |
+| Robinhood testnet | `LIGHTER_RH` | `https://api.rh-testnet.lighter.xyz`  | `wss://api.rh-testnet.lighter.xyz/stream`  | 300        |
 
-Use `LighterEnvironment::Mainnet` or `LighterEnvironment::Testnet` in data and execution
-configuration. URL overrides are available for private gateways or local test fixtures.
+Use the matching `LighterEnvironment` variant in data and execution configuration. Standard
+Lighter instruments use `.LIGHTER`; Robinhood Chain Lighter instruments use `.LIGHTER_RH`. The
+distinct venues allow both deployments to run in one Nautilus node with explicit client names.
+URL overrides are available for private gateways or local test fixtures, but do not change venue
+identity or the signing domain.
+
+To run standard and Robinhood Chain Lighter together, register each data and execution client with
+a unique client name. Nautilus routes `.LIGHTER` instruments to the standard client and
+`.LIGHTER_RH` instruments to the Robinhood client because the factories construct distinct venues
+from their environment configs. Account IDs must use the matching venue issuer, for example
+`LIGHTER-001` and `LIGHTER_RH-001`; the default `LIGHTER-001` is resolved to `LIGHTER_RH-001` for a
+Robinhood execution factory.
 
 ## Integrator attribution
 
@@ -133,8 +147,14 @@ ongoing maintenance. Maker and taker integrator fees are set to zero, so attribu
 cost.
 
 Lighter requires an `ApproveIntegrator` approval before these attributes can be attached to orders.
-During startup, the execution client submits the required **zero-fee** approval for the configured
-L2 account.
+By default the standard deployment submits the required **zero-fee** approval at startup. Robinhood
+Chain deployments disable integrator attribution by default and perform no maker-only lookup,
+approval, approval nonce allocation, or order tagging.
+
+Set `integrator_mode=LighterIntegratorMode::Disabled` to disable attribution explicitly on standard
+Lighter. `Enabled` requires the selected deployment to have a configured Nautilus integrator;
+enabling it on Robinhood Chain currently fails during client construction. Disabled create and
+modify transactions use empty `L2TxAttributes`.
 
 ### Revoking the approval
 
@@ -622,6 +642,8 @@ environment.
 |-------------|---------------------------------|------------------------------|---------------------------------|
 | Mainnet     | `LIGHTER_API_KEY_INDEX`         | `LIGHTER_API_SECRET`         | `LIGHTER_ACCOUNT_INDEX`         |
 | Testnet     | `LIGHTER_TESTNET_API_KEY_INDEX` | `LIGHTER_TESTNET_API_SECRET` | `LIGHTER_TESTNET_ACCOUNT_INDEX` |
+| Robinhood mainnet | `LIGHTER_RH_API_KEY_INDEX` | `LIGHTER_RH_API_SECRET` | `LIGHTER_RH_ACCOUNT_INDEX` |
+| Robinhood testnet | `LIGHTER_RH_TESTNET_API_KEY_INDEX` | `LIGHTER_RH_TESTNET_API_SECRET` | `LIGHTER_RH_TESTNET_ACCOUNT_INDEX` |
 
 Execution rejects incomplete credentials. The data client runs without credentials: its
 subscriptions and REST requests (instruments, book, trades, bars, funding) all use public
@@ -636,7 +658,7 @@ endpoints.
 | `base_url_http`                    | `None`    | Optional REST URL override.                         |
 | `base_url_ws`                      | `None`    | Optional WebSocket URL override.                    |
 | `proxy_url`                        | `None`    | Optional proxy URL for HTTP and WebSocket.          |
-| `environment`                      | `Mainnet` | `LighterEnvironment::Mainnet` or `Testnet`.         |
+| `environment`                      | `Mainnet` | Standard or Robinhood mainnet/testnet selector.     |
 | `account_index`                    | `None`    | Optional factory field; public data calls do not use it. |
 | `api_key_index`                    | `None`    | Optional factory field; public data calls do not use it. |
 | `private_key`                      | `None`    | Optional factory field; public data calls do not use it. |
@@ -651,14 +673,15 @@ endpoints.
 | Option                      | Default       | Description                                                |
 |-----------------------------|---------------|------------------------------------------------------------|
 | `trader_id`                 | `TRADER-001`  | Nautilus trader identifier.                                |
-| `account_id`                | `LIGHTER-001` | Nautilus account identifier for the venue.                 |
+| `account_id`                | Deployment default | Nautilus account identifier: `LIGHTER-001` or `LIGHTER_RH-001`. |
 | `account_index`             | `None`        | Lighter account index.                                     |
 | `api_key_index`             | `None`        | Lighter API key slot.                                      |
 | `private_key`               | `None`        | Hex private key for auth and L2 transaction signing.       |
 | `base_url_http`             | `None`        | Optional REST URL override.                                |
 | `base_url_ws`               | `None`        | Optional WebSocket URL override.                           |
 | `proxy_url`                 | `None`        | Optional proxy URL for HTTP and WebSocket.                 |
-| `environment`               | `Mainnet`     | `LighterEnvironment::Mainnet` or `Testnet`.                |
+| `environment`               | `Mainnet`     | Standard or Robinhood mainnet/testnet `LighterEnvironment`. |
+| `integrator_mode`           | `Default`     | Deployment default, explicitly enabled, or disabled.       |
 | `http_timeout_secs`         | `60`          | HTTP request timeout in seconds.                           |
 | `ws_timeout_secs`           | `30`          | WebSocket connection and reconnection timeout.             |
 | `market_order_slippage_bps` | `50`          | Slippage cap (bps) for `MARKET` / `STOP_MARKET` / `MIT`.   |
