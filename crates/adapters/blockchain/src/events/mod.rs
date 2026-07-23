@@ -26,5 +26,8 @@ pub mod fee_protocol_update;
 pub mod flash;
 pub mod initialize;
 pub mod mint;
+pub mod modify_liquidity;
 pub mod pool_created;
+pub mod protocol_fee_updated;
 pub mod swap;
+pub mod uniswap_v4_swap;

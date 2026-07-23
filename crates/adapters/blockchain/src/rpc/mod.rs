@@ -22,12 +22,13 @@
 
 use alloy::primitives::Address;
 use enum_dispatch::enum_dispatch;
+use nautilus_model::defi::DexType;
 use nautilus_network::websocket::TransportBackend;
 
 use crate::rpc::{
     chains::{
         arbitrum::ArbitrumRpcClient, base::BaseRpcClient, bsc::BscRpcClient,
-        ethereum::EthereumRpcClient, polygon::PolygonRpcClient,
+        ethereum::EthereumRpcClient, polygon::PolygonRpcClient, robinhood::RobinhoodRpcClient,
     },
     error::BlockchainRpcClientError,
     types::{BlockchainMessage, RpcEventType},
@@ -50,6 +51,7 @@ pub enum BlockchainRpcClientAny {
     Bsc(BscRpcClient),
     Ethereum(EthereumRpcClient),
     Polygon(PolygonRpcClient),
+    Robinhood(RobinhoodRpcClient),
 }
 
 #[async_trait::async_trait]
@@ -62,6 +64,13 @@ pub trait BlockchainRpcClient {
         event_type: RpcEventType,
         addresses: &[Address],
         event_signature: String,
+    ) -> Result<(), BlockchainRpcClientError>;
+    async fn subscribe_pool_manager_events(
+        &mut self,
+        dex: DexType,
+        pool_manager_address: Address,
+        event_signatures: &[String],
+        pool_ids: &[String],
     ) -> Result<(), BlockchainRpcClientError>;
     async fn unsubscribe_blocks(&mut self) -> Result<(), BlockchainRpcClientError>;
     async fn next_rpc_message(&mut self) -> Result<BlockchainMessage, BlockchainRpcClientError>;

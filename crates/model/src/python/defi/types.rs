@@ -400,6 +400,12 @@ impl Pool {
     }
 
     #[getter]
+    #[pyo3(name = "amm_type")]
+    fn py_amm_type(&self) -> AmmType {
+        self.amm_type
+    }
+
+    #[getter]
     #[pyo3(name = "instrument_id")]
     fn py_instrument_id(&self) -> InstrumentId {
         self.instrument_id

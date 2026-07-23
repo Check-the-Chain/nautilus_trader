@@ -82,5 +82,9 @@ pub mod hypersync;
 #[cfg(feature = "hypersync")]
 pub mod services;
 
+#[cfg(all(feature = "hypersync", any(test, feature = "test-utils")))]
+#[doc(hidden)]
+pub mod testing;
+
 #[cfg(feature = "python")]
 pub mod python;

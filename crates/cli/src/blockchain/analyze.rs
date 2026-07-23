@@ -67,7 +67,7 @@ pub(crate) async fn run_analyze_pool(
         multicall_calls_per_rpc_request,
     )
     .await?;
-    let to_block = resolve_to_block(&data_client, to_block).await;
+    let to_block = resolve_to_block(&data_client, to_block).await?;
 
     // Boxed to keep this function's async future small (large_futures lint).
     let outcomes = Box::pin(analyze_pool_with_client(
@@ -142,7 +142,7 @@ pub(crate) async fn run_analyze_pools(
             multicall_calls_per_rpc_request,
         )
         .await?;
-        resolve_to_block(&data_client, None).await
+        resolve_to_block(&data_client, None).await?
     };
 
     // Pools are independent (own RPC client, profiler state, and snapshot rows), so analyze them
@@ -565,11 +565,19 @@ fn rpc_http_url(chain: &Chain, rpc_url: Option<String>) -> anyhow::Result<String
         })
 }
 
-async fn resolve_to_block(data_client: &BlockchainDataClientCore, to_block: Option<u64>) -> u64 {
-    match to_block {
-        Some(block) => block,
-        None => data_client.hypersync_client.current_block().await,
+async fn resolve_to_block(
+    data_client: &BlockchainDataClientCore,
+    to_block: Option<u64>,
+) -> anyhow::Result<u64> {
+    if let Some(block) = to_block {
+        return Ok(block);
     }
+
+    let hypersync_client = data_client
+        .hypersync_client
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("HyperSync is unavailable for pool analysis"))?;
+    Ok(hypersync_client.current_block().await)
 }
 
 fn load_pool_addresses(

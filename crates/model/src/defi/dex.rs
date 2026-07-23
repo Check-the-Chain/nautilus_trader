@@ -115,6 +115,13 @@ pub enum DexType {
     UniswapV2,
     UniswapV3,
     UniswapV4,
+    // Append variants: Python values and binary Serde variant indexes follow declaration order.
+    GigaClassic,
+    GigaV3,
+    SwapHoodV2,
+    SwapHoodV3,
+    UpSlipstream,
+    UpV2,
 }
 
 impl DexType {
@@ -170,6 +177,14 @@ pub struct Dex {
 pub type SharedDex = Arc<Dex>;
 
 impl Dex {
+    fn encode_event_signature(event: &str) -> Cow<'static, str> {
+        if event.is_empty() {
+            Cow::Borrowed("")
+        } else {
+            hex::encode_prefixed(keccak256(event.as_bytes())).into()
+        }
+    }
+
     /// Creates a new [`Dex`] instance with the specified properties.
     ///
     /// # Panics
@@ -189,12 +204,6 @@ impl Dex {
         burn_event: &str,
         collect_event: &str,
     ) -> Self {
-        let encoded_pool_created_event =
-            hex::encode_prefixed(keccak256(pool_created_event.as_bytes()));
-        let encoded_swap_event = hex::encode_prefixed(keccak256(swap_event.as_bytes()));
-        let encoded_mint_event = hex::encode_prefixed(keccak256(mint_event.as_bytes()));
-        let encoded_burn_event = hex::encode_prefixed(keccak256(burn_event.as_bytes()));
-        let encoded_collect_event = hex::encode_prefixed(keccak256(collect_event.as_bytes()));
         let factory_address = match validate_address(factory) {
             Ok(address) => address,
             Err(e) => panic!(
@@ -206,18 +215,43 @@ impl Dex {
             name,
             factory: factory_address,
             factory_creation_block,
-            pool_created_event: encoded_pool_created_event.into(),
+            pool_created_event: Self::encode_event_signature(pool_created_event),
             initialize_event: None,
-            swap_created_event: encoded_swap_event.into(),
-            mint_created_event: encoded_mint_event.into(),
-            burn_created_event: encoded_burn_event.into(),
-            collect_created_event: encoded_collect_event.into(),
+            swap_created_event: Self::encode_event_signature(swap_event),
+            mint_created_event: Self::encode_event_signature(mint_event),
+            burn_created_event: Self::encode_event_signature(burn_event),
+            collect_created_event: Self::encode_event_signature(collect_event),
             flash_created_event: None,
             fee_protocol_update_event: None,
             fee_protocol_collect_event: None,
             amm_type,
             pairs: vec![],
         }
+    }
+
+    /// Creates a DEX registration that supports pool discovery but does not advertise operational
+    /// pool events.
+    #[must_use]
+    pub fn new_discovery_only(
+        chain: Chain,
+        name: DexType,
+        factory: &str,
+        factory_creation_block: u64,
+        amm_type: AmmType,
+        pool_created_event: &str,
+    ) -> Self {
+        Self::new(
+            chain,
+            name,
+            factory,
+            factory_creation_block,
+            amm_type,
+            pool_created_event,
+            "",
+            "",
+            "",
+            "",
+        )
     }
 
     /// Returns a unique identifier for this DEX, combining chain and protocol name.
@@ -305,7 +339,8 @@ impl From<Pool> for InstrumentAny {
 mod tests {
     use rstest::rstest;
 
-    use super::DexType;
+    use super::{AmmType, Dex, DexType};
+    use crate::defi::chain::chains;
 
     #[rstest]
     fn test_dex_type_from_dex_name_valid() {
@@ -349,6 +384,24 @@ mod tests {
     }
 
     #[rstest]
+    fn test_discovery_only_dex_does_not_hash_absent_event_signatures() {
+        let dex = Dex::new_discovery_only(
+            chains::ROBINHOOD.clone(),
+            DexType::UniswapV4,
+            "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+            9070,
+            AmmType::CLAMEnhanced,
+            "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)",
+        );
+
+        assert!(!dex.pool_created_event.is_empty());
+        assert!(dex.swap_created_event.is_empty());
+        assert!(dex.mint_created_event.is_empty());
+        assert!(dex.burn_created_event.is_empty());
+        assert!(dex.collect_created_event.is_empty());
+    }
+
+    #[rstest]
     fn test_dex_type_all_variants_mappable() {
         // Test that all DEX variants can be mapped from their string representation
         let all_dex_names = vec![
@@ -369,6 +422,12 @@ mod tests {
             "UniswapV2",
             "UniswapV3",
             "UniswapV4",
+            "GigaClassic",
+            "GigaV3",
+            "SwapHoodV2",
+            "SwapHoodV3",
+            "UpSlipstream",
+            "UpV2",
         ];
 
         for dex_name in all_dex_names {
@@ -389,5 +448,32 @@ mod tests {
             "AerodromeSlipstream"
         );
         assert_eq!(DexType::FluidDEX.to_string(), "FluidDEX");
+    }
+
+    #[rstest]
+    fn test_dex_type_existing_discriminants_are_stable() {
+        let existing = [
+            DexType::AerodromeSlipstream,
+            DexType::AerodromeV1,
+            DexType::BalancerV2,
+            DexType::BalancerV3,
+            DexType::BaseSwapV2,
+            DexType::BaseX,
+            DexType::CamelotV3,
+            DexType::CurveFinance,
+            DexType::FluidDEX,
+            DexType::MaverickV1,
+            DexType::MaverickV2,
+            DexType::PancakeSwapV3,
+            DexType::SushiSwapV2,
+            DexType::SushiSwapV3,
+            DexType::UniswapV2,
+            DexType::UniswapV3,
+            DexType::UniswapV4,
+        ];
+
+        for (expected, dex_type) in existing.into_iter().enumerate() {
+            assert_eq!(dex_type as usize, expected);
+        }
     }
 }

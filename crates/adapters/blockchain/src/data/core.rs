@@ -13,9 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{cmp::max, sync::Arc};
+use std::{cmp::max, collections::BTreeSet, str::FromStr, sync::Arc, time::Duration};
 
 use ahash::AHashMap;
+use alloy::primitives::{Address, B256};
 use anyhow::Context;
 use futures_util::StreamExt;
 use nautilus_common::messages::DataEvent;
@@ -55,12 +56,15 @@ use crate::{
         BlockchainRpcClient, BlockchainRpcClientAny,
         chains::{
             arbitrum::ArbitrumRpcClient, base::BaseRpcClient, bsc::BscRpcClient,
-            ethereum::EthereumRpcClient, polygon::PolygonRpcClient,
+            ethereum::EthereumRpcClient, polygon::PolygonRpcClient, robinhood::RobinhoodRpcClient,
         },
         http::BlockchainHttpRpcClient,
         types::BlockchainMessage,
     },
-    services::PoolDiscoveryService,
+    services::{
+        PoolDiscoveryService, UniswapV4HeadGuard, UniswapV4MirrorConfig, UniswapV4MirrorController,
+        UniswapV4MirrorRuntime,
+    },
 };
 
 const BLOCKS_PROCESS_IN_SYNC_REPORT: u64 = 50_000;
@@ -82,14 +86,18 @@ pub struct BlockchainDataClientCore {
     pub cache: BlockchainCache,
     /// Interface for interacting with ERC20 token contracts.
     tokens: Erc20Contract,
+    /// HTTP JSON-RPC client used for state reads and historical log discovery.
+    http_rpc_client: Arc<BlockchainHttpRpcClient>,
     /// Interface for interacting with UniswapV3 pool contracts.
     univ3_pool: UniswapV3PoolContract,
     /// Client for the HyperSync data indexing service.
-    pub hypersync_client: HyperSyncClient,
+    pub hypersync_client: Option<HyperSyncClient>,
     /// Optional WebSocket RPC client for direct blockchain node communication.
     pub rpc_client: Option<BlockchainRpcClientAny>,
     /// Manages subscriptions for various DEX events (swaps, mints, burns).
     pub subscription_manager: DefiDataSubscriptionManager,
+    /// Selected Uniswap v4 mirror runtime, when explicitly configured.
+    pub uniswap_v4_mirror: Option<UniswapV4MirrorRuntime>,
     /// Channel sender for data events.
     data_tx: Option<tokio::sync::mpsc::UnboundedSender<DataEvent>>,
     /// Cancellation token for graceful shutdown of long-running operations.
@@ -142,9 +150,6 @@ impl SnapshotValidation {
 impl BlockchainDataClientCore {
     /// Creates a new instance of [`BlockchainDataClientCore`].
     ///
-    /// # Panics
-    ///
-    /// Panics if `use_hypersync_for_live_data` is false but `wss_rpc_url` is None.
     #[must_use]
     pub fn new(
         config: BlockchainDataClientConfig,
@@ -162,15 +167,16 @@ impl BlockchainDataClientCore {
             config.http_rpc_url
         );
 
-        let rpc_client = if !config.use_hypersync_for_live_data && config.wss_rpc_url.is_some() {
-            let wss_rpc_url = config.wss_rpc_url.clone().expect("wss_rpc_url is required");
-            log::debug!("WebSocket RPC URL: {wss_rpc_url}");
-            Some(Self::initialize_rpc_client(
-                chain.name,
-                wss_rpc_url,
-                config.transport_backend,
-                config.proxy_url.clone(),
-            ))
+        let rpc_client = if !config.use_hypersync_for_live_data {
+            config.wss_rpc_url.clone().map(|wss_rpc_url| {
+                log::debug!("WebSocket RPC URL: {wss_rpc_url}");
+                Self::initialize_rpc_client(
+                    chain.name,
+                    wss_rpc_url,
+                    config.transport_backend,
+                    config.proxy_url.clone(),
+                )
+            })
         } else {
             log::debug!("Using HyperSync for live data (no WebSocket RPC)");
             None
@@ -186,13 +192,19 @@ impl BlockchainDataClientCore {
             config.pool_filters.remove_pools_with_empty_erc20fields,
         );
 
-        let hypersync_client =
-            HyperSyncClient::new(chain.clone(), hypersync_tx, cancellation_token.clone());
+        let needs_hypersync = config.use_hypersync_for_live_data
+            || config.dex_ids.iter().any(|dex_id| {
+                get_dex_extended(chain.name, dex_id)
+                    .is_some_and(DexExtended::supports_pool_discovery_hypersync)
+            });
+        let hypersync_client = needs_hypersync
+            .then(|| HyperSyncClient::new(chain.clone(), hypersync_tx, cancellation_token.clone()));
         Self {
             chain,
             config,
             rpc_client,
             tokens: erc20_contract,
+            http_rpc_client: http_rpc_client.clone(),
             univ3_pool: UniswapV3PoolContract::new(
                 http_rpc_client,
                 multicall_calls_per_rpc_request,
@@ -200,6 +212,7 @@ impl BlockchainDataClientCore {
             cache,
             hypersync_client,
             subscription_manager: DefiDataSubscriptionManager::new(),
+            uniswap_v4_mirror: None,
             data_tx,
             cancellation_token,
         }
@@ -240,6 +253,9 @@ impl BlockchainDataClientCore {
             }
             Blockchain::Bsc => {
                 BlockchainRpcClientAny::Bsc(BscRpcClient::new(wss_rpc_url, proxy_url))
+            }
+            Blockchain::Robinhood => {
+                BlockchainRpcClientAny::Robinhood(RobinhoodRpcClient::new(wss_rpc_url, proxy_url))
             }
             _ => panic!("Unsupported blockchain {blockchain} for RPC connection"),
         };
@@ -283,7 +299,133 @@ impl BlockchainDataClientCore {
             self.sync_exchange_pools(&dex, from_block, None, false)
                 .await?;
         }
+        self.initialize_uniswap_v4_mirror().await?;
 
+        Ok(())
+    }
+
+    async fn initialize_uniswap_v4_mirror(&mut self) -> anyhow::Result<()> {
+        let Some(config) = self.config.uniswap_v4_mirror.clone() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            !self.config.use_hypersync_for_live_data,
+            "Uniswap v4 mirrors require WSS RPC live mode"
+        );
+        anyhow::ensure!(
+            self.rpc_client.is_some(),
+            "Uniswap v4 mirrors require wss_rpc_url"
+        );
+        anyhow::ensure!(
+            self.config.dex_ids.contains(&DexType::UniswapV4),
+            "Uniswap v4 mirror configuration requires UniswapV4 in dex_ids"
+        );
+        anyhow::ensure!(
+            !config.pool_ids.is_empty(),
+            "Uniswap v4 mirror pool_ids cannot be empty"
+        );
+
+        let state_view_address = Address::from_str(&config.state_view_address)
+            .with_context(|| "invalid Uniswap v4 StateView address")?;
+        let head_guard = UniswapV4HeadGuard::new(Duration::from_millis(config.head_timeout_ms))
+            .map_err(anyhow::Error::new)?;
+        let dex = self
+            .cache
+            .get_dex(&DexType::UniswapV4)
+            .context("UniswapV4 DEX was not registered")?;
+        let mut controller = UniswapV4MirrorController::new(
+            Arc::clone(&dex),
+            dex.factory,
+            state_view_address,
+            Arc::clone(&self.http_rpc_client),
+            self.config.multicall_calls_per_rpc_request,
+        );
+        let mut selected = BTreeSet::new();
+
+        for configured_pool_id in config.pool_ids {
+            let pool_identifier = PoolIdentifier::new_checked(&configured_pool_id)
+                .with_context(|| format!("invalid Uniswap v4 Pool ID {configured_pool_id}"))?;
+            anyhow::ensure!(
+                matches!(pool_identifier, PoolIdentifier::PoolId(_)),
+                "Uniswap v4 mirror identifier must be a bytes32 Pool ID: {configured_pool_id}"
+            );
+            anyhow::ensure!(
+                selected.insert(pool_identifier),
+                "duplicate Uniswap v4 mirror Pool ID {pool_identifier}"
+            );
+
+            let pool = self.cache.get_pool(&pool_identifier).with_context(|| {
+                format!("selected Uniswap v4 pool {pool_identifier} was not discovered")
+            })?;
+            anyhow::ensure!(
+                pool.dex.name == DexType::UniswapV4,
+                "selected pool {pool_identifier} belongs to {}, not UniswapV4",
+                pool.dex.name
+            );
+            anyhow::ensure!(
+                pool.address == dex.factory,
+                "selected pool {pool_identifier} uses PoolManager {}, expected {}",
+                pool.address,
+                dex.factory
+            );
+
+            let pool_id = B256::from_str(pool_identifier.as_str())
+                .with_context(|| format!("invalid discovered Pool ID {pool_identifier}"))?;
+            let fee = pool.fee.with_context(|| {
+                format!("selected pool {pool_identifier} has no discovered fee")
+            })?;
+            let tick_spacing = pool
+                .tick_spacing
+                .with_context(|| {
+                    format!("selected pool {pool_identifier} has no discovered tick spacing")
+                })?
+                .try_into()
+                .with_context(|| {
+                    format!("selected pool {pool_identifier} tick spacing exceeds i32")
+                })?;
+            let hooks = pool.hooks.with_context(|| {
+                format!("selected pool {pool_identifier} has no discovered hooks")
+            })?;
+            controller.register_pool(
+                UniswapV4MirrorConfig::new(
+                    pool_id,
+                    pool.token0.address,
+                    pool.token1.address,
+                    tick_spacing,
+                    fee,
+                    hooks,
+                )
+                .with_context(|| format!("invalid PoolKey for selected pool {pool_identifier}"))?,
+            )?;
+        }
+
+        let runtime = UniswapV4MirrorRuntime::new(controller, head_guard);
+        let filter = runtime.subscription_filter()?;
+        let event_signatures = filter
+            .topic0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let pool_ids = filter
+            .topic1
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        self.uniswap_v4_mirror = Some(runtime);
+
+        let rpc_client = self
+            .rpc_client
+            .as_mut()
+            .context("Uniswap v4 mirror RPC client disappeared during initialization")?;
+        rpc_client.subscribe_blocks().await?;
+        rpc_client
+            .subscribe_pool_manager_events(
+                DexType::UniswapV4,
+                filter.address,
+                &event_signatures,
+                &pool_ids,
+            )
+            .await?;
         Ok(())
     }
 
@@ -361,7 +503,11 @@ impl BlockchainDataClientCore {
         let to_block = if let Some(block) = to_block {
             block
         } else {
-            self.hypersync_client.current_block().await
+            self.hypersync_client
+                .as_ref()
+                .context("HyperSync is unavailable for block synchronization")?
+                .current_block()
+                .await
         };
         let total_blocks = to_block.saturating_sub(from_block) + 1;
         log::debug!(
@@ -378,6 +524,8 @@ impl BlockchainDataClientCore {
 
         let blocks_stream = self
             .hypersync_client
+            .as_ref()
+            .context("HyperSync is unavailable for block synchronization")?
             .request_blocks_stream(from_block, Some(to_block))
             .await;
 
@@ -480,7 +628,13 @@ impl BlockchainDataClientCore {
 
         let to_block = match to_block {
             Some(block) => block,
-            None => self.hypersync_client.current_block().await,
+            None => {
+                self.hypersync_client
+                    .as_ref()
+                    .context("HyperSync is unavailable for pool-event synchronization")?
+                    .current_block()
+                    .await
+            }
         };
 
         // Skip sync if we're already up to date
@@ -589,6 +743,8 @@ impl BlockchainDataClientCore {
 
         let pool_events_stream = self
             .hypersync_client
+            .as_ref()
+            .context("HyperSync is unavailable for pool-event synchronization")?
             .request_contract_events_stream(
                 effective_from_block,
                 Some(to_block),
@@ -1154,7 +1310,8 @@ impl BlockchainDataClientCore {
             self.chain.clone(),
             &mut self.cache,
             &self.tokens,
-            &self.hypersync_client,
+            self.hypersync_client.as_ref(),
+            &self.http_rpc_client,
             self.cancellation_token.clone(),
             self.config.clone(),
         );
@@ -1211,10 +1368,14 @@ impl BlockchainDataClientCore {
         self.cache.add_dex(dex_extended.dex.clone()).await?;
         self.subscription_manager.register_dex_for_subscriptions(
             dex_id,
-            dex_extended.swap_created_event.as_ref(),
-            dex_extended.mint_created_event.as_ref(),
-            dex_extended.burn_created_event.as_ref(),
-            dex_extended.collect_created_event.as_ref(),
+            (!dex_extended.swap_created_event.is_empty())
+                .then_some(dex_extended.swap_created_event.as_ref()),
+            (!dex_extended.mint_created_event.is_empty())
+                .then_some(dex_extended.mint_created_event.as_ref()),
+            (!dex_extended.burn_created_event.is_empty())
+                .then_some(dex_extended.burn_created_event.as_ref()),
+            (!dex_extended.collect_created_event.is_empty())
+                .then_some(dex_extended.collect_created_event.as_ref()),
             dex_extended.flash_created_event.as_deref(),
         );
         self.subscription_manager.register_dex_fee_protocol_events(
@@ -1263,7 +1424,13 @@ impl BlockchainDataClientCore {
 
         let to_block = match to_block {
             Some(block) => block,
-            None => self.hypersync_client.current_block().await,
+            None => {
+                self.hypersync_client
+                    .as_ref()
+                    .context("HyperSync is unavailable for pool-profiler bootstrap")?
+                    .current_block()
+                    .await
+            }
         };
         let (mut profiler, from_position) = self
             .seed_pool_profiler_from_latest_snapshot(pool, to_block)
@@ -1548,6 +1715,8 @@ impl BlockchainDataClientCore {
 
         let pool_events_stream = self
             .hypersync_client
+            .as_ref()
+            .context("HyperSync is unavailable for pool-profiler bootstrap")?
             .request_contract_events_stream(
                 from_block,
                 Some(to_block),
@@ -2058,6 +2227,8 @@ impl BlockchainDataClientCore {
     ) -> anyhow::Result<BlockPosition> {
         let blocks_stream = self
             .hypersync_client
+            .as_ref()
+            .context("HyperSync is unavailable for block-scoped snapshot")?
             .request_blocks_stream(block_number, Some(block_number))
             .await;
         tokio::pin!(blocks_stream);
@@ -2214,7 +2385,9 @@ impl BlockchainDataClientCore {
     /// This method should be called when shutting down the client to ensure
     /// proper cleanup of network connections and background tasks.
     pub async fn disconnect(&mut self) {
-        self.hypersync_client.disconnect().await;
+        if let Some(hypersync_client) = &mut self.hypersync_client {
+            hypersync_client.disconnect().await;
+        }
     }
 }
 
@@ -2224,6 +2397,7 @@ mod tests {
     use nautilus_core::UnixNanos;
     use nautilus_model::defi::{
         Chain, Token,
+        chain::chains,
         pool_analysis::{
             position::PoolPosition,
             snapshot::{PoolAnalytics, PoolState},
@@ -2237,6 +2411,69 @@ mod tests {
 
     const WETH_USDT_POOL: &str = "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36";
     const WETH_USDT_CREATION_BLOCK: u64 = 12_375_326;
+
+    #[rstest]
+    fn initialize_rpc_client_supports_robinhood() {
+        let client = BlockchainDataClientCore::initialize_rpc_client(
+            Blockchain::Robinhood,
+            "ws://127.0.0.1:8548".to_string(),
+            TransportBackend::Tungstenite,
+            None,
+        );
+
+        assert!(matches!(client, BlockchainRpcClientAny::Robinhood(_)));
+    }
+
+    #[rstest]
+    fn robinhood_rpc_only_core_does_not_initialize_hypersync() {
+        let config = BlockchainDataClientConfig::builder()
+            .chain(Arc::new(chains::ROBINHOOD.clone()))
+            .dex_ids(vec![DexType::UniswapV4])
+            .http_rpc_url("https://rpc.mainnet.chain.robinhood.com".to_string())
+            .wss_rpc_url("ws://127.0.0.1:8548".to_string())
+            .use_hypersync_for_live_data(false)
+            .build();
+        let core = BlockchainDataClientCore::new(config, None, None, CancellationToken::new());
+
+        assert!(core.hypersync_client.is_none());
+        assert!(matches!(
+            core.rpc_client,
+            Some(BlockchainRpcClientAny::Robinhood(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Robinhood Chain RPC access"]
+    async fn live_robinhood_rpc_discovers_uniswap_v4_pool() {
+        let config = BlockchainDataClientConfig::builder()
+            .chain(Arc::new(chains::ROBINHOOD.clone()))
+            .http_rpc_url("https://rpc.mainnet.chain.robinhood.com".to_string())
+            .use_hypersync_for_live_data(false)
+            .build();
+        let mut core = BlockchainDataClientCore::new(config, None, None, CancellationToken::new());
+        core.register_dex_exchange(DexType::UniswapV4)
+            .await
+            .expect("register Robinhood UniswapV4");
+        core.sync_exchange_pools(&DexType::UniswapV4, 9_070, Some(19_069), true)
+            .await
+            .expect("discover Robinhood UniswapV4 pools");
+
+        let pool_id = PoolIdentifier::from_pool_id_hex(
+            "0xdb2c20421239d46bb30a7a73029b7f9b7f166489bfb972057d33cbd7249413a5",
+        )
+        .expect("valid pool ID");
+        let pool = core
+            .cache
+            .get_pool(&pool_id)
+            .expect("known initialized pool should be cached");
+
+        assert_eq!(
+            pool.address,
+            address!("8366a39CC670B4001A1121B8F6A443A643e40951")
+        );
+        assert_eq!(pool.fee, Some(3_000));
+        assert_eq!(pool.tick_spacing, Some(60));
+    }
 
     #[rstest]
     #[case(SnapshotValidation::OnChain, "on_chain", true)]

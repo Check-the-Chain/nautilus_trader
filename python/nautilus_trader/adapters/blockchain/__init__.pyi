@@ -13,6 +13,7 @@ __all__ = [
     "BlockchainDataClientConfig",
     "BlockchainDataClientFactory",
     "DexPoolFilters",
+    "UniswapV4MirrorDataConfig",
     "load_pool_snapshot",
 ]
 
@@ -40,6 +41,7 @@ class BlockchainDataClientConfig:
         postgres_cache_database_config: infrastructure.PostgresConnectOptions | None = None,
         proxy_url: str | None = None,
         transport_backend: network.TransportBackend | None = None,
+        uniswap_v4_mirror: UniswapV4MirrorDataConfig | None = None,
     ) -> None: ...
     @property
     def chain(self) -> model.Chain: ...
@@ -67,6 +69,10 @@ class BlockchainDataClientFactory:
 @typing.final
 class DexPoolFilters:
     def __init__(self, remove_pools_with_empty_erc20_fields: bool | None = ...) -> None: ...
+
+@typing.final
+class UniswapV4MirrorDataConfig:
+    def __init__(self, state_view_address: str, pool_ids: list[str], head_timeout_ms: int) -> None: ...
 
 def load_pool_snapshot(
     pg_config: infrastructure.PostgresConnectOptions,

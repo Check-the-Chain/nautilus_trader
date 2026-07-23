@@ -14,7 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use alloy::primitives::Address;
-use nautilus_model::defi::chain::chains;
+use nautilus_model::defi::{DexType, chain::chains};
 use nautilus_network::websocket::TransportBackend;
 
 use crate::rpc::{
@@ -56,6 +56,18 @@ impl BlockchainRpcClient for BaseRpcClient {
     ) -> Result<(), BlockchainRpcClientError> {
         self.base_client
             .subscribe_pool_events(event_type, addresses, event_signature)
+            .await
+    }
+
+    async fn subscribe_pool_manager_events(
+        &mut self,
+        dex: DexType,
+        pool_manager_address: Address,
+        event_signatures: &[String],
+        pool_ids: &[String],
+    ) -> Result<(), BlockchainRpcClientError> {
+        self.base_client
+            .subscribe_pool_manager_events(dex, pool_manager_address, event_signatures, pool_ids)
             .await
     }
 

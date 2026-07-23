@@ -18,6 +18,7 @@ use nautilus_model::defi::{Blockchain, Chain, DexType};
 use crate::exchanges::{
     arbitrum::ARBITRUM_DEX_EXTENDED_MAP, base::BASE_DEX_EXTENDED_MAP, bsc::BSC_DEX_EXTENDED_MAP,
     ethereum::ETHEREUM_DEX_EXTENDED_MAP, extended::DexExtended,
+    robinhood::ROBINHOOD_DEX_EXTENDED_MAP,
 };
 
 pub mod arbitrum;
@@ -26,6 +27,7 @@ pub mod bsc;
 pub mod ethereum;
 pub mod extended;
 pub mod parsing;
+pub mod robinhood;
 
 /// Returns a map of all DEX names to Dex instances across all chains
 #[must_use]
@@ -38,6 +40,7 @@ pub fn get_dex_extended(
         Blockchain::Base => BASE_DEX_EXTENDED_MAP.get(dex_type).copied(),
         Blockchain::Arbitrum => ARBITRUM_DEX_EXTENDED_MAP.get(dex_type).copied(),
         Blockchain::Bsc => BSC_DEX_EXTENDED_MAP.get(dex_type).copied(),
+        Blockchain::Robinhood => ROBINHOOD_DEX_EXTENDED_MAP.get(dex_type).copied(),
         _ => None,
     }
 }
@@ -50,6 +53,7 @@ pub fn get_supported_dexes_for_chain(blockchain: Blockchain) -> Vec<String> {
         Blockchain::Base => BASE_DEX_EXTENDED_MAP.keys().copied().collect(),
         Blockchain::Arbitrum => ARBITRUM_DEX_EXTENDED_MAP.keys().copied().collect(),
         Blockchain::Bsc => BSC_DEX_EXTENDED_MAP.keys().copied().collect(),
+        Blockchain::Robinhood => ROBINHOOD_DEX_EXTENDED_MAP.keys().copied().collect(),
         _ => vec![],
     };
 
@@ -63,11 +67,12 @@ pub fn get_supported_dexes_for_chain(blockchain: Blockchain) -> Vec<String> {
 ///
 /// Other chains (for example Polygon) are valid for block-level `sync-blocks` but have no DEX
 /// registrations, so DEX commands reject them.
-pub const DEX_SUPPORTED_CHAINS: [Blockchain; 4] = [
+pub const DEX_SUPPORTED_CHAINS: [Blockchain; 5] = [
     Blockchain::Ethereum,
     Blockchain::Base,
     Blockchain::Arbitrum,
     Blockchain::Bsc,
+    Blockchain::Robinhood,
 ];
 
 /// The capability tiers a registered DEX reaches on a chain, derived from its parser presence.
@@ -75,8 +80,12 @@ pub const DEX_SUPPORTED_CHAINS: [Blockchain; 4] = [
 pub struct DexCapability {
     /// The DEX type.
     pub dex_type: DexType,
-    /// Whether `sync-dex` can discover pools (a HyperSync `PoolCreated` parser is registered).
+    /// Whether `sync-dex` can discover pools through at least one provider.
     pub discovery: bool,
+    /// Whether pool discovery is available through HyperSync.
+    pub discovery_hypersync: bool,
+    /// Whether pool discovery is available through JSON-RPC.
+    pub discovery_rpc: bool,
     /// Whether `analyze-pool(s)` can build snapshots (the full pool-event parser set is registered).
     pub snapshots: bool,
     /// Whether replay keeps `fee_protocol` correct (snapshot-capable plus a `SetFeeProtocol` parser).
@@ -93,6 +102,7 @@ pub fn dex_capabilities_for_chain(blockchain: Blockchain) -> Vec<DexCapability> 
         Blockchain::Base => BASE_DEX_EXTENDED_MAP.keys().copied().collect(),
         Blockchain::Arbitrum => ARBITRUM_DEX_EXTENDED_MAP.keys().copied().collect(),
         Blockchain::Bsc => BSC_DEX_EXTENDED_MAP.keys().copied().collect(),
+        Blockchain::Robinhood => ROBINHOOD_DEX_EXTENDED_MAP.keys().copied().collect(),
         _ => return Vec::new(),
     };
     dex_types.sort_by_key(ToString::to_string);
@@ -104,6 +114,8 @@ pub fn dex_capabilities_for_chain(blockchain: Blockchain) -> Vec<DexCapability> 
             Some(DexCapability {
                 dex_type,
                 discovery: dex.supports_pool_discovery(),
+                discovery_hypersync: dex.supports_pool_discovery_hypersync(),
+                discovery_rpc: dex.supports_pool_discovery_rpc(),
                 snapshots: dex.missing_pool_analysis_parsers().is_empty(),
                 replay_ready: dex.supports_fee_protocol_replay(),
             })
@@ -132,18 +144,10 @@ pub fn find_dex_type_case_insensitive(dex_name: &str, chain: &Chain) -> Option<D
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::keccak256;
-    use nautilus_core::hex;
     use nautilus_model::defi::pool_analysis::PoolEventKind;
     use rstest::rstest;
 
     use super::*;
-
-    /// keccak256 of the empty string, used as the sentinel hash when a DEX
-    /// registration leaves an event signature blank.
-    fn empty_signature_hash() -> String {
-        hex::encode_prefixed(keccak256("".as_bytes()))
-    }
 
     /// Pre-existing (chain, dex, event) parser gaps that predate the structured-error
     /// patch. New gaps must not be added without also wiring the parser; legacy gaps
@@ -160,7 +164,6 @@ mod tests {
         let dex_extended = get_dex_extended(blockchain, &dex_type).unwrap_or_else(|| {
             panic!("{blockchain:?}:{dex_type:?} should be registered in the DEX map")
         });
-        let empty = empty_signature_hash();
         let dex = &dex_extended.dex;
 
         let mut record = |event: &str, has_parser: bool| {
@@ -171,26 +174,26 @@ mod tests {
             }
         };
 
-        if dex.pool_created_event.as_ref() != empty {
+        if !dex.pool_created_event.is_empty() {
             record(
                 "PoolCreated",
                 dex_extended.parse_pool_created_event_hypersync_fn.is_some(),
             );
         }
 
-        if dex.swap_created_event.as_ref() != empty {
+        if !dex.swap_created_event.is_empty() {
             record("Swap", dex_extended.parse_swap_event_hypersync_fn.is_some());
         }
 
-        if dex.mint_created_event.as_ref() != empty {
+        if !dex.mint_created_event.is_empty() {
             record("Mint", dex_extended.parse_mint_event_hypersync_fn.is_some());
         }
 
-        if dex.burn_created_event.as_ref() != empty {
+        if !dex.burn_created_event.is_empty() {
             record("Burn", dex_extended.parse_burn_event_hypersync_fn.is_some());
         }
 
-        if dex.collect_created_event.as_ref() != empty {
+        if !dex.collect_created_event.is_empty() {
             record(
                 "Collect",
                 dex_extended.parse_collect_event_hypersync_fn.is_some(),
@@ -295,6 +298,7 @@ mod tests {
     #[case(Blockchain::Base, DexType::AerodromeSlipstream, false, true, false)]
     #[case(Blockchain::Ethereum, DexType::UniswapV2, true, false, false)]
     #[case(Blockchain::Arbitrum, DexType::SushiSwapV2, false, false, false)]
+    #[case(Blockchain::Robinhood, DexType::UniswapV4, true, false, false)]
     fn test_dex_capability_tiers(
         #[case] blockchain: Blockchain,
         #[case] dex_type: DexType,
@@ -310,6 +314,24 @@ mod tests {
         assert_eq!(capability.discovery, discovery);
         assert_eq!(capability.snapshots, snapshots);
         assert_eq!(capability.replay_ready, replay_ready);
+    }
+
+    #[rstest]
+    fn test_robinhood_uniswap_v4_registration_is_rpc_discovery_only() {
+        let dex = get_dex_extended(Blockchain::Robinhood, &DexType::UniswapV4)
+            .expect("Robinhood UniswapV4 should be registered");
+
+        assert_eq!(
+            dex.factory.to_string().to_lowercase(),
+            "0x8366a39cc670b4001a1121b8f6a443a643e40951"
+        );
+        assert_eq!(dex.factory_creation_block, 9070);
+        assert!(dex.supports_pool_discovery_rpc());
+        assert!(!dex.supports_pool_discovery_hypersync());
+        assert!(dex.swap_created_event.is_empty());
+        assert!(dex.mint_created_event.is_empty());
+        assert!(dex.burn_created_event.is_empty());
+        assert!(dex.collect_created_event.is_empty());
     }
 
     #[rstest]

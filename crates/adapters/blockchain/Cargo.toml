@@ -32,6 +32,7 @@ extension-module = [
   "pyo3/extension-module",
 ]
 hypersync = ["hypersync-client", "nautilus-live/node"]
+test-utils = ["hypersync"]
 python = [
   "dep:nautilus-system",
   "nautilus-infrastructure/python",
@@ -107,3 +108,8 @@ doc = false
 name = "python"
 path = "tests/python.rs"
 required-features = ["python", "hypersync"]
+
+[[test]]
+name = "historical_replay_live"
+path = "tests/historical_replay_live.rs"
+required-features = ["test-utils"]

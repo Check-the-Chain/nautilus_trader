@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::str::FromStr;
+
 use derive_builder::Builder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -59,6 +61,9 @@ pub struct PostgresConnectOptions {
     pub username: String,
     pub password: String,
     pub database: String,
+    /// Opaque PostgreSQL URI, used instead of component fields when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
 }
 
 impl PostgresConnectOptions {
@@ -77,11 +82,29 @@ impl PostgresConnectOptions {
             username,
             password,
             database,
+            uri: None,
+        }
+    }
+
+    /// Creates connection options backed by a PostgreSQL URI.
+    #[must_use]
+    pub fn from_uri(uri: String) -> Self {
+        Self {
+            host: String::new(),
+            port: 5432,
+            username: String::new(),
+            password: String::new(),
+            database: String::from("DATABASE_URL"),
+            uri: Some(uri),
         }
     }
 
     #[must_use]
     pub fn connection_string(&self) -> String {
+        if let Some(uri) = &self.uri {
+            return uri.clone();
+        }
+
         format!(
             "postgres://{username}:{password}@{host}:{port}/{database}",
             username = self.username,
@@ -95,6 +118,10 @@ impl PostgresConnectOptions {
     /// Returns the connection string with the password masked for safe logging.
     #[must_use]
     pub fn connection_string_masked(&self) -> String {
+        if self.uri.is_some() {
+            return String::from("postgres://***");
+        }
+
         format!(
             "postgres://{username}:***@{host}:{port}/{database}",
             username = self.username,
@@ -130,6 +157,13 @@ impl Default for PostgresConnectOptions {
 
 impl From<PostgresConnectOptions> for PgConnectOptions {
     fn from(opt: PostgresConnectOptions) -> Self {
+        if let Some(uri) = opt.uri {
+            let uri = normalize_postgres_uri(&uri);
+            return Self::from_str(&uri)
+                .unwrap_or_else(|e| panic!("Invalid PostgreSQL connection URI: {e}"))
+                .disable_statement_logging();
+        }
+
         Self::new()
             .host(opt.host.as_str())
             .port(opt.port)
@@ -153,6 +187,15 @@ pub fn get_postgres_connect_options(
     password: Option<String>,
     database: Option<String>,
 ) -> PostgresConnectOptions {
+    let has_explicit_component_config = host.is_some()
+        || port.is_some()
+        || username.is_some()
+        || password.is_some()
+        || database.is_some();
+    if !has_explicit_component_config && let Ok(uri) = std::env::var("DATABASE_URL") {
+        return PostgresConnectOptions::from_uri(uri);
+    }
+
     let defaults = PostgresConnectOptions::default_administrator();
     let host = host
         .or_else(|| std::env::var("POSTGRES_HOST").ok())
@@ -185,29 +228,44 @@ pub async fn connect_pg(options: PgConnectOptions) -> anyhow::Result<PgPool> {
     Ok(PgPool::connect_with(options).await?)
 }
 
-/// Scans the current working directory for the `nautilus_trader` repository
-/// and constructs the path to the SQL schema directory.
+/// Connects to Postgres using a connection URI, including its TLS parameters.
+///
+/// # Errors
+///
+/// Returns an error if the URI cannot be parsed or the database connection fails.
+pub async fn connect_pg_uri(uri: &str) -> anyhow::Result<PgPool> {
+    let uri = normalize_postgres_uri(uri);
+    let options = PgConnectOptions::from_str(&uri)?.disable_statement_logging();
+    connect_pg(options).await
+}
+
+// libpq accepts `sslrootcert=system`; SQLx uses native roots when no explicit file is given.
+fn normalize_postgres_uri(uri: &str) -> String {
+    uri.replace("?sslrootcert=system&", "?")
+        .replace("&sslrootcert=system", "")
+        .replace("?sslrootcert=system", "")
+}
+
+/// Scans ancestors of the current working directory for the SQL schema directory.
 ///
 /// # Errors
 ///
 /// Returns an error if the `SCHEMA_DIR` environment variable is not set and the repository
 /// cannot be located in the current directory path.
 ///
-/// # Panics
-///
-/// Panics if the current working directory cannot be determined or contains invalid UTF-8.
 fn get_schema_dir() -> anyhow::Result<String> {
     std::env::var("SCHEMA_DIR").or_else(|_| {
-        let nautilus_git_repo_name = "nautilus_trader";
-        let binding = std::env::current_dir().unwrap();
-        let current_dir = binding.to_str().unwrap();
-        match current_dir.find(nautilus_git_repo_name){
-            Some(index) => {
-                let schema_path = current_dir[0..index + nautilus_git_repo_name.len()].to_string() + "/schema/sql";
-                Ok(schema_path)
-            }
-            None => anyhow::bail!("Could not calculate schema dir from current directory path or SCHEMA_DIR env variable")
-        }
+        let current_dir = std::env::current_dir()?;
+        current_dir
+            .ancestors()
+            .map(|ancestor| ancestor.join("schema/sql"))
+            .find(|candidate| candidate.is_dir())
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not locate schema/sql from the current directory or SCHEMA_DIR"
+                )
+            })
     })
 }
 
@@ -220,10 +278,6 @@ fn get_schema_dir() -> anyhow::Result<String> {
 /// # Panics
 ///
 /// Panics if `schema_dir` is missing and cannot be determined or if other unwraps fail.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Postgres initialization follows the ordered schema and role setup steps"
-)]
 pub async fn init_postgres(
     pg: &PgPool,
     database: String,
@@ -261,47 +315,7 @@ pub async fn init_postgres(
         }
     }
 
-    // Execute all the sql files in schema dir
-    let schema_dir = schema_dir.unwrap_or_else(|| get_schema_dir().unwrap());
-    let sql_files = vec!["types.sql", "functions.sql", "partitions.sql", "tables.sql"];
-    let plpgsql_regex =
-        Regex::new(r"\$\$ LANGUAGE plpgsql(?:[ \t\r\n]+SECURITY[ \t\r\n]+DEFINER)?;")?;
-
-    for file_name in &sql_files {
-        log::info!("Executing schema file: {file_name:?}");
-        let file_path = format!("{schema_dir}/{file_name}");
-        let sql_content = std::fs::read_to_string(&file_path)?;
-        let sql_statements: Vec<String> = match *file_name {
-            "functions.sql" | "partitions.sql" => {
-                let mut statements = Vec::new();
-                let mut last_end = 0;
-
-                for mat in plpgsql_regex.find_iter(&sql_content) {
-                    let statement = sql_content[last_end..mat.end()].to_string();
-                    if !statement.trim().is_empty() {
-                        statements.push(statement);
-                    }
-                    last_end = mat.end();
-                }
-                statements
-            }
-            _ => split_sql_statements(&sql_content),
-        };
-
-        for sql_statement in sql_statements {
-            sqlx::query(AssertSqlSafe(sql_statement.as_str()))
-                .execute(pg)
-                .await
-                .map_err(|e| {
-                    if e.to_string().contains("already exists") {
-                        log::info!("Already exists error on statement, skipping");
-                    } else {
-                        panic!("Error executing statement {sql_statement} with error: {e:?}")
-                    }
-                })
-                .unwrap();
-        }
-    }
+    apply_postgres_schema(pg, schema_dir).await?;
 
     // Grant connect
     match sqlx::query(AssertSqlSafe(format!(
@@ -358,6 +372,141 @@ pub async fn init_postgres(
         Err(e) => log::error!("Error granting all privileges to role {database}: {e:?}"),
     }
 
+    Ok(())
+}
+
+/// Applies the Nautilus SQL schema without creating roles or changing database grants.
+///
+/// # Errors
+///
+/// Returns an error if schema files cannot be read or a non-idempotent SQL statement fails.
+pub async fn apply_postgres_schema(pg: &PgPool, schema_dir: Option<String>) -> anyhow::Result<()> {
+    let schema_dir = match schema_dir {
+        Some(schema_dir) => schema_dir,
+        None => get_schema_dir()?,
+    };
+    let sql_files = ["types.sql", "functions.sql", "partitions.sql", "tables.sql"];
+    let plpgsql_regex =
+        Regex::new(r"\$\$ LANGUAGE plpgsql(?:[ \t\r\n]+SECURITY[ \t\r\n]+DEFINER)?;")?;
+
+    for file_name in sql_files {
+        log::info!("Executing schema file: {file_name:?}");
+        let file_path = format!("{schema_dir}/{file_name}");
+        let sql_content = std::fs::read_to_string(&file_path)?;
+        let sql_statements = match file_name {
+            "functions.sql" | "partitions.sql" => {
+                let mut statements = Vec::new();
+                let mut last_end = 0;
+
+                for mat in plpgsql_regex.find_iter(&sql_content) {
+                    let statement = sql_content[last_end..mat.end()].to_string();
+                    if !statement.trim().is_empty() {
+                        statements.push(statement);
+                    }
+                    last_end = mat.end();
+                }
+                statements
+            }
+            _ => split_sql_statements(&sql_content),
+        };
+
+        for sql_statement in sql_statements {
+            if let Err(error) = sqlx::query(AssertSqlSafe(sql_statement.as_str()))
+                .execute(pg)
+                .await
+            {
+                if error.to_string().contains("already exists") {
+                    log::info!("Already exists error on statement, skipping");
+                    continue;
+                }
+                anyhow::bail!(
+                    "error executing statement from {file_name}: {error}; statement: {sql_statement}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verifies the tables, numeric types, and functions required by the blockchain cache.
+///
+/// # Errors
+///
+/// Returns an error when a catalog query fails or a required schema object is absent.
+pub async fn verify_blockchain_cache_schema(pg: &PgPool) -> anyhow::Result<()> {
+    const TABLES: &[&str] = &[
+        "chain",
+        "block",
+        "block_default",
+        "pool_event_block",
+        "token",
+        "token_default",
+        "dex",
+        "pool",
+        "pool_swap_event",
+        "pool_liquidity_event",
+        "pool_collect_event",
+        "pool_fee_protocol_update_event",
+        "pool_fee_protocol_collect_event",
+        "pool_flash_event",
+        "pool_snapshot",
+        "pool_position",
+        "pool_tick",
+    ];
+    const TYPES: &[&str] = &["i256", "u256", "u128", "u160", "i128"];
+    const FUNCTIONS: &[&str] = &[
+        "get_last_continuous_block(integer)",
+        "create_block_partition(integer)",
+        "delete_block_partition(integer,boolean)",
+        "create_token_partition(integer)",
+        "delete_token_partition(integer,boolean)",
+    ];
+    const COLUMNS: &[(&str, &str, &str)] = &[("pool", "amm_type", "text")];
+
+    for table in TABLES {
+        let qualified = format!("public.{table}");
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(&qualified)
+            .fetch_one(pg)
+            .await?;
+        anyhow::ensure!(
+            found.is_some(),
+            "missing blockchain cache table {qualified}"
+        );
+    }
+    for data_type in TYPES {
+        let qualified = format!("public.{data_type}");
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regtype($1)::text")
+            .bind(&qualified)
+            .fetch_one(pg)
+            .await?;
+        anyhow::ensure!(found.is_some(), "missing blockchain cache type {qualified}");
+    }
+    for (table, column, expected_type) in COLUMNS {
+        let actual_type: Option<String> = sqlx::query_scalar(
+            "SELECT data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_optional(pg)
+        .await?;
+        anyhow::ensure!(
+            actual_type.as_deref() == Some(*expected_type),
+            "missing or invalid blockchain cache column public.{table}.{column}: expected {expected_type}, found {}",
+            actual_type.as_deref().unwrap_or("missing"),
+        );
+    }
+    for function in FUNCTIONS {
+        let qualified = format!("public.{function}");
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regprocedure($1)::text")
+            .bind(&qualified)
+            .fetch_one(pg)
+            .await?;
+        anyhow::ensure!(
+            found.is_some(),
+            "missing blockchain cache function {qualified}"
+        );
+    }
     Ok(())
 }
 
@@ -504,6 +653,18 @@ database = "nautilus"
         assert_eq!(config.port, 5432);
         assert_eq!(config.username, "nautilus");
         assert_eq!(config.database, "nautilus");
+        assert!(config.uri.is_none());
+    }
+
+    #[rstest]
+    fn test_postgres_uri_options_preserve_tls_and_mask_connection_string() {
+        let uri =
+            "postgresql://user:secret@example.com/database?sslmode=verify-full&sslrootcert=system";
+        let config = PostgresConnectOptions::from_uri(uri.to_string());
+
+        assert_eq!(config.connection_string(), uri);
+        assert_eq!(config.connection_string_masked(), "postgres://***");
+        let _: PgConnectOptions = config.into();
     }
 
     #[rstest]

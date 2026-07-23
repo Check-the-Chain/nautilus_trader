@@ -380,6 +380,7 @@ CREATE TABLE IF NOT EXISTS "dex" (
 CREATE TABLE IF NOT EXISTS "pool" (
     chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
     dex_name TEXT NOT NULL,
+    amm_type TEXT,
     address TEXT NOT NULL,
     pool_identifier TEXT NOT NULL,
     creation_block BIGINT NOT NULL,
@@ -398,6 +399,7 @@ CREATE TABLE IF NOT EXISTS "pool" (
     FOREIGN KEY (token1_chain, token1_address) REFERENCES token(chain_id, address),
     FOREIGN KEY (chain_id, dex_name) REFERENCES dex(chain_id, name)
 );
+ALTER TABLE "pool" ADD COLUMN IF NOT EXISTS amm_type TEXT;
 
 CREATE TABLE IF NOT EXISTS "pool_swap_event" (
     id BIGSERIAL PRIMARY KEY,

@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Instant};
 
 use nautilus_common::{
     clients::DataClient,
@@ -149,8 +149,13 @@ impl BlockchainDataClient {
 
             let mut command_rx = command_rx;
             let mut pending_pool_messages = VecDeque::new();
+            let hypersync_enabled = core_client.hypersync_client.is_some();
 
             loop {
+                let mirror_head_deadline = core_client
+                    .uniswap_v4_mirror
+                    .as_ref()
+                    .and_then(|runtime| runtime.head_deadline());
                 tokio::select! {
                     () = cancellation_token.cancelled() => {
                         log::debug!("Received cancellation signal in Blockchain data client process task");
@@ -193,7 +198,7 @@ impl BlockchainDataClient {
                             break;
                         }
                     }
-                    data = hypersync_rx.recv() => {
+                    data = Self::next_hypersync_message(hypersync_enabled, &mut hypersync_rx) => {
                         if let Some(msg) = data {
                             let is_block = matches!(&msg, BlockchainMessage::Block(_));
                             let Some(msg) = Self::ready_live_blockchain_message(
@@ -227,6 +232,13 @@ impl BlockchainDataClient {
                             break;
                         }
                     }
+                    () = Self::wait_for_mirror_head_deadline(mirror_head_deadline) => {
+                        if let Some(runtime) = &mut core_client.uniswap_v4_mirror
+                            && let Err(error) = runtime.check_head_liveness(Instant::now())
+                        {
+                            log::error!("Uniswap v4 mirror head stream became unavailable: {error}");
+                        }
+                    }
                     msg = async {
                         match core_client.rpc_client {
                             Some(ref mut rpc_client) => rpc_client.next_rpc_message().await,
@@ -236,6 +248,11 @@ impl BlockchainDataClient {
                         // This branch only fires when we actually receive a message
                         match msg {
                             Ok(msg) => {
+                                if let Err(error) =
+                                    Self::handle_uniswap_v4_rpc_message(&msg, &mut core_client).await
+                                {
+                                    log::error!("Uniswap v4 mirror runtime requires recovery: {error}");
+                                }
                                 let is_block = matches!(&msg, BlockchainMessage::Block(_));
 
                                 let Some(msg) = Self::ready_live_blockchain_message(
@@ -266,6 +283,9 @@ impl BlockchainDataClient {
                             }
                             Err(e) => {
                                 log::error!("Error processing RPC message: {e}");
+                                if let Some(runtime) = &mut core_client.uniswap_v4_mirror {
+                                    runtime.handle_transport_failure();
+                                }
                             }
                         }
                     }
@@ -276,6 +296,48 @@ impl BlockchainDataClient {
         });
 
         self.process_task = Some(handle);
+    }
+
+    async fn next_hypersync_message(
+        hypersync_enabled: bool,
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<BlockchainMessage>,
+    ) -> Option<BlockchainMessage> {
+        if hypersync_enabled {
+            receiver.recv().await
+        } else {
+            std::future::pending().await
+        }
+    }
+
+    async fn wait_for_mirror_head_deadline(deadline: Option<Instant>) {
+        if let Some(deadline) = deadline {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        } else {
+            std::future::pending().await
+        }
+    }
+
+    async fn handle_uniswap_v4_rpc_message(
+        msg: &BlockchainMessage,
+        core_client: &mut BlockchainDataClientCore,
+    ) -> anyhow::Result<()> {
+        let Some(runtime) = &mut core_client.uniswap_v4_mirror else {
+            return Ok(());
+        };
+        match msg {
+            BlockchainMessage::SubscriptionConfirmed(event) => {
+                runtime.handle_subscription_confirmation(*event, Instant::now());
+            }
+            BlockchainMessage::Block(block) => {
+                runtime.handle_block(block, Instant::now()).await?;
+            }
+            BlockchainMessage::PoolManagerEvent(DexType::UniswapV4, log) => {
+                runtime.handle_pool_manager_log(log.clone())?;
+            }
+            BlockchainMessage::Reconnected => runtime.handle_reconnected(),
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn drain_pending_pool_messages(
@@ -370,7 +432,10 @@ impl BlockchainDataClient {
             BlockchainMessage::FlashEvent(event) => Some(event.block_number),
             BlockchainMessage::FeeProtocolUpdateEvent(event) => Some(event.block_number),
             BlockchainMessage::FeeProtocolCollectEvent(event) => Some(event.block_number),
-            BlockchainMessage::Block(_) => None,
+            BlockchainMessage::Reconnected
+            | BlockchainMessage::SubscriptionConfirmed(_)
+            | BlockchainMessage::Block(_)
+            | BlockchainMessage::PoolManagerEvent(_, _) => None,
         }
     }
 
@@ -550,6 +615,9 @@ impl BlockchainDataClient {
                     }
                 }
             }
+            BlockchainMessage::Reconnected
+            | BlockchainMessage::SubscriptionConfirmed(_)
+            | BlockchainMessage::PoolManagerEvent(_, _) => None,
         }
     }
 
@@ -568,14 +636,22 @@ impl BlockchainDataClient {
                         log::warn!(
                             "RPC blocks subscription failed: {e}, falling back to HyperSync"
                         );
-                        core_client.hypersync_client.subscribe_blocks();
+                        let Some(hypersync_client) = &mut core_client.hypersync_client else {
+                            anyhow::bail!(
+                                "RPC blocks subscription failed and HyperSync is unavailable: {e}"
+                            );
+                        };
+                        hypersync_client.subscribe_blocks();
                         tokio::task::yield_now().await;
                     } else {
                         log::debug!("Successfully subscribed to blocks via RPC");
                     }
                 } else {
                     log::debug!("Subscribing to blocks via HyperSync");
-                    core_client.hypersync_client.subscribe_blocks();
+                    let Some(hypersync_client) = &mut core_client.hypersync_client else {
+                        anyhow::bail!("HyperSync is unavailable for block subscriptions");
+                    };
+                    hypersync_client.subscribe_blocks();
                     tokio::task::yield_now().await;
                 }
 
@@ -761,9 +837,11 @@ impl BlockchainDataClient {
             DefiUnsubscribeCommand::Blocks(_cmd) => {
                 log::debug!("Processing unsubscribe blocks command");
 
-                if Self::has_active_pool_event_subscriptions(core_client) {
+                if Self::has_active_pool_event_subscriptions(core_client)
+                    || core_client.uniswap_v4_mirror.is_some()
+                {
                     log::debug!(
-                        "Keeping block subscription active for live pool-event timestamp cache"
+                        "Keeping block subscription active for live pool-event or Uniswap v4 mirror control"
                     );
                     return Ok(());
                 }
@@ -772,7 +850,9 @@ impl BlockchainDataClient {
                     rpc.unsubscribe_blocks().await?;
                     log::debug!("Unsubscribed from blocks via RPC");
                 } else {
-                    core_client.hypersync_client.unsubscribe_blocks().await;
+                    if let Some(hypersync_client) = &mut core_client.hypersync_client {
+                        hypersync_client.unsubscribe_blocks().await;
+                    }
                     log::debug!("Unsubscribed from blocks via HyperSync");
                 }
 
@@ -1041,14 +1121,19 @@ impl BlockchainDataClient {
             .get_active_subscribed_dex_event_signatures(&dex);
 
         if !addresses.is_empty() && !event_signatures.is_empty() {
-            core_client.hypersync_client.subscribe_blocks();
+            let Some(hypersync_client) = &mut core_client.hypersync_client else {
+                log::error!("HyperSync is unavailable for DEX event subscriptions");
+                return;
+            };
+            hypersync_client.subscribe_blocks();
             tokio::task::yield_now().await;
         }
 
-        core_client
-            .hypersync_client
-            .update_dex_event_stream(dex, addresses, event_signatures)
-            .await;
+        if let Some(hypersync_client) = &mut core_client.hypersync_client {
+            hypersync_client
+                .update_dex_event_stream(dex, addresses, event_signatures)
+                .await;
+        }
     }
 
     fn has_active_pool_event_subscriptions(core_client: &BlockchainDataClientCore) -> bool {
@@ -1364,6 +1449,20 @@ mod tests {
 
     const WETH_USDT_CREATION_BLOCK: u64 = 12_375_326;
 
+    #[tokio::test]
+    async fn rpc_only_client_ignores_closed_hypersync_channel() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(sender);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            BlockchainDataClient::next_hypersync_message(false, &mut receiver),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires ENVIO_API_TOKEN and live HyperSync access"]
     async fn pool_snapshot_request_does_not_emit_snapshot_when_bootstrap_fails() {
@@ -1613,10 +1712,10 @@ mod tests {
             .expect("DEX should be added to in-memory cache");
         core.subscription_manager.register_dex_for_subscriptions(
             DexType::UniswapV3,
-            dex_extended.swap_created_event.as_ref(),
-            dex_extended.mint_created_event.as_ref(),
-            dex_extended.burn_created_event.as_ref(),
-            dex_extended.collect_created_event.as_ref(),
+            Some(dex_extended.swap_created_event.as_ref()),
+            Some(dex_extended.mint_created_event.as_ref()),
+            Some(dex_extended.burn_created_event.as_ref()),
+            Some(dex_extended.collect_created_event.as_ref()),
             dex_extended.flash_created_event.as_deref(),
         );
         core.subscription_manager.register_dex_fee_protocol_events(

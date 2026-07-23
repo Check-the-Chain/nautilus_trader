@@ -24,17 +24,13 @@ use crate::exchanges::{extended::DexExtended, parsing::uniswap_v4};
 
 /// Uniswap V4 DEX on Base.
 pub static UNISWAP_V4: LazyLock<DexExtended> = LazyLock::new(|| {
-    let dex = Dex::new(
+    let dex = Dex::new_discovery_only(
         chains::BASE.clone(),
         DexType::UniswapV4,
         "0x498581fF718922c3f8e6A244956aF099B2652b2b",
         25350988,
         AmmType::CLAMEnhanced,
         "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)",
-        "",
-        "",
-        "",
-        "",
     );
 
     let mut dex_extended = DexExtended::new(dex);

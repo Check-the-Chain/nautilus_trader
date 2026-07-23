@@ -14,5 +14,25 @@
 // -------------------------------------------------------------------------------------------------
 
 pub mod pool_discovery;
+pub mod uniswap_v4_mirror;
+pub mod uniswap_v4_mirror_controller;
+pub mod uniswap_v4_mirror_runtime;
+pub mod uniswap_v4_quote;
 
 pub use pool_discovery::PoolDiscoveryService;
+pub use uniswap_v4_mirror::{
+    UniswapV4EventPosition, UniswapV4Mirror, UniswapV4MirrorConfig, UniswapV4MirrorError,
+    UniswapV4MirrorEvent, UniswapV4MirrorTick,
+};
+pub use uniswap_v4_mirror_controller::{
+    UniswapV4BootstrapHead, UniswapV4HeadGuard, UniswapV4HeadGuardError, UniswapV4HeadOutcome,
+    UniswapV4MirrorController, UniswapV4MirrorControllerError, UniswapV4MirrorLogFilter,
+    UniswapV4MirrorLogOutcome, UniswapV4MirrorStatus,
+};
+pub use uniswap_v4_mirror_runtime::{
+    UniswapV4MirrorRuntime, UniswapV4MirrorRuntimeError, UniswapV4MirrorRuntimePhase,
+};
+pub use uniswap_v4_quote::{
+    ExactUniswapV4QuoteEngine, UniswapV4QuoteAmount, UniswapV4QuoteDirection, UniswapV4QuoteEngine,
+    UniswapV4QuoteError, UniswapV4QuoteRequest, UniswapV4QuoteResult,
+};

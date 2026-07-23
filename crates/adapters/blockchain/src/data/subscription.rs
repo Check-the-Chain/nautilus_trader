@@ -367,27 +367,35 @@ impl DefiDataSubscriptionManager {
     pub fn register_dex_for_subscriptions(
         &mut self,
         dex: DexType,
-        swap_event_signature: &str,
-        mint_event_signature: &str,
-        burn_event_signature: &str,
-        collect_event_signature: &str,
+        swap_event_signature: Option<&str>,
+        mint_event_signature: Option<&str>,
+        burn_event_signature: Option<&str>,
+        collect_event_signature: Option<&str>,
         flash_event_signature: Option<&str>,
     ) {
-        self.subscribed_pool_swaps.insert(dex, AHashSet::new());
-        self.pool_swap_event_encoded
-            .insert(dex, Self::normalize_topic(swap_event_signature));
+        if let Some(swap_event_signature) = swap_event_signature {
+            self.subscribed_pool_swaps.insert(dex, AHashSet::new());
+            self.pool_swap_event_encoded
+                .insert(dex, Self::normalize_topic(swap_event_signature));
+        }
 
-        self.subscribed_pool_mints.insert(dex, AHashSet::new());
-        self.pool_mint_event_encoded
-            .insert(dex, Self::normalize_topic(mint_event_signature));
+        if let Some(mint_event_signature) = mint_event_signature {
+            self.subscribed_pool_mints.insert(dex, AHashSet::new());
+            self.pool_mint_event_encoded
+                .insert(dex, Self::normalize_topic(mint_event_signature));
+        }
 
-        self.subscribed_pool_burns.insert(dex, AHashSet::new());
-        self.pool_burn_event_encoded
-            .insert(dex, Self::normalize_topic(burn_event_signature));
+        if let Some(burn_event_signature) = burn_event_signature {
+            self.subscribed_pool_burns.insert(dex, AHashSet::new());
+            self.pool_burn_event_encoded
+                .insert(dex, Self::normalize_topic(burn_event_signature));
+        }
 
-        self.subscribed_pool_collects.insert(dex, AHashSet::new());
-        self.pool_collect_event_encoded
-            .insert(dex, Self::normalize_topic(collect_event_signature));
+        if let Some(collect_event_signature) = collect_event_signature {
+            self.subscribed_pool_collects.insert(dex, AHashSet::new());
+            self.pool_collect_event_encoded
+                .insert(dex, Self::normalize_topic(collect_event_signature));
+        }
 
         if let Some(flash_event_signature) = flash_event_signature {
             self.subscribed_pool_flashes.insert(dex, AHashSet::new());
@@ -560,10 +568,10 @@ mod tests {
         let mut manager = DefiDataSubscriptionManager::new();
         manager.register_dex_for_subscriptions(
             DexType::UniswapV3,
-            "Swap(address,address,int256,int256,uint160,uint128,int24)",
-            "Mint(address,address,int24,int24,uint128,uint256,uint256)",
-            "Burn(address,int24,int24,uint128,uint256,uint256)",
-            "Collect(address,address,int24,int24,uint128,uint128)",
+            Some("Swap(address,address,int256,int256,uint160,uint128,int24)"),
+            Some("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
+            Some("Burn(address,int24,int24,uint128,uint256,uint256)"),
+            Some("Collect(address,address,int24,int24,uint128,uint128)"),
             Some("Flash(address,address,uint256,uint256,uint256,uint256)"),
         );
         manager
@@ -819,10 +827,10 @@ mod tests {
         // Step 1: Register DEX
         manager.register_dex_for_subscriptions(
             dex_type,
-            "Swap(address,uint256,uint256)",
-            "Mint(address,uint256)",
-            "Burn(address,uint256)",
-            "Collect(address,uint256,uint256)",
+            Some("Swap(address,uint256,uint256)"),
+            Some("Mint(address,uint256)"),
+            Some("Burn(address,uint256)"),
+            Some("Collect(address,uint256,uint256)"),
             Some("Flash(address,address,uint256,uint256,uint256,uint256)"),
         );
 
@@ -859,10 +867,10 @@ mod tests {
         // Register with raw event signatures
         manager.register_dex_for_subscriptions(
             DexType::UniswapV3,
-            "Swap(address,address,int256,int256,uint160,uint128,int24)",
-            "Mint(address,address,int24,int24,uint128,uint256,uint256)",
-            "Burn(address,int24,int24,uint128,uint256,uint256)",
-            "Collect(address,address,int24,int24,uint128,uint128)",
+            Some("Swap(address,address,int256,int256,uint160,uint128,int24)"),
+            Some("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
+            Some("Burn(address,int24,int24,uint128,uint256,uint256)"),
+            Some("Collect(address,address,int24,int24,uint128,uint128)"),
             Some("Flash(address,address,uint256,uint256,uint256,uint256)"),
         );
 
@@ -899,10 +907,10 @@ mod tests {
         // Register with pre-encoded keccak256 hashes (with 0x prefix)
         manager.register_dex_for_subscriptions(
             DexType::UniswapV3,
-            "Swap(address,address,int256,int256,uint160,uint128,int24)",
-            "Mint(address,address,int24,int24,uint128,uint256,uint256)",
-            "Burn(address,int24,int24,uint128,uint256,uint256)",
-            "Collect(address,address,int24,int24,uint128,uint128)",
+            Some("Swap(address,address,int256,int256,uint160,uint128,int24)"),
+            Some("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
+            Some("Burn(address,int24,int24,uint128,uint256,uint256)"),
+            Some("Collect(address,address,int24,int24,uint128,uint128)"),
             Some("Flash(address,address,uint256,uint256,uint256,uint256)"),
         );
 
@@ -938,10 +946,10 @@ mod tests {
         // Register with pre-encoded hashes without 0x prefix
         manager.register_dex_for_subscriptions(
             DexType::UniswapV3,
-            "Swap(address,address,int256,int256,uint160,uint128,int24)",
-            "Mint(address,address,int24,int24,uint128,uint256,uint256)",
-            "Burn(address,int24,int24,uint128,uint256,uint256)",
-            "Collect(address,address,int24,int24,uint128,uint128)",
+            Some("Swap(address,address,int256,int256,uint160,uint128,int24)"),
+            Some("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
+            Some("Burn(address,int24,int24,uint128,uint256,uint256)"),
+            Some("Collect(address,address,int24,int24,uint128,uint128)"),
             Some("Flash(address,address,uint256,uint256,uint256,uint256)"),
         );
 

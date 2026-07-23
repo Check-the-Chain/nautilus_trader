@@ -109,6 +109,9 @@ mod tests {
         // UniswapV2 is discovery-only (PoolCreated but no analysis parsers).
         assert!(help.contains("UniswapV2"));
         assert!(help.contains("UniswapV3"));
+        assert!(help.contains(
+            "robinhood:GigaClassic, GigaV3, SwapHoodV2, SwapHoodV3, UniswapV4, UpSlipstream, UpV2"
+        ));
         // AerodromeSlipstream has no PoolCreated parser, so it is not discoverable.
         assert!(!help.contains("AerodromeSlipstream"));
         // SushiSwapV2 is registered but wires no parsers.
@@ -125,5 +128,6 @@ mod tests {
         // Discovery-only and unsupported DEXes are absent.
         assert!(!help.contains("UniswapV2"));
         assert!(!help.contains("SushiSwapV2"));
+        assert!(!help.contains("SwapHoodV3"));
     }
 }

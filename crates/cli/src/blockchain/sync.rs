@@ -22,7 +22,9 @@ use nautilus_blockchain::{
     rpc::providers::check_infura_rpc_provider,
 };
 use nautilus_core::string::secret::mask_api_key;
-use nautilus_infrastructure::sql::pg::get_postgres_connect_options;
+use nautilus_infrastructure::sql::pg::{
+    connect_pg, get_postgres_connect_options, verify_blockchain_cache_schema,
+};
 use nautilus_model::defi::chain::Chain;
 
 use crate::opt::DatabaseConfig;
@@ -31,6 +33,8 @@ pub(crate) async fn run_sync_dex(
     chain: String,
     dex: String,
     rpc_url: Option<String>,
+    rpc_requests_per_second: Option<u32>,
+    to_block: Option<u64>,
     database: DatabaseConfig,
     reset: bool,
     multicall_calls_per_rpc_request: Option<u32>,
@@ -70,6 +74,9 @@ pub(crate) async fn run_sync_dex(
         database.password,
         database.database,
     );
+    let verification_pool = connect_pg(postgres_connect_options.clone().into()).await?;
+    verify_blockchain_cache_schema(&verification_pool).await?;
+    verification_pool.close().await;
     // Get RPC HTTP URL: CLI arg, Infura provider, OR RPC_HTTP_URL env var
     let rpc_http_url = rpc_url
         .or_else(|| check_infura_rpc_provider(&chain.name))
@@ -101,8 +108,9 @@ pub(crate) async fn run_sync_dex(
         .chain(Arc::new(chain.to_owned()))
         .dex_ids(vec![dex_type])
         .http_rpc_url(rpc_http_url)
+        .maybe_rpc_requests_per_second(rpc_requests_per_second)
         .maybe_multicall_calls_per_rpc_request(multicall_calls_per_rpc_request)
-        .use_hypersync_for_live_data(true)
+        .use_hypersync_for_live_data(dex_extended.supports_pool_discovery_hypersync())
         .postgres_cache_database_config(postgres_connect_options)
         .build();
     let cancellation_token = tokio_util::sync::CancellationToken::new();
@@ -114,11 +122,22 @@ pub(crate) async fn run_sync_dex(
         .register_dex_exchange(dex_type)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to register DEX exchange: {e}"))?;
-    // We want to have full pool sync, so from 0 to last.
     data_client
-        .sync_exchange_pools(&dex_type, 0, None, reset)
+        .sync_exchange_pools(&dex_type, 0, to_block, reset)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to sync pools: {e}"))?;
+    let persisted_pools = data_client.cache.load_pools(&dex_type).await?;
+    let checkpoint = data_client
+        .cache
+        .get_dex_last_synced_block(&dex_type)
+        .await?;
+    log::info!(
+        "DEX sync state: chain={}, dex={}, persisted_pools={}, last_synced_block={}",
+        chain.name,
+        dex_type,
+        persisted_pools.len(),
+        checkpoint.map_or_else(|| "none".to_string(), |block| block.to_string())
+    );
 
     Ok(())
 }

@@ -240,10 +240,9 @@ impl BlockchainCache {
             );
 
             for pool_row in pool_rows {
-                if let Some(pool) = self.build_pool_from_row(&pool_row, &dex) {
-                    loaded_pools.push(pool.clone());
-                    self.pools.insert(pool.pool_identifier, Arc::new(pool));
-                }
+                let pool = self.build_pool_from_row(&pool_row, &dex)?;
+                loaded_pools.push(pool.clone());
+                self.pools.insert(pool.pool_identifier, Arc::new(pool));
             }
         }
         Ok(loaded_pools)
@@ -279,9 +278,7 @@ impl BlockchainCache {
         let Some(pool_row) = pool_row else {
             return Ok(None);
         };
-        let Some(pool) = self.build_pool_from_row(&pool_row, &dex) else {
-            return Ok(None);
-        };
+        let pool = self.build_pool_from_row(&pool_row, &dex)?;
         self.pools
             .insert(pool.pool_identifier, Arc::new(pool.clone()));
         Ok(Some(pool))
@@ -289,56 +286,76 @@ impl BlockchainCache {
 
     /// Builds a [`Pool`] from a database row using cached tokens.
     ///
-    /// Returns `None` (after logging the reason) when a referenced token is missing from the cache
-    /// or the stored pool identifier cannot be parsed.
-    fn build_pool_from_row(&self, pool_row: &PoolRow, dex: &SharedDex) -> Option<Pool> {
-        let Some(token0) = self.tokens.get(&pool_row.token0_address) else {
-            log::error!(
-                "Failed to load pool {} for DEX {}: Token0 with address {} not found in cache. \
-                     This may indicate the token was not properly loaded from the database or the pool references an unknown token",
+    /// # Errors
+    ///
+    /// Returns an error when required persisted pool data is missing or invalid.
+    fn build_pool_from_row(&self, pool_row: &PoolRow, dex: &SharedDex) -> anyhow::Result<Pool> {
+        let token0 = self.tokens.get(&pool_row.token0_address).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Failed to load pool {} for DEX {}: token0 {} is missing from the cache",
                 pool_row.address,
                 dex.name,
-                pool_row.token0_address
-            );
-            return None;
-        };
-
-        let Some(token1) = self.tokens.get(&pool_row.token1_address) else {
-            log::error!(
-                "Failed to load pool {} for DEX {}: Token1 with address {} not found in cache. \
-                     This may indicate the token was not properly loaded from the database or the pool references an unknown token",
+                pool_row.token0_address,
+            )
+        })?;
+        let token1 = self.tokens.get(&pool_row.token1_address).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Failed to load pool {} for DEX {}: token1 {} is missing from the cache",
                 pool_row.address,
                 dex.name,
-                pool_row.token1_address
-            );
-            return None;
-        };
-
-        let Some(pool_identifier) = pool_row.pool_identifier.parse().ok() else {
-            log::error!(
-                "Invalid pool identifier '{}' in database for pool {}, skipping",
+                pool_row.token1_address,
+            )
+        })?;
+        let pool_identifier = pool_row.pool_identifier.parse().map_err(|error| {
+            anyhow::anyhow!(
+                "Invalid pool identifier '{}' for pool {}: {error}",
                 pool_row.pool_identifier,
-                pool_row.address
-            );
-            return None;
-        };
-
-        let ts_init = pool_row.creation_block_timestamp.unwrap_or_default();
+                pool_row.address,
+            )
+        })?;
+        let ts_init = pool_row.creation_block_timestamp.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing creation block timestamp for pool {} at block {}",
+                pool_row.address,
+                pool_row.creation_block,
+            )
+        })?;
+        let creation_block = u64::try_from(pool_row.creation_block).map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid negative creation block {} for pool {}",
+                pool_row.creation_block,
+                pool_row.address,
+            )
+        })?;
+        let fee = pool_row
+            .fee
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Invalid negative fee for pool {}", pool_row.address))?;
+        let tick_spacing = pool_row
+            .tick_spacing
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| {
+                anyhow::anyhow!("Invalid negative tick spacing for pool {}", pool_row.address)
+            })?;
 
         let mut pool = Pool::new(
             self.chain.clone(),
             dex.clone(),
             pool_row.address,
             pool_identifier,
-            pool_row.creation_block as u64,
+            creation_block,
             token0.clone(),
             token1.clone(),
-            pool_row.fee.map(|fee| fee as u32),
-            pool_row
-                .tick_spacing
-                .map(|tick_spacing| tick_spacing as u32),
+            fee,
+            tick_spacing,
             ts_init,
         );
+
+        if let Some(amm_type) = pool_row.amm_type {
+            pool.set_amm_type(amm_type);
+        }
 
         if let Some(ref hook_address_str) = pool_row.hook_address
             && let Ok(hooks) = hook_address_str.parse()
@@ -353,7 +370,7 @@ impl BlockchainCache {
             pool.initialize(initial_sqrt_price_x96, initial_tick);
         }
 
-        Some(pool)
+        Ok(pool)
     }
 
     /// Loads block timestamps from the database starting `from_block` number
@@ -1054,6 +1071,116 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case(None, AmmType::CLAMM)]
+    #[case(Some(AmmType::StableSwap), AmmType::StableSwap)]
+    fn build_pool_from_row_applies_stored_amm_type_or_dex_default(
+        #[case] stored_amm_type: Option<AmmType>,
+        #[case] expected: AmmType,
+    ) {
+        let mut cache = test_cache();
+        let chain = cache.chain.clone();
+        let dex = Arc::new(Dex::new_discovery_only(
+            (*chain).clone(),
+            DexType::UniswapV3,
+            "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+            0,
+            AmmType::CLAMM,
+            "PoolCreated",
+        ));
+        let token0_address = address!("0xA0b86a33E6441b936662bb6B5d1F8Fb0E2b57A5D");
+        let token1_address = address!("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+        let pool_address = address!("0x11b815efB8f581194ae79006d24E0d814B7697F6");
+        cache.insert_token_in_memory(Token::new(
+            chain.clone(),
+            token0_address,
+            "Wrapped Ether".to_string(),
+            "WETH".to_string(),
+            18,
+        ));
+        cache.insert_token_in_memory(Token::new(
+            chain.clone(),
+            token1_address,
+            "Tether USD".to_string(),
+            "USDT".to_string(),
+            6,
+        ));
+        let row = PoolRow {
+            address: pool_address,
+            pool_identifier: PoolIdentifier::from_address(pool_address).to_string(),
+            dex_name: DexType::UniswapV3.to_string(),
+            amm_type: stored_amm_type,
+            creation_block: 1,
+            creation_block_timestamp: Some(UnixNanos::from(1_700_000_000_000_000_000)),
+            token0_chain: chain.chain_id as i32,
+            token0_address,
+            token1_chain: chain.chain_id as i32,
+            token1_address,
+            fee: Some(3_000),
+            tick_spacing: Some(60),
+            initial_tick: None,
+            initial_sqrt_price_x96: None,
+            hook_address: None,
+        };
+
+        let pool = cache.build_pool_from_row(&row, &dex).unwrap();
+
+        assert_eq!(pool.amm_type, expected);
+    }
+
+    #[rstest]
+    fn build_pool_from_row_rejects_missing_creation_timestamp() {
+        let mut cache = test_cache();
+        let chain = cache.chain.clone();
+        let dex = Arc::new(Dex::new_discovery_only(
+            (*chain).clone(),
+            DexType::UniswapV3,
+            "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+            0,
+            AmmType::CLAMM,
+            "PoolCreated",
+        ));
+        let token0_address = address!("0xA0b86a33E6441b936662bb6B5d1F8Fb0E2b57A5D");
+        let token1_address = address!("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+        let pool_address = address!("0x11b815efB8f581194ae79006d24E0d814B7697F6");
+        cache.insert_token_in_memory(Token::new(
+            chain.clone(),
+            token0_address,
+            "Wrapped Ether".to_string(),
+            "WETH".to_string(),
+            18,
+        ));
+        cache.insert_token_in_memory(Token::new(
+            chain.clone(),
+            token1_address,
+            "Tether USD".to_string(),
+            "USDT".to_string(),
+            6,
+        ));
+        let mut row = PoolRow {
+            address: pool_address,
+            pool_identifier: PoolIdentifier::from_address(pool_address).to_string(),
+            dex_name: DexType::UniswapV3.to_string(),
+            amm_type: Some(AmmType::CLAMM),
+            creation_block: 1,
+            creation_block_timestamp: None,
+            token0_chain: chain.chain_id as i32,
+            token0_address,
+            token1_chain: chain.chain_id as i32,
+            token1_address,
+            fee: Some(3_000),
+            tick_spacing: Some(60),
+            initial_tick: None,
+            initial_sqrt_price_x96: None,
+            hook_address: None,
+        };
+
+        assert!(cache.build_pool_from_row(&row, &dex).is_err());
+        row.creation_block_timestamp = Some(UnixNanos::from(1_700_000_000_000_000_000));
+        row.creation_block = -1;
+        assert!(cache.build_pool_from_row(&row, &dex).is_err());
+    }
+
     #[tokio::test]
     async fn add_block_populates_timestamp_without_database() {
         let mut cache = test_cache();
@@ -1463,6 +1590,65 @@ mod tests {
                 "unexpected pool timestamps: expected {expected_timestamps:?}, observed {observed_timestamps:?}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pool_copy_and_batch_conflict_persist_authoritative_amm_type() -> anyhow::Result<()> {
+        let Some((database, schema)) = connect_cache_test_database().await? else {
+            return Ok(());
+        };
+        let chain = arbitrum();
+        let dex = uniswap_v3(&chain);
+        let token0 = weth(&chain);
+        let token1 = usdc(&chain);
+        let pool_address = address!("0xd13040d4fe917EE704158CfCB3338dCd2838B245");
+        let pool_identifier = PoolIdentifier::from_address(pool_address);
+        let mut pool = Pool::new(
+            chain.clone(),
+            dex.clone(),
+            pool_address,
+            pool_identifier,
+            30,
+            token0.clone(),
+            token1.clone(),
+            Some(500),
+            Some(10),
+            UnixNanos::default(),
+        );
+        pool.set_amm_type(AmmType::StableSwap);
+
+        let mut cache = BlockchainCache::new(chain.clone());
+        cache.database = Some(database);
+        cache.add_dex(dex.clone()).await?;
+        cache.add_token(token0.clone()).await?;
+        cache.add_token(token1.clone()).await?;
+        cache.add_pools_batch(vec![pool.clone()]).await?;
+
+        let database = cache.database.as_ref().expect("database must be set");
+        let copied = database
+            .load_pool(
+                chain.clone(),
+                &DexType::UniswapV3.to_string(),
+                &pool_identifier,
+            )
+            .await?
+            .expect("copied pool must exist");
+
+        pool.set_amm_type(AmmType::WeightedPool);
+        pool.fee = Some(3_000);
+        database.add_pools_batch(&[pool]).await?;
+        let updated = database
+            .load_pool(chain, &DexType::UniswapV3.to_string(), &pool_identifier)
+            .await?
+            .expect("updated pool must exist");
+
+        cache.database = None;
+        schema.cleanup().await?;
+
+        assert_eq!(copied.amm_type, Some(AmmType::StableSwap));
+        assert_eq!(updated.amm_type, Some(AmmType::WeightedPool));
+        assert_eq!(updated.fee, Some(3_000));
         Ok(())
     }
 
@@ -2058,6 +2244,7 @@ mod tests {
                 CREATE TABLE {schema}."pool" (
                     chain_id INTEGER NOT NULL,
                     dex_name TEXT NOT NULL,
+                    amm_type TEXT,
                     address TEXT NOT NULL,
                     pool_identifier TEXT NOT NULL,
                     creation_block BIGINT NOT NULL,

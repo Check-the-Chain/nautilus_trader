@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_model::defi::{Block, DexType};
+use nautilus_model::defi::{Block, DexType, rpc::RpcLog};
 
 use crate::events::{
     burn::BurnEvent, collect::CollectEvent, fee_protocol_collect::FeeProtocolCollectEvent,
@@ -24,6 +24,8 @@ use crate::events::{
 /// Represents normalized blockchain messages.
 #[derive(Debug, Clone)]
 pub enum BlockchainMessage {
+    Reconnected,
+    SubscriptionConfirmed(RpcEventType),
     Block(Block),
     SwapEvent(SwapEvent),
     MintEvent(MintEvent),
@@ -32,6 +34,7 @@ pub enum BlockchainMessage {
     FlashEvent(FlashEvent),
     FeeProtocolUpdateEvent(FeeProtocolUpdateEvent),
     FeeProtocolCollectEvent(FeeProtocolCollectEvent),
+    PoolManagerEvent(DexType, RpcLog),
 }
 
 /// Represents the types of events that can be subscribed to via the blockchain RPC interface.
@@ -48,4 +51,5 @@ pub enum RpcEventType {
     PoolFlash(DexType),
     PoolFeeProtocolUpdate(DexType),
     PoolFeeProtocolCollect(DexType),
+    PoolManager(DexType),
 }

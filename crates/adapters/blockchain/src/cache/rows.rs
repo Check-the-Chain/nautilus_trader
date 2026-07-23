@@ -22,7 +22,7 @@ use nautilus_core::{
 };
 use nautilus_model::{
     defi::{
-        PoolLiquidityUpdate, PoolLiquidityUpdateType, PoolSwap, SharedChain, SharedDex,
+        AmmType, PoolLiquidityUpdate, PoolLiquidityUpdateType, PoolSwap, SharedChain, SharedDex,
         data::{
             DexPoolData, PoolFeeCollect, PoolFeeProtocolCollect, PoolFeeProtocolUpdate, PoolFlash,
         },
@@ -70,6 +70,7 @@ pub struct PoolRow {
     pub address: Address,
     pub pool_identifier: String,
     pub dex_name: String,
+    pub amm_type: Option<AmmType>,
     pub creation_block: i64,
     pub creation_block_timestamp: Option<UnixNanos>,
     pub token0_chain: i32,
@@ -88,6 +89,7 @@ impl<'r> FromRow<'r, PgRow> for PoolRow {
         let address = validate_address(row.try_get::<String, _>("address")?.as_str()).unwrap();
         let pool_identifier = row.try_get::<String, _>("pool_identifier")?;
         let dex_name = row.try_get::<String, _>("dex_name")?;
+        let amm_type = parse_amm_type(row.try_get::<Option<String>, _>("amm_type")?)?;
         let creation_block = row.try_get::<i64, _>("creation_block")?;
         let creation_block_timestamp =
             row.try_get::<Option<String>, _>("creation_block_timestamp")?;
@@ -117,6 +119,7 @@ impl<'r> FromRow<'r, PgRow> for PoolRow {
             address,
             pool_identifier,
             dex_name,
+            amm_type,
             creation_block,
             creation_block_timestamp,
             token0_chain,
@@ -130,6 +133,16 @@ impl<'r> FromRow<'r, PgRow> for PoolRow {
             hook_address,
         })
     }
+}
+
+fn parse_amm_type(value: Option<String>) -> Result<Option<AmmType>, sqlx::Error> {
+    value
+        .map(|value| {
+            value.parse().map_err(|e| {
+                sqlx::Error::Decode(format!("Invalid pool AMM type '{value}': {e}").into())
+            })
+        })
+        .transpose()
 }
 
 /// A data transfer object that maps database rows to block timestamp data.
@@ -569,6 +582,23 @@ mod tests {
     #[rstest]
     fn parse_cached_block_timestamp_rejects_invalid_text() {
         let result = parse_cached_block_timestamp("not-a-timestamp");
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some("CLAMM"), Some(AmmType::CLAMM))]
+    #[case(Some("StableSwap"), Some(AmmType::StableSwap))]
+    fn parse_pool_amm_type(#[case] value: Option<&str>, #[case] expected: Option<AmmType>) {
+        let actual = parse_amm_type(value.map(str::to_string)).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    fn parse_pool_amm_type_rejects_invalid_text() {
+        let result = parse_amm_type(Some("invalid".to_string()));
 
         assert!(result.is_err());
     }

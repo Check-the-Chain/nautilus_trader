@@ -24,8 +24,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     data::HasTsInit,
     defi::{
-        Blockchain, PoolIdentifier, SharedDex, chain::SharedChain, dex::Dex,
-        tick_map::tick_math::get_tick_at_sqrt_ratio, token::Token,
+        Blockchain, PoolIdentifier, SharedDex,
+        chain::SharedChain,
+        dex::{AmmType, Dex},
+        tick_map::tick_math::get_tick_at_sqrt_ratio,
+        token::Token,
     },
     identifiers::{InstrumentId, Symbol, Venue},
 };
@@ -63,11 +66,14 @@ use crate::{
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "PoolDeserialization")]
 pub struct Pool {
     /// The blockchain network where this pool exists.
     pub chain: SharedChain,
     /// The decentralized exchange protocol that created and manages this pool.
     pub dex: SharedDex,
+    /// The automated market maker algorithm used by this pool.
+    pub amm_type: AmmType,
     /// The blockchain address where the pool smart contract code is deployed.
     pub address: Address,
     /// The unique identifier for this pool across all pools on the DEX.
@@ -104,6 +110,53 @@ pub struct Pool {
     pub ts_init: UnixNanos,
 }
 
+#[derive(Deserialize)]
+struct PoolDeserialization {
+    chain: SharedChain,
+    dex: SharedDex,
+    #[serde(default)]
+    amm_type: Option<AmmType>,
+    address: Address,
+    pool_identifier: PoolIdentifier,
+    instrument_id: InstrumentId,
+    creation_block: u64,
+    token0: Token,
+    token1: Token,
+    fee: Option<u32>,
+    tick_spacing: Option<u32>,
+    initial_tick: Option<i32>,
+    initial_sqrt_price_x96: Option<U160>,
+    hooks: Option<Address>,
+    #[serde(default)]
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
+
+impl From<PoolDeserialization> for Pool {
+    fn from(value: PoolDeserialization) -> Self {
+        let amm_type = value.amm_type.unwrap_or(value.dex.amm_type);
+
+        Self {
+            chain: value.chain,
+            dex: value.dex,
+            amm_type,
+            address: value.address,
+            pool_identifier: value.pool_identifier,
+            instrument_id: value.instrument_id,
+            creation_block: value.creation_block,
+            token0: value.token0,
+            token1: value.token1,
+            fee: value.fee,
+            tick_spacing: value.tick_spacing,
+            initial_tick: value.initial_tick,
+            initial_sqrt_price_x96: value.initial_sqrt_price_x96,
+            hooks: value.hooks,
+            ts_event: value.ts_event,
+            ts_init: value.ts_init,
+        }
+    }
+}
+
 /// A thread-safe shared pointer to a `Pool`, enabling efficient reuse across multiple components.
 pub type SharedPool = Arc<Pool>;
 
@@ -124,10 +177,12 @@ impl Pool {
         ts_init: UnixNanos,
     ) -> Self {
         let instrument_id = Self::create_instrument_id(chain.name, &dex, pool_identifier.as_str());
+        let amm_type = dex.amm_type;
 
         Self {
             chain,
             dex,
+            amm_type,
             address,
             pool_identifier,
             instrument_id,
@@ -142,6 +197,11 @@ impl Pool {
             ts_event: ts_init,
             ts_init,
         }
+    }
+
+    /// Sets the automated market maker algorithm used by this pool.
+    pub fn set_amm_type(&mut self, amm_type: AmmType) {
+        self.amm_type = amm_type;
     }
 
     /// Returns a formatted string representation of the pool for display purposes.
@@ -323,7 +383,7 @@ mod tests {
         let pool_identifier = PoolIdentifier::from_address(pool_address);
         let ts_init = UnixNanos::from(1_234_567_890_000_000_000u64);
 
-        let pool = Pool::new(
+        let mut pool = Pool::new(
             chain.clone(),
             Arc::new(dex),
             pool_address,
@@ -338,6 +398,7 @@ mod tests {
 
         assert_eq!(pool.chain.chain_id, chain.chain_id);
         assert_eq!(pool.dex.name, DexType::UniswapV3);
+        assert_eq!(pool.amm_type, AmmType::CLAMM);
         assert_eq!(pool.address, pool_address);
         assert_eq!(pool.creation_block, 12_345_678);
         assert_eq!(pool.token0.symbol, "WETH");
@@ -358,6 +419,19 @@ mod tests {
             pool.to_full_spec_string(),
             "WETH/USDT-3000.Ethereum:UniswapV3"
         );
+
+        pool.set_amm_type(AmmType::StableSwap);
+
+        assert_eq!(pool.amm_type, AmmType::StableSwap);
+
+        let serialized = serde_json::to_value(&pool).unwrap();
+        let deserialized: Pool = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(deserialized.amm_type, AmmType::StableSwap);
+
+        let mut legacy = serialized;
+        legacy.as_object_mut().unwrap().remove("amm_type");
+        let deserialized: Pool = serde_json::from_value(legacy).unwrap();
+        assert_eq!(deserialized.amm_type, AmmType::CLAMM);
     }
 
     #[rstest]

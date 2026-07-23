@@ -26,7 +26,7 @@ fn tick_position(tick: i32) -> (i16, u8) {
 }
 
 /// Represents a tick bitmap similar to Uniswap V3 with tick spacing
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickBitmap {
     /// Mapping of word positions to bitmap words (256 bits each)
     words: AHashMap<i16, U256>,

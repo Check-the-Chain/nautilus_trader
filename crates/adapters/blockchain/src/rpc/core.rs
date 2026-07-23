@@ -17,7 +17,6 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use alloy::primitives::Address;
 use nautilus_core::consts::NAUTILUS_USER_AGENT;
-#[cfg(feature = "hypersync")]
 use nautilus_model::defi::DexType;
 use nautilus_model::defi::{
     Block, Chain,
@@ -125,6 +124,52 @@ impl RpcSubscription {
                 "topics": [event_signature],
             })),
         }
+    }
+
+    fn pool_manager_logs(
+        pool_manager_address: Address,
+        event_signatures: &[String],
+        pool_ids: &[String],
+    ) -> Result<Self, BlockchainRpcClientError> {
+        let event_signatures = Self::topic_alternatives("event signatures", event_signatures)?;
+        let pool_ids = Self::topic_alternatives("pool IDs", pool_ids)?;
+
+        Ok(Self {
+            name: "logs".to_string(),
+            filter: Some(serde_json::json!({
+                "address": format!("{pool_manager_address:?}"),
+                "topics": [event_signatures, pool_ids],
+            })),
+        })
+    }
+
+    fn topic_alternatives(
+        name: &str,
+        topics: &[String],
+    ) -> Result<Vec<String>, BlockchainRpcClientError> {
+        if topics.is_empty() {
+            return Err(BlockchainRpcClientError::InvalidParameters(format!(
+                "PoolManager {name} cannot be empty"
+            )));
+        }
+
+        let mut topics = topics.to_vec();
+        for topic in &mut topics {
+            let Some(hex) = topic.strip_prefix("0x") else {
+                return Err(BlockchainRpcClientError::InvalidParameters(format!(
+                    "PoolManager {name} must contain 32-byte 0x-prefixed hex topics: {topic}"
+                )));
+            };
+            if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(BlockchainRpcClientError::InvalidParameters(format!(
+                    "PoolManager {name} must contain 32-byte 0x-prefixed hex topics: {topic}"
+                )));
+            }
+            topic.make_ascii_lowercase();
+        }
+        topics.sort();
+        topics.dedup();
+        Ok(topics)
     }
 
     fn params(&self) -> Vec<serde_json::Value> {
@@ -374,10 +419,8 @@ impl CoreBlockchainRpcClient {
                     if text == RECONNECTED {
                         log::info!("Detected reconnection for chain '{}'", self.chain.name);
 
-                        if let Err(e) = self.resubscribe_all().await {
-                            log::error!("Failed to re-establish subscriptions: {e:?}");
-                        }
-                        continue;
+                        self.resubscribe_all().await?;
+                        return Ok(BlockchainMessage::Reconnected);
                     }
 
                     match serde_json::from_str::<serde_json::Value>(&text) {
@@ -421,6 +464,9 @@ impl CoreBlockchainRpcClient {
                                 if self.subscriptions.read().await.contains_key(&event_type) {
                                     self.subscription_event_types
                                         .insert(result.to_string(), event_type);
+                                    return Ok(BlockchainMessage::SubscriptionConfirmed(
+                                        event_type,
+                                    ));
                                 } else {
                                     self.unsubscribe_events(result.to_string()).await?;
                                 }
@@ -447,7 +493,8 @@ impl CoreBlockchainRpcClient {
                                                 json
                                             ) {
                                                 Ok(block_response) => {
-                                                    let block = block_response.params.result;
+                                                    let mut block = block_response.params.result;
+                                                    block.set_chain(self.chain.name);
                                                     Ok(BlockchainMessage::Block(block))
                                                 }
                                                 Err(e) => Err(
@@ -458,6 +505,13 @@ impl CoreBlockchainRpcClient {
                                                     ),
                                                 ),
                                             };
+                                        }
+                                        RpcEventType::PoolManager(_) => {
+                                            let dex = Self::pool_event_dex(event_type)?;
+                                            let log = Self::parse_rpc_log_response(json)?;
+                                            return Ok(BlockchainMessage::PoolManagerEvent(
+                                                dex, log,
+                                            ));
                                         }
                                         RpcEventType::PoolSwap(_)
                                         | RpcEventType::PoolMint(_)
@@ -563,9 +617,9 @@ impl CoreBlockchainRpcClient {
             RpcEventType::PoolFeeProtocolCollect(_) => dex_extended
                 .parse_fee_protocol_collect_event_rpc(log)
                 .map(BlockchainMessage::FeeProtocolCollectEvent),
-            RpcEventType::NewBlock => Err(anyhow::anyhow!(
-                "NewBlock event type cannot parse pool logs"
-            )),
+            RpcEventType::NewBlock | RpcEventType::PoolManager(_) => {
+                Err(anyhow::anyhow!("event type cannot parse legacy pool logs"))
+            }
         }
         .map(Some)
         .map_err(|e| BlockchainRpcClientError::MessageParsingError(e.to_string()))
@@ -591,7 +645,6 @@ impl CoreBlockchainRpcClient {
         ))
     }
 
-    #[cfg(feature = "hypersync")]
     fn pool_event_dex(event_type: RpcEventType) -> Result<DexType, BlockchainRpcClientError> {
         match event_type {
             RpcEventType::PoolSwap(dex)
@@ -600,7 +653,8 @@ impl CoreBlockchainRpcClient {
             | RpcEventType::PoolCollect(dex)
             | RpcEventType::PoolFlash(dex)
             | RpcEventType::PoolFeeProtocolUpdate(dex)
-            | RpcEventType::PoolFeeProtocolCollect(dex) => Ok(dex),
+            | RpcEventType::PoolFeeProtocolCollect(dex)
+            | RpcEventType::PoolManager(dex) => Ok(dex),
             RpcEventType::NewBlock => Err(BlockchainRpcClientError::InternalRpcClientError(
                 "NewBlock event type has no DEX".to_string(),
             )),
@@ -628,9 +682,12 @@ impl CoreBlockchainRpcClient {
         addresses: &[Address],
         event_signature: String,
     ) -> Result<(), BlockchainRpcClientError> {
-        if matches!(event_type, RpcEventType::NewBlock) {
+        if matches!(
+            event_type,
+            RpcEventType::NewBlock | RpcEventType::PoolManager(_)
+        ) {
             return Err(BlockchainRpcClientError::InvalidParameters(
-                "NewBlock is not a pool event subscription".to_string(),
+                "event type is not a legacy pool event subscription".to_string(),
             ));
         }
 
@@ -643,6 +700,25 @@ impl CoreBlockchainRpcClient {
             RpcSubscription::pool_logs(addresses, event_signature),
         )
         .await
+    }
+
+    /// Subscribes to raw PoolManager logs for selected signatures and pool IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either topic list is empty, a topic is not a 32-byte hex string, the
+    /// subscription request fails, or the client is not connected.
+    pub async fn subscribe_pool_manager_events(
+        &mut self,
+        dex: DexType,
+        pool_manager_address: Address,
+        event_signatures: &[String],
+        pool_ids: &[String],
+    ) -> Result<(), BlockchainRpcClientError> {
+        let subscription =
+            RpcSubscription::pool_manager_logs(pool_manager_address, event_signatures, pool_ids)?;
+        self.replace_subscription(RpcEventType::PoolManager(dex), subscription)
+            .await
     }
 
     /// Cancels the subscription to real-time block updates.
@@ -689,7 +765,112 @@ mod tests {
         assert_eq!(filter["topics"], serde_json::json!([event_signature]));
     }
 
-    #[cfg(feature = "hypersync")]
+    #[rstest]
+    fn pool_manager_subscription_params_are_deterministic() {
+        let signature_a = format!("0x{}", "11".repeat(32));
+        let signature_b = format!("0x{}", "AA".repeat(32));
+        let pool_a = format!("0x{}", "22".repeat(32));
+        let pool_b = format!("0x{}", "bb".repeat(32));
+        let subscription = RpcSubscription::pool_manager_logs(
+            address!("1111111111111111111111111111111111111111"),
+            &[signature_b.clone(), signature_a.clone(), signature_b],
+            &[pool_b.clone(), pool_a.clone(), pool_b],
+        )
+        .expect("valid PoolManager filter should build");
+
+        assert_eq!(
+            subscription.params(),
+            serde_json::json!([
+                "logs",
+                {
+                    "address": "0x1111111111111111111111111111111111111111",
+                    "topics": [
+                        [signature_a, format!("0x{}", "aa".repeat(32))],
+                        [pool_a, format!("0x{}", "bb".repeat(32))],
+                    ],
+                }
+            ])
+            .as_array()
+            .unwrap()
+            .clone()
+        );
+    }
+
+    #[rstest]
+    fn pool_manager_subscription_rejects_empty_topic_alternatives() {
+        let topic = format!("0x{}", "11".repeat(32));
+
+        for (event_signatures, pool_ids) in
+            [(Vec::new(), vec![topic.clone()]), (vec![topic], Vec::new())]
+        {
+            let error = RpcSubscription::pool_manager_logs(
+                address!("1111111111111111111111111111111111111111"),
+                &event_signatures,
+                &pool_ids,
+            )
+            .expect_err("empty topic alternatives should fail");
+            assert!(matches!(
+                error,
+                BlockchainRpcClientError::InvalidParameters(_)
+            ));
+        }
+    }
+
+    #[rstest]
+    #[case("0x11")]
+    #[case("11")]
+    #[case("0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg")]
+    fn pool_manager_subscription_rejects_malformed_topics(#[case] malformed: &str) {
+        let topic = format!("0x{}", "11".repeat(32));
+
+        for (event_signatures, pool_ids) in [
+            (vec![malformed.to_string()], vec![topic.clone()]),
+            (vec![topic], vec![malformed.to_string()]),
+        ] {
+            let error = RpcSubscription::pool_manager_logs(
+                address!("1111111111111111111111111111111111111111"),
+                &event_signatures,
+                &pool_ids,
+            )
+            .expect_err("malformed topics should fail");
+            assert!(matches!(
+                error,
+                BlockchainRpcClientError::InvalidParameters(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_manager_subscription_validates_before_sending() {
+        let mut client = CoreBlockchainRpcClient::new(
+            Chain::from_chain_id(1)
+                .expect("Ethereum chain should exist")
+                .clone(),
+            "ws://127.0.0.1:9".to_string(),
+            None,
+        );
+        let topic = format!("0x{}", "11".repeat(32));
+
+        for (event_signatures, pool_ids) in [
+            (Vec::new(), vec![topic.clone()]),
+            (vec![topic], vec!["0x11".to_string()]),
+        ] {
+            let error = client
+                .subscribe_pool_manager_events(
+                    DexType::UniswapV4,
+                    address!("1111111111111111111111111111111111111111"),
+                    &event_signatures,
+                    &pool_ids,
+                )
+                .await
+                .expect_err("invalid filters should fail before requiring a connection");
+            assert!(matches!(
+                error,
+                BlockchainRpcClientError::InvalidParameters(_)
+            ));
+        }
+    }
+
     #[rstest]
     fn pool_event_dex_rejects_block_event_type() {
         assert!(CoreBlockchainRpcClient::pool_event_dex(RpcEventType::NewBlock).is_err());
@@ -697,6 +878,11 @@ mod tests {
             CoreBlockchainRpcClient::pool_event_dex(RpcEventType::PoolSwap(DexType::UniswapV3))
                 .unwrap(),
             DexType::UniswapV3
+        );
+        assert_eq!(
+            CoreBlockchainRpcClient::pool_event_dex(RpcEventType::PoolManager(DexType::UniswapV4))
+                .unwrap(),
+            DexType::UniswapV4
         );
     }
 
@@ -753,5 +939,171 @@ mod tests {
             .expect_err("unsubscribe ack should be skipped");
 
         assert!(matches!(error, BlockchainRpcClientError::NoMessageReceived));
+    }
+
+    #[tokio::test]
+    async fn reconnect_is_surfaced_before_new_subscription_confirmations() {
+        let mut client = CoreBlockchainRpcClient::new(
+            Chain::from_chain_id(4663)
+                .expect("Robinhood chain should exist")
+                .clone(),
+            "ws://127.0.0.1:9".to_string(),
+            None,
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        client.wss_consumer_rx = Some(rx);
+        tx.send(Message::Text(RECONNECTED.to_string().into()))
+            .expect("reconnect marker should enqueue");
+
+        assert!(matches!(
+            client.next_rpc_message().await,
+            Ok(BlockchainMessage::Reconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pool_manager_subscription_confirmation_is_surfaced() {
+        let mut client = CoreBlockchainRpcClient::new(
+            Chain::from_chain_id(4663)
+                .expect("Robinhood chain should exist")
+                .clone(),
+            "ws://127.0.0.1:9".to_string(),
+            None,
+        );
+        let event_type = RpcEventType::PoolManager(DexType::UniswapV4);
+        client.pending_subscription_request.insert(7, event_type);
+        client.subscriptions.write().await.insert(
+            event_type,
+            RpcSubscription::pool_manager_logs(
+                address!("8366a39CC670B4001A1121B8F6A443A643e40951"),
+                &[format!("0x{}", "11".repeat(32))],
+                &[format!("0x{}", "22".repeat(32))],
+            )
+            .unwrap(),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        client.wss_consumer_rx = Some(rx);
+        tx.send(Message::Text(
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": "0xabc"})
+                .to_string()
+                .into(),
+        ))
+        .expect("confirmation should enqueue");
+
+        assert!(matches!(
+            client.next_rpc_message().await,
+            Ok(BlockchainMessage::SubscriptionConfirmed(confirmed)) if confirmed == event_type
+        ));
+    }
+
+    #[tokio::test]
+    async fn next_rpc_message_assigns_chain_to_new_block() {
+        let mut client = CoreBlockchainRpcClient::new(
+            Chain::from_chain_id(4663)
+                .expect("Robinhood chain should exist")
+                .clone(),
+            "ws://127.0.0.1:9".to_string(),
+            None,
+        );
+        client
+            .subscription_event_types
+            .insert("0x1".to_string(), RpcEventType::NewBlock);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        client.wss_consumer_rx = Some(rx);
+        tx.send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_subscription",
+                "params": {
+                    "subscription": "0x1",
+                    "result": {
+                        "hash": "0x01",
+                        "number": "0x2a",
+                        "parentHash": "0x00",
+                        "miner": "0x0000000000000000000000000000000000000000",
+                        "gasLimit": "0x1c9c380",
+                        "gasUsed": "0x5208",
+                        "timestamp": "0x64"
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .expect("new-head notification should enqueue");
+
+        let message = client
+            .next_rpc_message()
+            .await
+            .expect("new-head notification should parse");
+        let BlockchainMessage::Block(block) = message else {
+            panic!("expected block message");
+        };
+
+        assert_eq!(block.chain(), nautilus_model::defi::Blockchain::Robinhood);
+    }
+
+    async fn assert_pool_manager_notification_preserves_raw_log(removed: bool) {
+        let mut client = CoreBlockchainRpcClient::new(
+            Chain::from_chain_id(1)
+                .expect("Ethereum chain should exist")
+                .clone(),
+            "ws://127.0.0.1:9".to_string(),
+            None,
+        );
+        client.subscription_event_types.insert(
+            "0x1".to_string(),
+            RpcEventType::PoolManager(DexType::UniswapV4),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        client.wss_consumer_rx = Some(rx);
+        tx.send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_subscription",
+                "params": {
+                    "subscription": "0x1",
+                    "result": {
+                        "removed": removed,
+                        "logIndex": "0x3",
+                        "transactionIndex": "0x2",
+                        "transactionHash": "0xtransaction",
+                        "blockHash": "0xblock",
+                        "blockNumber": "0x2a",
+                        "address": "0x1111111111111111111111111111111111111111",
+                        "data": "0x1234",
+                        "topics": [format!("0x{}", "11".repeat(32))]
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .expect("PoolManager notification should enqueue");
+
+        let message = client
+            .next_rpc_message()
+            .await
+            .expect("PoolManager notification should parse");
+        let BlockchainMessage::PoolManagerEvent(dex, log) = message else {
+            panic!("expected raw PoolManager message");
+        };
+
+        assert_eq!(dex, DexType::UniswapV4);
+        assert_eq!(log.removed, removed);
+        assert_eq!(log.log_index.as_deref(), Some("0x3"));
+        assert_eq!(log.transaction_index.as_deref(), Some("0x2"));
+        assert_eq!(log.block_number.as_deref(), Some("0x2a"));
+        assert_eq!(log.data, "0x1234");
+    }
+
+    #[tokio::test]
+    async fn pool_manager_notification_returns_raw_log() {
+        assert_pool_manager_notification_preserves_raw_log(false).await;
+    }
+
+    #[tokio::test]
+    async fn removed_pool_manager_notification_returns_raw_log() {
+        assert_pool_manager_notification_preserves_raw_log(true).await;
     }
 }

@@ -80,7 +80,9 @@ pub fn cli_command() -> clap::Command {
 /// Returns an error if execution of the specified command fails.
 pub async fn run(opt: NautilusCli) -> anyhow::Result<()> {
     match opt.command {
-        Commands::Database(database_opt) => run_database_command(database_opt).await?,
+        Commands::Database(database_opt) => {
+            Box::pin(run_database_command(database_opt)).await?;
+        }
         #[cfg(feature = "defi")]
         Commands::Blockchain(blockchain_opt) => {
             Box::pin(run_blockchain_command(blockchain_opt)).await?;

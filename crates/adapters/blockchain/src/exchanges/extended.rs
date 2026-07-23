@@ -594,13 +594,22 @@ impl DexExtended {
         self.dex.initialize_event.is_some()
     }
 
-    /// Returns `true` if this DEX can discover pools from HyperSync `PoolCreated` logs.
-    ///
-    /// `sync-dex` streams `PoolCreated` logs to populate the pool set, so a DEX without this
-    /// parser cannot be synced.
+    /// Returns `true` if this DEX can discover pools from an available provider.
     #[must_use]
     pub fn supports_pool_discovery(&self) -> bool {
-        self.parse_pool_created_event_hypersync_fn.is_some()
+        self.supports_pool_discovery_hypersync() || self.supports_pool_discovery_rpc()
+    }
+
+    /// Returns `true` if this DEX can discover pools from HyperSync logs.
+    #[must_use]
+    pub fn supports_pool_discovery_hypersync(&self) -> bool {
+        !self.pool_created_event.is_empty() && self.parse_pool_created_event_hypersync_fn.is_some()
+    }
+
+    /// Returns `true` if this DEX can discover pools from JSON-RPC logs.
+    #[must_use]
+    pub fn supports_pool_discovery_rpc(&self) -> bool {
+        !self.pool_created_event.is_empty() && self.parse_pool_created_event_rpc_fn.is_some()
     }
 
     /// Returns the pool-event families required to build snapshots that this DEX cannot parse

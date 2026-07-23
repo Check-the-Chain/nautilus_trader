@@ -13,19 +13,32 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, num::NonZeroU32, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+    str::FromStr,
+};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use bytes::Bytes;
 use nautilus_core::hex;
-use nautilus_model::defi::rpc::{RpcLog, RpcNodeHttpResponse};
+use nautilus_model::defi::{
+    Block,
+    rpc::{RpcLog, RpcNodeHttpResponse},
+};
 use nautilus_network::{
     http::{HttpClient, Method},
     ratelimiter::quota::Quota,
 };
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::rpc::error::BlockchainRpcClientError;
+
+#[derive(Debug, Deserialize)]
+struct RpcBlockNumber {
+    number: String,
+    hash: String,
+}
 
 /// Client for making HTTP-based RPC requests to blockchain nodes.
 ///
@@ -210,6 +223,82 @@ impl BlockchainHttpRpcClient {
             .map_err(|e| anyhow::anyhow!("Failed to parse balance hex string '{hex_string}': {e}"))
     }
 
+    /// Returns the latest block number reported by the RPC node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC call fails or the result is not a valid hexadecimal block
+    /// number.
+    pub async fn current_block(&self) -> anyhow::Result<u64> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_blockNumber",
+            "params": []
+        });
+        let block_number: String = self.execute_rpc_call(request).await?;
+        crate::rpc::helpers::parse_hex_u64(&block_number)
+    }
+
+    /// Returns the latest finalized block number reported by the RPC node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC call fails, the node does not support the `finalized` block tag,
+    /// or the result does not contain a valid hexadecimal block number.
+    pub async fn finalized_block(&self) -> anyhow::Result<u64> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getBlockByNumber",
+            "params": ["finalized", false]
+        });
+        let block: RpcBlockNumber = self.execute_rpc_call(request).await?;
+        crate::rpc::helpers::parse_hex_u64(&block.number)
+    }
+
+    /// Returns the canonical hash currently reported for an explicit block number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC call fails or the block response is malformed.
+    pub async fn block_hash(&self, block_number: u64) -> anyhow::Result<String> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getBlockByNumber",
+            "params": [format!("0x{block_number:x}"), false]
+        });
+        let block: RpcBlockNumber = self.execute_rpc_call(request).await?;
+        anyhow::ensure!(
+            crate::rpc::helpers::parse_hex_u64(&block.number)? == block_number,
+            "RPC returned a different block number than requested"
+        );
+        Ok(block.hash)
+    }
+
+    /// Returns the block header for an explicit block number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC call fails, the block response is malformed, or the node
+    /// returns a different block number than requested.
+    pub async fn block(&self, block_number: u64) -> anyhow::Result<Block> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getBlockByNumber",
+            "params": [format!("0x{block_number:x}"), false]
+        });
+        let block: Block = self.execute_rpc_call(request).await?;
+        anyhow::ensure!(
+            block.number == block_number,
+            "RPC returned block {} when block {block_number} was requested",
+            block.number,
+        );
+        Ok(block)
+    }
+
     /// Retrieves logs matching the given filter criteria.
     ///
     /// This method calls the `eth_getLogs` RPC method to fetch event logs from the blockchain.
@@ -255,5 +344,185 @@ impl BlockchainHttpRpcClient {
         });
 
         self.execute_rpc_call(request).await
+    }
+
+    /// Retrieves logs using typed OR alternatives at each indexed topic position.
+    ///
+    /// Each outer vector element is one topic position and each inner vector contains the hashes
+    /// accepted at that position. For example, two inner vectors serialize as
+    /// `topics: [[topic0_a, topic0_b], [topic1_a, topic1_b]]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range is inverted, there are more than four topic positions, a
+    /// position has no alternatives or contains duplicates, or the RPC call fails.
+    pub async fn get_logs_with_topic_alternatives(
+        &self,
+        address: Option<&Address>,
+        topic_alternatives: &[Vec<B256>],
+        from_block: u64,
+        to_block: u64,
+    ) -> anyhow::Result<Vec<RpcLog>> {
+        let filter =
+            construct_topic_alternatives_filter(address, topic_alternatives, from_block, to_block)?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getLogs",
+            "params": [filter]
+        });
+
+        self.execute_rpc_call(request).await
+    }
+}
+
+fn construct_topic_alternatives_filter(
+    address: Option<&Address>,
+    topic_alternatives: &[Vec<B256>],
+    from_block: u64,
+    to_block: u64,
+) -> anyhow::Result<serde_json::Value> {
+    anyhow::ensure!(
+        from_block <= to_block,
+        "eth_getLogs block range is inverted: {from_block}..={to_block}"
+    );
+    anyhow::ensure!(
+        topic_alternatives.len() <= 4,
+        "eth_getLogs supports at most four topic positions"
+    );
+
+    for (position, alternatives) in topic_alternatives.iter().enumerate() {
+        anyhow::ensure!(
+            !alternatives.is_empty(),
+            "eth_getLogs topic position {position} has no alternatives"
+        );
+        let unique = alternatives.iter().copied().collect::<HashSet<_>>();
+        anyhow::ensure!(
+            unique.len() == alternatives.len(),
+            "eth_getLogs topic position {position} contains duplicate alternatives"
+        );
+    }
+
+    let topics = topic_alternatives
+        .iter()
+        .map(|alternatives| {
+            alternatives
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut filter = serde_json::Map::new();
+    filter.insert(
+        "fromBlock".to_string(),
+        serde_json::json!(format!("0x{from_block:x}")),
+    );
+    filter.insert(
+        "toBlock".to_string(),
+        serde_json::json!(format!("0x{to_block:x}")),
+    );
+    if let Some(address) = address {
+        filter.insert(
+            "address".to_string(),
+            serde_json::json!(address.to_string()),
+        );
+    }
+    if !topics.is_empty() {
+        filter.insert("topics".to_string(), serde_json::json!(topics));
+    }
+    Ok(serde_json::Value::Object(filter))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{B256, address};
+
+    use super::{BlockchainHttpRpcClient, construct_topic_alternatives_filter};
+
+    #[test]
+    fn topic_alternatives_filter_is_typed_and_deterministic() {
+        let address = address!("8366a39CC670B4001A1121B8F6A443A643e40951");
+        let topic0 = vec![B256::repeat_byte(2), B256::repeat_byte(1)];
+        let topic1 = vec![B256::repeat_byte(4), B256::repeat_byte(3)];
+
+        let filter = construct_topic_alternatives_filter(
+            Some(&address),
+            &[topic0.clone(), topic1.clone()],
+            10,
+            20,
+        )
+        .unwrap();
+
+        assert_eq!(filter["fromBlock"], "0xa");
+        assert_eq!(filter["toBlock"], "0x14");
+        assert_eq!(filter["address"], address.to_string());
+        assert_eq!(
+            filter["topics"],
+            serde_json::json!([
+                topic0.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                topic1.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ])
+        );
+    }
+
+    #[test]
+    fn topic_alternatives_filter_rejects_invalid_shapes() {
+        let duplicate = B256::repeat_byte(1);
+        assert!(construct_topic_alternatives_filter(None, &[Vec::new()], 0, 1).is_err());
+        assert!(
+            construct_topic_alternatives_filter(None, &[vec![duplicate, duplicate]], 0, 1).is_err()
+        );
+        assert!(construct_topic_alternatives_filter(None, &[vec![duplicate]], 2, 1).is_err());
+        assert!(
+            construct_topic_alternatives_filter(
+                None,
+                &[
+                    vec![duplicate],
+                    vec![duplicate],
+                    vec![duplicate],
+                    vec![duplicate],
+                    vec![duplicate],
+                ],
+                0,
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Robinhood Chain RPC access"]
+    async fn live_robinhood_rpc_returns_initialize_logs() {
+        let client = BlockchainHttpRpcClient::new(
+            "https://rpc.mainnet.chain.robinhood.com".to_string(),
+            None,
+            None,
+        );
+        let head = client.current_block().await.expect("current block");
+        assert!(head >= 19_069);
+        let finalized = client.finalized_block().await.expect("finalized block");
+        assert!((19_069..=head).contains(&finalized));
+        let block = client.block(finalized).await.expect("finalized block header");
+        assert_eq!(block.number, finalized);
+        assert!(block.timestamp.as_u64() > 0);
+
+        let pool_manager = address!("8366a39CC670B4001A1121B8F6A443A643e40951");
+        let initialize = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
+        let logs = client
+            .get_logs(
+                Some(&pool_manager),
+                Some(vec![Some(initialize.to_string())]),
+                9_070,
+                19_069,
+            )
+            .await
+            .expect("Initialize logs");
+
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|log| !log.removed));
+        assert!(logs.iter().all(|log| {
+            log.address.eq_ignore_ascii_case(&pool_manager.to_string())
+                && log.topics.first().is_some_and(|topic| topic == initialize)
+        }));
     }
 }

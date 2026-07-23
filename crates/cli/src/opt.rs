@@ -68,6 +68,21 @@ pub struct DatabaseConfig {
 pub enum DatabaseCommand {
     /// Initializes a new Postgres database with the latest schema.
     Init(DatabaseConfig),
+    /// Applies the latest schema without creating roles or changing grants.
+    Migrate {
+        /// PostgreSQL connection URI. Falls back to `DATABASE_URL`.
+        #[arg(long)]
+        url: Option<String>,
+        /// Directory path to the schema files.
+        #[arg(long)]
+        schema: Option<String>,
+    },
+    /// Verifies that the Nautilus blockchain cache schema is present.
+    Verify {
+        /// PostgreSQL connection URI. Falls back to `DATABASE_URL`.
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// Drops roles, privileges and deletes all data from the database.
     Drop(DatabaseConfig),
 }
@@ -112,6 +127,12 @@ pub enum BlockchainCommand {
         /// RPC HTTP URL for blockchain calls (optional, falls back to `RPC_HTTP_URL` env var)
         #[arg(long)]
         rpc_url: Option<String>,
+        /// Maximum HTTP RPC requests per second
+        #[arg(long)]
+        rpc_requests_per_second: Option<u32>,
+        /// Last block to inspect (optional, RPC discovery clamps to finalized head)
+        #[arg(long)]
+        to_block: Option<u64>,
         /// Reset sync progress and start from the beginning, ignoring last synced block
         #[arg(long)]
         reset: bool,

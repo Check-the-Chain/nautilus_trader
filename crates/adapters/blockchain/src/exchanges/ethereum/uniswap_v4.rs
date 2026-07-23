@@ -24,17 +24,13 @@ use crate::exchanges::{extended::DexExtended, parsing::uniswap_v4};
 
 /// Uniswap V4 DEX on Ethereum.
 pub static UNISWAP_V4: LazyLock<DexExtended> = LazyLock::new(|| {
-    let dex = Dex::new(
+    let dex = Dex::new_discovery_only(
         chains::ETHEREUM.clone(),
         DexType::UniswapV4,
         "0x000000000004444c5dc75cB358380D2e3dE08A90",
         21688329,
         AmmType::CLAMEnhanced,
         "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)",
-        "",
-        "",
-        "",
-        "",
     );
 
     let mut dex_extended = DexExtended::new(dex);

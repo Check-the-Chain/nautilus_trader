@@ -50,6 +50,29 @@ impl Default for DexPoolFilters {
     }
 }
 
+/// Explicit controls for one selected Uniswap v4 mirror universe.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.blockchain",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.blockchain")
+)]
+pub struct UniswapV4MirrorDataConfig {
+    /// Address of the StateView contract bound to the configured Uniswap v4 PoolManager.
+    pub state_view_address: String,
+    /// Selected bytes32 Pool IDs. Complete PoolKeys are resolved from authenticated discovery.
+    pub pool_ids: Vec<String>,
+    /// Maximum local monotonic interval without an advancing WSS head.
+    pub head_timeout_ms: u64,
+}
+
 /// Configuration for blockchain data clients.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +116,9 @@ pub struct BlockchainDataClientConfig {
     #[builder(default)]
     #[serde(default)]
     pub pool_filters: DexPoolFilters,
+    /// Optional selected-pool Uniswap v4 mirror controls.
+    #[serde(default)]
+    pub uniswap_v4_mirror: Option<UniswapV4MirrorDataConfig>,
     /// Optional configuration for data client's Postgres cache database
     pub postgres_cache_database_config: Option<PostgresConnectOptions>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
@@ -107,6 +133,7 @@ nautilus_core::impl_pyo3_config_getters!(BlockchainDataClientConfig {
     multicall_calls_per_rpc_request: u32,
     pool_filters: DexPoolFilters,
     transport_backend: TransportBackend,
+    uniswap_v4_mirror: Option<UniswapV4MirrorDataConfig>,
 });
 
 const fn default_multicall_calls_per_rpc_request() -> u32 {
@@ -144,6 +171,7 @@ impl ClientConfig for BlockchainExecutionClientConfig {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::defi::Blockchain;
     use rstest::rstest;
 
     use super::*;
@@ -170,6 +198,57 @@ native_currency_decimals = 18
         assert_eq!(config.multicall_calls_per_rpc_request, 200);
         assert!(config.pool_filters.remove_pools_with_empty_erc20fields);
         assert_eq!(config.transport_backend, TransportBackend::default());
+        assert!(config.uniswap_v4_mirror.is_none());
+    }
+
+    #[rstest]
+    fn test_data_config_toml_robinhood_rpc() {
+        let config: BlockchainDataClientConfig = toml::from_str(
+            r#"
+http_rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+wss_rpc_url = "ws://127.0.0.1:8548"
+use_hypersync_for_live_data = false
+
+[chain]
+name = "Robinhood"
+chain_id = 4663
+hypersync_url = "https://4663.hypersync.xyz"
+native_currency_decimals = 18
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.chain.name, Blockchain::Robinhood);
+        assert_eq!(config.chain.chain_id, 4663);
+        assert_eq!(config.wss_rpc_url.as_deref(), Some("ws://127.0.0.1:8548"));
+        assert!(!config.use_hypersync_for_live_data);
+    }
+
+    #[test]
+    fn test_data_config_toml_uniswap_v4_mirror() {
+        let config: BlockchainDataClientConfig = toml::from_str(
+            r#"
+http_rpc_url = "https://robinhood-mainnet.example.com"
+wss_rpc_url = "wss://robinhood-mainnet.example.com"
+dex_ids = ["UniswapV4"]
+
+[uniswap_v4_mirror]
+state_view_address = "0xF3334192D15450CdD385c8B70e03f9A6bD9E673b"
+pool_ids = ["0x3bb34a44f1b2b5f32c034c38a53065a521a47b199700fa9bd19d60985ff24bf1"]
+head_timeout_ms = 5000
+
+[chain]
+name = "Robinhood"
+chain_id = 4663
+hypersync_url = "https://4663.hypersync.xyz"
+native_currency_decimals = 18
+"#,
+        )
+        .unwrap();
+
+        let mirror = config.uniswap_v4_mirror.unwrap();
+        assert_eq!(mirror.pool_ids.len(), 1);
+        assert_eq!(mirror.head_timeout_ms, 5_000);
     }
 
     #[rstest]

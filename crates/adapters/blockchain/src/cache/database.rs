@@ -62,6 +62,7 @@ const POOL_ROW_COLUMNS: &str = "
     address,
     pool_identifier,
     dex_name,
+    amm_type,
     creation_block,
     COALESCE(
         (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool.chain_id AND block.number = pool.creation_block),
@@ -98,8 +99,8 @@ impl BlockchainCacheDatabase {
     pub async fn connect(pg_options: PgConnectOptions) -> anyhow::Result<Self> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(32) // Increased from default 10
-            .min_connections(5) // Keep some connections warm
-            .acquire_timeout(std::time::Duration::from_secs(3))
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(30))
             .connect_with(pg_options)
             .await?;
         Ok(Self { pool })
@@ -540,31 +541,33 @@ impl BlockchainCacheDatabase {
         sqlx::query(
             "
             INSERT INTO pool (
-                chain_id, address, pool_identifier, dex_name, creation_block,
+                chain_id, address, pool_identifier, dex_name, amm_type, creation_block,
                 token0_chain, token0_address,
                 token1_chain, token1_address,
                 fee, tick_spacing, initial_tick, initial_sqrt_price_x96, hook_address
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (chain_id, dex_name, pool_identifier)
             DO UPDATE
             SET
                 address = $2,
-                creation_block = $5,
-                token0_chain = $6,
-                token0_address = $7,
-                token1_chain = $8,
-                token1_address = $9,
-                fee = $10,
-                tick_spacing = $11,
-                initial_tick = $12,
-                initial_sqrt_price_x96 = $13,
-                hook_address = $14
+                amm_type = $5,
+                creation_block = $6,
+                token0_chain = $7,
+                token0_address = $8,
+                token1_chain = $9,
+                token1_address = $10,
+                fee = $11,
+                tick_spacing = $12,
+                initial_tick = $13,
+                initial_sqrt_price_x96 = $14,
+                hook_address = $15
         ",
         )
         .bind(pool.chain.chain_id as i32)
         .bind(pool.address.to_string())
         .bind(pool.pool_identifier.as_ref())
         .bind(pool.dex.name.to_string())
+        .bind(pool.amm_type.to_string())
         .bind(pool.creation_block as i64)
         .bind(pool.token0.chain.chain_id as i32)
         .bind(pool.token0.address.to_string())
@@ -596,6 +599,7 @@ impl BlockchainCacheDatabase {
         let mut addresses: Vec<String> = Vec::with_capacity(len);
         let mut pool_identifiers: Vec<String> = Vec::with_capacity(len);
         let mut dex_names: Vec<String> = Vec::with_capacity(len);
+        let mut amm_types: Vec<String> = Vec::with_capacity(len);
         let mut creation_blocks: Vec<i64> = Vec::with_capacity(len);
         let mut token0_chains: Vec<i32> = Vec::with_capacity(len);
         let mut token0_addresses: Vec<String> = Vec::with_capacity(len);
@@ -614,6 +618,7 @@ impl BlockchainCacheDatabase {
             addresses.push(pool.address.to_string());
             pool_identifiers.push(pool.pool_identifier.to_string());
             dex_names.push(pool.dex.name.to_string());
+            amm_types.push(pool.amm_type.to_string());
             creation_blocks.push(pool.creation_block as i64);
             token0_chains.push(pool.token0.chain.chain_id as i32);
             token0_addresses.push(pool.token0.address.to_string());
@@ -631,24 +636,38 @@ impl BlockchainCacheDatabase {
         sqlx::query(
             "
             INSERT INTO pool (
-                chain_id, address, pool_identifier, dex_name, creation_block,
+                chain_id, address, pool_identifier, dex_name, amm_type, creation_block,
                 token0_chain, token0_address,
                 token1_chain, token1_address,
                 fee, tick_spacing, initial_tick, initial_sqrt_price_x96, hook_address
             )
             SELECT *
             FROM UNNEST(
-                $1::int4[], $2::text[], $3::text[], $4::text[], $5::int8[],
-                $6::int4[], $7::text[], $8::int4[], $9::text[],
-                $10::int4[], $11::int4[], $12::int4[], $13::text[], $14::text[]
+                $1::int4[], $2::text[], $3::text[], $4::text[], $5::text[], $6::int8[],
+                $7::int4[], $8::text[], $9::int4[], $10::text[],
+                $11::int4[], $12::int4[], $13::int4[], $14::text[], $15::text[]
             )
-            ON CONFLICT (chain_id, dex_name, pool_identifier) DO NOTHING
+            ON CONFLICT (chain_id, dex_name, pool_identifier)
+            DO UPDATE SET
+                address = EXCLUDED.address,
+                amm_type = EXCLUDED.amm_type,
+                creation_block = EXCLUDED.creation_block,
+                token0_chain = EXCLUDED.token0_chain,
+                token0_address = EXCLUDED.token0_address,
+                token1_chain = EXCLUDED.token1_chain,
+                token1_address = EXCLUDED.token1_address,
+                fee = EXCLUDED.fee,
+                tick_spacing = EXCLUDED.tick_spacing,
+                initial_tick = EXCLUDED.initial_tick,
+                initial_sqrt_price_x96 = EXCLUDED.initial_sqrt_price_x96,
+                hook_address = EXCLUDED.hook_address
            ",
         )
         .bind(&chain_ids[..])
         .bind(&addresses[..])
         .bind(&pool_identifiers[..])
         .bind(&dex_names[..])
+        .bind(&amm_types[..])
         .bind(&creation_blocks[..])
         .bind(&token0_chains[..])
         .bind(&token0_addresses[..])

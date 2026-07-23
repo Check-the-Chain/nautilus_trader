@@ -22,7 +22,7 @@ use nautilus_model::defi::{Chain, DexType};
 use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
-use crate::config::{BlockchainDataClientConfig, DexPoolFilters};
+use crate::config::{BlockchainDataClientConfig, DexPoolFilters, UniswapV4MirrorDataConfig};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods(module = "nautilus_trader.adapters.blockchain")]
@@ -39,11 +39,26 @@ impl DexPoolFilters {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods(module = "nautilus_trader.adapters.blockchain")]
+impl UniswapV4MirrorDataConfig {
+    /// Explicit controls for one selected Uniswap v4 mirror universe.
+    #[new]
+    #[must_use]
+    pub fn py_new(state_view_address: String, pool_ids: Vec<String>, head_timeout_ms: u64) -> Self {
+        Self {
+            state_view_address,
+            pool_ids,
+            head_timeout_ms,
+        }
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods(module = "nautilus_trader.adapters.blockchain")]
 impl BlockchainDataClientConfig {
     /// Configuration for blockchain data clients.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (chain, dex_ids, http_rpc_url, rpc_requests_per_second=None, multicall_calls_per_rpc_request=None, wss_rpc_url=None, use_hypersync_for_live_data=true, from_block=None, pool_filters=None, postgres_cache_database_config=None, proxy_url=None, transport_backend=None))]
+    #[pyo3(signature = (chain, dex_ids, http_rpc_url, rpc_requests_per_second=None, multicall_calls_per_rpc_request=None, wss_rpc_url=None, use_hypersync_for_live_data=true, from_block=None, pool_filters=None, postgres_cache_database_config=None, proxy_url=None, transport_backend=None, uniswap_v4_mirror=None))]
     fn py_new(
         #[gen_stub(
             override_type(
@@ -75,6 +90,7 @@ impl BlockchainDataClientConfig {
         postgres_cache_database_config: Option<PostgresConnectOptions>,
         proxy_url: Option<String>,
         transport_backend: Option<TransportBackend>,
+        uniswap_v4_mirror: Option<UniswapV4MirrorDataConfig>,
     ) -> Self {
         Self::builder()
             .chain(Arc::new(chain.clone()))
@@ -89,6 +105,7 @@ impl BlockchainDataClientConfig {
             .maybe_postgres_cache_database_config(postgres_cache_database_config)
             .maybe_proxy_url(proxy_url)
             .transport_backend(transport_backend.unwrap_or_default())
+            .maybe_uniswap_v4_mirror(uniswap_v4_mirror)
             .build()
     }
 

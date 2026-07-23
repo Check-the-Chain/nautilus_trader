@@ -53,6 +53,95 @@ fn format_numeric<T: ToString>(value: &T) -> String {
     s.to_string()
 }
 
+fn encode_pool_binary_row(chain_id: u32, pool: &Pool) -> std::io::Result<Vec<u8>> {
+    use std::io::Write;
+
+    let mut row_data = Vec::new();
+    row_data.write_all(&15u16.to_be_bytes())?;
+
+    let chain_id_bytes = (chain_id as i32).to_be_bytes();
+    row_data.write_all(&(chain_id_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&chain_id_bytes)?;
+
+    let dex_name_bytes = pool.dex.name.to_string().as_bytes().to_vec();
+    row_data.write_all(&(dex_name_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&dex_name_bytes)?;
+
+    let amm_type_bytes = pool.amm_type.to_string().as_bytes().to_vec();
+    row_data.write_all(&(amm_type_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&amm_type_bytes)?;
+
+    let address_bytes = pool.address.to_string().as_bytes().to_vec();
+    row_data.write_all(&(address_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&address_bytes)?;
+
+    let pool_identifier_bytes = pool.pool_identifier.as_str().as_bytes();
+    row_data.write_all(&(pool_identifier_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(pool_identifier_bytes)?;
+
+    let creation_block_bytes = (pool.creation_block as i64).to_be_bytes();
+    row_data.write_all(&(creation_block_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&creation_block_bytes)?;
+
+    let token0_chain_bytes = (pool.token0.chain.chain_id as i32).to_be_bytes();
+    row_data.write_all(&(token0_chain_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&token0_chain_bytes)?;
+
+    let token0_address_bytes = pool.token0.address.to_string().as_bytes().to_vec();
+    row_data.write_all(&(token0_address_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&token0_address_bytes)?;
+
+    let token1_chain_bytes = (pool.token1.chain.chain_id as i32).to_be_bytes();
+    row_data.write_all(&(token1_chain_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&token1_chain_bytes)?;
+
+    let token1_address_bytes = pool.token1.address.to_string().as_bytes().to_vec();
+    row_data.write_all(&(token1_address_bytes.len() as i32).to_be_bytes())?;
+    row_data.write_all(&token1_address_bytes)?;
+
+    if let Some(fee) = pool.fee {
+        let fee_bytes = (fee as i32).to_be_bytes();
+        row_data.write_all(&(fee_bytes.len() as i32).to_be_bytes())?;
+        row_data.write_all(&fee_bytes)?;
+    } else {
+        row_data.write_all(&(-1i32).to_be_bytes())?;
+    }
+
+    if let Some(tick_spacing) = pool.tick_spacing {
+        let tick_spacing_bytes = (tick_spacing as i32).to_be_bytes();
+        row_data.write_all(&(tick_spacing_bytes.len() as i32).to_be_bytes())?;
+        row_data.write_all(&tick_spacing_bytes)?;
+    } else {
+        row_data.write_all(&(-1i32).to_be_bytes())?;
+    }
+
+    if let Some(initial_tick) = pool.initial_tick {
+        let initial_tick_bytes = initial_tick.to_be_bytes();
+        row_data.write_all(&(initial_tick_bytes.len() as i32).to_be_bytes())?;
+        row_data.write_all(&initial_tick_bytes)?;
+    } else {
+        row_data.write_all(&(-1i32).to_be_bytes())?;
+    }
+
+    if let Some(ref initial_sqrt_price) = pool.initial_sqrt_price_x96 {
+        let sqrt_price_bytes = format_numeric(initial_sqrt_price).as_bytes().to_vec();
+        row_data.write_all(&(sqrt_price_bytes.len() as i32).to_be_bytes())?;
+        row_data.write_all(&sqrt_price_bytes)?;
+    } else {
+        row_data.write_all(&(-1i32).to_be_bytes())?;
+    }
+
+    if let Some(ref hooks) = pool.hooks {
+        let hooks_bytes = hooks.to_string().as_bytes().to_vec();
+        row_data.write_all(&(hooks_bytes.len() as i32).to_be_bytes())?;
+        row_data.write_all(&hooks_bytes)?;
+    } else {
+        row_data.write_all(&(-1i32).to_be_bytes())?;
+    }
+
+    Ok(row_data)
+}
+
 /// Handles PostgreSQL COPY BINARY operations for blockchain data.
 #[derive(Debug)]
 pub struct PostgresCopyHandler<'a> {
@@ -160,7 +249,7 @@ impl<'a> PostgresCopyHandler<'a> {
 
         let copy_statement = "
             COPY pool (
-                chain_id, dex_name, address, pool_identifier, creation_block,
+                chain_id, dex_name, amm_type, address, pool_identifier, creation_block,
                 token0_chain, token0_address, token1_chain, token1_address,
                 fee, tick_spacing, initial_tick, initial_sqrt_price_x96, hook_address
             ) FROM STDIN WITH (FORMAT BINARY)";
@@ -870,86 +959,7 @@ impl<'a> PostgresCopyHandler<'a> {
         chain_id: u32,
         pool: &Pool,
     ) -> anyhow::Result<()> {
-        use std::io::Write;
-        let mut row_data = Vec::new();
-
-        row_data.write_all(&14u16.to_be_bytes())?;
-
-        let chain_id_bytes = (chain_id as i32).to_be_bytes();
-        row_data.write_all(&(chain_id_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(&chain_id_bytes)?;
-
-        let dex_name_bytes = pool.dex.name.to_string().as_bytes().to_vec();
-        row_data.write_all(&(dex_name_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(&dex_name_bytes)?;
-
-        let address_bytes = pool.address.to_string().as_bytes().to_vec();
-        row_data.write_all(&(address_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(&address_bytes)?;
-
-        let pool_identifier_bytes = pool.pool_identifier.as_str().as_bytes();
-        row_data.write_all(&(pool_identifier_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(pool_identifier_bytes)?;
-
-        let creation_block_bytes = (pool.creation_block as i64).to_be_bytes();
-        row_data.write_all(&(creation_block_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(&creation_block_bytes)?;
-
-        let token0_chain_bytes = (pool.token0.chain.chain_id as i32).to_be_bytes();
-        row_data.write_all(&(token0_chain_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(&token0_chain_bytes)?;
-
-        let token0_address_bytes = pool.token0.address.to_string().as_bytes().to_vec();
-        row_data.write_all(&(token0_address_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(&token0_address_bytes)?;
-
-        let token1_chain_bytes = (pool.token1.chain.chain_id as i32).to_be_bytes();
-        row_data.write_all(&(token1_chain_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(&token1_chain_bytes)?;
-
-        let token1_address_bytes = pool.token1.address.to_string().as_bytes().to_vec();
-        row_data.write_all(&(token1_address_bytes.len() as i32).to_be_bytes())?;
-        row_data.write_all(&token1_address_bytes)?;
-
-        if let Some(fee) = pool.fee {
-            let fee_bytes = (fee as i32).to_be_bytes();
-            row_data.write_all(&(fee_bytes.len() as i32).to_be_bytes())?;
-            row_data.write_all(&fee_bytes)?;
-        } else {
-            row_data.write_all(&(-1i32).to_be_bytes())?; // NULL
-        }
-
-        if let Some(tick_spacing) = pool.tick_spacing {
-            let tick_spacing_bytes = (tick_spacing as i32).to_be_bytes();
-            row_data.write_all(&(tick_spacing_bytes.len() as i32).to_be_bytes())?;
-            row_data.write_all(&tick_spacing_bytes)?;
-        } else {
-            row_data.write_all(&(-1i32).to_be_bytes())?; // NULL
-        }
-
-        if let Some(initial_tick) = pool.initial_tick {
-            let initial_tick_bytes = initial_tick.to_be_bytes();
-            row_data.write_all(&(initial_tick_bytes.len() as i32).to_be_bytes())?;
-            row_data.write_all(&initial_tick_bytes)?;
-        } else {
-            row_data.write_all(&(-1i32).to_be_bytes())?; // NULL
-        }
-
-        if let Some(ref initial_sqrt_price) = pool.initial_sqrt_price_x96 {
-            let sqrt_price_bytes = format_numeric(initial_sqrt_price).as_bytes().to_vec();
-            row_data.write_all(&(sqrt_price_bytes.len() as i32).to_be_bytes())?;
-            row_data.write_all(&sqrt_price_bytes)?;
-        } else {
-            row_data.write_all(&(-1i32).to_be_bytes())?; // NULL
-        }
-
-        if let Some(ref hooks) = pool.hooks {
-            let hooks_bytes = hooks.to_string().as_bytes().to_vec();
-            row_data.write_all(&(hooks_bytes.len() as i32).to_be_bytes())?;
-            row_data.write_all(&hooks_bytes)?;
-        } else {
-            row_data.write_all(&(-1i32).to_be_bytes())?; // NULL
-        }
+        let row_data = encode_pool_binary_row(chain_id, pool)?;
 
         copy_in
             .send(row_data)
@@ -972,5 +982,85 @@ impl<'a> PostgresCopyHandler<'a> {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to write COPY trailer: {e}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use alloy::primitives::address;
+    use nautilus_core::UnixNanos;
+    use nautilus_model::defi::{AmmType, Blockchain, Chain, Dex, DexType, PoolIdentifier, Token};
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn encode_pool_binary_row_includes_pool_amm_type() {
+        let chain = Arc::new(Chain::new(Blockchain::Ethereum, 1));
+        let dex = Arc::new(Dex::new_discovery_only(
+            (*chain).clone(),
+            DexType::UniswapV3,
+            "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+            0,
+            AmmType::CLAMM,
+            "PoolCreated",
+        ));
+        let pool_address = address!("0x11b815efB8f581194ae79006d24E0d814B7697F6");
+        let mut pool = Pool::new(
+            chain.clone(),
+            dex,
+            pool_address,
+            PoolIdentifier::from_address(pool_address),
+            1,
+            Token::new(
+                chain.clone(),
+                address!("0xA0b86a33E6441b936662bb6B5d1F8Fb0E2b57A5D"),
+                "Wrapped Ether".to_string(),
+                "WETH".to_string(),
+                18,
+            ),
+            Token::new(
+                chain,
+                address!("0xdAC17F958D2ee523a2206206994597C13D831ec7"),
+                "Tether USD".to_string(),
+                "USDT".to_string(),
+                6,
+            ),
+            Some(3_000),
+            Some(60),
+            UnixNanos::default(),
+        );
+        pool.set_amm_type(AmmType::StableSwap);
+
+        let encoded = encode_pool_binary_row(1, &pool).unwrap();
+        let fields = decode_binary_fields(&encoded);
+
+        assert_eq!(fields.len(), 15);
+        assert_eq!(fields[1], Some(DexType::UniswapV3.to_string().as_bytes()));
+        assert_eq!(fields[2], Some(AmmType::StableSwap.to_string().as_bytes()));
+        assert_eq!(fields[3], Some(pool.address.to_string().as_bytes()));
+    }
+
+    fn decode_binary_fields(row: &[u8]) -> Vec<Option<&[u8]>> {
+        let field_count = u16::from_be_bytes(row[..2].try_into().unwrap()) as usize;
+        let mut offset = 2;
+        let mut fields = Vec::with_capacity(field_count);
+
+        for _ in 0..field_count {
+            let length = i32::from_be_bytes(row[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            if length < 0 {
+                fields.push(None);
+            } else {
+                let end = offset + length as usize;
+                fields.push(Some(&row[offset..end]));
+                offset = end;
+            }
+        }
+
+        assert_eq!(offset, row.len());
+        fields
     }
 }

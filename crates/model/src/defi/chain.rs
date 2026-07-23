@@ -116,6 +116,7 @@ pub enum Blockchain {
     Polygon,
     PolygonAmoy,
     PolygonZkEvm,
+    Robinhood,
     Rootstock,
     Saakuru,
     Scroll,
@@ -202,7 +203,8 @@ impl Chain {
             | Blockchain::Blast
             | Blockchain::BlastSepolia
             | Blockchain::Scroll
-            | Blockchain::Linea => ("ETH", "Ethereum"),
+            | Blockchain::Linea
+            | Blockchain::Robinhood => ("ETH", "Ethereum"),
             Blockchain::Polygon | Blockchain::PolygonAmoy => ("POL", "Polygon"),
             Blockchain::Avalanche | Blockchain::Fuji => ("AVAX", "Avalanche"),
             Blockchain::Bsc | Blockchain::BscTestnet => ("BNB", "Binance Coin"),
@@ -285,6 +287,7 @@ impl Chain {
             137 => Some(&chains::POLYGON),
             80002 => Some(&chains::POLYGON_AMOY),
             1101 => Some(&chains::POLYGON_ZKEVM),
+            4663 => Some(&chains::ROBINHOOD),
             30 => Some(&chains::ROOTSTOCK),
             1204 => Some(&chains::SAAKURU),
             534_352 => Some(&chains::SCROLL),
@@ -377,6 +380,7 @@ impl Chain {
             Blockchain::Polygon => Some(&chains::POLYGON),
             Blockchain::PolygonAmoy => Some(&chains::POLYGON_AMOY),
             Blockchain::PolygonZkEvm => Some(&chains::POLYGON_ZKEVM),
+            Blockchain::Robinhood => Some(&chains::ROBINHOOD),
             Blockchain::Rootstock => Some(&chains::ROOTSTOCK),
             Blockchain::Saakuru => Some(&chains::SAAKURU),
             Blockchain::Scroll => Some(&chains::SCROLL),
@@ -515,6 +519,8 @@ pub mod chains {
         LazyLock::new(|| Chain::new(Blockchain::PolygonAmoy, 80002));
     pub static POLYGON_ZKEVM: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::PolygonZkEvm, 1101));
+    pub static ROBINHOOD: LazyLock<Chain> =
+        LazyLock::new(|| Chain::new(Blockchain::Robinhood, 4663));
     pub static ROOTSTOCK: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Rootstock, 30));
     pub static SAAKURU: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Saakuru, 1204));
     pub static SCROLL: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Scroll, 534_352));
@@ -580,6 +586,22 @@ mod tests {
     }
 
     #[rstest]
+    fn test_robinhood_chain() {
+        let robinhood_chain = chains::ROBINHOOD.clone();
+        assert_eq!(
+            robinhood_chain.to_string(),
+            "Chain(name=Robinhood, id=4663)"
+        );
+        assert_eq!(robinhood_chain.name, Blockchain::Robinhood);
+        assert_eq!(robinhood_chain.chain_id, 4663);
+
+        let currency = robinhood_chain.native_currency();
+        assert_eq!(currency.code.as_str(), "ETH");
+        assert_eq!(currency.precision, 18);
+        assert_eq!(currency.name.as_str(), "Ethereum");
+    }
+
+    #[rstest]
     fn test_chain_constructor() {
         let chain = Chain::new(Blockchain::Polygon, 137);
 
@@ -608,6 +630,7 @@ mod tests {
         assert!(Chain::from_chain_id(137).is_some()); // Polygon
         assert!(Chain::from_chain_id(42161).is_some()); // Arbitrum
         assert!(Chain::from_chain_id(8453).is_some()); // Base
+        assert!(Chain::from_chain_id(4663).is_some()); // Robinhood
 
         // Verify specific chain
         let eth_chain = Chain::from_chain_id(1).unwrap();
@@ -629,6 +652,7 @@ mod tests {
         assert!(Chain::from_chain_name("Polygon").is_some());
         assert!(Chain::from_chain_name("Arbitrum").is_some());
         assert!(Chain::from_chain_name("Base").is_some());
+        assert!(Chain::from_chain_name("Robinhood").is_some());
 
         // Verify specific chain
         let eth_chain = Chain::from_chain_name("Ethereum").unwrap();
@@ -678,6 +702,7 @@ mod tests {
             ("Avalanche", 43114),
             ("Fantom", 250),
             ("Bsc", 56),
+            ("Robinhood", 4663),
         ];
 
         for (name, id) in chains_to_test {

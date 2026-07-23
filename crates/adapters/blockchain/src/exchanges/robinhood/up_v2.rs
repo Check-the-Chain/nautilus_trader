@@ -1,0 +1,39 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+use std::sync::LazyLock;
+
+use nautilus_model::defi::{
+    chain::chains,
+    dex::{AmmType, Dex, DexType},
+};
+
+use crate::exchanges::{extended::DexExtended, parsing::solidly_v2};
+
+/// UP V2 DEX on Robinhood Chain.
+pub static UP_V2: LazyLock<DexExtended> = LazyLock::new(|| {
+    let dex = Dex::new_discovery_only(
+        chains::ROBINHOOD.clone(),
+        DexType::UpV2,
+        "0xFA5429AEBa338BEa2BFcc1b9a889862Ee395bc28",
+        6_180_950,
+        AmmType::CPAMM,
+        "PoolCreated(address,address,bool,address,uint256)",
+    );
+    let mut dex_extended = DexExtended::new(dex);
+    dex_extended.set_pool_created_event_rpc_parsing(
+        solidly_v2::pool_created::parse_up_pool_created_event_rpc,
+    );
+    dex_extended
+});

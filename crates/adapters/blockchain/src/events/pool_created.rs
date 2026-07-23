@@ -14,7 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use alloy::primitives::{Address, U160};
-use nautilus_model::defi::PoolIdentifier;
+use nautilus_model::defi::{AmmType, PoolIdentifier};
 
 /// Represents a liquidity pool creation event from a decentralized exchange.
 ///
@@ -37,6 +37,8 @@ pub struct PoolCreatedEvent {
     pub fee: Option<u32>,
     /// The tick spacing parameter that controls the granularity of price ranges.
     pub tick_spacing: Option<u32>,
+    /// An AMM type override when this pool differs from the DEX default.
+    pub amm_type: Option<AmmType>,
     /// The square root of the price ratio encoded as a fixed point number with 96 fractional bits.
     pub sqrt_price_x96: Option<U160>,
     /// The current tick of the pool.
@@ -65,10 +67,16 @@ impl PoolCreatedEvent {
             pool_identifier,
             fee,
             tick_spacing,
+            amm_type: None,
             sqrt_price_x96: None,
             tick: None,
             hooks: None,
         }
+    }
+
+    /// Sets the AMM type override for this pool.
+    pub fn set_amm_type(&mut self, amm_type: AmmType) {
+        self.amm_type = Some(amm_type);
     }
 
     /// Sets the initialization parameters for the pool after it has been initialized.
@@ -82,5 +90,35 @@ impl PoolCreatedEvent {
     /// This is typically called for Uniswap V4 pools that have hooks enabled.
     pub fn set_hooks(&mut self, hooks: Address) {
         self.hooks = Some(hooks);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::defi::{AmmType, PoolIdentifier};
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_pool_created_event_amm_type_override() {
+        let token0 = Address::ZERO;
+        let token1 = Address::with_last_byte(1);
+        let pool_address = Address::with_last_byte(2);
+        let mut event = PoolCreatedEvent::new(
+            1,
+            token0,
+            token1,
+            pool_address,
+            PoolIdentifier::from_address(pool_address),
+            None,
+            None,
+        );
+
+        assert_eq!(event.amm_type, None);
+
+        event.set_amm_type(AmmType::StableSwap);
+
+        assert_eq!(event.amm_type, Some(AmmType::StableSwap));
     }
 }

@@ -13,8 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use anyhow::Context;
 use nautilus_infrastructure::sql::pg::{
-    connect_pg, drop_postgres, get_postgres_connect_options, init_postgres,
+    apply_postgres_schema, connect_pg, connect_pg_uri, drop_postgres, get_postgres_connect_options,
+    init_postgres, verify_blockchain_cache_schema,
 };
 
 use crate::opt::{DatabaseCommand, DatabaseOpt};
@@ -58,6 +60,25 @@ pub(crate) async fn run_database_command(opt: DatabaseOpt) -> anyhow::Result<()>
                 config.schema,
             )
             .await?;
+        }
+        DatabaseCommand::Migrate { url, schema } => {
+            let url = url
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .context("database migrate requires --url or DATABASE_URL")?;
+            log::info!("Connecting to Postgres for schema migration");
+            let pg = connect_pg_uri(&url).await?;
+            log::info!("Connected; applying schema without role or grant changes");
+            apply_postgres_schema(&pg, schema).await?;
+            verify_blockchain_cache_schema(&pg).await?;
+            log::info!("Nautilus blockchain cache schema verified");
+        }
+        DatabaseCommand::Verify { url } => {
+            let url = url
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .context("database verify requires --url or DATABASE_URL")?;
+            let pg = connect_pg_uri(&url).await?;
+            verify_blockchain_cache_schema(&pg).await?;
+            log::info!("Nautilus blockchain cache schema verified");
         }
         DatabaseCommand::Drop(config) => {
             let pg_connect_options = get_postgres_connect_options(
