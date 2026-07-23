@@ -14,6 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import os
+from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -23,6 +24,7 @@ from nautilus_trader.core.nautilus_pyo3 import BarAggregation
 from nautilus_trader.core.nautilus_pyo3 import BarSpecification
 from nautilus_trader.core.nautilus_pyo3 import BarType
 from nautilus_trader.core.nautilus_pyo3 import CurrencyPair
+from nautilus_trader.core.nautilus_pyo3 import FundingRateUpdate
 from nautilus_trader.core.nautilus_pyo3 import IndexPriceUpdate
 from nautilus_trader.core.nautilus_pyo3 import InstrumentId
 from nautilus_trader.core.nautilus_pyo3 import MarkPriceUpdate
@@ -352,6 +354,18 @@ def index_price_update(t):
     )
 
 
+def funding_rate_update(t):
+    instrument_id = TestIdProviderPyo3.ethusdt_binance_id()
+    return FundingRateUpdate(
+        instrument_id=instrument_id,
+        rate=Decimal("0.0001"),
+        interval=480,
+        next_funding_ns=t + 1,
+        ts_event=t,
+        ts_init=t,
+    )
+
+
 def test_write_quote_ticks(catalog: LegacyParquetDataCatalog):
     # Arrange
     pyo3_catalog = ParquetDataCatalog(catalog.path)
@@ -415,6 +429,21 @@ def test_write_index_price_updates(catalog: LegacyParquetDataCatalog):
     # Check that files were created
     used_files = pyo3_catalog.query_files("index_prices", ["ETH/USDT.BINANCE"])
     assert len(used_files) >= 1
+
+
+def test_funding_rate_updates_round_trip(catalog: LegacyParquetDataCatalog):
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
+    expected = [funding_rate_update(1), funding_rate_update(2)]
+
+    pyo3_catalog.write_funding_rate_updates(expected)
+    updates = pyo3_catalog.query_funding_rate_updates(["ETH/USDT.BINANCE"])
+
+    assert len(updates) == 2
+    assert updates[0].rate == Decimal("0.0001")
+    assert updates[0].interval == 480
+    assert updates[0].next_funding_ns == 2
+    assert updates[0].ts_event == 1
+    assert updates[0].ts_init == 1
 
 
 def test_query_files(catalog: LegacyParquetDataCatalog):

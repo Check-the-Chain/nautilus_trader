@@ -18,8 +18,9 @@ use std::collections::HashMap;
 use nautilus_core::{UnixNanos, python::to_pytype_err};
 use nautilus_model::{
     data::{
-        Bar, Data, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OptionGreeks,
-        OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
+        Bar, Data, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate,
+        OptionGreeks, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
+        close::InstrumentClose,
     },
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
 };
@@ -364,6 +365,40 @@ impl PyParquetDataCatalog {
             )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write index price updates: {e}")))
+    }
+
+    /// Write funding rate update data to Parquet files.
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: Vector of funding rate updates to write
+    /// - `start`: Optional start timestamp override (nanoseconds since Unix epoch)
+    /// - `end`: Optional end timestamp override (nanoseconds since Unix epoch)
+    ///
+    /// # Returns
+    ///
+    /// Returns the path of the created file as a string.
+    #[pyo3(signature = (data, start=None, end=None, skip_disjoint_check=false))]
+    pub fn write_funding_rate_updates(
+        &self,
+        data: Vec<FundingRateUpdate>,
+        start: Option<u64>,
+        end: Option<u64>,
+        skip_disjoint_check: bool,
+    ) -> PyResult<String> {
+        let start_nanos = start.map(UnixNanos::from);
+        let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
+
+        self.inner
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|e| PyIOError::new_err(format!("Failed to write funding rate updates: {e}")))
     }
 
     /// Write option greeks data to Parquet files.
@@ -1026,6 +1061,20 @@ impl PyParquetDataCatalog {
                     .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
                 prices.into_iter().map(Data::from).collect()
             }
+            "funding_rate_update" => {
+                let funding_rates = self
+                    .inner
+                    .query_typed_data::<FundingRateUpdate>(
+                        identifiers,
+                        start_nanos,
+                        end_nanos,
+                        where_clause,
+                        files,
+                        optimize_file_loading,
+                    )
+                    .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
+                funding_rates.into_iter().map(Data::from).collect()
+            }
             "option_greeks" => {
                 let greeks = self
                     .inner
@@ -1339,6 +1388,41 @@ impl PyParquetDataCatalog {
                 where_clause,
                 None,
                 true, // optimize_file_loading=true for directory-based registration (default)
+            )
+            .map_err(|e| PyIOError::new_err(format!("Failed to query data: {e}")))
+    }
+
+    /// Query funding rate update data from Parquet files.
+    ///
+    /// # Parameters
+    ///
+    /// - `instrument_ids`: Optional list of instrument IDs to filter by
+    /// - `start`: Optional start timestamp (nanoseconds since Unix epoch)
+    /// - `end`: Optional end timestamp (nanoseconds since Unix epoch)
+    /// - `where_clause`: Optional SQL WHERE clause for additional filtering
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of `FundingRateUpdate` objects matching the query criteria.
+    #[pyo3(signature = (instrument_ids=None, start=None, end=None, where_clause=None))]
+    pub fn query_funding_rate_updates(
+        &mut self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<u64>,
+        end: Option<u64>,
+        where_clause: Option<&str>,
+    ) -> PyResult<Vec<FundingRateUpdate>> {
+        let start_nanos = start.map(UnixNanos::from);
+        let end_nanos = end.map(UnixNanos::from);
+
+        self.inner
+            .query_typed_data::<FundingRateUpdate>(
+                instrument_ids,
+                start_nanos,
+                end_nanos,
+                where_clause,
+                None,
+                true,
             )
             .map_err(|e| PyIOError::new_err(format!("Failed to query data: {e}")))
     }
