@@ -8,6 +8,7 @@ from nautilus_trader import model
 __all__ = [
     "BestPriceFillModel",
     "CappedOptionFeeModel",
+    "CommissionScheduleFeeModel",
     "CompetitionAwareFillModel",
     "DefaultFillModel",
     "ExecutionEngineConfig",
@@ -47,6 +48,18 @@ class CappedOptionFeeModel:
         maker_rate: decimal.Decimal | None = None,
         taker_rate: decimal.Decimal | None = None,
         cap_rate: decimal.Decimal | None = None,
+    ) -> None: ...
+
+@typing.final
+class CommissionScheduleFeeModel:
+    def __init__(
+        self,
+        rate: decimal.Decimal,
+        per_unit: model.Money,
+        minimum: model.Money,
+        maximum_rate: decimal.Decimal,
+        buy_tax_rate: decimal.Decimal,
+        sell_tax_rate: decimal.Decimal,
     ) -> None: ...
 
 @typing.final

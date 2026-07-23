@@ -26,8 +26,9 @@ use pyo3::{IntoPyObject, IntoPyObjectExt, prelude::*};
 use rust_decimal::Decimal;
 
 use crate::models::fee::{
-    CappedOptionFeeModel, FeeModel, FeeModelAny, FeeModelHandle, FixedFeeModel, MakerTakerFeeModel,
-    PerContractFeeModel, ProbabilityPriceFeeModel, TieredNotionalOptionFeeModel,
+    CappedOptionFeeModel, CommissionScheduleFeeModel, FeeModel, FeeModelAny, FeeModelHandle,
+    FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel, ProbabilityPriceFeeModel,
+    TieredNotionalOptionFeeModel,
 };
 
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")]
@@ -245,6 +246,41 @@ impl PerContractFeeModel {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl CommissionScheduleFeeModel {
+    /// A per-unit commission clamped by a per-order minimum and a maximum
+    /// fraction of fill notional — the shape of fixed-rate US equity brokerage
+    /// pricing (e.g. IBKR Fixed: $0.005/share, min $1.00 per order, max 1% of
+    /// trade value).
+    ///
+    /// The minimum applies to an order's first fill only (mirroring per-order
+    /// minimums); subsequent partial fills pay the unclamped per-unit rate.
+    #[new]
+    fn py_new(
+        rate: Decimal,
+        per_unit: Money,
+        minimum: Money,
+        maximum_rate: Decimal,
+        buy_tax_rate: Decimal,
+        sell_tax_rate: Decimal,
+    ) -> PyResult<Self> {
+        Self::new(
+            rate,
+            per_unit,
+            minimum,
+            maximum_rate,
+            buy_tax_rate,
+            sell_tax_rate,
+        )
+        .map_err(to_pyruntime_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl ProbabilityPriceFeeModel {
     /// Fee model for probability-priced outcome shares.
     ///
@@ -326,6 +362,10 @@ pub fn pyobject_to_fee_model_any(obj: &Bound<'_, PyAny>) -> PyResult<FeeModelAny
         return Ok(FeeModelAny::PerContract(m));
     }
 
+    if let Ok(m) = obj.extract::<CommissionScheduleFeeModel>() {
+        return Ok(FeeModelAny::CommissionSchedule(m));
+    }
+
     if let Ok(m) = obj.extract::<ProbabilityPriceFeeModel>() {
         return Ok(FeeModelAny::ProbabilityPrice(m));
     }
@@ -377,6 +417,7 @@ pub fn fee_model_any_to_pyobject(py: Python<'_>, model: &FeeModelAny) -> PyResul
         FeeModelAny::Fixed(model) => model.clone().into_py_any(py),
         FeeModelAny::MakerTaker(model) => model.clone().into_py_any(py),
         FeeModelAny::PerContract(model) => model.clone().into_py_any(py),
+        FeeModelAny::CommissionSchedule(model) => model.clone().into_py_any(py),
         FeeModelAny::ProbabilityPrice(model) => model.clone().into_py_any(py),
         FeeModelAny::CappedOption(model) => model.clone().into_py_any(py),
         FeeModelAny::TieredNotionalOption(model) => model.clone().into_py_any(py),
