@@ -1973,6 +1973,17 @@ pub trait Strategy: DataActor {
         true // Proceed with stop
     }
 
+    /// Clears managed-exit state before an immediate component stop.
+    ///
+    /// This is used after a graceful-stop deadline expires so a recurring
+    /// market-exit timer cannot leak into a later lifecycle.
+    fn prepare_forced_stop(&mut self)
+    where
+        Self: StrategyNative,
+    {
+        self.cancel_market_exit();
+    }
+
     /// Denies an order by generating an `OrderDenied` event.
     ///
     /// This method creates an `OrderDenied` event, applies it to the order,
@@ -4517,6 +4528,54 @@ mod tests {
         // Should return early without changing state
         assert!(!should_proceed);
         assert!(strategy.core.pending_stop);
+    }
+
+    #[rstest]
+    fn test_prepare_forced_stop_clears_managed_exit_state_and_timer() {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            order_id_tag: Some("001".to_string()),
+            manage_stop: true,
+            ..Default::default()
+        };
+        let mut strategy = TestStrategy::new(config);
+
+        let trader_id = TraderId::from("TRADER-001");
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        clock
+            .borrow_mut()
+            .register_default_handler(TimeEventCallback::from(|_event: TimeEvent| {}));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let portfolio = Rc::new(RefCell::new(Portfolio::new(
+            clock.clone(),
+            cache.clone(),
+            None,
+        )));
+        strategy
+            .core
+            .register(trader_id, clock, cache, portfolio)
+            .unwrap();
+        strategy.initialize().unwrap();
+        strategy.start().unwrap();
+
+        assert!(!Strategy::stop(&mut strategy));
+        assert!(strategy.core.is_exiting);
+        assert!(strategy.core.pending_stop);
+        let timer_name = strategy.core.market_exit_timer_name;
+        assert!(
+            strategy
+                .core
+                .clock_mut()
+                .timer_names()
+                .contains(&timer_name.as_str())
+        );
+
+        Strategy::prepare_forced_stop(&mut strategy);
+
+        assert!(!strategy.core.is_exiting);
+        assert!(!strategy.core.pending_stop);
+        assert_eq!(strategy.core.market_exit_attempts, 0);
+        assert!(strategy.core.clock_mut().timer_names().is_empty());
     }
 
     #[rstest]

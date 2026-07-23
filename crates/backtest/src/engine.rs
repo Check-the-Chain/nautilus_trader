@@ -885,7 +885,9 @@ impl BacktestEngine {
             self.flush_accumulator_events(&clocks, flush_ts);
         }
 
-        self.kernel.stop_trader();
+        if let Err(error) = self.kernel.stop_trader() {
+            log::error!("Error stopping trader: {error:#}");
+        }
 
         // Settle residual on_stop commands before stopping engines. Venue modules are
         // not re-run; process_modules is once per timestamp.
@@ -905,6 +907,10 @@ impl BacktestEngine {
         }
 
         self.settle_venues(ts_now);
+
+        if let Err(error) = self.kernel.finalize_trader_stop() {
+            log::error!("Error finalizing deferred trader components: {error:#}");
+        }
 
         self.kernel.portfolio.borrow_mut().finalize_equity_curve();
 

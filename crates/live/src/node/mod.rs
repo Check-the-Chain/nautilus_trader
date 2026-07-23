@@ -165,6 +165,7 @@ pub struct LiveNode {
     exec_clients: Vec<LiveExecutionClient>,
     external_msgbus: Option<ExternalMessageBusIngress>,
     shutdown_deadline: Option<dst::time::Instant>,
+    trader_stop_error: Option<anyhow::Error>,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
 }
@@ -191,6 +192,7 @@ impl LiveNode {
             exec_clients,
             external_msgbus,
             shutdown_deadline: None,
+            trader_stop_error: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
         }
@@ -270,6 +272,7 @@ impl LiveNode {
             exec_clients: Vec::new(),
             external_msgbus: None,
             shutdown_deadline: None,
+            trader_stop_error: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
         };
@@ -470,7 +473,10 @@ impl LiveNode {
         #[cfg(not(feature = "plugin"))]
         let controller_stop_result: anyhow::Result<()> = Ok(());
 
-        self.kernel.stop_trader();
+        if let Err(error) = self.kernel.stop_trader() {
+            log::error!("Error stopping trader: {error:#}");
+            self.trader_stop_error = Some(error);
+        }
         let delay = self.kernel.delay_post_stop();
         log::info!("Awaiting residual events ({delay:?})...");
 
@@ -654,7 +660,7 @@ impl LiveNode {
             })
             .await
             .map_err(|_| {
-                anyhow::anyhow!("startup reconciliation timed out for client {client_id}")
+                anyhow::anyhow!("Startup reconciliation timeout reached for client {client_id}")
             })?;
 
             match mass_status_result {
@@ -791,9 +797,16 @@ impl LiveNode {
         }
 
         if self.kernel.is_event_store_replay_configured() {
-            self.abort_startup("Event-store replay did not start")
-                .await?;
-            return Ok(());
+            let result = self.abort_startup("Event-store replay did not start").await;
+            Self::drain_channels(
+                &mut time_evt_rx,
+                &mut data_evt_rx,
+                &mut data_cmd_rx,
+                &mut exec_evt_rx,
+                &mut exec_cmd_rx,
+            );
+            log::info!("Event loop stopped");
+            return result;
         }
 
         let mut external_msgbus_rx = match self.take_external_ingress_receiver() {
@@ -878,7 +891,7 @@ impl LiveNode {
             .abort_reason()
             .or_else(|| self.startup_abort_reason())
         {
-            self.abort_startup(reason).await?;
+            let result = self.abort_startup(reason).await;
             Self::drain_channels(
                 &mut time_evt_rx,
                 &mut data_evt_rx,
@@ -887,7 +900,7 @@ impl LiveNode {
                 &mut exec_cmd_rx,
             );
             log::info!("Event loop stopped");
-            return Ok(());
+            return result;
         }
 
         if engine_connection_status == EngineConnectionStatus::Connected {
@@ -1408,7 +1421,7 @@ impl LiveNode {
         drop(external_msgbus_rx.take());
         let _ = self.kernel.cache().borrow().check_residuals();
 
-        self.finalize_stop().await?;
+        let finalize_result = self.finalize_stop().await;
 
         // Handle events that arrived during finalize_stop
         Self::drain_channels(
@@ -1421,7 +1434,7 @@ impl LiveNode {
 
         log::info!("Event loop stopped");
 
-        Ok(())
+        finalize_result
     }
 
     #[expect(
@@ -1584,7 +1597,10 @@ impl LiveNode {
         if let Err(e) = self.plugins.stop_controllers() {
             log::error!("Error stopping plug-in controllers: {e}");
         }
-        self.kernel.stop_trader();
+        if let Err(error) = self.kernel.stop_trader() {
+            log::error!("Error stopping trader: {error:#}");
+            self.trader_stop_error = Some(error);
+        }
         let delay = self.kernel.delay_post_stop();
         log::info!("Awaiting residual events ({delay:?})...");
 
@@ -1593,11 +1609,22 @@ impl LiveNode {
     }
 
     async fn finalize_stop(&mut self) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        if let Some(error) = self.trader_stop_error.take() {
+            errors.push(format!("failed to stop trader: {error:#}"));
+        }
+
+        let component_stop_result = self.kernel.finalize_trader_stop();
+        if let Err(error) = component_stop_result {
+            log::error!("Error finalizing deferred trader components: {error:#}");
+            errors.push(format!("failed to finalize trader components: {error:#}"));
+        }
         self.close_external_ingress();
 
         let disconnect_result = self.kernel.disconnect_clients().await;
-        if let Err(ref e) = disconnect_result {
-            log::error!("Error disconnecting clients: {e}");
+        if let Err(error) = disconnect_result {
+            errors.push(format!("failed to disconnect clients: {error:#}"));
+            log::error!("Error disconnecting clients: {error}");
         }
 
         self.await_engines_disconnected().await;
@@ -1605,7 +1632,11 @@ impl LiveNode {
 
         self.handle.set_state(NodeState::Stopped);
 
-        disconnect_result
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("LiveNode shutdown failed: {}", errors.join("; "))
+        }
     }
 
     fn drain_channels(

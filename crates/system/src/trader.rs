@@ -79,6 +79,12 @@ pub(crate) enum StrategyCommand {
     ExitMarket,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrategyStopMode {
+    Graceful,
+    Immediate,
+}
+
 /// Central orchestrator for managing trading components.
 ///
 /// The `Trader` manages the lifecycle and coordination of actors, strategies,
@@ -114,7 +120,7 @@ pub struct Trader {
     /// Registered strategy IDs (strategies stored in global registry).
     strategy_ids: Vec<StrategyId>,
     /// Strategy stop functions for managed stop behavior.
-    strategy_stop_fns: AHashMap<StrategyId, Box<dyn FnMut() -> bool>>,
+    strategy_stop_fns: AHashMap<StrategyId, Box<dyn FnMut(StrategyStopMode) -> bool>>,
     /// Msgbus handler IDs for strategy event subscriptions (order, position).
     strategy_handler_ids: AHashMap<StrategyId, (Ustr, Ustr)>,
     /// Registered exec algorithm IDs (algorithms stored in global registry).
@@ -574,9 +580,15 @@ impl Trader {
 
         // Register stop hook
         let stop_actor_id = actor_id;
-        let stop_fn = Box::new(move || -> bool {
+        let stop_fn = Box::new(move |mode| -> bool {
             if let Some(mut strategy) = try_get_actor_unchecked::<T>(&stop_actor_id) {
-                Strategy::stop(&mut *strategy)
+                match mode {
+                    StrategyStopMode::Graceful => Strategy::stop(&mut *strategy),
+                    StrategyStopMode::Immediate => {
+                        Strategy::prepare_forced_stop(&mut *strategy);
+                        true
+                    }
+                }
             } else {
                 log::error!("Strategy {stop_actor_id} not found for stop");
                 true
@@ -732,9 +744,15 @@ impl Trader {
             .insert(strategy_id, (order_handler_id, position_handler_id));
 
         let stop_actor_id = actor_id;
-        let stop_fn = Box::new(move || -> bool {
+        let stop_fn = Box::new(move |mode| -> bool {
             if let Some(mut strategy) = try_get_actor_unchecked::<T>(&stop_actor_id) {
-                Strategy::stop(&mut *strategy)
+                match mode {
+                    StrategyStopMode::Graceful => Strategy::stop(&mut *strategy),
+                    StrategyStopMode::Immediate => {
+                        Strategy::prepare_forced_stop(&mut *strategy);
+                        true
+                    }
+                }
             } else {
                 log::error!("Strategy {stop_actor_id} not found for stop");
                 true // Proceed with component stop anyway
@@ -1110,29 +1128,117 @@ impl Trader {
     ///
     /// Returns an error if any component fails to stop.
     pub fn stop_components(&mut self) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+
         for actor_id in &self.actor_ids {
             log::debug!("Stopping actor {actor_id}");
-            Self::stop_component_if_active(actor_id.inner())?;
+            if let Err(error) = Self::stop_component_if_active(actor_id.inner()) {
+                errors.push(format!("actor {actor_id}: {error:#}"));
+            }
         }
 
-        for exec_algorithm_id in &self.exec_algorithm_ids {
-            log::debug!("Stopping execution algorithm {exec_algorithm_id}");
-            Self::stop_component_if_active(exec_algorithm_id.inner())?;
-        }
-
+        let mut strategy_stop_deferred = false;
         for strategy_id in self.strategy_ids.clone() {
             log::debug!("Stopping strategy {strategy_id}");
             let should_proceed = self
                 .strategy_stop_fns
                 .get_mut(&strategy_id)
-                .is_none_or(|stop_fn| stop_fn());
+                .is_none_or(|stop_fn| stop_fn(StrategyStopMode::Graceful));
 
-            if should_proceed {
-                Self::stop_component_if_active(strategy_id.inner())?;
+            if should_proceed
+                && let Err(error) = Self::stop_component_if_active(strategy_id.inner())
+            {
+                errors.push(format!("strategy {strategy_id}: {error:#}"));
+            } else if !should_proceed {
+                strategy_stop_deferred = true;
+                log::info!(
+                    "Deferring execution algorithm shutdown while strategy {strategy_id} completes managed stop"
+                );
             }
         }
 
-        Ok(())
+        // Strategies must quiesce their primaries while execution algorithms
+        // can still process the resulting cancellation lifecycle.
+        if !strategy_stop_deferred {
+            for exec_algorithm_id in &self.exec_algorithm_ids {
+                log::debug!("Stopping execution algorithm {exec_algorithm_id}");
+                if let Err(error) = Self::stop_component_if_active(exec_algorithm_id.inner()) {
+                    errors.push(format!(
+                        "execution algorithm {exec_algorithm_id}: {error:#}"
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to stop one or more trader components: {}",
+                errors.join("; ")
+            )
+        }
+    }
+
+    /// Forces any components deferred by managed strategy shutdown to stop at
+    /// the end of the residual-event grace period. Strategies are stopped
+    /// before execution algorithms so no new algorithm work can be created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an aggregated error after attempting every deferred component.
+    pub fn finalize_deferred_component_stop(&mut self) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+
+        for actor_id in &self.actor_ids {
+            log::debug!("Finalizing actor stop {actor_id}");
+            if let Err(error) = Self::finalize_component_stop(actor_id.inner()) {
+                errors.push(format!("actor {actor_id}: {error:#}"));
+            }
+        }
+
+        for strategy_id in self.strategy_ids.clone() {
+            log::debug!("Finalizing deferred strategy stop {strategy_id}");
+            if let Some(stop_fn) = self.strategy_stop_fns.get_mut(&strategy_id) {
+                stop_fn(StrategyStopMode::Immediate);
+            }
+            if let Err(error) = Self::finalize_component_stop(strategy_id.inner()) {
+                errors.push(format!("strategy {strategy_id}: {error:#}"));
+            }
+        }
+
+        for exec_algorithm_id in &self.exec_algorithm_ids {
+            log::debug!("Finalizing deferred execution algorithm stop {exec_algorithm_id}");
+            if let Err(error) = Self::finalize_component_stop(exec_algorithm_id.inner()) {
+                errors.push(format!(
+                    "execution algorithm {exec_algorithm_id}: {error:#}"
+                ));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to finalize one or more deferred trader components: {}",
+                errors.join("; ")
+            )
+        }
+    }
+
+    fn finalize_component_stop(component_id: Ustr) -> anyhow::Result<()> {
+        match component_state(&component_id)? {
+            ComponentState::Starting
+            | ComponentState::Running
+            | ComponentState::Resuming
+            | ComponentState::Degraded => stop_component(&component_id),
+            ComponentState::PreInitialized
+            | ComponentState::Ready
+            | ComponentState::Stopped
+            | ComponentState::Disposed
+            | ComponentState::Faulted => Ok(()),
+            state => anyhow::bail!("component {component_id} remains in {state} state"),
+        }
     }
 
     /// Stops a partially started trader without deferring managed strategy shutdown.
@@ -1170,17 +1276,17 @@ impl Trader {
             }
         }
 
-        for exec_algorithm_id in &self.exec_algorithm_ids {
-            log::debug!("Stopping execution algorithm {exec_algorithm_id} after startup failure");
-            if let Err(e) = Self::stop_component_if_active(exec_algorithm_id.inner()) {
-                errors.push(format!("execution algorithm {exec_algorithm_id}: {e:#}"));
-            }
-        }
-
         for strategy_id in &self.strategy_ids {
             log::debug!("Stopping strategy {strategy_id} after startup failure");
             if let Err(e) = Self::stop_component_if_active(strategy_id.inner()) {
                 errors.push(format!("strategy {strategy_id}: {e:#}"));
+            }
+        }
+
+        for exec_algorithm_id in &self.exec_algorithm_ids {
+            log::debug!("Stopping execution algorithm {exec_algorithm_id} after startup failure");
+            if let Err(e) = Self::stop_component_if_active(exec_algorithm_id.inner()) {
+                errors.push(format!("execution algorithm {exec_algorithm_id}: {e:#}"));
             }
         }
 
@@ -1197,7 +1303,10 @@ impl Trader {
     fn stop_component_if_active(component_id: Ustr) -> anyhow::Result<()> {
         if !matches!(
             component_state(&component_id)?,
-            ComponentState::Starting | ComponentState::Running
+            ComponentState::Starting
+                | ComponentState::Running
+                | ComponentState::Resuming
+                | ComponentState::Degraded
         ) {
             return Ok(());
         }
@@ -1437,7 +1546,7 @@ impl Trader {
         let should_proceed = self
             .strategy_stop_fns
             .get_mut(strategy_id)
-            .is_none_or(|stop_fn| stop_fn());
+            .is_none_or(|stop_fn| stop_fn(StrategyStopMode::Graceful));
 
         if should_proceed {
             stop_component(&strategy_id.inner())?;
@@ -1506,7 +1615,11 @@ impl Trader {
             .position(|id| id == strategy_id)
             .ok_or_else(|| anyhow::anyhow!("Cannot remove strategy, {strategy_id} not found"))?;
 
-        // Stop if running, then dispose
+        // Stop if running, then dispose. Clear any managed-exit state first so
+        // removing a strategy cannot leave its recurring timer behind.
+        if let Some(stop_fn) = self.strategy_stop_fns.get_mut(strategy_id) {
+            stop_fn(StrategyStopMode::Immediate);
+        }
         let _ = stop_component(&strategy_id.inner());
         dispose_component(&strategy_id.inner())?;
 
@@ -1944,17 +2057,31 @@ mod tests {
     #[derive(Debug)]
     struct TestDataActor {
         core: DataActorCore,
+        fail_on_stop: bool,
     }
 
     impl TestDataActor {
         fn new(config: DataActorConfig) -> Self {
             Self {
                 core: DataActorCore::new(config),
+                fail_on_stop: false,
+            }
+        }
+
+        fn failing_on_stop(config: DataActorConfig) -> Self {
+            Self {
+                core: DataActorCore::new(config),
+                fail_on_stop: true,
             }
         }
     }
 
-    impl DataActor for TestDataActor {}
+    impl DataActor for TestDataActor {
+        fn on_stop(&mut self) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.fail_on_stop, "intentional actor stop failure");
+            Ok(())
+        }
+    }
 
     nautilus_actor!(TestDataActor);
 
@@ -1962,17 +2089,39 @@ mod tests {
     #[derive(Debug)]
     struct TestExecAlgorithm {
         core: ExecutionAlgorithmCore,
+        required_strategy_stop: Option<Rc<Cell<bool>>>,
     }
 
     impl TestExecAlgorithm {
         fn new(config: ExecutionAlgorithmConfig) -> Self {
             Self {
                 core: ExecutionAlgorithmCore::new(config),
+                required_strategy_stop: None,
+            }
+        }
+
+        fn requiring_strategy_stop(
+            config: ExecutionAlgorithmConfig,
+            strategy_stopped: Rc<Cell<bool>>,
+        ) -> Self {
+            Self {
+                core: ExecutionAlgorithmCore::new(config),
+                required_strategy_stop: Some(strategy_stopped),
             }
         }
     }
 
-    impl DataActor for TestExecAlgorithm {}
+    impl DataActor for TestExecAlgorithm {
+        fn on_stop(&mut self) -> anyhow::Result<()> {
+            if let Some(strategy_stopped) = &self.required_strategy_stop {
+                anyhow::ensure!(
+                    strategy_stopped.get(),
+                    "execution algorithm stopped before its strategy"
+                );
+            }
+            Ok(())
+        }
+    }
 
     nautilus_execution_algorithm!(TestExecAlgorithm, {
         fn on_order(&mut self, _order: OrderAny) -> anyhow::Result<()> {
@@ -1984,17 +2133,45 @@ mod tests {
     #[derive(Debug)]
     struct TestStrategy {
         core: StrategyCore,
+        stopped: Option<Rc<Cell<bool>>>,
+        fail_on_stop: bool,
     }
 
     impl TestStrategy {
         fn new(config: StrategyConfig) -> Self {
             Self {
                 core: StrategyCore::new(config),
+                stopped: None,
+                fail_on_stop: false,
+            }
+        }
+
+        fn with_stop_flag(config: StrategyConfig, stopped: Rc<Cell<bool>>) -> Self {
+            Self {
+                core: StrategyCore::new(config),
+                stopped: Some(stopped),
+                fail_on_stop: false,
+            }
+        }
+
+        fn failing_on_stop(config: StrategyConfig) -> Self {
+            Self {
+                core: StrategyCore::new(config),
+                stopped: None,
+                fail_on_stop: true,
             }
         }
     }
 
-    impl DataActor for TestStrategy {}
+    impl DataActor for TestStrategy {
+        fn on_stop(&mut self) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.fail_on_stop, "intentional strategy stop failure");
+            if let Some(stopped) = &self.stopped {
+                stopped.set(true);
+            }
+            Ok(())
+        }
+    }
 
     nautilus_strategy!(TestStrategy);
 
@@ -2582,6 +2759,158 @@ mod tests {
         // Test dispose components
         assert!(trader.dispose_components().is_ok());
         assert_eq!(trader.component_count(), 0);
+    }
+
+    #[rstest]
+    fn stop_components_attempts_strategy_shutdown_after_an_actor_error() {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache,
+            portfolio,
+        );
+        let actor = TestDataActor::failing_on_stop(DataActorConfig {
+            actor_id: Some(ActorId::from("FAILING-STOP-ACTOR")),
+            ..Default::default()
+        });
+        let strategy_stopped = Rc::new(Cell::new(false));
+        let strategy = TestStrategy::with_stop_flag(
+            StrategyConfig {
+                strategy_id: Some(StrategyId::from("STOP-TRACKING-STRATEGY")),
+                ..Default::default()
+            },
+            Rc::clone(&strategy_stopped),
+        );
+        trader.add_actor(actor).unwrap();
+        trader.add_strategy(strategy).unwrap();
+        trader.start_components().unwrap();
+
+        let error = trader.stop_components().unwrap_err();
+
+        assert!(error.to_string().contains("intentional actor stop failure"));
+        assert!(strategy_stopped.get());
+
+        let error = trader.finalize_deferred_component_stop().unwrap_err();
+        assert!(error.to_string().contains("actor FAILING-STOP-ACTOR"));
+        assert!(error.to_string().contains("remains in STOPPING state"));
+    }
+
+    #[rstest]
+    fn stop_components_quiesces_strategies_before_execution_algorithms() {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache,
+            portfolio,
+        );
+        let strategy_stopped = Rc::new(Cell::new(false));
+        let strategy = TestStrategy::with_stop_flag(
+            StrategyConfig {
+                strategy_id: Some(StrategyId::from("ORDERED-STOP-STRATEGY")),
+                ..Default::default()
+            },
+            Rc::clone(&strategy_stopped),
+        );
+        let exec_algorithm = TestExecAlgorithm::requiring_strategy_stop(
+            ExecutionAlgorithmConfig {
+                exec_algorithm_id: Some(ExecAlgorithmId::from("ORDERED-STOP-ALGORITHM")),
+                ..Default::default()
+            },
+            strategy_stopped,
+        );
+        trader.add_strategy(strategy).unwrap();
+        trader.add_exec_algorithm(exec_algorithm).unwrap();
+        trader.start_components().unwrap();
+
+        trader.stop_components().unwrap();
+    }
+
+    #[rstest]
+    fn stop_components_keeps_execution_algorithms_running_for_deferred_strategies() {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache,
+            portfolio,
+        );
+        let strategy_id = StrategyId::from("DEFERRED-STOP-STRATEGY");
+        let exec_algorithm_id = ExecAlgorithmId::from("DEFERRED-STOP-ALGORITHM");
+        trader
+            .add_strategy(TestStrategy::new(StrategyConfig {
+                strategy_id: Some(strategy_id),
+                ..Default::default()
+            }))
+            .unwrap();
+        trader
+            .add_exec_algorithm(TestExecAlgorithm::new(ExecutionAlgorithmConfig {
+                exec_algorithm_id: Some(exec_algorithm_id),
+                ..Default::default()
+            }))
+            .unwrap();
+        trader.start_components().unwrap();
+        trader
+            .strategy_stop_fns
+            .insert(strategy_id, Box::new(|_| false));
+
+        trader.stop_components().unwrap();
+
+        assert_eq!(
+            component_state(&exec_algorithm_id.inner()).unwrap(),
+            ComponentState::Running
+        );
+
+        trader.finalize_deferred_component_stop().unwrap();
+        assert_eq!(
+            component_state(&strategy_id.inner()).unwrap(),
+            ComponentState::Stopped
+        );
+        assert_eq!(
+            component_state(&exec_algorithm_id.inner()).unwrap(),
+            ComponentState::Stopped
+        );
+    }
+
+    #[rstest]
+    fn finalize_deferred_component_stop_reports_a_strategy_stuck_stopping() {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache,
+            portfolio,
+        );
+        let strategy_id = StrategyId::from("FAILING-DEFERRED-STOP-STRATEGY");
+        trader
+            .add_strategy(TestStrategy::failing_on_stop(StrategyConfig {
+                strategy_id: Some(strategy_id),
+                ..Default::default()
+            }))
+            .unwrap();
+        trader.start_components().unwrap();
+
+        assert!(trader.stop_components().is_err());
+
+        let error = trader.finalize_deferred_component_stop().unwrap_err();
+        assert!(error.to_string().contains("remains in STOPPING state"));
+        assert_eq!(
+            component_state(&strategy_id.inner()).unwrap(),
+            ComponentState::Stopping
+        );
     }
 
     #[rstest]

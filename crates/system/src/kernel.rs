@@ -687,18 +687,24 @@ impl NautilusKernel {
     /// This method initiates a graceful shutdown of trading components (strategies, actors)
     /// which may trigger residual events such as order cancellations. The caller should
     /// continue processing events after calling this method to handle these residual events.
-    pub fn stop_trader(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the trader or any registered component cannot stop.
+    pub fn stop_trader(&mut self) -> anyhow::Result<()> {
         disarm_shutdown_on_error();
 
         if !self.trader.borrow().is_running() {
-            return;
+            return Ok(());
         }
 
         log::info!("Stopping trader...");
 
-        if let Err(e) = self.trader.borrow_mut().stop() {
+        let result = self.trader.borrow_mut().stop();
+        if let Err(ref e) = result {
             log::error!("Error stopping trader: {e}");
         }
+        result
     }
 
     /// Stops a partially started trader without deferring managed strategy shutdown.
@@ -731,6 +737,10 @@ impl NautilusKernel {
     pub async fn finalize_stop(&mut self) {
         disarm_shutdown_on_error();
 
+        if let Err(error) = self.finalize_trader_stop() {
+            log::error!("Error finalizing deferred trader components: {error:#}");
+        }
+
         // Execution and data clients are stopped by their engines via `stop_engines` below
 
         self.portfolio.borrow_mut().finalize_equity_curve();
@@ -745,6 +755,16 @@ impl NautilusKernel {
         }
         self.ts_shutdown = Some(ts_shutdown);
         log::info!("Stopped");
+    }
+
+    /// Forces managed strategy and execution-algorithm shutdown after the
+    /// residual-event grace period.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any managed component cannot complete shutdown.
+    pub fn finalize_trader_stop(&mut self) -> anyhow::Result<()> {
+        self.trader.borrow_mut().finalize_deferred_component_stop()
     }
 
     /// Returns the kernel-managed event-store integration, when one was injected.
@@ -796,6 +816,14 @@ impl NautilusKernel {
     pub fn dispose(&mut self) {
         disarm_shutdown_on_error();
         log::info!("Disposing");
+
+        if let Err(e) = self.stop_trader() {
+            log::error!("Error stopping trader for disposal: {e:#}");
+        }
+
+        if let Err(e) = self.finalize_trader_stop() {
+            log::error!("Error finalizing deferred trader components for disposal: {e:#}");
+        }
 
         {
             let mut trader = self.trader.borrow_mut();
@@ -1099,7 +1127,7 @@ mod lifecycle_tests {
 
         data_commands.clear();
         drop(emulator);
-        kernel.stop_trader();
+        kernel.stop_trader().unwrap();
         kernel.dispose();
 
         let commands = data_commands.get_messages();
@@ -1140,7 +1168,7 @@ mod lifecycle_tests {
                 .get_matching_core(&instrument_id)
                 .is_some()
         );
-        kernel.stop_trader();
+        kernel.stop_trader().unwrap();
         data_commands.clear();
 
         kernel.reset();
